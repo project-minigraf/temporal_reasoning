@@ -30,7 +30,7 @@ def _get_repo_info() -> Optional[Dict[str, str]]:
     """Get current repo info using gh."""
     try:
         result = subprocess.run(
-            ["gh", "repo", "view", "--json", "owner,name,number"],
+            ["gh", "repo", "view", "--json", "owner,name"],
             capture_output=True,
             text=True,
             timeout=10
@@ -40,8 +40,7 @@ def _get_repo_info() -> Optional[Dict[str, str]]:
             data = json.loads(result.stdout)
             return {
                 "owner": data.get("owner", {}).get("login", ""),
-                "name": data.get("name", ""),
-                "number": data.get("number", 0)
+                "name": data.get("name", "")
             }
     except Exception:
         pass
@@ -113,8 +112,7 @@ def report_issue(
                 "gh", "issue", "create",
                 "--repo", f"{repo['owner']}/{repo['name']}",
                 "--title", title,
-                "--body", body,
-                "--label", "bug,minigraf"
+                "--body", body
             ],
             capture_output=True,
             text=True,
