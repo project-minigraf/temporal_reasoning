@@ -29,9 +29,21 @@ result = query("[:find ?desc :where [?e :decision/description ?desc]]")
 # Install minigraf
 cargo install --git https://github.com/adityamukho/minigraf
 
-# Or use the install script
+# Run setup (checks dependencies, syncs skill from GitHub)
 python install.py
 ```
+
+## Starting a Session
+
+```bash
+# Before starting work, run install.py to check for updates
+python install.py
+
+# Then start OpenCode
+opencode .
+```
+
+**Note:** `install.py` checks for updates weekly. Run it manually to force an immediate update.
 
 ## Files
 
