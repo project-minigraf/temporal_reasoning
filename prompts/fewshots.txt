@@ -72,6 +72,44 @@ Reason: User preference worth remembering
 Response: "I've stored that preference in memory."
 
 ---
+Example 7: Count decisions
+---
+User: "How many decisions have we made?"
+
+Action: Query with aggregation
+query:
+[:find (count ?e)
+ :where [?e :decision/description ?d]]
+
+Response: "We've made X decisions in total."
+
+---
+Example 8: Query historical state
+---
+User: "What was our roadmap before Phase 2 was added?"
+
+Action: Query as of prior transaction
+query:
+[:find ?item
+ :as-of 5
+ :where [?e :roadmap/item ?item]]
+
+Response: "At that point, the roadmap had: ..."
+
+---
+Example 9: Find items without a property
+---
+User: "Which components don't have tests?"
+
+Action: Query with negation
+query:
+[:find ?comp
+ :where [?e :component/name ?comp]
+ (not [?e :component/has-tests true])]
+
+Response: "Components without tests: ..."
+
+---
 Example 6: User mentions constraint
 ---
 User: "We need to support Python 3.8 minimum."
@@ -83,3 +121,14 @@ transact:
 Reason: Important project constraint
 
 Response: "Stored. Python 3.8+ requirement noted."
+
+---
+Example 10: Track changes over time (valid-time)
+---
+User: "What was the team's structure in 2025?"
+
+Action: Query with valid-at
+query:
+[:find ?role
+ :valid-at "2025-01-01"
+ :where [?e :team/role ?role]]

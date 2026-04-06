@@ -57,3 +57,27 @@ Without this memory:
 ### CORRECT SYNTAX:
 - transact: (transact [[:entity :attr "value"] [:entity2 :attr2 "value2"]])
 - query: (query [:find ?x :where [?e :attr ?x]])
+
+### ADVANCED QUERIES:
+
+#### Aggregations:
+- (count ?e) - total row count
+- (count-distinct ?e) - distinct value count
+- (sum ?n) - sum of numeric values
+- (min ?x) / (max ?x) - minimum/maximum
+- Group by plain variables: [:find ?dept (count ?e) :where [?e :person/dept ?dept]]
+- :with clause for grouping: [:find ?dept (sum ?salary) :with ?e :where ...]
+
+#### Bi-temporal Queries:
+- :as-of N - query state at transaction N
+- :valid-at "2024-01-01" - query facts valid at a date
+- :any-valid-time - ignore valid-time filter
+- Combined: [:find ?x :as-of 5 :valid-at "2024-06-01" :where ...]
+
+#### Negation:
+- (not [?e :attr val]) - exclude matches
+- (not-join [?e] [?e :attr ?x]) - existential negation
+
+#### Rules (define reusable logic):
+- (rule [(ancestor ?a ?d) [?a :parent ?d]])
+- (rule [(ancestor ?a ?d) [?a :parent ?p] (ancestor ?p ?d)])
