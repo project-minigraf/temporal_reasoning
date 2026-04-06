@@ -4,7 +4,7 @@ Example 1: User shares architecture decision
 ---
 User: "We're using Apache Ignite 3 and prioritizing low-latency reads over write throughput."
 
-Action: Store it
+Action: Store it IMMEDIATELY
 transact:
 [[:project/ignite3 :project/name "Apache Ignite 3"]
  [:project/ignite3 :project/priority "low-latency reads"]
@@ -12,12 +12,14 @@ transact:
  [:project/ignite3 :fact/created "2026-04-06"]]
 Reason: Architecture constraint worth remembering across sessions
 
+Response: "I've stored that in memory."
+
 ---
 Example 2: User mentions component relationship
 ---
 User: "The auth service calls the JWT module for token validation."
 
-Action: Store it
+Action: Store it IMMEDIATELY
 transact:
 [[:component/auth :component/name "AuthService"]
  [:component/auth :calls :component/jwt]
@@ -25,30 +27,59 @@ transact:
  [:component/auth :fact/role "authentication"]]
 Reason: Dependency relationship needed for impact analysis
 
+Response: "I've stored that in memory."
+
 ---
 Example 3: Before modifying existing code
 ---
 User: "Add caching to the query layer"
 
-Action: FIRST query memory
+Action: FIRST query memory to check for past decisions
 query:
 [:find ?decision ?constraint
  :where
  [?e :decision/description ?decision]
  [?e :project/constraint ?constraint]]
 
-Then write code based on retrieved context
+Response: "Based on memory, we decided to use Redis for caching (from our architecture review on 2026-04-06)."
 
 ---
 Example 4: User asks about past decisions
 ---
 User: "What did we decide about the cache strategy?"
 
-Action: Query memory first
+Action: Query memory FIRST
 query:
 [:find ?desc ?reason
  :where
  [?e :decision/description ?desc]
  [?e :decision/reason ?reason]]
 
-Respond with retrieved facts
+Response: "From memory: we decided to use Redis for session cache because of the low latency requirement."
+
+---
+Example 5: User expresses preference
+---
+User: "I don't like using exceptions for flow control."
+
+Action: Store it IMMEDIATELY
+transact:
+[[:user/preference :preference/type "exception-usage"]
+ [:user/preference :preference/value "not for flow control"]
+ [:user/preference :preference/reason "harder to reason about"]]
+Reason: User preference worth remembering
+
+Response: "I've stored that preference in memory."
+
+---
+Example 6: User mentions constraint
+---
+User: "We need to support Python 3.8 minimum."
+
+Action: Store it IMMEDIATELY  
+transact:
+[[:project/constraint :constraint/type "python-version"]
+ [:project/constraint :constraint/value "3.8+"]]
+Reason: Important project constraint
+
+Response: "Stored. Python 3.8+ requirement noted."

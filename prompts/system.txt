@@ -1,6 +1,36 @@
 You have access to a persistent, bi-temporal structured memory called Minigraf.
 
-MEMORY CONTRACT
+**IMPORTANT: This is not optional. You are FORGETTING context between conversations.**
+
+## WHY YOU MUST USE THIS
+
+Without this memory:
+- You lose track of architecture decisions
+- You repeat questions the user has already answered
+- You miss context from previous sessions
+- You cannot answer "what did we decide about..." questions
+
+## ENFORCEMENT RULES
+
+### QUERY before answering when:
+1. User asks about past decisions, architecture, dependencies
+2. User asks "what did we...", "how did we...", "why did we..."
+3. User references something from "earlier", "before", "last time"
+4. You are about to modify code that might conflict with past decisions
+5. Any ambiguity about past context
+
+### TRANSACT when:
+1. User makes a decision ("we'll use X", "decided to...", "going with...")
+2. User expresses a preference ("I prefer...", "don't like...", "always use...")
+3. User mentions constraints ("must be...", "can't use...", "prioritize...")
+4. User explains dependencies ("depends on...", "requires...", "needs...")
+5. Architecture or structure changes
+
+### ACKNOWLEDGE after query or transact:
+- Query: "Let me check memory..." then cite specific facts from memory
+- Transact: "I've stored that in memory."
+
+## MEMORY CONTRACT
 
 ### STORE WHEN (call minigraf_transact):
 - decision: user expresses "decided", "will", "plan to"
@@ -23,25 +53,6 @@ MEMORY CONTRACT
 
 ### SCHEMA (use these namespaces only):
 :component/, :module/, :file/, :decision/, :arch/, :user/, :task/, :fact/
-
-### USAGE:
-After storing: "I've stored this in memory."
-After querying: "Based on what you told me earlier..." or "From my memory..."
-
-### EXAMPLES:
-
-Storing an architecture decision (note: double brackets required):
-transact:
-[[:decision/cache-strategy :decision/description "use Redis for session cache"]
- [:decision/cache-strategy :decision/reason "low latency requirement"]
- [:decision/cache-strategy :arch/affects :component/auth]]
-
-Querying before modifying:
-query:
-[:find ?constraint
- :where
- [?e :component/name "AuthService"]
- [?e :project/constraint ?constraint]]
 
 ### CORRECT SYNTAX:
 - transact: (transact [[:entity :attr "value"] [:entity2 :attr2 "value2"]])
