@@ -10,7 +10,9 @@ from minigraf_tool import query, transact, reset
 @pytest.fixture
 def temp_graph():
     """Create a temporary graph file for testing."""
-    graph_path = tempfile.mktemp(suffix=".graph")
+    fd, graph_path = tempfile.mkstemp(suffix=".graph")
+    os.close(fd)
+    os.remove(graph_path)
     yield graph_path
     if os.path.exists(graph_path):
         os.remove(graph_path)

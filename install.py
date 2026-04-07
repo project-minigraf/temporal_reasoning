@@ -165,7 +165,7 @@ def update_skill():
             
             # Record update time
             with open(LAST_UPDATE_FILE, 'w') as f:
-                f.write(str(time.time()))
+                f.write(str(int(time.time())))
             
             print("✓ Skill updated!")
             return True

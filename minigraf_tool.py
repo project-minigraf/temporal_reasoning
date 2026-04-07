@@ -23,7 +23,7 @@ from typing import Optional, Dict, Any, List, Union
 
 logger = logging.getLogger("minigraf_tool")
 
-if not logger.handlers and not logging.getLogger().handlers:
+if not logging.getLogger().handlers:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -58,7 +58,7 @@ def _get_default_graph_path() -> str:
         base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
         graph_dir = Path(base) / "temporal-reasoning"
     elif system == "Darwin":
-        base = os.environ.get("HOME")
+        base = os.environ.get("HOME") or os.path.expanduser("~")
         graph_dir = Path(base) / "Library" / "Application Support" / "temporal-reasoning"
     else:
         xdg_data = os.environ.get("XDG_DATA_HOME")
@@ -89,7 +89,7 @@ def _run_http(endpoint: str, data: Dict) -> Dict[str, Any]:
             data=json.dumps(data).encode("utf-8"),
             headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=MINIGRAF_TIMEOUT) as response:
             result = json.loads(response.read().decode("utf-8"))
             return {"ok": True, "data": result}
     except urllib.error.URLError as e:
