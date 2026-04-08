@@ -149,10 +149,10 @@ def query(
     """
     # Check for local memory.graph in current directory first (for backward compatibility)
     local_path = os.path.join(os.getcwd(), "memory.graph")
-    if os.path.exists(local_path):
-        path = local_path
-    elif graph_path:
+    if graph_path:
         path = graph_path
+    elif os.path.exists(local_path):
+        path = local_path
     else:
         path = DEFAULT_GRAPH_PATH
 
@@ -225,7 +225,7 @@ def query(
         if len(values) >= col_count:
             results.append(values[:col_count])
 
-    return {"ok": True, "results": results}
+    return {"ok": True, "results": results, "path": path}
 
 
 def transact(
@@ -249,10 +249,10 @@ def transact(
 
     # Check for local memory.graph in current directory first (for backward compatibility)
     local_path = os.path.join(os.getcwd(), "memory.graph")
-    if os.path.exists(local_path):
-        path = local_path
-    elif graph_path:
+    if graph_path:
         path = graph_path
+    elif os.path.exists(local_path):
+        path = local_path
     else:
         path = DEFAULT_GRAPH_PATH
 
@@ -315,10 +315,10 @@ def retract(
 
     # Check for local memory.graph in current directory first (for backward compatibility)
     local_path = os.path.join(os.getcwd(), "memory.graph")
-    if os.path.exists(local_path):
-        path = local_path
-    elif graph_path:
+    if graph_path:
         path = graph_path
+    elif os.path.exists(local_path):
+        path = local_path
     else:
         path = get_graph_path()
 
@@ -369,10 +369,10 @@ def reset(graph_path: Optional[str] = None) -> Dict[str, Any]:
     """Delete the graph file to start fresh."""
     # Check for local memory.graph in current directory first (for backward compatibility)
     local_path = os.path.join(os.getcwd(), "memory.graph")
-    if os.path.exists(local_path):
-        path = local_path
-    elif graph_path:
+    if graph_path:
         path = graph_path
+    elif os.path.exists(local_path):
+        path = local_path
     else:
         path = DEFAULT_GRAPH_PATH
     if os.path.exists(path):
@@ -385,10 +385,10 @@ def export(graph_path: Optional[str] = None) -> Dict[str, Any]:
     """Export all facts from the graph to a JSON file."""
     # Check for local memory.graph in current directory first (for backward compatibility)
     local_path = os.path.join(os.getcwd(), "memory.graph")
-    if os.path.exists(local_path):
-        path = local_path
-    elif graph_path:
+    if graph_path:
         path = graph_path
+    elif os.path.exists(local_path):
+        path = local_path
     else:
         path = DEFAULT_GRAPH_PATH
 
@@ -430,10 +430,10 @@ def import_data(data: Dict, graph_path: Optional[str] = None) -> Dict[str, Any]:
     """Import facts from exported JSON data."""
     # Check for local memory.graph in current directory first (for backward compatibility)
     local_path = os.path.join(os.getcwd(), "memory.graph")
-    if os.path.exists(local_path):
-        path = local_path
-    elif graph_path:
+    if graph_path:
         path = graph_path
+    elif os.path.exists(local_path):
+        path = local_path
     else:
         path = DEFAULT_GRAPH_PATH
 
