@@ -19,7 +19,7 @@ REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 LAST_UPDATE_FILE = os.path.join(REPO_DIR, ".last_update")
 
 FILES_TO_SYNC = ["SKILL.md", "minigraf_tool.py", "skill.json"]
-DIRS_TO_SYNC = ["tools", "prompts"]
+DIRS_TO_SYNC = ["tools"]
 SKILL_DIRS = [
     os.path.join(".opencode", "skills", "temporal_reasoning"),
     os.path.join("skills", "temporal-reasoning"),

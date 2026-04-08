@@ -45,9 +45,41 @@ You are FORGETTING important context between conversations. Without this memory:
 4. User explains dependencies ("depends on...", "requires...", "needs...")
 5. Architecture or structure changes
 
-**After any query or transact, acknowledge it:**
+**You MUST retract when:**
+1. User explicitly says "remove", "delete", "retract", "forget"
+2. A fact is incorrect or has been superseded
+3. Replacing a fact with a cleaner or updated version
+
+**After any query, transact, or retract, acknowledge it:**
 - Query: "Let me check memory..." then cite specific facts
 - Transact: "I've stored that in memory."
+- Retract: "I've removed that from memory (original preserved for history)."
+
+## Memory Contract
+
+### STORE (minigraf_transact):
+- decision: user expresses "decided", "will", "plan to"
+- architecture: system structure, components, relationships
+- constraint: priorities, tradeoffs, requirements, invariants
+- preference: likes, dislikes, prefers
+- dependency: what depends on what
+
+### REMOVE (minigraf_retract):
+- user explicitly says "remove", "delete", "retract"
+- fact is incorrect or obsolete
+- replaced by cleaner version
+
+### QUERY (minigraf_query):
+- task references past work, decisions, or entities
+- about to generate code affecting existing system
+- user asks "what did we..." or anything historical
+- ambiguity exists about past context
+
+### NEVER store:
+- transient observations
+- intermediate reasoning steps
+- raw code
+- redundant restatements
 
 ## Dependencies
 
@@ -95,7 +127,7 @@ retract("[[:rules/old-rule :rules/old-rule/description \"obsolete rule\"]]", rea
    - ALL attribute names MUST follow the form: `:namespace/entity-unique-name/attribute-name`
    - Use only the defined namespaces: :project/, :preference/, :rules/
    - Examples:
-     - GOOD: :project/temporal-reasoning/name, :project/temporal-reasoning/phase, :preference/minigraph-search/description, :rules/ci-monitoring/description
+     - GOOD: :project/temporal-reasoning/name, :project/temporal-reasoning/phase, :preference/minigraf-search/description, :rules/ci-monitoring/description
      - BAD: :rules/description (missing entity-unique-name), :project/name (missing entity-unique-name)
    - Query memory first to find existing entities before adding new facts about them
 
@@ -151,6 +183,115 @@ echo "(transact [[:rules/test-rule :rules/test-rule/description \"test\"]])" | m
 echo "(query [:find ?desc :where [?e :rules/test-rule/description ?desc]])" | minigraf --file memory.graph
 ```
 
+## Examples
+
+### Example 1: User shares architecture decision
+User: "We're using Apache Ignite 3 and prioritizing low-latency reads over write throughput."
+
+Action: Store it IMMEDIATELY
+```python
+transact("""[[:project/ignite3 :project/ignite3/name "Apache Ignite 3"]
+             [:project/ignite3 :project/ignite3/priority "low-latency reads"]
+             [:project/ignite3 :project/ignite3/tradeoff "sacrifice write throughput"]]""",
+         reason="Architecture constraint worth remembering across sessions")
+```
+
+---
+
+### Example 2: User mentions component relationship
+User: "The auth service calls the JWT module for token validation."
+
+```python
+transact("""[[:project/auth-service :project/auth-service/name "AuthService"]
+             [:project/auth-service :project/auth-service/calls "jwt-module"]
+             [:project/jwt-module :project/jwt-module/name "JWTModule"]
+             [:project/auth-service :project/auth-service/role "authentication"]]""",
+         reason="Dependency relationship needed for impact analysis")
+```
+
+---
+
+### Example 3: Before modifying existing code
+User: "Add caching to the query layer"
+
+Action: FIRST query memory to check for past decisions
+```python
+result = query("[:find ?e ?a ?v :where [?e ?a ?v]]")
+# Filter results for :rules/ attributes to find relevant constraints
+```
+
+---
+
+### Example 4: User expresses preference
+User: "I don't like using exceptions for flow control."
+
+```python
+transact("[[:preference/exception-usage :preference/exception-usage/description \"avoid using exceptions for flow control — harder to reason about\"]]",
+         reason="User preference worth remembering")
+```
+
+---
+
+### Example 5: User mentions constraint
+User: "We need to support Python 3.8 minimum."
+
+```python
+transact("[[:rules/python-version :rules/python-version/description \"must support Python 3.8 minimum\"]]",
+         reason="Important project constraint")
+```
+
+---
+
+### Example 6: Count stored rules
+User: "How many rules have we stored?"
+
+```python
+result = query("[:find (count ?e) :where [?e ?a ?v]]")
+# Filter count to :rules/ namespace entities
+```
+
+---
+
+### Example 7: Query historical state
+User: "What was our roadmap before Phase 2 was added?"
+
+```python
+result = query("[:find ?item :as-of 5 :where [?e :project/roadmap/item ?item]]")
+```
+
+---
+
+### Example 8: Find items without a property
+User: "Which components don't have tests?"
+
+```python
+result = query("""[:find ?name
+                   :where [?e :project/component/name ?name]
+                   (not [?e :project/component/has-tests "true"])]""")
+```
+
+---
+
+### Example 9: Retract obsolete fact
+User: "Remove the old phase-1 reference."
+
+```python
+# First query to find the entity UUID
+e = query("[:find ?e :where [?e :project/phase/status \"active\"]]")
+# Then retract using the UUID
+retract(f'[#uuid "{e}" :project/phase/status "active"]',
+        reason="Outdated - replaced by phase-2")
+```
+
+---
+
+### Example 10: Query with valid-time
+User: "What was the team's structure in 2025?"
+
+```python
+result = query('[:find ?role :valid-at "2025-01-01" :where [?e :project/team/role ?role]]')
+```
+
 ## Files
 
 | File | Purpose |
@@ -161,10 +302,9 @@ echo "(query [:find ?desc :where [?e :rules/test-rule/description ?desc]])" | mi
 | `install.py` | One-command setup script |
 | `tools/query.json` | Tool schema for `minigraf_query` |
 | `tools/transact.json` | Tool schema for `minigraf_transact` |
+| `tools/retract.json` | Tool schema for `minigraf_retract` |
 | `tools/report_issue.json` | Tool schema for `minigraf_report_issue` |
 | `skill.json` | Portable skill manifest |
-| `prompts/system.txt` | Operational contract (when to store/query) |
-| `prompts/fewshots.txt` | Coding-specific examples |
 | `tests/test_harness.py` | Validation tests |
 | `ROADMAP.md` | Project roadmap |
 
