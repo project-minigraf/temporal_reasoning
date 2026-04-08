@@ -180,9 +180,13 @@ def query(datalog: str, as_of: Optional[Union[int, str]] = None, graph_path: Opt
     
     result_header = lines[0]
     separator = lines[1]
-    
-    # Count expected columns from header tokens
-    col_count = result_header.count("?") + result_header.count(":")
+
+    # Count expected columns by splitting the header the same way data rows are
+    # split — on "|" — then counting tokens that start with "?" (variable) or
+    # ":" (keyword). Counting raw characters was incorrect: a namespaced keyword
+    # like :decision/description contains a ":" but is one column, not two.
+    header_tokens = [t.strip() for t in result_header.split("|")]
+    col_count = sum(1 for t in header_tokens if t.startswith("?") or t.startswith(":"))
     if col_count == 0:
         return {"ok": False, "error": f"Unexpected output format from minigraf: {output[:200]}"}
     
