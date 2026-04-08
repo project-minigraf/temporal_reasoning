@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 UPDATE_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-SKILL_DIR = os.path.join(REPO_DIR, ".opencode", "skills", "temporal-reasoning")
+SKILL_DIR = os.path.join(REPO_DIR, ".opencode", "skills", "temporal_reasoning")
 LAST_UPDATE_FILE = os.path.join(REPO_DIR, ".last_update")
 
 
@@ -150,7 +150,7 @@ def update_skill():
     import shutil
 
     repo_dir = os.path.dirname(os.path.abspath(__file__))
-    skill_dir = os.path.join(repo_dir, ".opencode", "skills", "temporal-reasoning")
+    skill_dir = os.path.join(repo_dir, ".opencode", "skills", "temporal_reasoning")
 
     print("Checking for skill updates...")
 
