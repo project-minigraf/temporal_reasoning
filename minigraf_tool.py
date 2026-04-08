@@ -196,16 +196,19 @@ def query(
 
     # Parse results - Note: verified against minigraf v0.18.0
     # Output format: header line, separator line (---), then data lines
-    # Header contains ?variable or :keyword tokens
+    # Header contains ?variable, :keyword, or aggregate functions like (count ?e)
     result_header = lines[0]
     separator = lines[1]
 
     # Count expected columns by splitting the header the same way data rows are
-    # split — on "|" — then counting tokens that start with "?" (variable) or
-    # ":" (keyword). Counting raw characters was incorrect: a namespaced keyword
-    # like :decision/description contains a ":" but is one column, not two.
+    # split — on "|" — then counting tokens that start with "?" or ":" or contain "(" (aggregates)
     header_tokens = [t.strip() for t in result_header.split("|")]
-    col_count = sum(1 for t in header_tokens if t.startswith("?") or t.startswith(":"))
+    col_count = 0
+    for t in header_tokens:
+        if t.startswith("?") or t.startswith(":"):
+            col_count += 1
+        elif t.startswith("("):  # Handle aggregates like (count ?e)
+            col_count += 1
     if col_count == 0:
         return {"ok": False, "error": f"Unexpected output format from minigraf: {output[:200]}"}
 
