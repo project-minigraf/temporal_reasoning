@@ -257,7 +257,7 @@ def temporal_query(datalog: str, as_of: Union[int, str], graph_path: Optional[st
     Returns:
         Dict with query results
     """
-    return query(datalog, graph_path)
+    return query(datalog, graph_path=graph_path)
 
 
 def reset(graph_path: Optional[str] = None) -> Dict[str, Any]:
