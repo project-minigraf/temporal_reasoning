@@ -170,7 +170,8 @@ async fn main() {
         .route("/query", post(query_handler))
         .route("/transact", post(transact_handler));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
-    println!("Server running on http://127.0.0.1:3000");
+    let addr = std::env::var("MINIGRAF_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    println!("Server running on http://{}", addr);
     axum::serve(listener, app).await.unwrap();
 }
