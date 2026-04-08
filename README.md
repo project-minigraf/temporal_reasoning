@@ -64,26 +64,20 @@ python install.py
 
 ### Install In Agent Environments
 
-Use the local repository path as the skill source:
-
-```text
-/home/aditya/workspaces/pycharm/temporal_reasoning
-```
-
 Claude Code / Codex:
 - Install the local skill from this repository as `temporal-reasoning`.
-- Use [SKILL.md](/home/aditya/workspaces/pycharm/temporal_reasoning/SKILL.md) and [skill.json](/home/aditya/workspaces/pycharm/temporal_reasoning/skill.json) as the primary skill files.
+- Use [SKILL.md](<PROJECT_ROOT>/SKILL.md) and [skill.json](<PROJECT_ROOT>/skill.json) as the primary skill files.
 
 OpenCode:
 - Run `python install.py` from the repository root.
 - This syncs the skill into `.opencode/skills/temporal-reasoning`.
 
 If manual installation is required, include:
-- [SKILL.md](/home/aditya/workspaces/pycharm/temporal_reasoning/SKILL.md)
-- [skill.json](/home/aditya/workspaces/pycharm/temporal_reasoning/skill.json)
-- [tools/query.json](/home/aditya/workspaces/pycharm/temporal_reasoning/tools/query.json)
-- [tools/transact.json](/home/aditya/workspaces/pycharm/temporal_reasoning/tools/transact.json)
-- [tools/report_issue.json](/home/aditya/workspaces/pycharm/temporal_reasoning/tools/report_issue.json)
+- [SKILL.md](<PROJECT_ROOT>/SKILL.md)
+- [skill.json](<PROJECT_ROOT>/skill.json)
+- [tools/query.json](<PROJECT_ROOT>/tools/query.json)
+- [tools/transact.json](<PROJECT_ROOT>/tools/transact.json)
+- [tools/report_issue.json](<PROJECT_ROOT>/tools/report_issue.json)
 
 ## Quick Start
 
