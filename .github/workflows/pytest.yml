@@ -39,6 +39,7 @@ jobs:
           pip install pytest
 
       - name: Run tests with pytest
-        run: pytest -q
+        run: |
+          python -m pytest -v --tb=short tests/
         env:
-          PYTHONPATH: .
+          PYTHONPATH: ${{ github.workspace }}
