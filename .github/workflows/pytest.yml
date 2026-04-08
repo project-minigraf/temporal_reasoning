@@ -38,8 +38,8 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Install package
-        run: pip install -e .
+- name: Install package
+        run: pip install -e ".[dev]"
 
       - name: Run tests with pytest
         run: pytest -q
