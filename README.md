@@ -53,7 +53,7 @@ What it is NOT:
 
 ```bash
 # Install minigraf (requires Rust)
-cargo install --git https://github.com/adityamukho/minigraf
+cargo install minigraf
 
 # Or use pip (if available)
 pip install temporal-reasoning

@@ -16,7 +16,7 @@ Persistent bi-temporal graph memory skill for AI coding agents. Prevents context
 
 ## Dependencies
 
-- **Minigraf >= 0.13.0** — install via: `cargo install --git https://github.com/adityamukho/minigraf`
+- **Minigraf >= 0.13.0** — install via: `cargo install minigraf`
 - **Python 3** — for the CLI wrapper
 
 ## Files

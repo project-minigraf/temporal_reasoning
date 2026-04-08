@@ -50,7 +50,7 @@ def check_minigraf():
     print("✗ minigraf CLI not found")
     print()
     print("To install minigraf:")
-    print("  cargo install --git https://github.com/adityamukho/minigraf")
+    print("  cargo install minigraf")
     print()
     print("Or see README.md for full installation instructions.")
     return False

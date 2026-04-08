@@ -46,7 +46,7 @@ You are FORGETTING important context between conversations. Without this memory:
 
 ## Dependencies
 
-- **Minigraf >= 0.13.0** — install via: `cargo install --git https://github.com/adityamukho/minigraf`
+- **Minigraf >= 0.13.0** — install via: `cargo install minigraf`
 - **Python 3** — for the CLI wrapper
 
 ## Tools
