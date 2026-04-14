@@ -251,13 +251,24 @@ All functions return `{"ok": bool, ...}`. Common errors:
 - `as_of requires :as-of clause` — include `:as-of N` in query
 - `reason is required for all writes` — provide non-empty reason
 
+If an error persists after checking syntax and installation, use `minigraf_report_issue` to file a structured bug report with the failing query and error message:
+
+```python
+from report_issue import report_issue
+report_issue("parse_error", "query returns unexpected output",
+             datalog="[:find ?x :where [?e :a ?x]]",
+             error="<error text from result['error']>")
+```
+
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `minigraf_tool.py` | Python wrapper (import or CLI) |
+| `report_issue.py` | GitHub issue reporter for minigraf errors |
 | `tools/query.json` | Tool schema for minigraf_query |
 | `tools/transact.json` | Tool schema for minigraf_transact |
 | `tools/retract.json` | Tool schema for minigraf_retract |
+| `tools/report_issue.json` | Tool schema for minigraf_report_issue |
 | `install.py` | Setup script |
 | `ROADMAP.md` | Project roadmap |
