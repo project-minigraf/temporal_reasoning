@@ -47,7 +47,10 @@ MINIGRAF_HTTP_URL = os.environ.get("MINIGRAF_HTTP_URL", "http://localhost:8080")
 
 
 def _get_project_root_path() -> str:
-    """Get the default graph path (CWD memory.graph)."""
+    """Get the default graph path, respecting MINIGRAF_GRAPH_PATH if set."""
+    env_path = os.environ.get("MINIGRAF_GRAPH_PATH")
+    if env_path:
+        return env_path
     return str(Path.cwd() / "memory.graph")
 
 
