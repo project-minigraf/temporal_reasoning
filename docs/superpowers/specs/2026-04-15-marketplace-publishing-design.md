@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-15
 **Status:** Approved
-**Scope:** GitHub-hosted plugin distribution for the Vulcan skill
+**Scope:** GitHub-hosted plugin distribution; revert skill and repo name to `temporal-reasoning`
 
 ---
 
@@ -17,11 +17,34 @@ minigraf v0.19.0 (2026-04-14) ships pre-built binaries for all target platforms,
 
 **Target marketplace:** GitHub-hosted plugin (self-published). Users add the repo to `extraKnownMarketplaces` in their Claude Code `settings.json`. The `claude-plugins-official` marketplace is a future consideration pending a relationship with its maintainers.
 
+**Name revert:** The "Vulcan" rebrand carries trademark risk (existing software trademarks for "Vulcan" in tech). The skill and repo are reverting to `temporal-reasoning` / `temporal_reasoning`. The Python module (`vulcan.py`, `from vulcan import`) is out of scope for this change — it is internal API, not the public skill identity.
+
 ---
 
 ## Changes
 
-### 1. install.py — binary download
+### 1. GitHub repo rename
+
+Rename `adityamukho/vulcan` → `adityamukho/temporal_reasoning` via GitHub repo settings (manual step — cannot be scripted). After renaming:
+
+- Update `git remote set-url origin git@github.com:adityamukho/temporal_reasoning.git`
+- GitHub automatically redirects the old URL, but all internal references should be updated.
+
+### 2. Name revert across files
+
+| File | Change |
+|---|---|
+| `SKILL.md` frontmatter | `name: vulcan` → `name: temporal-reasoning` |
+| `SKILL.md` H1 / prose | Remove "Vulcan" brand header; use "Temporal Reasoning" as the project name throughout |
+| `CLAUDE.md` | `# Vulcan — AI Coding Agent Memory` → `# Temporal Reasoning — AI Coding Agent Memory` |
+| `AGENTS.md` | Same heading rename |
+| `install.py` `SKILL_DIRS` | `skills/vulcan` → `skills/temporal-reasoning`; `.opencode/skills/vulcan` → `.opencode/skills/temporal-reasoning` |
+| `README.md` | All "Vulcan" brand references → "Temporal Reasoning" |
+| `ROADMAP.md` | Update repo URL and any "Vulcan" references |
+
+The tool schemas (`tools/*.json`) use names like `vulcan_query`, `vulcan_transact`, etc. These are the Python-level tool identifiers and are **not** renamed in this change (same reason as `vulcan.py` — internal API, breaking change).
+
+### 3. install.py — binary download
 
 `check_minigraf()` is replaced by `ensure_minigraf()` with the following flow:
 
@@ -49,27 +72,27 @@ minigraf v0.19.0 (2026-04-14) ships pre-built binaries for all target platforms,
 - Linux/macOS: `~/.local/bin` (created if absent; user is told to add it to PATH if not already present)
 - Windows: `%LOCALAPPDATA%\Programs\minigraf\` (binary placed directly; user told to add to PATH if needed)
 
-### 2. skill.json
+### 4. skill.json
 
 Bump `requires.minigraf` from `>=0.18.0` to `>=0.19.0`.
 
-### 3. SKILL.md — reframe description
+### 5. SKILL.md — reframe description
 
 The `## Dependencies` section replaces the `cargo install minigraf` instruction with: "Run `install.py` — it downloads the correct pre-built binary for your platform automatically."
 
 The `## The Core Idea` opening paragraph is reordered to lead with the user-facing problem (context lost between sessions, repeated questions, contradicted decisions) before explaining the mechanism.
 
-### 4. README.md — plugin install instructions
+### 6. README.md — plugin install instructions
 
 Two installation paths documented:
 
 **Primary (plugin system):**
 ```json
 "extraKnownMarketplaces": {
-  "vulcan": {
+  "temporal-reasoning": {
     "source": {
       "source": "git",
-      "url": "https://github.com/adityamukho/vulcan"
+      "url": "https://github.com/adityamukho/temporal_reasoning"
     }
   }
 }
@@ -79,7 +102,7 @@ Then enable the plugin in Claude Code and run `install.py` once to download the 
 **Fallback (manual):**
 Clone the repo and run `install.py` directly. Suitable for environments without the plugin system or for development.
 
-### 5. ROADMAP.md
+### 7. ROADMAP.md
 
 Mark "Marketplace Publishing" as complete. Note that the pre-built binary blocker was resolved by minigraf v0.19.0.
 
@@ -88,6 +111,7 @@ Mark "Marketplace Publishing" as complete. Note that the pre-built binary blocke
 ## Out of Scope
 
 - `claude-plugins-official` submission (no relationship with maintainers yet)
+- Renaming `vulcan.py` or `vulcan_*` tool schema identifiers (internal API — breaking change deferred)
 - Windows PATH mutation from within install.py (instruct the user instead)
 - ARM Linux musl target (not shipped by minigraf v0.19.0; cargo fallback covers it)
 - Automatic version pinning or update checks for the minigraf binary
