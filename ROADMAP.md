@@ -61,6 +61,34 @@ Extend the bi-temporal graph to store code structure extracted from git history,
 - Cross-layer queries that join code structure edges with agent decision datoms in the same graph — e.g., "show dependency changes that occurred after the database migration decision"
 - Natural-language question templates mapped to Datalog patterns so agents can ask structural questions without writing raw Datalog
 
+## Future Phase 5+ — Observability and Trust for Automatic Memory
+
+### Context
+
+Turn-by-turn automatic memory injection and extraction (Phase 3) is the right direction for solving agent memory loss, but the pattern has well-known failure modes when deployed without observability:
+
+1. **Opaque injection** — memory is silently retrieved and prepended to the prompt; the agent treats injected facts as context without knowing their provenance, making behavior non-reproducible and hard to debug.
+2. **Extraction corrupts memory** — the post-turn extractor is itself an LLM call and can hallucinate. A misread sarcastic remark becomes a permanent fact that compounds across future turns.
+3. **Latency and cost** — each turn triggers at minimum two additional LLM calls (prepare + finalize); without parallelism and model-tier selection this doubles per-turn cost.
+4. **Trust and consent** — users may not know which parts of their messages are stored, or be able to inspect or correct the stored form.
+
+The bi-temporal model partially addresses (2): wrong facts can be retracted without losing audit history, and point-in-time queries can recover the pre-corruption state. But structural observability tooling is still needed before this pattern is appropriate in any hosted or multi-user deployment.
+
+### Proposed work
+
+- **Injection trace logging** — for each `memory_prepare_turn` call, log which facts were retrieved, how they were ranked, and how they were formatted. Queryable via a `memory_audit_query` tool.
+- **Extraction confidence tagging** — tag every auto-extracted datom with `{:source "heuristic"|"llm"|"agent", :confidence 0.0–1.0, :model "...", :turn N}`. Low-confidence datoms can be auto-flagged for review rather than silently committed.
+- **Provisional extraction mode** — store extracted facts in a staging namespace (`:staged/...`) for a configurable number of turns before promoting to permanent; reversals during the staging window are low-cost.
+- **Periodic correction pass** — a background task (or agent-invocable tool) that scans recent extractions for internal contradictions and flags them. Leverages the bi-temporal graph's ability to show the full history of an entity's values.
+- **User-visible memory summary** — a `memory_summarize` tool that returns a human-readable summary of what is currently known about the session, queryable by topic, so users can spot and correct errors.
+- **Scoped injection** — allow `memory_prepare_turn` to be restricted to specific namespaces or entity types (e.g. `:decision/...` only, not `:user-preference/...`) to limit the blast radius of bad extractions.
+
+### When this matters
+
+For a local single-user developer tool (the current Phase 3 target), stored data stays on the user's machine, the user can inspect the `.graph` file directly, and wrong facts can be corrected manually. The risk profile is manageable without this work. For any hosted or multi-tenant deployment the observability layer is a prerequisite.
+
+---
+
 ## Marketplace Publishing ✓
 
 Published as a GitHub-hosted Claude Code plugin. Users add the repo to `extraKnownMarketplaces` in `settings.json` — see README for instructions.
