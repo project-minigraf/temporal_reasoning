@@ -85,7 +85,6 @@ class TestVulcanQuery:
 
     def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.side_effect = MiniGrafError("bad datalog")
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.side_effect = MiniGrafError("bad datalog")
@@ -120,6 +119,17 @@ class TestVulcanTransact:
         db_instance.checkpoint.assert_called_once()
         assert result["ok"] is True
 
+    def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.side_effect = MiniGrafError("bad facts")
+
+        result = mcp_server.handle_vulcan_transact("[[:bad]]", reason="test")
+
+        assert result["ok"] is False
+        assert "bad facts" in result["error"]
+
 
 class TestVulcanRetract:
     def test_requires_reason(self, mock_minigraf_db, tmp_path):
@@ -142,3 +152,34 @@ class TestVulcanRetract:
 
         db_instance.checkpoint.assert_called_once()
         assert result["ok"] is True
+
+    def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.side_effect = MiniGrafError("bad retract")
+
+        result = mcp_server.handle_vulcan_retract("[[:e :a :v]]", reason="gone")
+
+        assert result["ok"] is False
+        assert "bad retract" in result["error"]
+
+
+class TestVulcanReportIssue:
+    def test_delegates_to_report_issue(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mock_module = MagicMock()
+        with patch.dict("sys.modules", {"report_issue": mock_module}):
+            result = mcp_server.handle_vulcan_report_issue("bug", "something broke")
+        assert result["ok"] is True
+        mock_module.report_issue.assert_called_once_with(
+            "bug", "something broke", datalog=None, error=None
+        )
+
+    def test_returns_error_on_import_failure(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        with patch.dict("sys.modules", {"report_issue": None}):
+            result = mcp_server.handle_vulcan_report_issue("bug", "something broke")
+        assert result["ok"] is False

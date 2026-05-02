@@ -43,10 +43,7 @@ def open_db(graph_path: Optional[str] = None) -> MiniGrafDb:
     path = graph_path or _get_graph_path()
     _db = MiniGrafDb.open(path)
     for rule in SESSION_RULES:
-        try:
-            _db.execute(rule)
-        except MiniGrafError:
-            pass
+        _db.execute(rule)
     return _db
 
 
@@ -66,7 +63,7 @@ def _parse_query_result(raw_json: str) -> Dict[str, Any]:
     try:
         data = json.loads(raw_json)
         return {"ok": True, "results": data.get("results", [])}
-    except (json.JSONDecodeError, KeyError) as e:
+    except json.JSONDecodeError as e:
         return {"ok": False, "error": f"Unexpected result format: {e} — raw: {raw_json[:200]}"}
 
 
@@ -75,7 +72,7 @@ def _parse_tx_result(raw_json: str) -> Dict[str, Any]:
     try:
         data = json.loads(raw_json)
         return {"ok": True, "tx": str(data.get("tx", "unknown"))}
-    except (json.JSONDecodeError, KeyError) as e:
+    except json.JSONDecodeError as e:
         return {"ok": False, "error": f"Unexpected result format: {e} — raw: {raw_json[:200]}"}
 
 
@@ -115,7 +112,7 @@ def handle_vulcan_retract(facts: str, reason: str) -> Dict[str, Any]:
         return {"ok": False, "error": "reason is required for retract"}
     db = get_db()
     try:
-        raw = db.execute(f"(retract [{facts}])")
+        raw = db.execute(f"(retract {facts})")
         db.checkpoint()
         result = _parse_tx_result(raw)
         if result["ok"]:
