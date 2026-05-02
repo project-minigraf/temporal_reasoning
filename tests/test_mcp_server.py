@@ -7,6 +7,7 @@ import sys
 import os
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
+from minigraf import MiniGrafError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -66,3 +67,78 @@ class TestOpenDb:
         import mcp_server
         mcp_server.open_db()
         mock_class.open.assert_called_once_with(custom_path)
+
+
+class TestVulcanQuery:
+    def test_returns_results_on_success(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": [["FastAPI", ":decision"]]})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        result = mcp_server.handle_vulcan_query("[:find ?n :where [?e :name ?n]]")
+
+        db_instance.execute.assert_called_once()
+        assert result["ok"] is True
+        assert result["results"] == [["FastAPI", ":decision"]]
+
+    def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.side_effect = MiniGrafError("bad datalog")
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.side_effect = MiniGrafError("bad datalog")
+
+        result = mcp_server.handle_vulcan_query("[:bad]")
+
+        assert result["ok"] is False
+        assert "bad datalog" in result["error"]
+
+
+class TestVulcanTransact:
+    def test_requires_reason(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        result = mcp_server.handle_vulcan_transact("[[:e :a :v]]", reason="")
+
+        assert result["ok"] is False
+        assert "reason" in result["error"].lower()
+
+    def test_transacts_and_checkpoints(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx": "3"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        result = mcp_server.handle_vulcan_transact("[[:e :a :v]]", reason="test")
+
+        db_instance.execute.assert_called_once()
+        db_instance.checkpoint.assert_called_once()
+        assert result["ok"] is True
+
+
+class TestVulcanRetract:
+    def test_requires_reason(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        result = mcp_server.handle_vulcan_retract("[[:e :a :v]]", reason="")
+
+        assert result["ok"] is False
+
+    def test_retracts_and_checkpoints(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx": "4"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        result = mcp_server.handle_vulcan_retract("[[:e :a :v]]", reason="gone")
+
+        db_instance.checkpoint.assert_called_once()
+        assert result["ok"] is True
