@@ -96,12 +96,16 @@ def handle_vulcan_query(datalog: str) -> Dict[str, Any]:
 
 
 def handle_vulcan_transact(facts: str, reason: str) -> Dict[str, Any]:
-    """Transact facts into the graph. reason is required."""
+    """Transact facts into the graph. reason is required.
+
+    :valid-at is set to the current UTC ms timestamp so every agent-initiated
+    write has a recorded valid time, enabling correct bi-temporal queries.
+    """
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for all writes"}
     db = get_db()
     try:
-        raw = db.execute(f"(transact {facts})")
+        raw = db.execute(f'(transact {facts} {{:valid-at "{_now_utc_ms()}"}})')
         db.checkpoint()
         result = _parse_tx_result(raw)
         if result["ok"]:
@@ -183,6 +187,9 @@ _HISTORICAL_SIGNALS = re.compile(
     r"\b(last\s+\w+|yesterday|before|earlier|as\s+of|at\s+the\s+time|back\s+when|previously)\b",
     re.IGNORECASE,
 )
+# Note: "last <word>" is a broad pattern — "last resort", "last mile", etc. will match.
+# Without an explicit ISO date in the message, _build_query_clauses falls back to the
+# current UTC timestamp regardless, so false positives cause no harm in practice.
 _DATE_PATTERN = re.compile(
     r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})\b"
 )
@@ -232,9 +239,10 @@ def handle_memory_prepare_turn(user_message: str) -> str:
     Query graph for facts relevant to the user message.
     Returns a formatted context block string for injection as additionalContext.
 
-    Uses :any-valid-time for most queries so facts stored without an explicit
-    valid-at are included. Historical queries with a detected ISO date use
-    :valid-at to restrict to the point-in-time state.
+    For current-state queries, uses :valid-at with the current UTC ms timestamp
+    (via _build_query_clauses) so facts whose valid window includes right now
+    are returned. For historical queries where an explicit ISO date is detected
+    in the user message, :valid-at is set to that date (midnight UTC).
     """
     db = get_db()
     scan_limit = int(os.environ.get("VULCAN_PREPARE_SCAN_LIMIT", "50"))
@@ -282,6 +290,10 @@ def handle_memory_prepare_turn(user_message: str) -> str:
 # ---------------------------------------------------------------------------
 
 _SIGNAL_PATTERNS = [
+    # Each pattern captures a single token after the signal phrase. Articles ("a", "the", etc.)
+    # will match first if present (e.g. "depends on the auth-service" → captures "the"), but
+    # the stop-word filter below drops them, producing zero facts for that phrase. Users should
+    # write "depends on auth-service" (no article) to ensure capture.
     (r"we(?:'ll?|\s+will)\s+use\s+([\w\-]+)", "decision", ":description", "chosen technology or approach"),
     (r"going\s+with\s+([\w\-]+)", "decision", ":description", "chosen approach"),
     (r"decided\s+(?:to\s+)?(?:use\s+)?([\w\-]+)", "decision", ":description", "decided approach"),
@@ -438,6 +450,8 @@ def _llm_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
         db = get_db()
         db.execute(f'(transact {datalog} {{:valid-at "{valid_at}"}})')
         db.checkpoint()
+        # Approximate: count "[:" occurrences as a proxy for triple count.
+        # Entity-reference values use ":foo" not "[:foo", so false positives are rare.
         stored_count = datalog.count("[:")
         return {"ok": True, "stored_count": stored_count, "strategy": "llm"}
     except Exception as e:
@@ -490,6 +504,7 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
         db = get_db()
         db.execute(f'(transact {datalog} {{:valid-at "{valid_at}"}})')
         db.checkpoint()
+        # Approximate: count "[:" occurrences as a proxy for triple count.
         stored_count = datalog.count("[:")
         return {"ok": True, "stored_count": stored_count, "strategy": "agent"}
     except Exception as e:

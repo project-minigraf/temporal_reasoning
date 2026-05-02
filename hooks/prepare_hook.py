@@ -29,6 +29,10 @@ def main() -> None:
     if prompt:
         try:
             import mcp_server
+            # This hook opens its own MiniGrafDb handle to the same .graph file that the
+            # persistent MCP server process also holds open. minigraf uses file-level locking
+            # for writes; concurrent reads are safe. The prepare hook is read-only, so no
+            # write conflict occurs here. finalize_hook.py writes — it waits on the lock.
             mcp_server.open_db()
             context = mcp_server.handle_memory_prepare_turn(prompt)
         except Exception:

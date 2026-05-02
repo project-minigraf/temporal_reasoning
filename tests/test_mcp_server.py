@@ -464,6 +464,23 @@ class TestMcpToolWiring:
         data = json.loads(result[0].text)
         assert data["ok"] is True
 
+    def test_call_tool_vulcan_retract(self, mock_minigraf_db, tmp_path):
+        import asyncio
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx": "12"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        result = asyncio.run(mcp_server.call_tool(
+            "vulcan_retract",
+            {"facts": '[[:decision/cache :description "Redis"]]', "reason": "no longer needed"},
+        ))
+
+        assert len(result) == 1
+        data = json.loads(result[0].text)
+        assert data["ok"] is True
+
     def test_call_tool_unknown_raises(self, mock_minigraf_db, tmp_path):
         import asyncio
         import mcp_server
@@ -471,3 +488,34 @@ class TestMcpToolWiring:
 
         with pytest.raises(Exception, match="Unknown tool"):
             asyncio.run(mcp_server.call_tool("nonexistent_tool", {}))
+
+
+class TestParseValidAtHint:
+    def test_returns_utc_ms_timestamp_when_no_hint(self):
+        import re
+        import mcp_server
+        valid_at, datalog = mcp_server._parse_valid_at_hint('[[:e :a "v"]]')
+        assert datalog == '[[:e :a "v"]]'
+        assert re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z", valid_at)
+
+    def test_extracts_valid_at_date_from_comment(self):
+        import mcp_server
+        raw = '; valid-at: 2024-03-15\n[[:decision/x :desc "y"]]'
+        valid_at, datalog = mcp_server._parse_valid_at_hint(raw)
+        assert valid_at == "2024-03-15"
+        assert "; valid-at:" not in datalog
+        assert '[[:decision/x :desc "y"]]' in datalog
+
+    def test_ignores_invalid_date_format_in_comment(self):
+        import re
+        import mcp_server
+        raw = '; valid-at: not-a-date\n[[:e :a "v"]]'
+        valid_at, datalog = mcp_server._parse_valid_at_hint(raw)
+        # Falls back to current UTC ms timestamp
+        assert re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z", valid_at)
+
+    def test_last_valid_at_comment_wins_when_multiple(self):
+        import mcp_server
+        raw = '; valid-at: 2024-01-01\n; valid-at: 2025-06-30\n[[:e :a "v"]]'
+        valid_at, datalog = mcp_server._parse_valid_at_hint(raw)
+        assert valid_at == "2025-06-30"

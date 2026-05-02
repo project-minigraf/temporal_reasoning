@@ -17,9 +17,11 @@ result = query("[:find ?d :where [?e :decision/description ?d]]")
 
 ## Key Files
 
-- `vulcan.py` - Python wrapper for minigraf CLI
+- `mcp_server.py` - Persistent MCP server (primary interface)
+- `vulcan.py` - Python wrapper for direct use outside MCP
 - `SKILL.md` - Skill definition with all query syntax
 - `install.py` - Setup script (runs weekly updates)
+- `hooks/claude-code.json` - Claude Code MCP + auto-memory hook config
 
 ## Graph Storage
 
