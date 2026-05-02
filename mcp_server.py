@@ -157,11 +157,12 @@ _MIN_ENTITY_LEN = 4
 def _extract_entities(text: str) -> List[str]:
     """Extract candidate entity tokens from user message text."""
     tokens = text.lower().split()
-    return [
-        t.strip(".,?!;:\"'()[]")
-        for t in tokens
-        if len(t) >= _MIN_ENTITY_LEN and t not in _STOP_WORDS
-    ]
+    result = []
+    for t in tokens:
+        stripped = t.strip(".,?!;:\"'()[]")
+        if len(stripped) >= _MIN_ENTITY_LEN and stripped not in _STOP_WORDS:
+            result.append(stripped)
+    return result
 
 
 def _format_facts(results: List[List[str]]) -> str:
@@ -191,10 +192,17 @@ def _build_query_clauses(user_message: str) -> str:
     """
     Return temporal clauses to append to a Datalog query.
 
-    For historical queries where a specific ISO date is detected, use :valid-at
-    to restrict to facts valid at that date. For all other queries, use
-    :any-valid-time so that facts stored without an explicit valid-at are
-    included (the common case for facts written via standard transact).
+    minigraf `:valid-at "YYYY-MM-DD"` resolves the date to midnight UTC at the
+    START of that day. Facts transacted without an explicit valid-at receive a
+    valid_from equal to the transaction timestamp (after midnight). Querying
+    with :valid-at "today" therefore misses all facts written today, and
+    :valid-at "yesterday" misses all facts written since yesterday midnight.
+
+    Consequence: :any-valid-time is the correct clause for current-state
+    queries — it returns all facts regardless of valid period, which is what
+    "what do we know right now?" requires. :valid-at is reserved for
+    point-in-time historical queries with an explicit PAST date, where we
+    specifically want the graph state as it was at midnight on that date.
     """
     if _is_historical_query(user_message):
         date_match = _DATE_PATTERN.search(user_message)

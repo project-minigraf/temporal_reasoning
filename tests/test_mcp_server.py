@@ -241,3 +241,27 @@ class TestMemoryPrepareTurn:
 
         mcp_server.handle_memory_prepare_turn("hello")
         # Should not raise; limit is respected internally
+
+    def test_uses_valid_at_for_message_with_explicit_iso_date(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        mcp_server.handle_memory_prepare_turn("what did we decide before 2026-01-15?")
+
+        calls = [str(c) for c in db_instance.execute.call_args_list]
+        assert any(':valid-at "2026-01-15"' in c for c in calls)
+
+    def test_uses_any_valid_time_for_current_state_queries(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        mcp_server.handle_memory_prepare_turn("what database are we using?")
+
+        calls = [str(c) for c in db_instance.execute.call_args_list]
+        assert any(":any-valid-time" in c for c in calls)
