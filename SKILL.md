@@ -1,15 +1,3 @@
----
-name: temporal-reasoning
-description: >
-  Use this skill whenever the user mentions decisions ("we'll use X", "going with Y", "decided to Z"),
-  preferences ("I prefer", "I don't like", "always use", "never use"), constraints ("must be", "can't use",
-  "prioritize"), dependencies ("depends on", "requires"), or references past context ("what did we",
-  "last time", "before", "earlier", "what was our"). Also use before any code modification that might
-  conflict with past decisions — if you're about to touch an area where architectural choices might apply,
-  query first. When in doubt, query. If auto-memory hooks are not configured, call memory_prepare_turn
-  at the start of each turn and memory_finalize_turn at the end.
----
-
 # Temporal Reasoning
 
 Perfect memory. Exact reasoning. Complete history.
