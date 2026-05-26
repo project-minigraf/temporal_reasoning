@@ -1342,6 +1342,8 @@ class TestIngestionWrites:
         call_args = db_instance.execute.call_args[0][0]
         assert ':valid-from "2025-03-01T10:00:00Z"' in call_args
         assert ":valid-to" not in call_args
+        # facts vector must come before the options map
+        assert call_args.index("[:module/foo") < call_args.index(":valid-from")
 
     def test_ingest_close_uses_valid_from_and_valid_to(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -1360,6 +1362,8 @@ class TestIngestionWrites:
         call_args = db_instance.execute.call_args[0][0]
         assert ':valid-from "2025-01-01T00:00:00Z"' in call_args
         assert ':valid-to "2025-03-01T10:00:00Z"' in call_args
+        # facts vector must come before the options map
+        assert call_args.index("[:module/foo") < call_args.index(":valid-from")
 
     def test_watermark_update_transacts_hash(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -1398,4 +1402,13 @@ class TestIngestionWrites:
         db = mcp_server.get_db()
         db_instance.execute.reset_mock()
         mcp_server._ingest_transact(db, [], "2025-03-01T10:00:00Z", "r")
+        db_instance.execute.assert_not_called()
+
+    def test_ingest_close_noop_for_empty_triples(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        db_instance.execute.reset_mock()
+        mcp_server._ingest_close(db, [], "2025-01-01T00:00:00Z", "2025-03-01T00:00:00Z", "r")
         db_instance.execute.assert_not_called()

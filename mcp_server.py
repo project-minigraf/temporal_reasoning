@@ -590,7 +590,7 @@ def _ingest_transact(
     if not triples:
         return
     facts_str = "[" + " ".join(triples) + "]"
-    db.execute(f'(transact {{:valid-from "{commit_ts_iso}"}} {facts_str})')
+    db.execute(f'(transact {facts_str} {{:valid-from "{commit_ts_iso}"}})')
 
 
 def _ingest_close(
@@ -609,13 +609,13 @@ def _ingest_close(
         return
     facts_str = "[" + " ".join(triples) + "]"
     db.execute(
-        f'(transact {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}} {facts_str})'
+        f'(transact {facts_str} {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}})'
     )
 
 
 def _watermark_query(db: Any) -> Optional[str]:
     """Return the hash of the last ingested commit, or None if no watermark exists."""
-    raw = db.execute("[:find ?h :where [:ingestion/watermark :hash ?h]]")
+    raw = db.execute("(query [:find ?h :where [:ingestion/watermark :hash ?h]])")
     results = json.loads(raw).get("results", [])
     return results[0][0] if results else None
 
@@ -623,11 +623,11 @@ def _watermark_query(db: Any) -> Optional[str]:
 def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str) -> None:
     """Record the last successfully ingested commit hash in the graph."""
     db.execute(
-        f'(transact {{:valid-from "{commit_ts_iso}"}} '
-        f'[[:ingestion/watermark :entity-type :type/ingestion] '
+        f'(transact [[:ingestion/watermark :entity-type :type/ingestion] '
         f'[:ingestion/watermark :ident ":ingestion/watermark"] '
         f'[:ingestion/watermark :description "git ingestion watermark"] '
-        f'[:ingestion/watermark :hash "{commit_hash}"]])'
+        f'[:ingestion/watermark :hash "{commit_hash}"]] '
+        f'{{:valid-from "{commit_ts_iso}"}})'
     )
 
 
