@@ -604,9 +604,7 @@ If nothing worth storing was found, return an empty list: []
 
 Allowed entity type prefixes: :decision/ :preference/ :constraint/ :dependency/
 Canonical ident form: lowercase, hyphens only — :decision/redis not :decision/Redis_cache.
-
 {canonical_entities_section}
-
 Use these attributes: :description (required), :rationale (optional), :date (optional), :alias (optional).
 No other attributes are valid.
 
@@ -704,7 +702,7 @@ def _llm_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
         canonical = _query_canonical_entities()
         if canonical:
             canonical_entities_section = (
-                "Existing canonical entities (reuse these idents — do not invent synonyms):\n"
+                "\nExisting canonical entities (reuse these idents — do not invent synonyms):\n"
                 + canonical
             )
         else:
@@ -740,9 +738,7 @@ _AGENT_SAMPLING_PROMPT = """Review this conversation turn and output ONLY a Data
 
 Allowed entity type prefixes: :decision/ :preference/ :constraint/ :dependency/
 Canonical ident form: lowercase, hyphens only — :decision/redis not :decision/Redis_cache.
-
 {canonical_entities_section}
-
 Use these attributes: :description (required), :rationale (optional), :date (optional), :alias (optional).
 No other attributes are valid. If an entity matches an existing ident or alias, reuse it exactly.
 
@@ -776,7 +772,7 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
         canonical = _query_canonical_entities()
         if canonical:
             canonical_entities_section = (
-                "Existing canonical entities (reuse these idents — do not invent synonyms):\n"
+                "\nExisting canonical entities (reuse these idents — do not invent synonyms):\n"
                 + canonical
             )
         else:

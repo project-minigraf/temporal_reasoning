@@ -904,3 +904,22 @@ class TestQueryCanonicalEntities:
             mcp_server._llm_extract_and_transact("User: test\nAgent: ok")
 
         assert ":decision/redis" in captured_prompt.get("prompt", "")
+
+    def test_injected_into_agent_prompt(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":decision/redis", "use Redis"]]
+        })
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        captured = {}
+        async def fake_request_block(conversation_delta, canonical_entities_section=""):
+            captured["canonical_entities_section"] = canonical_entities_section
+            return "[]"
+
+        with patch("mcp_server._request_agent_memory_block_async", side_effect=fake_request_block):
+            import asyncio
+            asyncio.run(mcp_server._agent_extract_and_transact("User: test\nAgent: ok"))
+
+        assert ":decision/redis" in captured.get("canonical_entities_section", "")
