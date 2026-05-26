@@ -10,7 +10,6 @@ import datetime
 import json
 import os
 import re
-import uuid as _uuid_mod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -223,88 +222,86 @@ def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
 
     as_of_clause = f":as-of {as_of} " if as_of is not None else ""
 
-    # Step 1: Collect all keyword idents for entities that have :ident stored.
-    # _transact_extracted_facts writes [:entity :ident ":entity"] alongside :entity-type.
-    # Using :ident as the lookup key avoids the UUID round-trip problem:
-    # join variables bind to UUIDs which cannot be used in subsequent where-clauses
-    # or retract expressions, but keyword idents used as LITERALS work correctly.
-    ident_query = f"[:find ?id {as_of_clause}:where [?e :ident ?id]]"
-    try:
-        ident_result = handle_vulcan_query(ident_query)
-        ident_rows = ident_result.get("results", [])
-    except Exception:
-        ident_rows = []
-
-    for ident_row in ident_rows:
-        if not ident_row:
-            continue
-        kw_ident = ident_row[0]  # e.g. ":decision/phase-4-normalization"
-        if not isinstance(kw_ident, str) or not kw_ident.startswith(":"):
-            continue
-        # Derive entity_type from keyword namespace prefix (":decision/slug" → "decision").
-        parts = kw_ident[1:].split("/", 1)
-        if len(parts) != 2:
-            continue
-        entity_type = parts[0]
-        if entity_type not in VULCAN_SCHEMA:
-            continue  # unknown entity type — skip; only known schema types are audited
-
-        audited += 1
-
-        # Step 2: Fetch all attributes for this entity using the keyword ident as a
-        # LITERAL in the where-clause. Minigraf resolves keyword literals correctly —
-        # only join-variable bindings (UUIDs) fail in subsequent where-clauses.
-        attr_query = f"[:find ?a ?v {as_of_clause}:where [{kw_ident} ?a ?v]]"
+    for entity_type in VULCAN_SCHEMA:
+        # Step 1: Find all entity UUIDs of this type.
+        type_query = (
+            f"[:find ?e {as_of_clause}"
+            f":where [?e :entity-type :type/{entity_type}]]"
+        )
         try:
-            attr_result = handle_vulcan_query(attr_query)
-            attr_rows = attr_result.get("results", [])
+            type_result = handle_vulcan_query(type_query)
+            type_rows = type_result.get("results", [])
         except Exception:
             continue
 
-        # Exclude system attributes from schema validation.
-        attr_facts = [
-            {
-                "entity": kw_ident,
-                "entity_type": entity_type,
-                "attribute": a,
-                "value": v,
-            }
-            for a, v in attr_rows
-            if a not in _SYSTEM_ATTRS
-        ]
+        for row in type_rows:
+            if not row:
+                continue
+            entity_uuid = row[0]
+            audited += 1
 
-        if not attr_facts:
-            # Entity exists but has no domain attribute triples.
-            attr_facts = [{"entity": kw_ident, "entity_type": entity_type,
-                           "attribute": ":__no_attributes__", "value": ""}]
+            # Step 2: Fetch all attributes using #uuid tagged literal.
+            # minigraf's EDN parser treats #uuid "..." as EdnValue::Uuid and routes
+            # it through edn_to_entity_id directly — no keyword-to-UUID derivation
+            # needed and no join-variable round-trip problem.
+            attr_query = (
+                f'[:find ?a ?v {as_of_clause}'
+                f':where [#uuid "{entity_uuid}" ?a ?v]]'
+            )
+            try:
+                attr_result = handle_vulcan_query(attr_query)
+                attr_rows = attr_result.get("results", [])
+            except Exception:
+                continue
 
-        violations = _validate_facts(attr_facts)
-        if violations:
-            for v in violations:
-                all_violations.append({"entity": kw_ident, "detail": v})
+            # Extract keyword ident from the stored :ident datom for reporting.
+            # Falls back to the UUID string if :ident was not written.
+            kw_ident = next(
+                (v for a, v in attr_rows if a == ":ident" and isinstance(v, str)),
+                entity_uuid,
+            )
 
-            if as_of is None:
-                # Retract the invalid entity and all its attribute triples —
-                # history preserved (bi-temporal). kw_ident is the keyword form
-                # (:decision/slug) and works correctly in retract expressions.
-                try:
-                    retract_triples = [
-                        f"[{kw_ident} :entity-type :type/{entity_type}]",
-                        f'[{kw_ident} :ident "{kw_ident}"]',
-                    ]
-                    for a, v in attr_rows:
-                        if a in _SYSTEM_ATTRS:
-                            continue
-                        if isinstance(v, str):
-                            escaped = v.replace('"', '\\"')
-                            retract_triples.append(f'[{kw_ident} {a} "{escaped}"]')
-                    retract_expr = f"(retract [{' '.join(retract_triples)}])"
-                    db.execute(retract_expr)
-                    db.checkpoint()
-                    _update_mtime()
-                    retracted += 1
-                except Exception:
-                    pass
+            # Exclude system attributes from schema validation.
+            attr_facts = [
+                {
+                    "entity": kw_ident,
+                    "entity_type": entity_type,
+                    "attribute": a,
+                    "value": v,
+                }
+                for a, v in attr_rows
+                if a not in _SYSTEM_ATTRS
+            ]
+
+            if not attr_facts:
+                attr_facts = [{"entity": kw_ident, "entity_type": entity_type,
+                               "attribute": ":__no_attributes__", "value": ""}]
+
+            violations = _validate_facts(attr_facts)
+            if violations:
+                for v in violations:
+                    all_violations.append({"entity": kw_ident, "detail": v})
+
+                if as_of is None:
+                    # Retract using #uuid tagged literal — works even without knowing
+                    # the original keyword ident. History preserved (bi-temporal).
+                    try:
+                        retract_triples = [
+                            f'[#uuid "{entity_uuid}" :entity-type :type/{entity_type}]',
+                        ]
+                        for a, v in attr_rows:
+                            if isinstance(v, str):
+                                escaped = v.replace('"', '\\"')
+                                retract_triples.append(
+                                    f'[#uuid "{entity_uuid}" {a} "{escaped}"]'
+                                )
+                        retract_expr = f"(retract [{' '.join(retract_triples)}])"
+                        db.execute(retract_expr)
+                        db.checkpoint()
+                        _update_mtime()
+                        retracted += 1
+                    except Exception:
+                        pass
 
     return {
         "ok": True,
@@ -340,16 +337,6 @@ def _canonical_ident(entity_type: str, value: str) -> str:
     slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
     slug = re.sub(r"-+", "-", slug).strip("-")
     return f":{entity_type}/{slug}"
-
-
-def _keyword_uuid(keyword: str) -> str:
-    """Derive a stable UUID from a Minigraf keyword string.
-
-    Same keyword always produces the same UUID — used for entity resolution
-    without string-matching. Ported from keyword_entity_id() in
-    minigraf-examples minigraf-algorithms crate.
-    """
-    return str(_uuid_mod.uuid5(_uuid_mod.NAMESPACE_OID, keyword))
 
 
 # System attributes written by _transact_extracted_facts alongside domain attributes.
@@ -474,16 +461,34 @@ def _query_canonical_entities() -> str:
     Returns a formatted string listing up to 50 entity idents and their
     descriptions. Returns empty string if the graph has no entities — in
     that case the caller omits the section from the prompt entirely.
+
+    Uses a two-step approach: first fetches all stored :ident keyword strings,
+    then fetches each entity's :description using the keyword ident as a literal.
+    This returns proper keyword idents (e.g. :decision/redis) rather than the
+    internal UUIDs that join-variable queries would return for ?e.
     """
     try:
-        result = handle_vulcan_query("[:find ?e ?desc :where [?e :description ?desc]]")
-        rows = result.get("results", [])
+        ident_result = handle_vulcan_query("[:find ?id :where [?e :ident ?id]]")
+        ident_rows = ident_result.get("results", [])
     except Exception:
         return ""
-    if not rows:
+    if not ident_rows:
         return ""
-    rows = rows[:50]
-    lines = [f"  {ident} — {desc}" for ident, desc in rows]
+    lines = []
+    for row in ident_rows[:50]:
+        kw_ident = row[0] if row else None
+        if not isinstance(kw_ident, str) or not kw_ident.startswith(":"):
+            continue
+        try:
+            desc_result = handle_vulcan_query(
+                f"[:find ?desc :where [{kw_ident} :description ?desc]]"
+            )
+            desc_rows = desc_result.get("results", [])
+            desc = desc_rows[0][0] if desc_rows else ""
+        except Exception:
+            desc = ""
+        if desc:
+            lines.append(f"  {kw_ident} — {desc}")
     return "\n".join(lines)
 
 
@@ -689,8 +694,8 @@ def _transact_extracted_facts(facts: List[Dict[str, str]]) -> int:
             # Combine main fact, :entity-type tag, and :ident into one transact so
             # all triples are written atomically — a single (transact [...]) is one
             # transaction. :ident stores the keyword ident as a string value so that
-            # handle_vulcan_audit can retrieve it for retraction (bare UUIDs returned
-            # by query results cannot be used as entity refs in retract expressions).
+            # handle_vulcan_audit and _query_canonical_entities can surface it for
+            # display without knowing the UUID (audits retract via #uuid "..." syntax).
             if entity_type:
                 triples = (
                     f'[{entity} {attribute} "{value}"]'

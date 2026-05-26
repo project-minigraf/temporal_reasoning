@@ -649,25 +649,6 @@ class TestCanonicalIdent:
         assert mcp_server._canonical_ident("decision", " redis ") == ":decision/redis"
 
 
-class TestKeywordUuid:
-    def test_same_keyword_same_uuid(self):
-        import mcp_server
-        a = mcp_server._keyword_uuid(":decision/redis")
-        b = mcp_server._keyword_uuid(":decision/redis")
-        assert a == b
-
-    def test_different_keywords_different_uuids(self):
-        import mcp_server
-        a = mcp_server._keyword_uuid(":decision/redis")
-        b = mcp_server._keyword_uuid(":decision/postgres")
-        assert a != b
-
-    def test_returns_string(self):
-        import mcp_server
-        result = mcp_server._keyword_uuid(":decision/redis")
-        assert isinstance(result, str)
-
-
 class TestValidateFacts:
     def test_valid_fact_no_violations(self):
         import mcp_server
@@ -892,11 +873,14 @@ class TestQueryCanonicalEntities:
 
     def test_formats_entities_as_lines(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":decision/redis", "use Redis"]]
-        })
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
+        # Two-step: first call returns ident list, second returns description.
+        # Set side_effect after open_db to avoid consuming SESSION_RULES calls.
+        db_instance.execute.side_effect = [
+            json.dumps({"results": [[":decision/redis"]]}),  # ident query
+            json.dumps({"results": [["use Redis"]]}),         # desc query
+        ] + [json.dumps({"results": []})] * 5
 
         result = mcp_server._query_canonical_entities()
         assert ":decision/redis" in result
@@ -904,11 +888,16 @@ class TestQueryCanonicalEntities:
 
     def test_caps_at_50_entities(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[f":decision/item-{i}", f"item {i}"] for i in range(60)]
-        })
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
+        # First call: ident query returns 60 items (only first 50 are processed).
+        # Subsequent calls: one description query per processed ident.
+        # Set side_effect after open_db to avoid consuming SESSION_RULES calls.
+        ident_results = [[f":decision/item-{i}"] for i in range(60)]
+        desc_calls = [json.dumps({"results": [[f"item {i}"]]}) for i in range(50)]
+        db_instance.execute.side_effect = (
+            [json.dumps({"results": ident_results})] + desc_calls
+        )
 
         result = mcp_server._query_canonical_entities()
         assert result.count(":decision/") == 50
@@ -917,9 +906,6 @@ class TestQueryCanonicalEntities:
         mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("VULCAN_LLM_MODEL", "claude-haiku-4-5-20251001")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":decision/redis", "use Redis"]]
-        })
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
@@ -928,16 +914,14 @@ class TestQueryCanonicalEntities:
             captured_prompt["prompt"] = prompt
             return "[]"
 
-        with patch("mcp_server._call_llm", side_effect=fake_call_llm):
-            mcp_server._llm_extract_and_transact("User: test\nAgent: ok")
+        with patch("mcp_server._query_canonical_entities", return_value="  :decision/redis — use Redis"):
+            with patch("mcp_server._call_llm", side_effect=fake_call_llm):
+                mcp_server._llm_extract_and_transact("User: test\nAgent: ok")
 
         assert ":decision/redis" in captured_prompt.get("prompt", "")
 
     def test_injected_into_agent_prompt(self, mock_minigraf_db, tmp_path, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":decision/redis", "use Redis"]]
-        })
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
@@ -946,9 +930,10 @@ class TestQueryCanonicalEntities:
             captured["canonical_entities_section"] = canonical_entities_section
             return "[]"
 
-        with patch("mcp_server._request_agent_memory_block_async", side_effect=fake_request_block):
-            import asyncio
-            asyncio.run(mcp_server._agent_extract_and_transact("User: test\nAgent: ok"))
+        with patch("mcp_server._query_canonical_entities", return_value="  :decision/redis — use Redis"):
+            with patch("mcp_server._request_agent_memory_block_async", side_effect=fake_request_block):
+                import asyncio
+                asyncio.run(mcp_server._agent_extract_and_transact("User: test\nAgent: ok"))
 
         assert ":decision/redis" in captured.get("canonical_entities_section", "")
 
@@ -972,22 +957,22 @@ class TestVulcanAudit:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        # handle_vulcan_audit now uses a two-step approach:
-        #   Step 1: [:find ?id :where [?e :ident ?id]] → list of keyword idents
-        #   Step 2: [:find ?a ?v :where [KEYWORD ?a ?v]] per ident → attr rows
+        # handle_vulcan_audit uses type query → UUID, then #uuid attr query.
+        # Step 1: type query for "decision" returns UUID.
+        # Step 2: attr query using #uuid tagged literal returns all attributes.
         # Entity has :ident + :entity-type (system) + :rationale (domain).
-        # Missing :description → violation → retract call.
+        # Missing :description → violation → retract call using #uuid.
+        # Remaining entity types return empty.
+        uuid = "bcc294db-aef9-53ae-8da8-9434eb6d1642"
         db_instance.execute.side_effect = [
-            # Step 1: ident query returns one entity keyword
-            json.dumps({"results": [[":decision/redis"]]}),
-            # Step 2: attr query for :decision/redis returns all its attributes
-            json.dumps({"results": [
+            json.dumps({"results": [[uuid]]}),         # Step 1: type query for decision
+            json.dumps({"results": [                   # Step 2: #uuid attr query
                 [":entity-type", ":type/decision"],
                 [":ident", ":decision/redis"],
                 [":rationale", "fast"],
             ]}),
-            json.dumps({"tx": "10"}),  # retract call
-        ] + [json.dumps({"results": []})] * 10
+            json.dumps({"tx": "10"}),                  # retract call
+        ] + [json.dumps({"results": []})] * 10         # remaining type queries
 
         result = mcp_server.handle_vulcan_audit()
 
@@ -995,23 +980,22 @@ class TestVulcanAudit:
         assert result["retracted"] == 1
         assert len(result["violations"]) == 1
 
-        # Verify a retract was actually issued (Fix 2: full entity retraction).
         retract_calls = [
             str(call) for call in db_instance.execute.call_args_list
             if "retract" in str(call)
         ]
         assert len(retract_calls) >= 1, "Expected at least one retract call"
-        assert ":decision/redis" in retract_calls[0]
+        assert "#uuid" in retract_calls[0]
+        assert uuid in retract_calls[0]
 
     def test_as_of_reports_violations_without_retracting(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
+        uuid = "bcc294db-aef9-53ae-8da8-9434eb6d1642"
         db_instance.execute.side_effect = [
-            # Step 1: ident query
-            json.dumps({"results": [[":decision/redis"]]}),
-            # Step 2: attr query — missing :description
+            json.dumps({"results": [[uuid]]}),
             json.dumps({"results": [
                 [":entity-type", ":type/decision"],
                 [":ident", ":decision/redis"],
@@ -1025,31 +1009,33 @@ class TestVulcanAudit:
         assert result["retracted"] == 0  # read-only when as_of provided
         assert len(result["violations"]) == 1
 
-    def test_ident_attr_used_for_retraction(self, mock_minigraf_db, tmp_path):
-        """The keyword ident from :ident is used in retract, not the UUID."""
+    def test_ident_attr_used_for_display_in_violations(self, mock_minigraf_db, tmp_path):
+        """Violation report shows keyword ident from :ident, not the raw UUID."""
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
+        uuid = "dca29477-f050-517e-9b4a-ef6d5dcada09"
         kw = ":decision/claude-haiku-4-5-20251001"
         db_instance.execute.side_effect = [
-            json.dumps({"results": [[kw]]}),          # Step 1: ident query
-            json.dumps({"results": [                  # Step 2: attr query
+            json.dumps({"results": [[uuid]]}),
+            json.dumps({"results": [
                 [":entity-type", ":type/decision"],
                 [":ident", kw],
-                # :description absent → violation
             ]}),
-            json.dumps({"tx": "10"}),                 # retract call
+            json.dumps({"tx": "10"}),
         ] + [json.dumps({"results": []})] * 10
 
         result = mcp_server.handle_vulcan_audit()
 
         assert result["retracted"] == 1
+        assert result["violations"][0]["entity"] == kw  # keyword ident in report
         retract_calls = [
             str(call) for call in db_instance.execute.call_args_list
             if "retract" in str(call)
         ]
-        assert ":decision/claude-haiku-4-5-20251001" in retract_calls[0]
+        assert "#uuid" in retract_calls[0]
+        assert uuid in retract_calls[0]
 
     def test_result_shape(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
