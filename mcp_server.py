@@ -575,6 +575,62 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
     return result.stdout
 
 
+# ---------------------------------------------------------------------------
+# Bi-temporal write helpers
+# ---------------------------------------------------------------------------
+
+
+def _ingest_transact(
+    db: Any,
+    triples: List[str],
+    commit_ts_iso: str,
+    reason: str,
+) -> None:
+    """Transact code-structure facts with :valid-from set to the commit timestamp."""
+    if not triples:
+        return
+    facts_str = "[" + " ".join(triples) + "]"
+    db.execute(f'(transact {{:valid-from "{commit_ts_iso}"}} {facts_str})')
+
+
+def _ingest_close(
+    db: Any,
+    triples: List[str],
+    original_ts_iso: str,
+    commit_ts_iso: str,
+    reason: str,
+) -> None:
+    """Close a fact's valid window at the deletion commit timestamp.
+
+    retract has no temporal options, so deletions are expressed as a
+    re-transact with explicit :valid-from (creation) and :valid-to (deletion).
+    """
+    if not triples:
+        return
+    facts_str = "[" + " ".join(triples) + "]"
+    db.execute(
+        f'(transact {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}} {facts_str})'
+    )
+
+
+def _watermark_query(db: Any) -> Optional[str]:
+    """Return the hash of the last ingested commit, or None if no watermark exists."""
+    raw = db.execute("[:find ?h :where [:ingestion/watermark :hash ?h]]")
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str) -> None:
+    """Record the last successfully ingested commit hash in the graph."""
+    db.execute(
+        f'(transact {{:valid-from "{commit_ts_iso}"}} '
+        f'[[:ingestion/watermark :entity-type :type/ingestion] '
+        f'[:ingestion/watermark :ident ":ingestion/watermark"] '
+        f'[:ingestion/watermark :description "git ingestion watermark"] '
+        f'[:ingestion/watermark :hash "{commit_hash}"]])'
+    )
+
+
 # System attributes written by _transact_extracted_facts alongside domain attributes.
 # They are invisible to schema validation and filtered from attr_facts in vulcan_audit.
 _SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})
