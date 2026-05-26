@@ -467,18 +467,19 @@ class TestAgentStrategy:
 
 
 class TestMcpToolWiring:
-    def test_list_tools_returns_six_tools(self, mock_minigraf_db, tmp_path):
+    def test_list_tools_returns_seven_tools(self, mock_minigraf_db, tmp_path):
         import asyncio
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         tools = asyncio.run(mcp_server.list_tools())
 
-        assert len(tools) == 6
+        assert len(tools) == 7
         names = {t.name for t in tools}
         assert names == {
             "vulcan_query", "vulcan_transact", "vulcan_retract",
             "vulcan_report_issue", "memory_prepare_turn", "memory_finalize_turn",
+            "vulcan_audit",
         }
 
     def test_call_tool_vulcan_query(self, mock_minigraf_db, tmp_path):
@@ -923,3 +924,71 @@ class TestQueryCanonicalEntities:
             asyncio.run(mcp_server._agent_extract_and_transact("User: test\nAgent: ok"))
 
         assert ":decision/redis" in captured.get("canonical_entities_section", "")
+
+
+class TestVulcanAudit:
+    def test_clean_db_returns_zero_retracted(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        # No entities of any known type
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        result = mcp_server.handle_vulcan_audit()
+
+        assert result["ok"] is True
+        assert result["retracted"] == 0
+        assert result["violations"] == []
+
+    def test_entity_missing_required_attr_is_retracted(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        # open_db registers SESSION_RULES (4 calls). After that, we set side_effect.
+        # handle_vulcan_audit calls handle_vulcan_query which calls db.execute.
+        # First entity type query for "decision" returns one entity.
+        # Second: attr query for that entity returns only :rationale (missing :description).
+        # Third: retract call for the invalid entity.
+        # Remaining: empty results for other entity types (preference, constraint, dependency).
+        db_instance.execute.side_effect = [
+            json.dumps({"results": [[":decision/redis"]]}),  # type query for decision
+            json.dumps({"results": [[":rationale", "fast"]]}),  # attr query
+            json.dumps({"tx": "10"}),  # retract call
+        ] + [json.dumps({"results": []})] * 10  # remaining type queries
+
+        result = mcp_server.handle_vulcan_audit()
+
+        assert result["ok"] is True
+        assert result["retracted"] == 1
+        assert len(result["violations"]) == 1
+
+    def test_as_of_reports_violations_without_retracting(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        db_instance.execute.side_effect = [
+            json.dumps({"results": [[":decision/redis"]]}),
+            json.dumps({"results": [[":rationale", "fast"]]}),
+        ] + [json.dumps({"results": []})] * 10
+
+        result = mcp_server.handle_vulcan_audit(as_of=5)
+
+        assert result["ok"] is True
+        assert result["retracted"] == 0  # read-only when as_of provided
+        assert len(result["violations"]) == 1
+
+    def test_result_shape(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        result = mcp_server.handle_vulcan_audit()
+
+        assert "ok" in result
+        assert "audited" in result
+        assert "retracted" in result
+        assert "violations" in result
+        assert isinstance(result["violations"], list)

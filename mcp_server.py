@@ -207,6 +207,88 @@ def handle_vulcan_report_issue(
         return {"ok": False, "error": str(e)}
 
 
+def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
+    """Audit graph entities against VULCAN_SCHEMA.
+
+    Current state (as_of=None): validates all entities and retracts violators.
+    Point-in-time (as_of=N): reports violations only — no retractions.
+
+    Ported from Schema.audit_as_of() in minigraf-examples minigraf-schema crate.
+    """
+    _refresh_if_stale()
+    db = get_db()
+    audited = 0
+    retracted = 0
+    all_violations: List[Dict[str, Any]] = []
+
+    as_of_clause = f":as-of {as_of} " if as_of is not None else ""
+
+    for entity_type, schema in VULCAN_SCHEMA.items():
+        # Find all entities of this type.
+        type_query = (
+            f"[:find ?e {as_of_clause}"
+            f":where [?e :entity-type :type/{entity_type}]]"
+        )
+        try:
+            type_result = handle_vulcan_query(type_query)
+            entity_rows = type_result.get("results", [])
+        except Exception:
+            continue
+
+        for row in entity_rows:
+            if not row:
+                continue
+            entity_ident = row[0]
+            audited += 1
+
+            # Fetch all attributes for this entity.
+            attr_query = (
+                f"[:find ?a ?v {as_of_clause}"
+                f":where [{entity_ident} ?a ?v]]"
+            )
+            try:
+                attr_result = handle_vulcan_query(attr_query)
+                attr_rows = attr_result.get("results", [])
+            except Exception:
+                continue
+
+            # Reconstruct per-attribute fact dicts for _validate_facts.
+            attr_facts = []
+            for attr_row in attr_rows:
+                if len(attr_row) == 2:
+                    attr, val = attr_row
+                    attr_facts.append({
+                        "entity": entity_ident,
+                        "entity_type": entity_type,
+                        "attribute": attr,
+                        "value": val,
+                    })
+
+            violations = _validate_facts(attr_facts)
+            if violations:
+                for v in violations:
+                    all_violations.append({"entity": entity_ident, "detail": v})
+
+                if as_of is None:
+                    # Retract the invalid entity — history preserved (bi-temporal).
+                    try:
+                        db.execute(
+                            f"(retract [[{entity_ident} :entity-type :type/{entity_type}]])"
+                        )
+                        db.checkpoint()
+                        _update_mtime()
+                        retracted += 1
+                    except Exception:
+                        pass
+
+    return {
+        "ok": True,
+        "audited": audited,
+        "retracted": retracted,
+        "violations": all_violations,
+    }
+
+
 # ---------------------------------------------------------------------------
 # memory_prepare_turn
 # ---------------------------------------------------------------------------
@@ -967,6 +1049,25 @@ _TOOLS: List[Tool] = [
             "required": ["conversation_delta"],
         },
     ),
+    Tool(
+        name="vulcan_audit",
+        description=(
+            "Audit all graph entities against the built-in schema. "
+            "Retracts entities with schema violations (missing required attributes, "
+            "unknown types, unknown attributes). Run periodically or after heavy write sessions. "
+            "Pass as_of (transaction number) for a read-only point-in-time audit without retractions."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "as_of": {
+                    "type": "integer",
+                    "description": "Optional transaction number for point-in-time audit (read-only, no retractions)",
+                },
+            },
+            "required": [],
+        },
+    ),
 ]
 
 
@@ -1004,6 +1105,11 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
 
     if name == "memory_finalize_turn":
         result = await handle_memory_finalize_turn(arguments["conversation_delta"])
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    if name == "vulcan_audit":
+        as_of = arguments.get("as_of")
+        result = handle_vulcan_audit(as_of=as_of)
         return [TextContent(type="text", text=json.dumps(result))]
 
     raise ValueError(f"Unknown tool: {name}")
