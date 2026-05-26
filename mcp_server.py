@@ -25,6 +25,8 @@ SESSION_RULES = [
     "(rule [(linked ?a ?b) [?a :calls ?b]])",
     "(rule [(reachable ?a ?b) [?a :depends-on ?b]])",
     "(rule [(reachable ?a ?b) [?a :calls ?b]])",
+    "(rule [(linked ?a ?b) [?a :contains ?b]])",
+    "(rule [(reachable ?a ?b) [?a :contains ?b]])",
 ]
 
 # Module-level DB instance — opened once, held for the session lifetime
@@ -363,6 +365,22 @@ VULCAN_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
     "dependency": {
         "required": {":description": str},
         "optional": {":rationale": str, ":alias": str},
+    },
+    "module": {
+        "required": {":description": str},
+        "optional": {":path": str, ":alias": str},
+    },
+    "function": {
+        "required": {":description": str},
+        "optional": {":file": str, ":alias": str},
+    },
+    "class": {
+        "required": {":description": str},
+        "optional": {":file": str, ":alias": str},
+    },
+    "ingestion": {
+        "required": {":description": str},
+        "optional": {":hash": str, ":alias": str},
     },
 }
 

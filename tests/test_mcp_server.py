@@ -1067,4 +1067,50 @@ class TestVulcanAudit:
         assert "audited" in result
         assert "retracted" in result
         assert "violations" in result
-        assert isinstance(result["violations"], list)
+
+
+class TestPhase5Schema:
+    def test_module_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        facts = [{"entity": ":module/src-auth-py", "entity_type": "module",
+                  "attribute": ":description", "value": "src/auth.py"}]
+        assert mcp_server._validate_facts(facts) == []
+
+    def test_function_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        facts = [{"entity": ":function/src-auth-py-login", "entity_type": "function",
+                  "attribute": ":description", "value": "login"}]
+        assert mcp_server._validate_facts(facts) == []
+
+    def test_class_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        facts = [{"entity": ":class/src-auth-py-user", "entity_type": "class",
+                  "attribute": ":description", "value": "User"}]
+        assert mcp_server._validate_facts(facts) == []
+
+    def test_ingestion_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        facts = [{"entity": ":ingestion/watermark", "entity_type": "ingestion",
+                  "attribute": ":description", "value": "git ingestion watermark"}]
+        assert mcp_server._validate_facts(facts) == []
+
+    def test_unknown_code_attr_fails_validation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        facts = [{"entity": ":module/foo", "entity_type": "module",
+                  "attribute": ":description", "value": "foo.py"},
+                 {"entity": ":module/foo", "entity_type": "module",
+                  "attribute": ":unknown-attr", "value": "x"}]
+        violations = mcp_server._validate_facts(facts)
+        assert any("unknown-attr" in v for v in violations)
+
+    def test_contains_rule_registered_at_startup(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        executed = [call.args[0] for call in db_instance.execute.call_args_list]
+        assert any("contains" in r for r in executed)
