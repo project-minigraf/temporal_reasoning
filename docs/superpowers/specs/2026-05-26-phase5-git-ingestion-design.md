@@ -179,36 +179,35 @@ The `::` separator ensures that `src/auth_login.py` (module) and `src/auth.py::l
 
 ### 6. Bi-temporal writes
 
-All ingestion writes — both additions and deletions — carry the commit's unix timestamp as `:valid-at`. This is what makes the graph genuinely bi-temporal for code structure: the valid time records when the fact was true in the world (the commit), not when it was recorded in the graph (the ingestion run).
+All ingestion writes carry the commit's ISO 8601 UTC timestamp as explicit valid-time bounds. This is what makes the graph genuinely bi-temporal for code structure: valid time records when the fact was true in the world (the commit), not when it was recorded in the graph (the ingestion run).
 
-**Additions (A- and M-status files):**
-
-```python
-db.execute(f'(transact {facts} {{:valid-at "{commit_ts_ms}"}})')
-```
-
-Where `commit_ts_ms` is the commit's unix timestamp in milliseconds.
-
-**Deletions (D-status files and removed functions/classes within M-status files):**
+**Additions (A- and M-status files — new or updated entities):**
 
 ```python
-db.execute(f'(retract {facts} {{:valid-at "{commit_ts_ms}"}})')
+db.execute(f'(transact {{:valid-from "{commit_ts_iso}"}} {facts})')
 ```
 
-The retract uses the same commit timestamp so that the fact's valid window is closed at the correct wall-clock time. Without `:valid-at` on the retract, minigraf defaults to transaction time (now), which would misdatestamp the removal as happening at ingestion time rather than at the commit that deleted it.
+`:valid-from` is set to the commit's UTC timestamp. No `:valid-to` is set — the fact is valid from this commit onwards until explicitly closed.
 
-Note: `handle_vulcan_retract` (the agent-facing MCP tool) currently calls `(retract {facts})` without `:valid-at`. The ingestion pipeline uses `db.execute()` directly with the explicit timestamp — it does not go through `handle_vulcan_retract`. Fixing `handle_vulcan_retract` to pass `:valid-at` is a separate follow-on item.
+**Deletions (D-status files and functions/classes removed within M-status files):**
+
+`retract` has no temporal options (`(retract fact-vector)` only — no `{:valid-at ...}`). Calling retract for historical deletions would timestamp the removal at ingestion time, not at the commit that deleted it.
+
+Instead, deletions are handled by re-transacting with an explicit `:valid-to` to close the valid window at the deletion commit's timestamp:
+
+```python
+db.execute(f'(transact {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}} {facts})')
+```
+
+`original_ts_iso` is the timestamp of the commit that originally added the entity. The ingestion pipeline tracks this locally in a `dict[ident → valid_from_ts]` during the ingestion run; for entities first added in a prior session (incremental ingestion), the valid-from is queried from the graph before the deletion is processed.
 
 **Watermark update:**
 
-After each commit's transact and retract calls succeed, update `:ingestion/watermark`:
-
 ```python
-db.execute(f'(transact [[:ingestion/watermark :hash "{commit_hash}"]] {{:valid-at "{commit_ts_ms}"}})')
+db.execute(f'(transact {{:valid-from "{commit_ts_iso}"}} [[:ingestion/watermark :hash "{commit_hash}"]])')
 ```
 
-The watermark itself carries the commit timestamp so point-in-time queries on the watermark reflect the correct ingestion boundary.
-
+- `commit_ts_iso` = commit unix timestamp formatted as `"YYYY-MM-DDTHH:MM:SSZ"` (ISO 8601 UTC)
 - `reason` for all writes = `"git:<hash> <author>: <message>"`
 
 ### 8. Lock yield
@@ -225,30 +224,30 @@ After each commit's lock release, yield to the event loop before acquiring the l
 
 Examples to add to `SKILL.md` as fewshots:
 
-Point-in-time queries require both `:as-of` (transaction time) and `:valid-at` (valid time) for a correct bi-temporal view. Using only one gives a partial picture — see `mcp_server.py` `_build_query_clauses` docstring.
+Point-in-time queries require both `:as-of` (transaction time) and `:valid-at` (valid time) for a correct bi-temporal view. Using only one gives a partial picture — see `mcp_server.py` `_build_query_clauses` docstring. Valid-at accepts ISO 8601 UTC strings (`"YYYY-MM-DD"` or `"YYYY-MM-DDTHH:MM:SSZ"`); `"now"` is not a supported keyword.
 
 ```datalog
-; All functions in auth.py right now
-[:find ?fn :valid-at "now"
+; All functions in auth.py as of today
+[:find ?fn :valid-at "2026-05-26"
  :where [:module/src-auth-py :contains ?e] [?e :description ?fn]]
 
-; Functions that existed in auth.py at a specific commit date (wall-clock valid time)
+; Functions that existed in auth.py at a specific commit date
 [:find ?fn :as-of <tx-number> :valid-at "2025-03-01"
  :where [:module/src-auth-py :contains ?e] [?e :description ?fn]]
 
-; All modules that currently depend on auth.py
-[:find ?caller :valid-at "now"
+; All modules that depend on auth.py as of today
+[:find ?caller :valid-at "2026-05-26"
  :where [?e :depends-on :module/src-auth-py] [?e :description ?caller]]
 
-; Reachability: all modules transitively reachable from src/auth.py right now
-[:find ?dep :valid-at "now"
+; Reachability: all modules transitively reachable from src/auth.py as of today
+[:find ?dep :valid-at "2026-05-26"
  :where (reachable :module/src-auth-py ?d) [?d :description ?dep]]
 
-; Cross-layer: which dependency edges appeared after the postgres decision date?
+; Cross-layer: which dependency edges appeared after a specific date?
 ; Run two queries and diff in the application layer:
 ;   Q1 (before): [:find ?m ?d :valid-at "2024-12-01" :where [?e :depends-on ?f] [?e :description ?m] [?f :description ?d]]
-;   Q2 (after):  [:find ?m ?d :valid-at "now"         :where [?e :depends-on ?f] [?e :description ?m] [?f :description ?d]]
-;   Rows in Q2 absent from Q1 = dependencies that appeared after the decision
+;   Q2 (after):  [:find ?m ?d :valid-at "2026-05-26" :where [?e :depends-on ?f] [?e :description ?m] [?f :description ?d]]
+;   Rows in Q2 absent from Q1 = dependencies that appeared after the date
 ```
 
 ---
