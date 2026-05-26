@@ -92,6 +92,16 @@ Returns current state from module-level `_ingest_progress` dict. `status` is one
 
 ---
 
+## Auto-Invocation at Session Start
+
+`vulcan_ingest_git` is added to the `UserPromptSubmit` hook alongside `memory_prepare_turn` in all harness hook configs (`hooks/claude-code.json`, `hooks/codex.toml`, `hooks/hermes.yaml`). It fires at the start of every session.
+
+Since ingestion is async and returns immediately, session start is never blocked — regardless of whether the watermark exists (incremental: only new commits) or not (first-time: full history). The background task runs concurrently with the session; the agent can call `vulcan_ingest_status` to check progress if needed.
+
+If an ingestion is already running when the hook fires (e.g. a very long first-time ingestion that spans multiple turns), `vulcan_ingest_git` returns `{ok: false, error: "ingestion already in progress"}` — the hook treats this as a no-op.
+
+---
+
 ## DB Locking
 
 A module-level `_db_lock: asyncio.Lock` is introduced and acquired by **all** DB-touching operations: `vulcan_query`, `vulcan_transact`, `vulcan_retract`, `vulcan_audit`, `memory_prepare_turn`, `memory_finalize_turn`, and the ingestion background task.
@@ -106,7 +116,7 @@ for commit in commits:
     await asyncio.sleep(0)   # yield to event loop before next commit
 ```
 
-This is the same pattern as the fix in commit f6d9bde (release file lock after each tool call so `prepare_hook` can read between turns). `memory_prepare_turn` calls from the harness hook can acquire `_db_lock` between commits without waiting for the full ingestion run.
+This is the same pattern as the fix in commit f6d9bde (release file lock after each tool call so `prepare_hook` can read between turns). `memory_prepare_turn` calls from the harness hook suspend on `_db_lock` until the ingestion task releases it at the end of the current commit — a wait bounded by one commit's parse + transact time (typically a few milliseconds). No timeout or failure path is needed; the wait is imperceptible in practice. The one edge case is an unusually large commit (thousands of files in a single changeset); if this becomes a problem, per-file yielding can be introduced in a follow-on change without altering the tool interface.
 
 ---
 
@@ -228,6 +238,9 @@ Examples to add to `SKILL.md` as fewshots:
 | `mcp_server.py` | Add `VULCAN_SCHEMA` entries; extend `SESSION_RULES`; add `_db_lock`; add `_ingest_progress`; add ingestion pipeline functions; add `vulcan_ingest_git` and `vulcan_ingest_status` handlers |
 | `tests/test_mcp_server.py` | New tests for schema, tools, pipeline, watermark, incremental ingestion, lock interleave |
 | `SKILL.md` | Add `vulcan_ingest_git` / `vulcan_ingest_status` tool docs; add code-structure query fewshots; note `ingestion` entity type is system-only |
+| `hooks/claude-code.json` | Add `vulcan_ingest_git` to `UserPromptSubmit` hook |
+| `hooks/codex.toml` | Add `vulcan_ingest_git` to `UserPromptSubmit` hook |
+| `hooks/hermes.yaml` | Add `vulcan_ingest_git` to `pre_llm_call` hook |
 | `ROADMAP.md` | Mark Phase 5 in-progress |
 
 ---
@@ -247,6 +260,6 @@ Both added to `install.py` checks and `requirements.txt` (if present).
 
 - Cross-file call resolution via type inference or import graph traversal — call edges are best-effort name matching only
 - Commit entity type in `VULCAN_SCHEMA` — commits are referenced by hash in the write `reason` and as the `:ingestion/watermark` value, but are not first-class graph entities in this phase
-- `vulcan_ingest_git` as a post-commit hook — the tool exists; wiring it as a harness hook is a follow-on configuration task
+- Post-commit git hook (`.git/hooks/post-commit`) — auto-ingesting on every commit is a follow-on configuration task; the MCP tool is the building block
 - Multi-repo ingestion — single repo per MCP server session
 - Binary/generated file parsing — skipped by extension detection
