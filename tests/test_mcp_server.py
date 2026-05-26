@@ -5,6 +5,7 @@ All tests mock MiniGrafDb so no live minigraf install is required.
 import json
 import sys
 import os
+import subprocess as _subprocess
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from minigraf import MiniGrafError
@@ -1267,3 +1268,58 @@ class TestCodeIdent:
     def test_name_is_lowercased(self):
         import mcp_server
         assert mcp_server._code_ident("function", "Foo.py", "MyFunc") == ":function/foo-py-myfunc"
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    """Create a minimal git repo with two commits."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    # Commit 1
+    (repo / "auth.py").write_text("def login(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+
+    # Commit 2
+    (repo / "models.py").write_text("class User: pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add models"], cwd=repo, check=True, capture_output=True)
+
+    return repo
+
+
+class TestGitHelpers:
+    def test_git_commits_full_history(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        assert len(commits) == 2
+        hash_, ts_iso, author, subject = commits[0]
+        assert len(hash_) == 40
+        assert ts_iso.endswith("Z")
+        assert subject == "add auth"
+
+    def test_git_commits_incremental(self, git_repo):
+        import mcp_server
+        all_commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        first_hash = all_commits[0][0]
+        incremental = mcp_server._git_commits(str(git_repo), watermark_hash=first_hash)
+        assert len(incremental) == 1
+        assert incremental[0][3] == "add models"
+
+    def test_git_changed_files(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        second_hash = commits[1][0]
+        changes = mcp_server._git_changed_files(str(git_repo), second_hash)
+        assert ("A", "models.py") in changes
+
+    def test_git_file_content(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        first_hash = commits[0][0]
+        content = mcp_server._git_file_content(str(git_repo), first_hash, "auth.py")
+        assert b"def login" in content

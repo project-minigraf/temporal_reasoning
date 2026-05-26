@@ -10,6 +10,7 @@ import datetime
 import json
 import os
 import re
+import subprocess as _subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -516,6 +517,62 @@ def _code_ident(entity_type: str, file_path: str, name: Optional[str] = None) ->
     else:
         value = file_path
     return _canonical_ident(entity_type, value)
+
+
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+
+def _git_commits(
+    repo_path: str,
+    watermark_hash: Optional[str],
+    branch: str = "HEAD",
+) -> List[tuple]:
+    """Return list of (hash, ts_iso, author_email, subject) in chronological order."""
+    range_spec = f"{watermark_hash}..{branch}" if watermark_hash else branch
+    result = _subprocess.run(
+        ["git", "log", "--reverse", "--format=%H %at %ae %s", range_spec],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    commits = []
+    for line in result.stdout.strip().splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(" ", 3)
+        hash_ = parts[0]
+        ts_unix = int(parts[1])
+        author = parts[2]
+        subject = parts[3] if len(parts) > 3 else ""
+        ts_iso = datetime.datetime.utcfromtimestamp(ts_unix).strftime("%Y-%m-%dT%H:%M:%SZ")
+        commits.append((hash_, ts_iso, author, subject))
+    return commits
+
+
+def _git_changed_files(repo_path: str, commit_hash: str) -> List[tuple]:
+    """Return list of (status_char, path) for files changed in this commit."""
+    result = _subprocess.run(
+        ["git", "diff-tree", "--no-commit-id", "-r", "--name-status", commit_hash],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    changes = []
+    for line in result.stdout.strip().splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            status_char = parts[0][0]  # A, M, D, R, C → take first char
+            changes.append((status_char, parts[1]))
+    return changes
+
+
+def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes:
+    """Return raw bytes of a file at the given commit."""
+    result = _subprocess.run(
+        ["git", "show", f"{commit_hash}:{file_path}"],
+        cwd=repo_path, capture_output=True, check=True,
+    )
+    return result.stdout
 
 
 # System attributes written by _transact_extracted_facts alongside domain attributes.
