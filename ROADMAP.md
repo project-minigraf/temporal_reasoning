@@ -27,11 +27,11 @@
 | Agent extraction | MCP sampling requests a memory block from the connected agent | Complete ✓ |
 | Bi-temporal writes | `:valid-at` recorded on every write; point-in-time queries correct | Complete ✓ |
 
-## Phase 3 — Finish Line
+## Phase 3 — Finish Line (Complete ✓)
 
 | Item | Description | Status |
 |------|-------------|--------|
-| OpenAI/Codex support | `VULCAN_LLM_MODEL=gpt-4o-mini` selects OpenAI client automatically; Codex hook wiring fully enabled. Spec: `docs/superpowers/specs/2026-05-26-openai-llm-strategy-design.md` | Pending |
+| OpenAI/Codex support | `VULCAN_LLM_MODEL=gpt-4o-mini` selects OpenAI client automatically; Codex hook wiring fully enabled. Spec: `docs/superpowers/specs/2026-05-26-openai-llm-strategy-design.md` | Complete ✓ |
 
 ## Phase 4 — Entity Normalization and Schema-Aware Extraction
 
