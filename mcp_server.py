@@ -166,7 +166,7 @@ def handle_vulcan_transact(facts: str, reason: str) -> Dict[str, Any]:
     _refresh_if_stale()
     db = get_db()
     try:
-        raw = db.execute(f'(transact {facts} {{:valid-at "{_now_utc_ms()}"}})')
+        raw = db.execute(f'(transact {facts} {{:valid-from "{_now_utc_ms()}"}})')
         db.checkpoint()
         _update_mtime()
         result = _parse_tx_result(raw)
@@ -673,13 +673,17 @@ def heuristic_extract(text: str) -> List[Dict[str, str]]:
     return facts
 
 
-def _transact_extracted_facts(facts: List[Dict[str, str]]) -> int:
+def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[str] = None) -> int:
     """
     Transact a list of extracted fact dicts. Returns count of successfully stored facts.
 
-    Sets :valid-at to the current UTC ms timestamp on every write so that
+    Sets :valid-from to the current UTC ms timestamp on every write so that
     valid-time is recorded. Combined with :as-of in queries this enables true
     bi-temporal point-in-time reads.
+
+    valid_from: override the :valid-from timestamp (ISO 8601). If None, defaults
+    to the current UTC time. Pass a past date to backdate facts (e.g. from
+    LLM-annotated '; valid-at: YYYY-MM-DD' hints).
     """
     _refresh_if_stale()
     db = get_db()
@@ -693,7 +697,7 @@ def _transact_extracted_facts(facts: List[Dict[str, str]]) -> int:
         violations = _validate_facts([fact])
         if violations:
             continue
-        now_z = _now_utc_ms()
+        now_z = valid_from or _now_utc_ms()
         try:
             # Combine main fact, :entity-type tag, and :ident into one transact so
             # all triples are written atomically — a single (transact [...]) is one
@@ -708,7 +712,7 @@ def _transact_extracted_facts(facts: List[Dict[str, str]]) -> int:
                 )
             else:
                 triples = f'[{entity} {attribute} "{value}"]'
-            db.execute(f'(transact [{triples}] {{:valid-at "{now_z}"}})')
+            db.execute(f'(transact [{triples}] {{:valid-from "{now_z}"}})')
             stored += 1
         except MiniGrafError:
             continue
@@ -883,15 +887,13 @@ def _llm_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
         raw_facts = _strip_code_fences(_call_llm(model, prompt))
         if not raw_facts or raw_facts == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "llm"}
-        # Strip valid-at hint comments before parsing — the hint is noted but
-        # _transact_extracted_facts stamps each fact with the current time.
-        _valid_at, datalog = _parse_valid_at_hint(raw_facts)
+        valid_at, datalog = _parse_valid_at_hint(raw_facts)
         if not datalog or datalog == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "llm"}
         # Route through _transact_extracted_facts so each fact gets schema
         # validation and an :entity-type tag — same path as heuristic extraction.
         parsed = _parse_transact_facts(datalog)
-        stored_count = _transact_extracted_facts(parsed)
+        stored_count = _transact_extracted_facts(parsed, valid_from=valid_at)
         return {"ok": True, "stored_count": stored_count, "strategy": "llm"}
     except Exception as e:
         return {"ok": False, "error": str(e), "strategy": "llm"}
@@ -952,7 +954,7 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
             return {"ok": True, "stored_count": 0, "strategy": "agent"}
         _refresh_if_stale()
         db = get_db()
-        db.execute(f'(transact {datalog} {{:valid-at "{valid_at}"}})')
+        db.execute(f'(transact {datalog} {{:valid-from "{valid_at}"}})')
         db.checkpoint()
         _update_mtime()
         # Approximate: count "[:" occurrences as a proxy for triple count.
