@@ -709,3 +709,17 @@ class TestValidateFacts:
             facts = [{"entity": f":{etype}/x", "entity_type": etype,
                       "attribute": ":description", "value": "test"}]
             assert mcp_server._validate_facts(facts) == [], f"Failed for {etype}"
+
+
+class TestHeuristicNormalization:
+    def test_ident_uses_canonical_slug(self):
+        import mcp_server
+        facts = mcp_server.heuristic_extract("We'll use Redis for caching.")
+        assert any(f["entity"] == ":decision/redis" for f in facts)
+
+    def test_ident_not_underscore_form(self):
+        import mcp_server
+        facts = mcp_server.heuristic_extract("We'll use postgres-db for storage.")
+        matching = [f for f in facts if "postgres" in f["entity"]]
+        assert matching, "No fact with postgres found"
+        assert "_" not in matching[0]["entity"], f"Underscore found in {matching[0]['entity']}"

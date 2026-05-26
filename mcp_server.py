@@ -488,7 +488,7 @@ def heuristic_extract(text: str) -> List[Dict[str, str]]:
             if key in seen_values:
                 continue
             seen_values.add(key)
-            entity_ident = f":{entity_type}/{value.lower().replace('-', '_')}"
+            entity_ident = _canonical_ident(entity_type, value)
             facts.append({
                 "entity": entity_ident,
                 "entity_type": entity_type,
