@@ -800,6 +800,15 @@ class TestParseTransactFacts:
         )
         assert facts == []
 
+    def test_extracts_entity_type_from_namespace(self):
+        import mcp_server
+        facts = mcp_server._parse_transact_facts(
+            '[[:service/auth :description "auth service"]]'
+        )
+        assert len(facts) == 1
+        assert facts[0]["entity_type"] == "service"
+        assert facts[0]["entity"] == ":service/auth"
+
 
 class TestVulcanTransactSchema:
     def test_rejects_unknown_entity_type(self, mock_minigraf_db, tmp_path):
@@ -824,6 +833,20 @@ class TestVulcanTransactSchema:
         result = mcp_server.handle_vulcan_transact(
             '[[:decision/redis :description "use Redis"]]',
             reason="test"
+        )
+
+        assert result["ok"] is True
+
+    def test_keyword_only_transact_bypasses_schema_validation(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx": "6"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        # Keyword-only triple (no quoted string values) — not schema-validated by design
+        result = mcp_server.handle_vulcan_transact(
+            '[[:service/auth :calls :component/jwt]]',
+            reason="test relationship edge"
         )
 
         assert result["ok"] is True

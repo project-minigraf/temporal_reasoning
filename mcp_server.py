@@ -152,6 +152,9 @@ def handle_vulcan_transact(facts: str, reason: str) -> Dict[str, Any]:
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for all writes"}
     # Schema validation — closed-world enforcement on parseable string-valued triples.
+    # Only string-valued triples are schema-validated. Keyword-valued triples
+    # (e.g. relationship edges like [:service/auth :calls :component/jwt]) are
+    # not covered by VULCAN_SCHEMA and pass through unvalidated by design.
     parsed = _parse_transact_facts(facts)
     if parsed:
         violations = _validate_facts(parsed)
