@@ -1251,12 +1251,14 @@ class TestCodeIdent:
 
     def test_function_ident_distinct_from_module(self):
         import mcp_server
-        module_ident = mcp_server._code_ident("module", "src/auth.py")
+        # Same entity_type — separator must place tokens in a different order
         fn_ident = mcp_server._code_ident("function", "src/auth.py", "login")
-        assert module_ident == ":module/src-auth-py"
+        # "src/auth.py::login" → src-auth-py-login
+        # "src/auth_login.py"  → src-auth-login-py  (py comes last, not before login)
+        file_ident = mcp_server._code_ident("function", "src/auth_login.py")
         assert fn_ident == ":function/src-auth-py-login"
-        # Key: src/auth_login.py module would be :module/src-auth-login-py — different
-        assert mcp_server._code_ident("module", "src/auth_login.py") != fn_ident
+        assert file_ident == ":function/src-auth-login-py"
+        assert fn_ident != file_ident
 
     def test_class_ident(self):
         import mcp_server

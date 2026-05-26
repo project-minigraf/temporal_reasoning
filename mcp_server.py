@@ -504,10 +504,12 @@ def _canonical_ident(entity_type: str, value: str) -> str:
 def _code_ident(entity_type: str, file_path: str, name: Optional[str] = None) -> str:
     """Return a canonical ident for a code entity.
 
-    Uses '::' as separator between file path and name so slugging produces
-    a distinct result from a file whose path contains the name literally.
-    e.g. "src/auth.py::login" → ":function/src-auth-py-login"
-         "src/auth_login.py"  → ":module/src-auth-login-py"  (different)
+    Appends '::name' to file_path before slugging so that the function
+    name appears AFTER the file extension in the slug, keeping it distinct
+    from a file whose path ends with the name (e.g. 'src/auth_login.py').
+
+    This is best-effort — the separator itself becomes '-' after slugging,
+    so collisions are still possible for contrived path/name combinations.
     """
     if name:
         value = f"{file_path}::{name}"
