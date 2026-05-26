@@ -257,7 +257,6 @@ def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
                     break
 
             # Exclude system attributes from schema validation.
-            _SYSTEM_ATTRS = {":entity-type", ":ident"}
             attr_facts = [
                 {
                     "entity": kw_ident,
@@ -351,6 +350,10 @@ def _keyword_uuid(keyword: str) -> str:
     return str(_uuid_mod.uuid5(_uuid_mod.NAMESPACE_OID, keyword))
 
 
+# System attributes written by _transact_extracted_facts alongside domain attributes.
+# They are invisible to schema validation and filtered from attr_facts in vulcan_audit.
+_SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})
+
 VULCAN_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
     "decision": {
         "required": {":description": str},
@@ -375,6 +378,8 @@ def _validate_facts(facts: List[Dict[str, Any]]) -> List[str]:
     """Validate proposed facts against VULCAN_SCHEMA. Returns violation strings.
 
     Closed-world: unknown entity types and unknown attributes are both violations.
+    System attributes (_SYSTEM_ATTRS) are silently skipped — they are internal
+    tags added by _transact_extracted_facts, not domain attributes.
     Pure function — no DB access. Mirrors Schema.validate() from minigraf-schema.
     """
     violations: List[str] = []
@@ -387,6 +392,8 @@ def _validate_facts(facts: List[Dict[str, Any]]) -> List[str]:
         entity_type = fact.get("entity_type", "")
         attribute = fact.get("attribute", "")
         value = fact.get("value")
+        if attribute in _SYSTEM_ATTRS:
+            continue  # system attributes bypass schema validation
         entity_attrs.setdefault(entity, {})[attribute] = value
         if entity_type:
             entity_types[entity] = entity_type
