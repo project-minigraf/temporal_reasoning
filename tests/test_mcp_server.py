@@ -330,6 +330,28 @@ class TestMemoryFinalizeTurnHeuristic:
         assert result["stored_count"] == 0
 
 
+class TestStripCodeFences:
+    def test_no_fences_unchanged(self):
+        import mcp_server
+        assert mcp_server._strip_code_fences("[[]]") == "[[]]"
+
+    def test_strips_plain_fence(self):
+        import mcp_server
+        assert mcp_server._strip_code_fences("```\n[[:decision/redis :description \"use Redis\"]]\n```") == '[[:decision/redis :description "use Redis"]]'
+
+    def test_strips_language_tagged_fence(self):
+        import mcp_server
+        assert mcp_server._strip_code_fences("```datalog\n[[:decision/redis :description \"use Redis\"]]\n```") == '[[:decision/redis :description "use Redis"]]'
+
+    def test_strips_surrounding_whitespace(self):
+        import mcp_server
+        assert mcp_server._strip_code_fences("  ```\n[[]]\n```  ") == "[[]]"
+
+    def test_empty_list_unchanged(self):
+        import mcp_server
+        assert mcp_server._strip_code_fences("[]") == "[]"
+
+
 class TestCallLlm:
     def test_is_openai_model_gpt(self):
         import mcp_server

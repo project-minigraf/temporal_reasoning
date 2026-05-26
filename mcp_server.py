@@ -758,6 +758,24 @@ def _get_openai_client():
     return openai.OpenAI(api_key=api_key)
 
 
+def _strip_code_fences(text: str) -> str:
+    """Remove markdown code fences that LLMs sometimes wrap around Datalog output.
+
+    Handles both ``` and ```datalog (or any language tag). Returns the inner
+    content, stripped. If no fences are present, returns the input unchanged.
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        # Drop the opening fence line (``` or ```datalog etc.)
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1:]
+        # Drop the closing fence if present
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+    return text.strip()
+
+
 def _llm_missing_package_warning(error: str) -> str:
     """Return a user-facing install instruction when the LLM package is absent.
 
@@ -836,7 +854,7 @@ def _llm_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
             conversation=conversation_delta,
             canonical_entities_section=canonical_entities_section,
         )
-        raw_facts = _call_llm(model, prompt).strip()
+        raw_facts = _strip_code_fences(_call_llm(model, prompt))
         if not raw_facts or raw_facts == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "llm"}
         valid_at, datalog = _parse_valid_at_hint(raw_facts)
@@ -902,8 +920,7 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
             )
         else:
             canonical_entities_section = ""
-        raw_facts = await _request_agent_memory_block_async(conversation_delta, canonical_entities_section)
-        raw_facts = raw_facts.strip()
+        raw_facts = _strip_code_fences(await _request_agent_memory_block_async(conversation_delta, canonical_entities_section))
         if not raw_facts or raw_facts == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "agent"}
         valid_at, datalog = _parse_valid_at_hint(raw_facts)
