@@ -468,6 +468,45 @@ def _get_anthropic_client():
     return anthropic.Anthropic(api_key=api_key)
 
 
+_OPENAI_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4")
+
+
+def _is_openai_model(model: str) -> bool:
+    return any(model.startswith(p) for p in _OPENAI_MODEL_PREFIXES)
+
+
+def _get_openai_client():
+    """Return an OpenAI client. Raises if openai package or API key is missing."""
+    try:
+        import openai
+    except ImportError:
+        raise RuntimeError("openai package not installed — pip install openai")
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    return openai.OpenAI(api_key=api_key)
+
+
+def _call_llm(model: str, prompt: str) -> str:
+    """Call an LLM and return the response text. Dispatches to OpenAI or Anthropic by model name."""
+    if _is_openai_model(model):
+        client = _get_openai_client()
+        response = client.chat.completions.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content
+    else:
+        client = _get_anthropic_client()
+        message = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return message.content[0].text
+
+
 def _parse_valid_at_hint(raw: str):
     """Extract optional '; valid-at: YYYY-MM-DD' comment from model output.
 
@@ -490,15 +529,9 @@ def _parse_valid_at_hint(raw: str):
 def _llm_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
     """Call a lightweight LLM to extract facts. Returns {ok, stored_count, strategy}."""
     try:
-        client = _get_anthropic_client()
         model = os.environ.get("VULCAN_LLM_MODEL", "claude-haiku-4-5-20251001")
         prompt = _LLM_EXTRACTION_PROMPT.format(conversation=conversation_delta)
-        message = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw_facts = message.content[0].text.strip()
+        raw_facts = _call_llm(model, prompt).strip()
         if not raw_facts or raw_facts == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "llm"}
         valid_at, datalog = _parse_valid_at_hint(raw_facts)

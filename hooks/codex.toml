@@ -7,13 +7,14 @@ command = ["python", "PATH_TO_REPO/mcp_server.py"]
 
 [mcp_servers."temporal-reasoning".env]
 MINIGRAF_GRAPH_PATH = "PATH_TO_PROJECT/memory.graph"
-VULCAN_EXTRACTION_STRATEGY = "heuristic"
+VULCAN_EXTRACTION_STRATEGY = "llm"
+VULCAN_LLM_MODEL = "gpt-4o-mini"
+OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
 
-# Auto-memory hooks — uncomment if your Codex version supports pre/post-turn hooks:
-# [hooks.pre_turn]
-# command = ["python", "PATH_TO_REPO/hooks/prepare_hook.py"]
-# timeout_ms = 5000
-#
-# [hooks.post_turn]
-# command = ["python", "PATH_TO_REPO/hooks/finalize_hook.py"]
-# timeout_ms = 10000
+[hooks.pre_turn]
+command = ["python", "PATH_TO_REPO/hooks/prepare_hook.py"]
+timeout_ms = 5000
+
+[hooks.post_turn]
+command = ["python", "PATH_TO_REPO/hooks/finalize_hook.py"]
+timeout_ms = 10000

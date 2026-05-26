@@ -330,6 +330,86 @@ class TestMemoryFinalizeTurnHeuristic:
         assert result["stored_count"] == 0
 
 
+class TestCallLlm:
+    def test_is_openai_model_gpt(self):
+        import mcp_server
+        assert mcp_server._is_openai_model("gpt-4o-mini") is True
+
+    def test_is_openai_model_o_series(self):
+        import mcp_server
+        assert mcp_server._is_openai_model("o1") is True
+        assert mcp_server._is_openai_model("o3-mini") is True
+        assert mcp_server._is_openai_model("o4") is True
+
+    def test_is_openai_model_claude(self):
+        import mcp_server
+        assert mcp_server._is_openai_model("claude-haiku-4-5-20251001") is False
+
+    def test_call_llm_anthropic_path(self, monkeypatch):
+        import mcp_server
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="[]")]
+        )
+        with patch("mcp_server._get_anthropic_client", return_value=mock_client):
+            result = mcp_server._call_llm("claude-haiku-4-5-20251001", "test prompt")
+        mock_client.messages.create.assert_called_once()
+        assert result == "[]"
+
+    def test_call_llm_openai_path(self, monkeypatch):
+        import mcp_server
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="[]"))]
+        )
+        with patch("mcp_server._get_openai_client", return_value=mock_client):
+            result = mcp_server._call_llm("gpt-4o-mini", "test prompt")
+        mock_client.chat.completions.create.assert_called_once()
+        assert result == "[]"
+
+
+class TestLlmStrategyOpenAI:
+    def test_calls_openai_api(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "llm")
+        monkeypatch.setenv("VULCAN_LLM_MODEL", "gpt-4o-mini")
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        db_instance.execute.return_value = json.dumps({"tx": "6"})
+        import mcp_server
+
+        fake_response_text = '[[:decision/redis :description "Redis"]]\n'
+        mock_openai_client = MagicMock()
+        mock_openai_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content=fake_response_text))]
+        )
+
+        with patch("mcp_server._get_openai_client", return_value=mock_openai_client):
+            mcp_server.open_db(str(tmp_path / "t.graph"))
+            result = mcp_server._llm_extract_and_transact(
+                "User: We'll use Redis.\nAgent: Stored."
+            )
+
+        assert result["ok"] is True
+        assert result["stored_count"] > 0
+        mock_openai_client.chat.completions.create.assert_called_once()
+
+    def test_falls_back_to_agent_on_openai_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
+        import asyncio
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "llm")
+        monkeypatch.setenv("VULCAN_LLM_MODEL", "gpt-4o-mini")
+        db_instance.execute.return_value = json.dumps({"tx": "7"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        with patch("mcp_server._get_openai_client", side_effect=Exception("no key")):
+            with patch("mcp_server._agent_extract_and_transact", new_callable=AsyncMock) as mock_agent:
+                mock_agent.return_value = {"ok": True, "stored_count": 0, "strategy": "agent"}
+                result = asyncio.run(mcp_server.handle_memory_finalize_turn("We'll use Kafka."))
+
+        mock_agent.assert_called_once()
+
+
 class TestLlmStrategy:
     def test_calls_anthropic_api(self, mock_minigraf_db, tmp_path, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
