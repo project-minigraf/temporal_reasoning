@@ -13,6 +13,7 @@ __pycache__/
 .codex
 .codex/
 *.graph
+*.graph.lock
 .mcp.json
 
 # Claude Code plugin/session state
