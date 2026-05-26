@@ -44,7 +44,7 @@
 | `vulcan_audit` | 7th MCP tool; audits all entities against schema, retracts violators (bi-temporal — history preserved) | Complete ✓ |
 | Entity Resolution section | `SKILL.md` updated with resolution guidance and `vulcan_audit` instructions | Complete ✓ |
 
-## Phase 5 (In Progress) — Code Structure Evolution from Git History
+## Phase 5 (Complete ✓) — Code Structure Evolution from Git History
 
 Extend the bi-temporal graph to store code structure extracted from git history, enabling temporal queries over how a codebase evolved and why. Ingested structural entities resolve against the canonical schema from Phase 4. Phase 6 observability will add confidence tagging on top of the ingested edges.
 
@@ -109,7 +109,7 @@ The bi-temporal model partially addresses (2): wrong facts can be retracted with
 
 ### When this matters
 
-For a local single-user developer tool (the current Phase 5 target), stored data stays on the user's machine, the user can inspect the `.graph` file directly, and wrong facts can be corrected manually. The risk profile is manageable without this work. For any hosted or multi-tenant deployment the observability layer is a prerequisite. Phase 5 git ingestion will also clarify the actual observability pain points before this phase is designed in detail.
+For a local single-user developer tool (the current Phase 5 target), stored data stays on the user's machine, the user can inspect the `.graph` file directly, and wrong facts can be corrected manually. The risk profile is manageable without this work. For any hosted or multi-tenant deployment the observability layer is a prerequisite. Phase 5 git ingestion clarified the actual observability pain points and this phase will be designed in detail after Phase 5 production use.
 
 ## Backlog (unscheduled)
 

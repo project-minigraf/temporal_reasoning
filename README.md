@@ -26,7 +26,7 @@ These queries are impossible with git log, vector search, or key-value memory:
  :where [?module :depends-on :service/payment]]
 ```
 
-This is the only tool where both the decision and the structural change live as datoms in the same graph and can be joined in a single query. See [Phase 4](ROADMAP.md) for code structure evolution from git history.
+This is the only tool where both the decision and the structural change live as datoms in the same graph and can be joined in a single query. See [Phase 5](ROADMAP.md) for code structure evolution from git history.
 
 ## Why Temporal Reasoning?
 
@@ -192,6 +192,7 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 | `mcp_server.py` | Persistent stdio MCP server — primary interface to the graph |
 | `vulcan.py` | Python CLI wrapper (direct use outside MCP) |
 | `hooks/prepare_hook.py` | Claude Code UserPromptSubmit hook — injects memory context |
+| `hooks/ingest_hook.py` | Claude Code UserPromptSubmit hook — triggers background git ingestion |
 | `hooks/finalize_hook.py` | Claude Code Stop hook — extracts and stores facts |
 | `hooks/claude-code.json` | Hook + MCP configuration for Claude Code |
 | `report_issue.py` | GitHub issue reporter |
@@ -209,6 +210,8 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 - **vulcan_report_issue** — File GitHub issues
 - **memory_prepare_turn** — Retrieve relevant context for the current user message
 - **memory_finalize_turn** — Extract and store memorable facts after a turn
+- **vulcan_ingest_git** — Ingest code structure from git history into the bi-temporal graph (background task)
+- **vulcan_ingest_status** — Poll progress of a running git ingestion
 
 ## Query Examples
 
@@ -309,4 +312,6 @@ See [`evals/benchmark.md`](evals/benchmark.md) for full results and per-eval bre
 - **Phase 1** — Python skill layer ✓
 - **Phase 2** — Write policy, report_issue, install, skill benchmarks ✓
 - **Phase 3** — MCP server, per-turn auto-memory hooks ✓
-- **Phase 4** — Code structure evolution from git history (future)
+- **Phase 4** — Entity normalization, schema-aware extraction, vulcan_audit ✓
+- **Phase 5** — Code structure ingestion from git history, vulcan_ingest_git ✓
+- **Phase 6** — Observability and trust for automatic memory (planned)
