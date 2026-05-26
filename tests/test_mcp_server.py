@@ -1164,6 +1164,47 @@ class TestGetParser:
         assert parser is None
 
 
+class TestExtractFromSource:
+    def _python_parser(self):
+        import mcp_server
+        mcp_server._grammar_cache.clear()
+        return mcp_server._get_parser("x.py")
+
+    def test_extracts_function_names(self):
+        import mcp_server
+        source = b"def login(user):\n    pass\ndef logout():\n    pass\n"
+        result = mcp_server._extract_from_source(source, self._python_parser(), "auth.py")
+        assert "login" in result["functions"]
+        assert "logout" in result["functions"]
+
+    def test_extracts_class_names(self):
+        import mcp_server
+        source = b"class User:\n    pass\nclass Admin(User):\n    pass\n"
+        result = mcp_server._extract_from_source(source, self._python_parser(), "models.py")
+        assert "User" in result["classes"]
+        assert "Admin" in result["classes"]
+
+    def test_extracts_from_imports(self):
+        import mcp_server
+        source = b"import os\nfrom pathlib import Path\n"
+        result = mcp_server._extract_from_source(source, self._python_parser(), "foo.py")
+        assert "os" in result["imports"]
+        assert "pathlib" in result["imports"]
+
+    def test_extracts_call_names(self):
+        import mcp_server
+        source = b"def foo():\n    bar()\n    baz(1, 2)\n"
+        result = mcp_server._extract_from_source(source, self._python_parser(), "foo.py")
+        assert "bar" in result["calls"]
+        assert "baz" in result["calls"]
+
+    def test_parse_error_returns_empty(self):
+        import mcp_server
+        parser = self._python_parser()
+        result = mcp_server._extract_from_source(b"\x00\xff\xfe", parser, "bad.py")
+        assert result == {"functions": [], "classes": [], "imports": [], "calls": []}
+
+
 class TestVulcanIngestStatus:
     def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):
         import mcp_server

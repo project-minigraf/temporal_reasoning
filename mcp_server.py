@@ -64,6 +64,20 @@ _EXT_TO_LANG: Dict[str, str] = {
 
 _grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
 
+# Mapping from lang_name to standalone tree-sitter grammar package name
+_LANG_TO_GRAMMAR_PKG: Dict[str, str] = {
+    "python": "tree_sitter_python",
+    "javascript": "tree_sitter_javascript",
+    "typescript": "tree_sitter_typescript",
+    "rust": "tree_sitter_rust",
+    "go": "tree_sitter_go",
+    "java": "tree_sitter_java",
+    "c": "tree_sitter_c",
+    "cpp": "tree_sitter_cpp",
+    "c_sharp": "tree_sitter_c_sharp",
+    "ruby": "tree_sitter_ruby",
+}
+
 
 def _get_parser(file_path: str) -> Optional[Any]:
     """Return a cached tree_sitter.Parser for the file's language, or None if unsupported."""
@@ -81,8 +95,131 @@ def _get_parser(file_path: str) -> Optional[Any]:
         parser.set_language(lang)
         _grammar_cache[lang_name] = parser
     except Exception:
-        _grammar_cache[lang_name] = None
+        # Fallback: try standalone grammar packages (tree-sitter >= 0.21 API)
+        try:
+            import importlib
+            import tree_sitter  # type: ignore
+            pkg_name = _LANG_TO_GRAMMAR_PKG.get(lang_name)
+            if pkg_name is None:
+                raise ImportError(f"No standalone grammar package for {lang_name}")
+            grammar_mod = importlib.import_module(pkg_name)
+            lang = tree_sitter.Language(grammar_mod.language())
+            parser = tree_sitter.Parser(lang)
+            _grammar_cache[lang_name] = parser
+        except Exception:
+            _grammar_cache[lang_name] = None
     return _grammar_cache[lang_name]
+
+# ---------------------------------------------------------------------------
+# AST extraction
+# ---------------------------------------------------------------------------
+
+_LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
+    "python": {
+        "functions": {"function_definition", "async_function_definition"},
+        "classes": {"class_definition"},
+        "imports": {"import_statement", "import_from_statement"},
+        "calls": {"call"},
+    },
+    "javascript": {
+        "functions": {"function_declaration", "function_expression", "method_definition"},
+        "classes": {"class_declaration"},
+        "imports": {"import_statement"},
+        "calls": {"call_expression"},
+    },
+    "typescript": {
+        "functions": {"function_declaration", "function_expression", "method_definition"},
+        "classes": {"class_declaration"},
+        "imports": {"import_statement"},
+        "calls": {"call_expression"},
+    },
+    "rust": {
+        "functions": {"function_item"},
+        "classes": {"struct_item", "impl_item"},
+        "imports": {"use_declaration"},
+        "calls": {"call_expression"},
+    },
+    "go": {
+        "functions": {"function_declaration", "method_declaration"},
+        "classes": {"type_declaration"},
+        "imports": {"import_declaration"},
+        "calls": {"call_expression"},
+    },
+}
+
+
+def _extract_import_name(node, lang_name: str) -> Optional[str]:
+    """Extract the top-level module name from an import node."""
+    if lang_name == "python":
+        if node.type == "import_from_statement":
+            m = node.child_by_field_name("module_name")
+            return m.text.decode("utf-8").split(".")[0] if m else None
+        # import_statement: first named child is dotted_name or aliased_import
+        for child in node.named_children:
+            if child.type == "aliased_import":
+                n = child.child_by_field_name("name")
+                return n.text.decode("utf-8").split(".")[0] if n else None
+            if child.type == "dotted_name":
+                return child.text.decode("utf-8").split(".")[0]
+    elif lang_name in ("javascript", "typescript"):
+        src = node.child_by_field_name("source")
+        if src:
+            return src.text.decode("utf-8").strip("'\"")
+    return None
+
+
+def _extract_call_name(node, lang_name: str) -> Optional[str]:
+    """Extract the function name from a call node (best-effort, identifiers only)."""
+    fn = node.child_by_field_name("function")
+    if fn and fn.type == "identifier":
+        return fn.text.decode("utf-8")
+    return None
+
+
+def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
+    """Recursively extract code entities from a tree-sitter AST node."""
+    node_types = _LANG_NODE_TYPES.get(lang_name)
+    if node_types is None:
+        return
+
+    if node.type in node_types.get("functions", set()):
+        name_node = node.child_by_field_name("name")
+        if name_node:
+            results["functions"].append(name_node.text.decode("utf-8"))
+
+    elif node.type in node_types.get("classes", set()):
+        name_node = node.child_by_field_name("name")
+        if name_node:
+            results["classes"].append(name_node.text.decode("utf-8"))
+
+    elif node.type in node_types.get("imports", set()):
+        name = _extract_import_name(node, lang_name)
+        if name:
+            results["imports"].append(name)
+
+    elif node.type in node_types.get("calls", set()):
+        name = _extract_call_name(node, lang_name)
+        if name:
+            results["calls"].append(name)
+
+    for child in node.children:
+        _walk_ast(child, results, lang_name)
+
+
+def _extract_from_source(
+    source: bytes, parser: Any, file_path: str
+) -> Dict[str, List[str]]:
+    """Parse source bytes and extract functions, classes, imports, calls."""
+    results: Dict[str, List[str]] = {
+        "functions": [], "classes": [], "imports": [], "calls": []
+    }
+    try:
+        tree = parser.parse(source)
+        lang_name = _EXT_TO_LANG.get(Path(file_path).suffix.lower(), "")
+        _walk_ast(tree.root_node, results, lang_name)
+    except Exception:
+        pass  # best-effort; parse failures are non-fatal
+    return results
 
 # ---------------------------------------------------------------------------
 # DB lifecycle
