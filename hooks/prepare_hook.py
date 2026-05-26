@@ -23,7 +23,7 @@ def main() -> None:
     except (json.JSONDecodeError, ValueError):
         data = {}
 
-    prompt = data.get("prompt", "")
+    prompt = data.get("message", "") or data.get("prompt", "")
     context = ""
 
     if prompt:
