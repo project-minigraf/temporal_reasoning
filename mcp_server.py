@@ -516,6 +516,10 @@ def _transact_extracted_facts(facts: List[Dict[str, str]]) -> int:
         entity_type = fact.get("entity_type", "")
         attribute = fact["attribute"]
         value = fact["value"]
+        # Schema validation — closed-world: skip invalid facts.
+        violations = _validate_facts([fact])
+        if violations:
+            continue
         now_z = _now_utc_ms()
         try:
             # Combine main fact and :entity-type into one transact so both triples

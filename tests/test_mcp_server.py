@@ -723,3 +723,51 @@ class TestHeuristicNormalization:
         matching = [f for f in facts if "postgres" in f["entity"]]
         assert matching, "No fact with postgres found"
         assert "_" not in matching[0]["entity"], f"Underscore found in {matching[0]['entity']}"
+
+
+class TestTransactExtractedFactsSchema:
+    def test_invalid_entity_type_is_skipped(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx": "1"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        facts = [{"entity": ":service/auth", "entity_type": "service",
+                  "attribute": ":description", "value": "auth service"}]
+        stored = mcp_server._transact_extracted_facts(facts)
+
+        assert stored == 0
+        transact_calls = [c for c in db_instance.execute.call_args_list
+                          if "transact" in str(c)]
+        assert len(transact_calls) == 0
+
+    def test_valid_fact_is_stored(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx": "2"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description", "value": "use Redis"}]
+        stored = mcp_server._transact_extracted_facts(facts)
+
+        assert stored == 1
+
+    def test_mixed_batch_stores_only_valid(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx": "3"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        facts = [
+            {"entity": ":decision/redis", "entity_type": "decision",
+             "attribute": ":description", "value": "use Redis"},
+            {"entity": ":service/auth", "entity_type": "service",
+             "attribute": ":description", "value": "auth service"},
+        ]
+        stored = mcp_server._transact_extracted_facts(facts)
+
+        assert stored == 1
