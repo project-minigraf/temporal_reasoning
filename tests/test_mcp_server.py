@@ -963,6 +963,14 @@ class TestVulcanAudit:
         assert result["retracted"] == 1
         assert len(result["violations"]) == 1
 
+        # Verify a retract was actually issued (Fix 2: full entity retraction).
+        retract_calls = [
+            str(call) for call in db_instance.execute.call_args_list
+            if "retract" in str(call)
+        ]
+        assert len(retract_calls) >= 1, "Expected at least one retract call"
+        assert ":decision/redis" in retract_calls[0]
+
     def test_as_of_reports_violations_without_retracting(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         import mcp_server

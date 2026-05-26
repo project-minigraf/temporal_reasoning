@@ -264,17 +264,37 @@ def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
                         "value": val,
                     })
 
+            if not attr_facts:
+                # Entity exists (has :entity-type) but has no attribute triples at all.
+                # Pass a minimal fact so _validate_facts can flag missing required attributes.
+                attr_facts = [{"entity": entity_ident, "entity_type": entity_type,
+                               "attribute": ":__no_attributes__", "value": ""}]
+
             violations = _validate_facts(attr_facts)
             if violations:
                 for v in violations:
                     all_violations.append({"entity": entity_ident, "detail": v})
 
                 if as_of is None:
-                    # Retract the invalid entity — history preserved (bi-temporal).
+                    # Retract the invalid entity and all its attribute triples —
+                    # history preserved (bi-temporal).
+                    reason = f"vulcan_audit: schema violation — {'; '.join(violations)}"
                     try:
-                        db.execute(
-                            f"(retract [[{entity_ident} :entity-type :type/{entity_type}]])"
-                        )
+                        # Build retract triples for all attributes + entity-type tag.
+                        retract_triples = [
+                            f"[{entity_ident} :entity-type :type/{entity_type}]"
+                        ]
+                        for attr_row in attr_rows:
+                            if len(attr_row) == 2:
+                                attr, val = attr_row
+                                # Only retract string-valued attributes (quoted in Datalog).
+                                if isinstance(val, str):
+                                    escaped = val.replace('"', '\\"')
+                                    retract_triples.append(
+                                        f'[{entity_ident} {attr} "{escaped}"]'
+                                    )
+                        retract_expr = f"(retract [{' '.join(retract_triples)}])"
+                        db.execute(retract_expr)
                         db.checkpoint()
                         _update_mtime()
                         retracted += 1
