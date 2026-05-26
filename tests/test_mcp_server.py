@@ -14,11 +14,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 @pytest.fixture(autouse=True)
 def reset_mcp_server_db():
-    """Reset the module-level _db singleton between tests."""
+    """Reset the module-level _db singleton and grammar cache between tests."""
     import mcp_server
     mcp_server._db = None
+    mcp_server._grammar_cache.clear()
     yield
     mcp_server._db = None
+    mcp_server._grammar_cache.clear()
 
 
 @pytest.fixture
