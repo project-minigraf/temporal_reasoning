@@ -42,6 +42,13 @@ _db_mtime: float = 0.0
 # Module-level server reference — set after server creation for MCP sampling
 _server_ref: Optional[Server] = None
 
+# Ingestion state
+_ingest_task: Optional["asyncio.Task"] = None
+_ingest_progress: Dict[str, Any] = {
+    "status": "idle", "processed": 0, "total": 0,
+    "current_commit": "", "error": None,
+}
+
 # ---------------------------------------------------------------------------
 # DB lifecycle
 # ---------------------------------------------------------------------------
@@ -1025,6 +1032,11 @@ async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]
     return {"ok": False, "error": f"Unknown strategy: {strategy}"}
 
 
+def handle_vulcan_ingest_status() -> Dict[str, Any]:
+    """Return current ingestion progress."""
+    return {"ok": True, **_ingest_progress}
+
+
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
@@ -1187,6 +1199,36 @@ _TOOLS: List[Tool] = [
             "required": [],
         },
     ),
+    Tool(
+        name="vulcan_ingest_git",
+        description=(
+            "Ingest code structure from git history into the bi-temporal graph. "
+            "Starts a background task and returns immediately. "
+            "Call vulcan_ingest_status to poll progress."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Absolute path to the git repo root. Defaults to cwd.",
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "Branch or ref to walk. Defaults to HEAD.",
+                },
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="vulcan_ingest_status",
+        description=(
+            "Return the current git ingestion progress. "
+            "status is one of: idle, running, complete, error."
+        ),
+        inputSchema={"type": "object", "properties": {}, "required": []},
+    ),
 ]
 
 
@@ -1231,6 +1273,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         if name == "vulcan_audit":
             as_of = arguments.get("as_of")
             result = handle_vulcan_audit(as_of=as_of)
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        if name == "vulcan_ingest_git":
+            result = await handle_vulcan_ingest_git(
+                repo_path=arguments.get("repo_path"),
+                branch=arguments.get("branch", "HEAD"),
+            )
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        if name == "vulcan_ingest_status":
+            result = handle_vulcan_ingest_status()
             return [TextContent(type="text", text=json.dumps(result))]
 
         raise ValueError(f"Unknown tool: {name}")

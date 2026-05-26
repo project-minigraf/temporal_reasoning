@@ -493,19 +493,19 @@ class TestAgentStrategy:
 
 
 class TestMcpToolWiring:
-    def test_list_tools_returns_seven_tools(self, mock_minigraf_db, tmp_path):
+    def test_list_tools_returns_nine_tools(self, mock_minigraf_db, tmp_path):
         import asyncio
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         tools = asyncio.run(mcp_server.list_tools())
 
-        assert len(tools) == 7
+        assert len(tools) == 9
         names = {t.name for t in tools}
         assert names == {
             "vulcan_query", "vulcan_transact", "vulcan_retract",
             "vulcan_report_issue", "memory_prepare_turn", "memory_finalize_turn",
-            "vulcan_audit",
+            "vulcan_audit", "vulcan_ingest_git", "vulcan_ingest_status",
         }
 
     def test_call_tool_vulcan_query(self, mock_minigraf_db, tmp_path):
@@ -1114,3 +1114,30 @@ class TestPhase5Schema:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         executed = [call.args[0] for call in db_instance.execute.call_args_list]
         assert any("contains" in r for r in executed)
+
+
+class TestVulcanIngestStatus:
+    def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        result = mcp_server.handle_vulcan_ingest_status()
+        assert result["ok"] is True
+        assert result["status"] == "idle"
+        assert result["processed"] == 0
+
+    def test_returns_running_status(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "running", "processed": 3, "total": 10,
+            "current_commit": "abc123", "error": None,
+        }
+        result = mcp_server.handle_vulcan_ingest_status()
+        assert result["status"] == "running"
+        assert result["processed"] == 3
+        assert result["total"] == 10
+        assert result["current_commit"] == "abc123"
