@@ -33,47 +33,16 @@
 |------|-------------|--------|
 | OpenAI/Codex support | `VULCAN_LLM_MODEL=gpt-4o-mini` selects OpenAI client automatically; Codex hook wiring fully enabled. Spec: `docs/superpowers/specs/2026-05-26-openai-llm-strategy-design.md` | Complete ✓ |
 
-## Phase 4 — Entity Normalization and Schema-Aware Extraction
+## Phase 4 (Complete ✓) — Entity Normalization and Schema-Aware Extraction
 
-Normalization is foundational to memory quality. Every subsequent phase adds more entities to the graph; without normalization they fragment into disconnected synonym clusters. This work precedes code structure ingestion (Phase 6) deliberately — landing normalization first keeps the data clean as volume scales.
-
-### The problem
-
-Without normalization the graph degrades into disconnected synonym clusters:
-- Same entity, different names: "the auth service", "the login system", "the SSO module" → three separate entities, queries miss two of three.
-- Same relationship, different predicates: `:depends-on` vs `:requires` vs `:uses`.
-- Same decision, different phrasings: "use Redis", "use Redis for caching", "Redis-based cache" → split across unconnected datoms.
-
-The bi-temporal model preserves *when* things were said but cannot help when the *what* is fragmented across synonyms.
-
-### Why a vector store is the wrong first move
-
-A vector store is a retrieval tool, not a normalization tool. It can find things *near* "auth service" in embedding space but cannot assert that "auth service" and "login system" are the *same* entity — "Redis" and "Memcached" are also near in embedding space. Fuzzy matching injected upstream of Datalog pattern queries also destroys reproducibility: the same query returns different results depending on embedding model version and similarity threshold.
-
-### Three approaches in increasing complexity
-
-**1. Canonicalization at write time (recommended first move).** The extractor is made schema-aware: before transacting, it receives a list of existing canonical entity names and attribute predicates (a cheap Datalog query: `[:find ?e ?n :where [?e :entity/canonical-name ?n]]`) and is instructed to reuse an existing entity ID where the reference is clear, or create a new canonical name if genuinely new. The bi-temporal model provides a safety net: a wrong merge can be retracted and re-asserted. This handles the large majority of normalization with no new infrastructure.
-
-**2. Alias facts at query time.** Store user phrasings as alias facts — `(:service/auth :alias "the auth service")`, `(:service/auth :alias "login system")`. Queries resolve non-canonical names through the alias index before pattern matching. More forgiving than (1) because the canonical decision is not irrevocable at write time. These aliases are just more datoms in Minigraf; no new infrastructure.
-
-**3. Embedding-based disambiguation as a fallback.** The vector store enters only when the extractor sees a reference it cannot confidently map to an existing entity or a confidently new one. It proposes candidates ("this looks 0.87 similar to `:service/auth`") and either the extractor or the user resolves the ambiguity. The vector store never directly answers Datalog queries; it is a disambiguation aid for the long tail.
-
-In practice (1) + (2) handle 90%+ of cases. (3) catches the long tail. Starting with (3) before trying (1) is a common mistake.
-
-### When a vector store becomes necessary
-
-Wait until at least two of these are true:
-- **Volume:** tens of thousands of entities, and schema-injection into the extractor prompt hits context limits.
-- **Cross-session resolution:** the user references something from months ago that isn't in the extractor's prompt window and canonical lookup fails.
-- **Free-text search:** users want to find facts by approximate description, not exact name ("show me anything related to performance"). This is a feature request, not a normalization problem, but a vector store solves it.
-
-### Shape of the vector store if added
-
-Embedded, co-located with the `.graph` file — `sqlite-vec`, `lancedb`, or a flat index. Not a separate service. Adding Pinecone or Qdrant to a personal-scale local tool would be architecturally inconsistent with the single-file embedded model. For mobile in particular, a separate vector store means more storage, memory, startup time, and battery.
-
-### Implementation note
-
-The normalization problem is fundamentally an *ontology problem*, not a tooling problem. "Are 'the auth service' and 'the login system' the same thing?" depends on project-specific context that only the extractor has (conversation context + existing graph schema). The correct architectural move is to make the extractor schema-aware and treat entity resolution as part of extraction, not a separate post-processing step.
+| Item | Description | Status |
+|------|-------------|--------|
+| Slug canonicalization | `_canonical_ident` + `_keyword_uuid`; heuristic extractor updated | Complete ✓ |
+| Closed-world schema | `VULCAN_SCHEMA` (4 entity types) + `_validate_facts`; pre-transact enforcement in extraction pipeline and `handle_vulcan_transact` | Complete ✓ |
+| Alias datoms | `:alias` declared as optional attribute on all entity types | Complete ✓ |
+| Schema-aware prompts | `_query_canonical_entities` injects existing idents into LLM and agent extraction prompts | Complete ✓ |
+| `vulcan_audit` | 7th MCP tool; audits all entities against schema, retracts violators (bi-temporal — history preserved) | Complete ✓ |
+| Entity Resolution section | `SKILL.md` updated with resolution guidance and `vulcan_audit` instructions | Complete ✓ |
 
 ## Phase 5 — Observability and Trust for Automatic Memory
 
@@ -146,6 +115,7 @@ The graph is built *from* git but answers queries git cannot express. Value scal
 
 - WASM bindings (browser + edge) — no spec or concrete driver yet
 - Mobile embedding — no spec or concrete driver yet
+- Vector store / embedding-based disambiguation — add only when at least two of: (a) entity volume exceeds prompt injection limits, (b) cross-session resolution fails on canonical lookup, (c) free-text search is explicitly requested. Preferred shape: embedded co-located index (`sqlite-vec` or `lancedb`), not a separate service.
 
 ---
 
