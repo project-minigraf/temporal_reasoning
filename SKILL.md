@@ -509,6 +509,7 @@ report_issue("parse_error", "query returns unexpected output",
 | `hooks/claude-code.json` | Claude Code settings fragment (MCP server + auto-memory hooks) |
 | `hooks/prepare_hook.py` | UserPromptSubmit hook script for Claude Code |
 | `hooks/finalize_hook.py` | Stop hook script for Claude Code |
+| `hooks/ingest_hook.py` | Git ingestion trigger hook (fires at session start) |
 | `hooks/opencode.json` | OpenCode MCP config (degraded mode — no hook support yet) |
 | `hooks/openclaw.json` | OpenClaw MCP config (degraded mode — issue #28596) |
 | `hooks/codex.toml` | Codex CLI MCP config with commented hook stubs |

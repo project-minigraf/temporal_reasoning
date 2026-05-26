@@ -18,12 +18,15 @@ sys.path.insert(0, REPO_DIR)
 
 
 def main() -> None:
+    import os
     try:
         import asyncio
+        from pathlib import Path
         import mcp_server
         mcp_server.open_db()
-        # vulcan_ingest_git is async — run it in a new event loop
-        asyncio.run(mcp_server.handle_vulcan_ingest_git())
+        # Run ingestion directly — the hook's 2-second timeout will kill the process
+        # if it takes too long (acceptable for large first-time ingestion; fast for incremental)
+        asyncio.run(mcp_server._run_ingestion(str(Path.cwd()), "HEAD"))
     except Exception:
         pass  # Never block the turn on ingestion errors
 
