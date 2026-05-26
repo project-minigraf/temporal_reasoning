@@ -113,6 +113,7 @@ For a local single-user developer tool (the current Phase 5 target), stored data
 
 ## Backlog (unscheduled)
 
+- `vulcan_ingest_docs` (experiment) — ingest plain text/markdown files from git history using the existing heuristic/llm/agent extraction strategies, with commit timestamps as `:valid-from`. Enables backdated decision entities from committed ADRs and design docs. Risk: duplication against conversation-extracted entities; quality depends on extraction strategy. Spec before building.
 - WASM bindings (browser + edge) — no spec or concrete driver yet
 - Mobile embedding — no spec or concrete driver yet
 - Vector store / embedding-based disambiguation — add only when at least two of: (a) entity volume exceeds prompt injection limits, (b) cross-session resolution fails on canonical lookup, (c) free-text search is explicitly requested. Preferred shape: embedded co-located index (`sqlite-vec` or `lancedb`), not a separate service.
