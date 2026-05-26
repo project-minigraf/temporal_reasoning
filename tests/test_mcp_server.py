@@ -393,7 +393,7 @@ class TestLlmStrategyOpenAI:
         assert result["stored_count"] > 0
         mock_openai_client.chat.completions.create.assert_called_once()
 
-    def test_falls_back_to_agent_on_openai_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_falls_back_to_heuristic_on_openai_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "llm")
@@ -403,11 +403,10 @@ class TestLlmStrategyOpenAI:
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with patch("mcp_server._get_openai_client", side_effect=Exception("no key")):
-            with patch("mcp_server._agent_extract_and_transact", new_callable=AsyncMock) as mock_agent:
-                mock_agent.return_value = {"ok": True, "stored_count": 0, "strategy": "agent"}
-                result = asyncio.run(mcp_server.handle_memory_finalize_turn("We'll use Kafka."))
+            result = asyncio.run(mcp_server.handle_memory_finalize_turn("We'll use Kafka."))
 
-        mock_agent.assert_called_once()
+        assert result["ok"] is True
+        assert "heuristic" in result["strategy"]
 
 
 class TestLlmStrategy:
@@ -433,7 +432,7 @@ class TestLlmStrategy:
         assert result["ok"] is True
         mock_anthropic_client.messages.create.assert_called_once()
 
-    def test_falls_back_to_agent_on_api_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_falls_back_to_heuristic_on_api_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "llm")
@@ -442,11 +441,11 @@ class TestLlmStrategy:
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with patch("mcp_server._get_anthropic_client", side_effect=Exception("no key")):
-            with patch("mcp_server._agent_extract_and_transact", new_callable=AsyncMock) as mock_agent:
-                mock_agent.return_value = {"ok": True, "stored_count": 0, "strategy": "agent"}
-                result = asyncio.run(mcp_server.handle_memory_finalize_turn("We'll use Kafka."))
+            result = asyncio.run(mcp_server.handle_memory_finalize_turn("We'll use Kafka."))
 
-        mock_agent.assert_called_once()
+        assert result["ok"] is True
+        assert "heuristic" in result["strategy"]
+        assert "warning" in result
 
 
 class TestAgentStrategy:

@@ -758,6 +758,29 @@ def _get_openai_client():
     return openai.OpenAI(api_key=api_key)
 
 
+def _llm_missing_package_warning(error: str) -> str:
+    """Return a user-facing install instruction when the LLM package is absent.
+
+    Inspects the error string from _llm_extract_and_transact and maps it to
+    the correct pip install command based on the configured model.
+    Returns an empty string when the error is not a missing-package error.
+    """
+    model = os.environ.get("VULCAN_LLM_MODEL", "claude-haiku-4-5-20251001")
+    if "anthropic package not installed" in error:
+        return (
+            "ACTION REQUIRED: pip install anthropic\n"
+            f"  The configured model '{model}' requires the anthropic package.\n"
+            "  Set VULCAN_LLM_MODEL in .mcp.json if you want to use an OpenAI model instead."
+        )
+    if "openai package not installed" in error:
+        return (
+            "ACTION REQUIRED: pip install openai\n"
+            f"  The configured model '{model}' requires the openai package.\n"
+            "  Set VULCAN_LLM_MODEL in .mcp.json if you want to use an Anthropic model instead."
+        )
+    return ""
+
+
 def _call_llm(model: str, prompt: str) -> str:
     """Call an LLM and return the response text. Dispatches to OpenAI or Anthropic by model name."""
     if _is_openai_model(model):
@@ -918,7 +941,22 @@ async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]
         result = _llm_extract_and_transact(conversation_delta)
         if result["ok"]:
             return result
-        return await _agent_extract_and_transact(conversation_delta)
+        # LLM failed — fall back to heuristic and surface a warning so the user
+        # can see what went wrong (e.g. missing package, bad API key).
+        llm_error = result.get("error", "")
+        warning = _llm_missing_package_warning(llm_error)
+        facts = heuristic_extract(conversation_delta)
+        stored = _transact_extracted_facts(facts)
+        response: Dict[str, Any] = {
+            "ok": True,
+            "stored_count": stored,
+            "strategy": "heuristic (llm fallback)",
+        }
+        if warning:
+            response["warning"] = warning
+        elif llm_error:
+            response["warning"] = f"LLM extraction failed ({llm_error}); fell back to heuristic."
+        return response
 
     if strategy == "agent":
         return await _agent_extract_and_transact(conversation_delta)
