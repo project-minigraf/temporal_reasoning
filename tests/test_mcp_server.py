@@ -771,3 +771,59 @@ class TestTransactExtractedFactsSchema:
         stored = mcp_server._transact_extracted_facts(facts)
 
         assert stored == 1
+
+
+class TestParseTransactFacts:
+    def test_parses_single_triple(self):
+        import mcp_server
+        facts = mcp_server._parse_transact_facts(
+            '[[:decision/redis :description "use Redis"]]'
+        )
+        assert len(facts) == 1
+        assert facts[0]["entity"] == ":decision/redis"
+        assert facts[0]["attribute"] == ":description"
+        assert facts[0]["value"] == "use Redis"
+        assert facts[0]["entity_type"] == "decision"
+
+    def test_parses_multiple_triples(self):
+        import mcp_server
+        facts = mcp_server._parse_transact_facts(
+            '[[:decision/redis :description "use Redis"] '
+            '[:decision/redis :rationale "fast"]]'
+        )
+        assert len(facts) == 2
+
+    def test_returns_empty_for_non_string_values(self):
+        import mcp_server
+        facts = mcp_server._parse_transact_facts(
+            "[[:decision/redis :entity-type :type/decision]]"
+        )
+        assert facts == []
+
+
+class TestVulcanTransactSchema:
+    def test_rejects_unknown_entity_type(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        result = mcp_server.handle_vulcan_transact(
+            '[[:service/auth :description "auth service"]]',
+            reason="test"
+        )
+
+        assert result["ok"] is False
+        assert "schema" in result["error"].lower() or "violation" in result["error"].lower()
+
+    def test_accepts_valid_fact(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx": "5"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        result = mcp_server.handle_vulcan_transact(
+            '[[:decision/redis :description "use Redis"]]',
+            reason="test"
+        )
+
+        assert result["ok"] is True

@@ -151,6 +151,12 @@ def handle_vulcan_transact(facts: str, reason: str) -> Dict[str, Any]:
     """
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for all writes"}
+    # Schema validation — closed-world enforcement on parseable string-valued triples.
+    parsed = _parse_transact_facts(facts)
+    if parsed:
+        violations = _validate_facts(parsed)
+        if violations:
+            return {"ok": False, "error": f"schema violations: {'; '.join(violations)}"}
     _refresh_if_stale()
     db = get_db()
     try:
@@ -321,6 +327,27 @@ def _validate_facts(facts: List[Dict[str, Any]]) -> List[str]:
                 )
 
     return violations
+
+
+def _parse_transact_facts(facts_str: str) -> List[Dict[str, Any]]:
+    """Parse a Datalog transact string into fact dicts for schema validation.
+
+    Only captures string-valued triples (quoted values). Keyword values
+    like :type/decision are skipped — they are internal type tags, not
+    user-authored facts subject to schema validation.
+    """
+    pattern = r'\[(\:[^\s\]]+)\s+(\:[^\s\]]+)\s+"([^"]+)"\]'
+    result = []
+    for match in re.finditer(pattern, facts_str):
+        entity, attribute, value = match.groups()
+        entity_type = entity.split("/")[0].lstrip(":") if "/" in entity else ""
+        result.append({
+            "entity": entity,
+            "entity_type": entity_type,
+            "attribute": attribute,
+            "value": value,
+        })
+    return result
 
 
 def _extract_entities(text: str) -> List[str]:
