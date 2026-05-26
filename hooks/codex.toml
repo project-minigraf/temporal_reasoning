@@ -15,6 +15,10 @@ OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
 command = ["python", "PATH_TO_REPO/hooks/prepare_hook.py"]
 timeout_ms = 5000
 
+[hooks.pre_turn_ingest]
+command = ["python", "PATH_TO_REPO/hooks/ingest_hook.py"]
+timeout_ms = 2000
+
 [hooks.post_turn]
 command = ["python", "PATH_TO_REPO/hooks/finalize_hook.py"]
 timeout_ms = 10000

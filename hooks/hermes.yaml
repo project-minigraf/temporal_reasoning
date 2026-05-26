@@ -12,10 +12,12 @@ mcp_servers:
       VULCAN_EXTRACTION_STRATEGY: heuristic
 
 # Auto-memory hooks — uncomment if your Hermes version supports pre/post-turn hooks:
-# hooks:
-#   pre_turn:
-#     command: python PATH_TO_REPO/hooks/prepare_hook.py
-#     timeout_ms: 5000
-#   post_turn:
-#     command: python PATH_TO_REPO/hooks/finalize_hook.py
-#     timeout_ms: 10000
+hooks:
+  pre_turn:
+    - command: python PATH_TO_REPO/hooks/prepare_hook.py
+      timeout_ms: 5000
+    - command: python PATH_TO_REPO/hooks/ingest_hook.py
+      timeout_ms: 2000
+  post_turn:
+    command: python PATH_TO_REPO/hooks/finalize_hook.py
+    timeout_ms: 10000

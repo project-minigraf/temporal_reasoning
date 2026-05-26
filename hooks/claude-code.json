@@ -25,6 +25,11 @@
             "type": "command",
             "command": "python PATH_TO_REPO/hooks/prepare_hook.py",
             "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "python PATH_TO_REPO/hooks/ingest_hook.py",
+            "timeout": 2000
           }
         ]
       }

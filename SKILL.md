@@ -93,7 +93,7 @@ Only mint a new ident if the entity is genuinely new.
 
 Canonical ident form: lowercase, hyphens only — `:decision/redis` not `:decision/Redis_cache`.
 
-Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`
+Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`, `:module/`, `:function/`, `:class/` (code structure — auto-ingested); `:ingestion/` is system-only, do not write to it directly
 Required attribute on all types: `:description`
 Optional attributes: `:rationale`, `:date`, `:alias`
 
@@ -224,6 +224,61 @@ query("[:find ?a ?v :as-of 5 :where [:project/postgres ?a ?v]]")
 from vulcan import retract
 retract("[[:project/old-service :name \"obsolete\"]]",
         reason="Service decommissioned")
+```
+
+### vulcan_ingest_git
+
+Start background ingestion of code structure from git history into the bi-temporal graph. Returns immediately — ingestion runs as an asyncio background task.
+
+```python
+vulcan_ingest_git(repo_path="/path/to/repo", branch="HEAD")
+# → {"ok": true, "job_id": "git-ingest", "message": "Ingestion started for /path/to/repo"}
+
+# If already running:
+# → {"ok": false, "error": "ingestion already in progress"}
+```
+
+Auto-invoked at session start via the `UserPromptSubmit` hook. The hook fires `vulcan_ingest_git` with no arguments, defaulting to `cwd` and `HEAD`. Incremental: reads the `:ingestion/watermark` entity to determine the last ingested commit, then only processes new commits.
+
+Do not write to `:ingestion/watermark` or any `:ingestion/` entity directly.
+
+### vulcan_ingest_status
+
+Poll the current git ingestion progress.
+
+```python
+vulcan_ingest_status()
+# → {"ok": true, "status": "running", "processed": 12, "total": 47,
+#    "current_commit": "a3f2bc...", "error": null}
+```
+
+`status` is one of: `idle`, `running`, `complete`, `error`.
+
+### Code Structure Query Examples
+
+Once ingestion is complete, query code structure with `:valid-at` for point-in-time views:
+
+```datalog
+; All functions in auth.py as of today
+[:find ?fn :valid-at "2026-05-26"
+ :where [:module/src-auth-py :contains ?e] [?e :description ?fn]]
+
+; All modules that depend on auth.py
+[:find ?caller :valid-at "2026-05-26"
+ :where [?e :depends-on :module/src-auth-py] [?e :description ?caller]]
+
+; All modules transitively reachable from src/auth.py (via :contains and :depends-on)
+[:find ?dep :valid-at "2026-05-26"
+ :where (reachable :module/src-auth-py ?d) [?d :description ?dep]]
+```
+
+Cross-layer queries joining code structure with agent decisions:
+```datalog
+; What dependency changes happened after a specific date?
+; Run two queries and diff:
+; Q1 (before): [:find ?m ?d :valid-at "2024-12-01" :where [?e :depends-on ?f] [?e :description ?m] [?f :description ?d]]
+; Q2 (after):  [:find ?m ?d :valid-at "2026-05-26" :where [?e :depends-on ?f] [?e :description ?m] [?f :description ?d]]
+; Rows in Q2 absent from Q1 = new dependencies since the date
 ```
 
 ## Quick Reference
