@@ -501,6 +501,21 @@ def _canonical_ident(entity_type: str, value: str) -> str:
     return f":{entity_type}/{slug}"
 
 
+def _code_ident(entity_type: str, file_path: str, name: Optional[str] = None) -> str:
+    """Return a canonical ident for a code entity.
+
+    Uses '::' as separator between file path and name so slugging produces
+    a distinct result from a file whose path contains the name literally.
+    e.g. "src/auth.py::login" → ":function/src-auth-py-login"
+         "src/auth_login.py"  → ":module/src-auth-login-py"  (different)
+    """
+    if name:
+        value = f"{file_path}::{name}"
+    else:
+        value = file_path
+    return _canonical_ident(entity_type, value)
+
+
 # System attributes written by _transact_extracted_facts alongside domain attributes.
 # They are invisible to schema validation and filtered from attr_facts in vulcan_audit.
 _SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})

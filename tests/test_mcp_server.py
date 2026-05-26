@@ -1242,3 +1242,26 @@ class TestVulcanIngestStatus:
         assert result["processed"] == 3
         assert result["total"] == 10
         assert result["current_commit"] == "abc123"
+
+
+class TestCodeIdent:
+    def test_module_ident_from_path(self):
+        import mcp_server
+        assert mcp_server._code_ident("module", "src/auth.py") == ":module/src-auth-py"
+
+    def test_function_ident_distinct_from_module(self):
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "src/auth.py")
+        fn_ident = mcp_server._code_ident("function", "src/auth.py", "login")
+        assert module_ident == ":module/src-auth-py"
+        assert fn_ident == ":function/src-auth-py-login"
+        # Key: src/auth_login.py module would be :module/src-auth-login-py — different
+        assert mcp_server._code_ident("module", "src/auth_login.py") != fn_ident
+
+    def test_class_ident(self):
+        import mcp_server
+        assert mcp_server._code_ident("class", "src/auth.py", "User") == ":class/src-auth-py-user"
+
+    def test_name_is_lowercased(self):
+        import mcp_server
+        assert mcp_server._code_ident("function", "Foo.py", "MyFunc") == ":function/foo-py-myfunc"
