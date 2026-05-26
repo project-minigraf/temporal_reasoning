@@ -972,20 +972,22 @@ class TestVulcanAudit:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        # open_db registers SESSION_RULES (4 calls). After that, we set side_effect.
-        # handle_vulcan_audit issues one join query per entity type.
-        # Join query for "decision" returns [entity, attr, val] rows.
-        # :entity-type row is filtered out before validation; :rationale alone
-        # means :description is missing → violation → retract call.
-        # Remaining entity types return empty.
+        # handle_vulcan_audit now uses a two-step approach:
+        #   Step 1: [:find ?id :where [?e :ident ?id]] → list of keyword idents
+        #   Step 2: [:find ?a ?v :where [KEYWORD ?a ?v]] per ident → attr rows
+        # Entity has :ident + :entity-type (system) + :rationale (domain).
+        # Missing :description → violation → retract call.
         db_instance.execute.side_effect = [
-            # join query for decision: entity has :entity-type + :rationale only
+            # Step 1: ident query returns one entity keyword
+            json.dumps({"results": [[":decision/redis"]]}),
+            # Step 2: attr query for :decision/redis returns all its attributes
             json.dumps({"results": [
-                [":decision/redis", ":entity-type", ":type/decision"],
-                [":decision/redis", ":rationale", "fast"],
+                [":entity-type", ":type/decision"],
+                [":ident", ":decision/redis"],
+                [":rationale", "fast"],
             ]}),
             json.dumps({"tx": "10"}),  # retract call
-        ] + [json.dumps({"results": []})] * 10  # remaining type join queries
+        ] + [json.dumps({"results": []})] * 10
 
         result = mcp_server.handle_vulcan_audit()
 
@@ -1007,10 +1009,13 @@ class TestVulcanAudit:
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         db_instance.execute.side_effect = [
-            # join query for decision: missing :description
+            # Step 1: ident query
+            json.dumps({"results": [[":decision/redis"]]}),
+            # Step 2: attr query — missing :description
             json.dumps({"results": [
-                [":decision/redis", ":entity-type", ":type/decision"],
-                [":decision/redis", ":rationale", "fast"],
+                [":entity-type", ":type/decision"],
+                [":ident", ":decision/redis"],
+                [":rationale", "fast"],
             ]}),
         ] + [json.dumps({"results": []})] * 10
 
@@ -1021,19 +1026,20 @@ class TestVulcanAudit:
         assert len(result["violations"]) == 1
 
     def test_ident_attr_used_for_retraction(self, mock_minigraf_db, tmp_path):
-        """When join query returns :ident row, that keyword is used in the retract call."""
+        """The keyword ident from :ident is used in retract, not the UUID."""
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        # The UUID is the key in entity_attrs; :ident row supplies the keyword.
-        uuid = "dca29477-f050-517e-9b4a-ef6d5dcada09"
+        kw = ":decision/claude-haiku-4-5-20251001"
         db_instance.execute.side_effect = [
-            json.dumps({"results": [
-                [uuid, ":entity-type", ":type/decision"],
-                [uuid, ":ident", ":decision/claude-haiku-4-5-20251001"],
+            json.dumps({"results": [[kw]]}),          # Step 1: ident query
+            json.dumps({"results": [                  # Step 2: attr query
+                [":entity-type", ":type/decision"],
+                [":ident", kw],
+                # :description absent → violation
             ]}),
-            json.dumps({"tx": "10"}),  # retract call
+            json.dumps({"tx": "10"}),                 # retract call
         ] + [json.dumps({"results": []})] * 10
 
         result = mcp_server.handle_vulcan_audit()
@@ -1044,7 +1050,6 @@ class TestVulcanAudit:
             if "retract" in str(call)
         ]
         assert ":decision/claude-haiku-4-5-20251001" in retract_calls[0]
-        assert uuid not in retract_calls[0]  # UUID must NOT appear in retract
 
     def test_result_shape(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db

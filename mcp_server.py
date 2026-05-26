@@ -223,86 +223,88 @@ def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
 
     as_of_clause = f":as-of {as_of} " if as_of is not None else ""
 
-    for entity_type, schema in VULCAN_SCHEMA.items():
-        # Single join query: avoids UUID round-trip that causes empty attr results.
-        # ?e is bound once inside minigraf; both clauses share the same binding.
-        join_query = (
-            f"[:find ?e ?a ?v {as_of_clause}"
-            f":where [?e :entity-type :type/{entity_type}] [?e ?a ?v]]"
-        )
+    # Step 1: Collect all keyword idents for entities that have :ident stored.
+    # _transact_extracted_facts writes [:entity :ident ":entity"] alongside :entity-type.
+    # Using :ident as the lookup key avoids the UUID round-trip problem:
+    # join variables bind to UUIDs which cannot be used in subsequent where-clauses
+    # or retract expressions, but keyword idents used as LITERALS work correctly.
+    ident_query = f"[:find ?id {as_of_clause}:where [?e :ident ?id]]"
+    try:
+        ident_result = handle_vulcan_query(ident_query)
+        ident_rows = ident_result.get("results", [])
+    except Exception:
+        ident_rows = []
+
+    for ident_row in ident_rows:
+        if not ident_row:
+            continue
+        kw_ident = ident_row[0]  # e.g. ":decision/phase-4-normalization"
+        if not isinstance(kw_ident, str) or not kw_ident.startswith(":"):
+            continue
+        # Derive entity_type from keyword namespace prefix (":decision/slug" → "decision").
+        parts = kw_ident[1:].split("/", 1)
+        if len(parts) != 2:
+            continue
+        entity_type = parts[0]
+        if entity_type not in VULCAN_SCHEMA:
+            continue  # unknown entity type — skip; only known schema types are audited
+
+        audited += 1
+
+        # Step 2: Fetch all attributes for this entity using the keyword ident as a
+        # LITERAL in the where-clause. Minigraf resolves keyword literals correctly —
+        # only join-variable bindings (UUIDs) fail in subsequent where-clauses.
+        attr_query = f"[:find ?a ?v {as_of_clause}:where [{kw_ident} ?a ?v]]"
         try:
-            join_result = handle_vulcan_query(join_query)
-            join_rows = join_result.get("results", [])
+            attr_result = handle_vulcan_query(attr_query)
+            attr_rows = attr_result.get("results", [])
         except Exception:
             continue
 
-        # Group rows by entity ident.
-        entity_attrs: Dict[str, List] = {}
-        for row in join_rows:
-            if len(row) != 3:
-                continue
-            ent, attr, val = row
-            entity_attrs.setdefault(ent, []).append([attr, val])
+        # Exclude system attributes from schema validation.
+        attr_facts = [
+            {
+                "entity": kw_ident,
+                "entity_type": entity_type,
+                "attribute": a,
+                "value": v,
+            }
+            for a, v in attr_rows
+            if a not in _SYSTEM_ATTRS
+        ]
 
-        for entity_ident, attr_rows in entity_attrs.items():
-            audited += 1
+        if not attr_facts:
+            # Entity exists but has no domain attribute triples.
+            attr_facts = [{"entity": kw_ident, "entity_type": entity_type,
+                           "attribute": ":__no_attributes__", "value": ""}]
 
-            # Extract the stored :ident value — written by _transact_extracted_facts
-            # alongside :entity-type. Bare UUIDs returned by query results cannot be
-            # used as entity refs in retract expressions; the keyword ident can be.
-            kw_ident = entity_ident  # fallback: UUID (may fail in retract)
-            for attr, val in attr_rows:
-                if attr == ":ident" and isinstance(val, str):
-                    kw_ident = val
-                    break
+        violations = _validate_facts(attr_facts)
+        if violations:
+            for v in violations:
+                all_violations.append({"entity": kw_ident, "detail": v})
 
-            # Exclude system attributes from schema validation.
-            attr_facts = [
-                {
-                    "entity": kw_ident,
-                    "entity_type": entity_type,
-                    "attribute": attr,
-                    "value": val,
-                }
-                for attr, val in attr_rows
-                if attr not in _SYSTEM_ATTRS
-            ]
-
-            if not attr_facts:
-                # Entity exists (has :entity-type) but has no domain attribute triples.
-                # Pass a minimal fact so _validate_facts can flag missing required attributes.
-                attr_facts = [{"entity": kw_ident, "entity_type": entity_type,
-                               "attribute": ":__no_attributes__", "value": ""}]
-
-            violations = _validate_facts(attr_facts)
-            if violations:
-                for v in violations:
-                    all_violations.append({"entity": kw_ident, "detail": v})
-
-                if as_of is None:
-                    # Retract the invalid entity and all its attribute triples —
-                    # history preserved (bi-temporal). Use kw_ident (keyword form)
-                    # because bare UUIDs are not valid Datalog entity refs in retract.
-                    try:
-                        retract_triples = [
-                            f"[{kw_ident} :entity-type :type/{entity_type}]",
-                            f'[{kw_ident} :ident "{kw_ident}"]',
-                        ]
-                        for attr, val in attr_rows:
-                            if attr in _SYSTEM_ATTRS:
-                                continue
-                            if isinstance(val, str):
-                                escaped = val.replace('"', '\\"')
-                                retract_triples.append(
-                                    f'[{kw_ident} {attr} "{escaped}"]'
-                                )
-                        retract_expr = f"(retract [{' '.join(retract_triples)}])"
-                        db.execute(retract_expr)
-                        db.checkpoint()
-                        _update_mtime()
-                        retracted += 1
-                    except Exception:
-                        pass
+            if as_of is None:
+                # Retract the invalid entity and all its attribute triples —
+                # history preserved (bi-temporal). kw_ident is the keyword form
+                # (:decision/slug) and works correctly in retract expressions.
+                try:
+                    retract_triples = [
+                        f"[{kw_ident} :entity-type :type/{entity_type}]",
+                        f'[{kw_ident} :ident "{kw_ident}"]',
+                    ]
+                    for a, v in attr_rows:
+                        if a in _SYSTEM_ATTRS:
+                            continue
+                        if isinstance(v, str):
+                            escaped = v.replace('"', '\\"')
+                            retract_triples.append(f'[{kw_ident} {a} "{escaped}"]')
+                    retract_expr = f"(retract [{' '.join(retract_triples)}])"
+                    db.execute(retract_expr)
+                    db.checkpoint()
+                    _update_mtime()
+                    retracted += 1
+                except Exception:
+                    pass
 
     return {
         "ok": True,
