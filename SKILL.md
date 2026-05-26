@@ -79,6 +79,26 @@ query("[:find ?a ?v :where [:project/postgres ?a ?v]]")
 
 Before adding new facts about an entity, query it first to find existing attributes and avoid duplication.
 
+## Entity Resolution
+
+Before storing a new entity, always check for existing canonical idents and aliases:
+
+```datalog
+[:find ?e ?desc :where [?e :description ?desc]]
+[:find ?e ?a :where [?e :alias ?a]]
+```
+
+If a reference matches an existing ident or alias, reuse that exact ident.
+Only mint a new ident if the entity is genuinely new.
+
+Canonical ident form: lowercase, hyphens only — `:decision/redis` not `:decision/Redis_cache`.
+
+Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`
+Required attribute on all types: `:description`
+Optional attributes: `:rationale`, `:date`, `:alias`
+
+Run `vulcan_audit` periodically or after a session with heavy writes to detect and retract any schema violations.
+
 ## Entity Types and Graph Relationships
 
 ### Typing entities with `:entity-type`
