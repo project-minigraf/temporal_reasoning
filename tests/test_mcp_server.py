@@ -599,3 +599,48 @@ class TestParseValidAtHint:
         raw = '; valid-at: 2024-01-01\n; valid-at: 2025-06-30\n[[:e :a "v"]]'
         valid_at, datalog = mcp_server._parse_valid_at_hint(raw)
         assert valid_at == "2025-06-30"
+
+
+class TestCanonicalIdent:
+    def test_lowercases_value(self):
+        import mcp_server
+        assert mcp_server._canonical_ident("decision", "Redis") == ":decision/redis"
+
+    def test_replaces_spaces_with_hyphens(self):
+        import mcp_server
+        assert mcp_server._canonical_ident("preference", "use postgres") == ":preference/use-postgres"
+
+    def test_replaces_underscores(self):
+        import mcp_server
+        assert mcp_server._canonical_ident("constraint", "must_be_stateless") == ":constraint/must-be-stateless"
+
+    def test_replaces_dots(self):
+        import mcp_server
+        assert mcp_server._canonical_ident("dependency", "pydantic.v2") == ":dependency/pydantic-v2"
+
+    def test_collapses_consecutive_hyphens(self):
+        import mcp_server
+        assert mcp_server._canonical_ident("decision", "use  Redis") == ":decision/use-redis"
+
+    def test_strips_leading_trailing_hyphens(self):
+        import mcp_server
+        assert mcp_server._canonical_ident("decision", " redis ") == ":decision/redis"
+
+
+class TestKeywordUuid:
+    def test_same_keyword_same_uuid(self):
+        import mcp_server
+        a = mcp_server._keyword_uuid(":decision/redis")
+        b = mcp_server._keyword_uuid(":decision/redis")
+        assert a == b
+
+    def test_different_keywords_different_uuids(self):
+        import mcp_server
+        a = mcp_server._keyword_uuid(":decision/redis")
+        b = mcp_server._keyword_uuid(":decision/postgres")
+        assert a != b
+
+    def test_returns_string(self):
+        import mcp_server
+        result = mcp_server._keyword_uuid(":decision/redis")
+        assert isinstance(result, str)

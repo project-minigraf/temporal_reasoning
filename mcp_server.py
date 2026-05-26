@@ -10,6 +10,7 @@ import datetime
 import json
 import os
 import re
+import uuid as _uuid_mod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -211,6 +212,28 @@ _STOP_WORDS = frozenset(
 )
 
 _MIN_ENTITY_LEN = 4
+
+
+def _canonical_ident(entity_type: str, value: str) -> str:
+    """Slug-canonicalize a value into a Minigraf keyword ident.
+
+    Lowercases, replaces any character outside [a-z0-9-] with a hyphen,
+    collapses consecutive hyphens, strips leading/trailing hyphens.
+    Ported from _to_kw() in minigraf-examples LlamaIndex integration.
+    """
+    slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return f":{entity_type}/{slug}"
+
+
+def _keyword_uuid(keyword: str) -> str:
+    """Derive a stable UUID from a Minigraf keyword string.
+
+    Same keyword always produces the same UUID — used for entity resolution
+    without string-matching. Ported from keyword_entity_id() in
+    minigraf-examples minigraf-algorithms crate.
+    """
+    return str(_uuid_mod.uuid5(_uuid_mod.NAMESPACE_OID, keyword))
 
 
 def _extract_entities(text: str) -> List[str]:
