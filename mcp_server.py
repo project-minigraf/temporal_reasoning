@@ -247,45 +247,55 @@ def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
         for entity_ident, attr_rows in entity_attrs.items():
             audited += 1
 
-            # Exclude :entity-type from validation — it's an internal tag, not in VULCAN_SCHEMA.
+            # Extract the stored :ident value — written by _transact_extracted_facts
+            # alongside :entity-type. Bare UUIDs returned by query results cannot be
+            # used as entity refs in retract expressions; the keyword ident can be.
+            kw_ident = entity_ident  # fallback: UUID (may fail in retract)
+            for attr, val in attr_rows:
+                if attr == ":ident" and isinstance(val, str):
+                    kw_ident = val
+                    break
+
+            # Exclude system attributes from schema validation.
+            _SYSTEM_ATTRS = {":entity-type", ":ident"}
             attr_facts = [
                 {
-                    "entity": entity_ident,
+                    "entity": kw_ident,
                     "entity_type": entity_type,
                     "attribute": attr,
                     "value": val,
                 }
                 for attr, val in attr_rows
-                if attr != ":entity-type"
+                if attr not in _SYSTEM_ATTRS
             ]
 
             if not attr_facts:
                 # Entity exists (has :entity-type) but has no domain attribute triples.
                 # Pass a minimal fact so _validate_facts can flag missing required attributes.
-                attr_facts = [{"entity": entity_ident, "entity_type": entity_type,
+                attr_facts = [{"entity": kw_ident, "entity_type": entity_type,
                                "attribute": ":__no_attributes__", "value": ""}]
 
             violations = _validate_facts(attr_facts)
             if violations:
                 for v in violations:
-                    all_violations.append({"entity": entity_ident, "detail": v})
+                    all_violations.append({"entity": kw_ident, "detail": v})
 
                 if as_of is None:
                     # Retract the invalid entity and all its attribute triples —
-                    # history preserved (bi-temporal).
+                    # history preserved (bi-temporal). Use kw_ident (keyword form)
+                    # because bare UUIDs are not valid Datalog entity refs in retract.
                     try:
-                        # Build retract triples for all attributes + entity-type tag.
                         retract_triples = [
-                            f"[{entity_ident} :entity-type :type/{entity_type}]"
+                            f"[{kw_ident} :entity-type :type/{entity_type}]",
+                            f'[{kw_ident} :ident "{kw_ident}"]',
                         ]
                         for attr, val in attr_rows:
-                            if attr == ":entity-type":
-                                continue  # already added above
-                            # Only retract string-valued attributes (quoted in Datalog).
+                            if attr in _SYSTEM_ATTRS:
+                                continue
                             if isinstance(val, str):
                                 escaped = val.replace('"', '\\"')
                                 retract_triples.append(
-                                    f'[{entity_ident} {attr} "{escaped}"]'
+                                    f'[{kw_ident} {attr} "{escaped}"]'
                                 )
                         retract_expr = f"(retract [{' '.join(retract_triples)}])"
                         db.execute(retract_expr)
@@ -667,12 +677,16 @@ def _transact_extracted_facts(facts: List[Dict[str, str]]) -> int:
             continue
         now_z = _now_utc_ms()
         try:
-            # Combine main fact and :entity-type into one transact so both triples
-            # are written atomically — a single (transact [...]) is one transaction.
+            # Combine main fact, :entity-type tag, and :ident into one transact so
+            # all triples are written atomically — a single (transact [...]) is one
+            # transaction. :ident stores the keyword ident as a string value so that
+            # handle_vulcan_audit can retrieve it for retraction (bare UUIDs returned
+            # by query results cannot be used as entity refs in retract expressions).
             if entity_type:
                 triples = (
                     f'[{entity} {attribute} "{value}"]'
                     f' [{entity} :entity-type :type/{entity_type}]'
+                    f' [{entity} :ident "{entity}"]'
                 )
             else:
                 triples = f'[{entity} {attribute} "{value}"]'

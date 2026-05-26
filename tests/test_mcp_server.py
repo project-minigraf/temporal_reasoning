@@ -776,6 +776,12 @@ class TestTransactExtractedFactsSchema:
         stored = mcp_server._transact_extracted_facts(facts)
 
         assert stored == 1
+        # Verify :ident triple is included for audit retraction
+        transact_calls = [c for c in db_instance.execute.call_args_list
+                          if "transact" in str(c)]
+        assert len(transact_calls) == 1
+        assert ":ident" in str(transact_calls[0])
+        assert '":decision/redis"' in str(transact_calls[0])
 
     def test_mixed_batch_stores_only_valid(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -1013,6 +1019,32 @@ class TestVulcanAudit:
         assert result["ok"] is True
         assert result["retracted"] == 0  # read-only when as_of provided
         assert len(result["violations"]) == 1
+
+    def test_ident_attr_used_for_retraction(self, mock_minigraf_db, tmp_path):
+        """When join query returns :ident row, that keyword is used in the retract call."""
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        # The UUID is the key in entity_attrs; :ident row supplies the keyword.
+        uuid = "dca29477-f050-517e-9b4a-ef6d5dcada09"
+        db_instance.execute.side_effect = [
+            json.dumps({"results": [
+                [uuid, ":entity-type", ":type/decision"],
+                [uuid, ":ident", ":decision/claude-haiku-4-5-20251001"],
+            ]}),
+            json.dumps({"tx": "10"}),  # retract call
+        ] + [json.dumps({"results": []})] * 10
+
+        result = mcp_server.handle_vulcan_audit()
+
+        assert result["retracted"] == 1
+        retract_calls = [
+            str(call) for call in db_instance.execute.call_args_list
+            if "retract" in str(call)
+        ]
+        assert ":decision/claude-haiku-4-5-20251001" in retract_calls[0]
+        assert uuid not in retract_calls[0]  # UUID must NOT appear in retract
 
     def test_result_shape(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
