@@ -48,11 +48,16 @@ class TestOpenDb:
         for rule in mcp_server.SESSION_RULES:
             db_instance.execute.assert_any_call(rule)
 
-    def test_get_db_raises_before_open(self):
+    def test_get_db_auto_opens_when_db_none(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
         import mcp_server
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "auto.graph"))
         mcp_server._db = None
-        with pytest.raises(RuntimeError, match="DB not initialised"):
-            mcp_server.get_db()
+        mcp_server._graph_path = ""
+
+        result = mcp_server.get_db()
+
+        assert result is db_instance
 
     def test_get_db_returns_instance_after_open(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -582,6 +587,19 @@ class TestMcpToolWiring:
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["ok"] is True
+
+    def test_db_released_after_call_tool(self, mock_minigraf_db, tmp_path):
+        import asyncio
+        import mcp_server
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        asyncio.run(mcp_server.call_tool(
+            "vulcan_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
+        ))
+
+        assert mcp_server._db is None, "lock must be released after call_tool so prepare_hook can open the DB"
 
     def test_call_tool_unknown_raises(self, mock_minigraf_db, tmp_path):
         import asyncio

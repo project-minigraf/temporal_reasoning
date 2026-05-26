@@ -100,9 +100,13 @@ def _refresh_if_stale() -> None:
 
 
 def get_db() -> MiniGrafDb:
-    """Return the open DB instance; raises RuntimeError if not initialised."""
+    """Return the open DB instance, opening it if not currently held.
+
+    The DB is opened per-operation and released after each call_tool() invocation
+    so that the prepare_hook subprocess can acquire the file lock between turns.
+    """
     if _db is None:
-        raise RuntimeError("DB not initialised — call open_db() first")
+        _open_db_at(_graph_path or _get_graph_path())
     return _db
 
 
@@ -1173,47 +1177,52 @@ async def list_tools() -> List[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-    if name == "vulcan_query":
-        result = handle_vulcan_query(arguments["datalog"])
-        return [TextContent(type="text", text=json.dumps(result))]
+    global _db
+    try:
+        if name == "vulcan_query":
+            result = handle_vulcan_query(arguments["datalog"])
+            return [TextContent(type="text", text=json.dumps(result))]
 
-    if name == "vulcan_transact":
-        result = handle_vulcan_transact(arguments["facts"], arguments["reason"])
-        return [TextContent(type="text", text=json.dumps(result))]
+        if name == "vulcan_transact":
+            result = handle_vulcan_transact(arguments["facts"], arguments["reason"])
+            return [TextContent(type="text", text=json.dumps(result))]
 
-    if name == "vulcan_retract":
-        result = handle_vulcan_retract(arguments["facts"], arguments["reason"])
-        return [TextContent(type="text", text=json.dumps(result))]
+        if name == "vulcan_retract":
+            result = handle_vulcan_retract(arguments["facts"], arguments["reason"])
+            return [TextContent(type="text", text=json.dumps(result))]
 
-    if name == "vulcan_report_issue":
-        result = handle_vulcan_report_issue(
-            arguments["issue_type"],
-            arguments["description"],
-            datalog=arguments.get("datalog"),
-            error=arguments.get("error"),
-        )
-        return [TextContent(type="text", text=json.dumps(result))]
+        if name == "vulcan_report_issue":
+            result = handle_vulcan_report_issue(
+                arguments["issue_type"],
+                arguments["description"],
+                datalog=arguments.get("datalog"),
+                error=arguments.get("error"),
+            )
+            return [TextContent(type="text", text=json.dumps(result))]
 
-    if name == "memory_prepare_turn":
-        block = handle_memory_prepare_turn(arguments["user_message"])
-        return [TextContent(type="text", text=block)]
+        if name == "memory_prepare_turn":
+            block = handle_memory_prepare_turn(arguments["user_message"])
+            return [TextContent(type="text", text=block)]
 
-    if name == "memory_finalize_turn":
-        result = await handle_memory_finalize_turn(arguments["conversation_delta"])
-        return [TextContent(type="text", text=json.dumps(result))]
+        if name == "memory_finalize_turn":
+            result = await handle_memory_finalize_turn(arguments["conversation_delta"])
+            return [TextContent(type="text", text=json.dumps(result))]
 
-    if name == "vulcan_audit":
-        as_of = arguments.get("as_of")
-        result = handle_vulcan_audit(as_of=as_of)
-        return [TextContent(type="text", text=json.dumps(result))]
+        if name == "vulcan_audit":
+            as_of = arguments.get("as_of")
+            result = handle_vulcan_audit(as_of=as_of)
+            return [TextContent(type="text", text=json.dumps(result))]
 
-    raise ValueError(f"Unknown tool: {name}")
+        raise ValueError(f"Unknown tool: {name}")
+    finally:
+        # Release the file lock after every tool call so that the prepare_hook
+        # subprocess can open the DB between turns. get_db() re-opens on demand.
+        _db = None
 
 
 async def main() -> None:
     global _server_ref
     _server_ref = server
-    open_db()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
