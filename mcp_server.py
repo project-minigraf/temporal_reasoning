@@ -1311,6 +1311,145 @@ async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]
     return {"ok": False, "error": f"Unknown strategy: {strategy}"}
 
 
+def _build_code_triples(
+    file_path: str,
+    extracted: Dict[str, List[str]],
+    commit_ts_iso: str,
+    entity_valid_from: Dict[str, str],
+) -> List[str]:
+    """Return Datalog triple strings for a file's extracted code entities."""
+    triples: List[str] = []
+    module_ident = _code_ident("module", file_path)
+
+    triples += [
+        f"[{module_ident} :entity-type :type/module]",
+        f'[{module_ident} :ident "{module_ident}"]',
+        f'[{module_ident} :description "{file_path}"]',
+        f'[{module_ident} :path "{file_path}"]',
+    ]
+    entity_valid_from.setdefault(module_ident, commit_ts_iso)
+
+    for fn_name in extracted["functions"]:
+        fn_ident = _code_ident("function", file_path, fn_name)
+        triples += [
+            f"[{fn_ident} :entity-type :type/function]",
+            f'[{fn_ident} :ident "{fn_ident}"]',
+            f'[{fn_ident} :description "{fn_name}"]',
+            f'[{fn_ident} :file "{file_path}"]',
+            f"[{module_ident} :contains {fn_ident}]",
+        ]
+        entity_valid_from.setdefault(fn_ident, commit_ts_iso)
+
+    for cls_name in extracted["classes"]:
+        cls_ident = _code_ident("class", file_path, cls_name)
+        triples += [
+            f"[{cls_ident} :entity-type :type/class]",
+            f'[{cls_ident} :ident "{cls_ident}"]',
+            f'[{cls_ident} :description "{cls_name}"]',
+            f'[{cls_ident} :file "{file_path}"]',
+            f"[{module_ident} :contains {cls_ident}]",
+        ]
+        entity_valid_from.setdefault(cls_ident, commit_ts_iso)
+
+    for import_name in set(extracted["imports"]):
+        dep_ident = _canonical_ident("module", import_name)
+        triples.append(f"[{module_ident} :depends-on {dep_ident}]")
+
+    for call_name in set(extracted["calls"]):
+        callee_ident = _canonical_ident("function", call_name)
+        triples.append(f"[{module_ident} :calls {callee_ident}]")
+
+    return triples
+
+
+async def _run_ingestion(repo_path: str, branch: str) -> None:
+    """Background coroutine: walk git history and ingest code structure."""
+    global _db, _ingest_progress
+    try:
+        # Read watermark before releasing DB
+        db = get_db()
+        watermark = _watermark_query(db)
+        _db = None  # release file lock while enumerating commits
+
+        commits = _git_commits(repo_path, watermark, branch)
+        _ingest_progress["total"] = len(commits)
+        _ingest_progress["status"] = "running"
+
+        # Track valid-from timestamps for entities seen this session
+        entity_valid_from: Dict[str, str] = {}
+
+        for commit_hash, commit_ts_iso, author, subject in commits:
+            _ingest_progress["current_commit"] = commit_hash
+            reason = f"git:{commit_hash} {author}: {subject}"
+
+            # Acquire DB fresh each commit — never hold across yield
+            db = get_db()
+            try:
+                changed = _git_changed_files(repo_path, commit_hash)
+                add_triples: List[str] = []
+                close_items: List[tuple] = []  # (triples, original_ts_iso)
+
+                for status, file_path in changed:
+                    parser = _get_parser(file_path)
+                    if parser is None:
+                        continue
+
+                    module_ident = _code_ident("module", file_path)
+
+                    if status == "D":
+                        # Close the module entity
+                        orig_ts = entity_valid_from.get(module_ident, commit_ts_iso)
+                        close_items.append(
+                            ([f'[{module_ident} :description "{file_path}"]'], orig_ts)
+                        )
+                    else:  # A or M
+                        try:
+                            content = _git_file_content(repo_path, commit_hash, file_path)
+                        except Exception:
+                            continue
+                        extracted = _extract_from_source(content, parser, file_path)
+                        triples = _build_code_triples(
+                            file_path, extracted, commit_ts_iso, entity_valid_from
+                        )
+                        add_triples.extend(triples)
+
+                _ingest_transact(db, add_triples, commit_ts_iso, reason)
+                for close_triples, orig_ts in close_items:
+                    _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason)
+                _watermark_update(db, commit_hash, commit_ts_iso, reason)
+                db.checkpoint()
+
+            finally:
+                _db = None  # release file lock between commits
+
+            _ingest_progress["processed"] += 1
+            await asyncio.sleep(0)  # yield to event loop
+
+        _ingest_progress["status"] = "complete"
+
+    except Exception as e:
+        _ingest_progress["status"] = "error"
+        _ingest_progress["error"] = str(e)
+        _db = None
+
+
+async def handle_vulcan_ingest_git(
+    repo_path: Optional[str] = None,
+    branch: str = "HEAD",
+) -> Dict[str, Any]:
+    """Start background git ingestion. Returns immediately."""
+    global _ingest_task, _ingest_progress
+    if _ingest_task and not _ingest_task.done():
+        return {"ok": False, "error": "ingestion already in progress"}
+    repo = repo_path or str(Path.cwd())
+    _ingest_progress = {
+        "status": "idle", "processed": 0, "total": 0,
+        "current_commit": "", "error": None,
+    }
+    _ingest_task = asyncio.create_task(_run_ingestion(repo, branch))
+    return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
+
+
 def handle_vulcan_ingest_status() -> Dict[str, Any]:
     """Return current ingestion progress."""
     return {"ok": True, **_ingest_progress}

@@ -2,6 +2,7 @@
 
 All tests mock MiniGrafDb so no live minigraf install is required.
 """
+import asyncio
 import json
 import sys
 import os
@@ -1412,3 +1413,87 @@ class TestIngestionWrites:
         db_instance.execute.reset_mock()
         mcp_server._ingest_close(db, [], "2025-01-01T00:00:00Z", "2025-03-01T00:00:00Z", "r")
         db_instance.execute.assert_not_called()
+
+
+class TestRunIngestion:
+    @pytest.mark.asyncio
+    async def test_ingestion_processes_all_commits(self, mock_minigraf_db, git_repo):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_watermark_updated_after_each_commit(self, mock_minigraf_db, git_repo):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        watermark_calls = [
+            c for c in db_instance.execute.call_args_list
+            if ":ingestion/watermark" in str(c) and "transact" in str(c)
+        ]
+        assert len(watermark_calls) >= 2  # one per commit
+
+    @pytest.mark.asyncio
+    async def test_db_released_between_commits(self, mock_minigraf_db, git_repo):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        db_none_snapshots = []
+
+        original_sleep = asyncio.sleep
+        async def patched_sleep(t):
+            db_none_snapshots.append(mcp_server._db is None)
+            await original_sleep(t)
+
+        with patch("mcp_server.asyncio.sleep", patched_sleep):
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert all(db_none_snapshots), f"_db was not None at yield: {db_none_snapshots}"
+
+    @pytest.mark.asyncio
+    async def test_handle_vulcan_ingest_git_returns_immediately(self, mock_minigraf_db, git_repo):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        result = await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
+        assert result["ok"] is True
+        assert "job_id" in result
+
+    @pytest.mark.asyncio
+    async def test_second_call_while_running_returns_error(self, mock_minigraf_db, git_repo):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
+        result = await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
+        assert result["ok"] is False
+        assert "already in progress" in result["error"]
