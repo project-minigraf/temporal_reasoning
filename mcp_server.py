@@ -224,48 +224,43 @@ def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
     as_of_clause = f":as-of {as_of} " if as_of is not None else ""
 
     for entity_type, schema in VULCAN_SCHEMA.items():
-        # Find all entities of this type.
-        type_query = (
-            f"[:find ?e {as_of_clause}"
-            f":where [?e :entity-type :type/{entity_type}]]"
+        # Single join query: avoids UUID round-trip that causes empty attr results.
+        # ?e is bound once inside minigraf; both clauses share the same binding.
+        join_query = (
+            f"[:find ?e ?a ?v {as_of_clause}"
+            f":where [?e :entity-type :type/{entity_type}] [?e ?a ?v]]"
         )
         try:
-            type_result = handle_vulcan_query(type_query)
-            entity_rows = type_result.get("results", [])
+            join_result = handle_vulcan_query(join_query)
+            join_rows = join_result.get("results", [])
         except Exception:
             continue
 
-        for row in entity_rows:
-            if not row:
+        # Group rows by entity ident.
+        entity_attrs: Dict[str, List] = {}
+        for row in join_rows:
+            if len(row) != 3:
                 continue
-            entity_ident = row[0]
+            ent, attr, val = row
+            entity_attrs.setdefault(ent, []).append([attr, val])
+
+        for entity_ident, attr_rows in entity_attrs.items():
             audited += 1
 
-            # Fetch all attributes for this entity.
-            attr_query = (
-                f"[:find ?a ?v {as_of_clause}"
-                f":where [{entity_ident} ?a ?v]]"
-            )
-            try:
-                attr_result = handle_vulcan_query(attr_query)
-                attr_rows = attr_result.get("results", [])
-            except Exception:
-                continue
-
-            # Reconstruct per-attribute fact dicts for _validate_facts.
-            attr_facts = []
-            for attr_row in attr_rows:
-                if len(attr_row) == 2:
-                    attr, val = attr_row
-                    attr_facts.append({
-                        "entity": entity_ident,
-                        "entity_type": entity_type,
-                        "attribute": attr,
-                        "value": val,
-                    })
+            # Exclude :entity-type from validation — it's an internal tag, not in VULCAN_SCHEMA.
+            attr_facts = [
+                {
+                    "entity": entity_ident,
+                    "entity_type": entity_type,
+                    "attribute": attr,
+                    "value": val,
+                }
+                for attr, val in attr_rows
+                if attr != ":entity-type"
+            ]
 
             if not attr_facts:
-                # Entity exists (has :entity-type) but has no attribute triples at all.
+                # Entity exists (has :entity-type) but has no domain attribute triples.
                 # Pass a minimal fact so _validate_facts can flag missing required attributes.
                 attr_facts = [{"entity": entity_ident, "entity_type": entity_type,
                                "attribute": ":__no_attributes__", "value": ""}]
@@ -278,21 +273,20 @@ def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
                 if as_of is None:
                     # Retract the invalid entity and all its attribute triples —
                     # history preserved (bi-temporal).
-                    reason = f"vulcan_audit: schema violation — {'; '.join(violations)}"
                     try:
                         # Build retract triples for all attributes + entity-type tag.
                         retract_triples = [
                             f"[{entity_ident} :entity-type :type/{entity_type}]"
                         ]
-                        for attr_row in attr_rows:
-                            if len(attr_row) == 2:
-                                attr, val = attr_row
-                                # Only retract string-valued attributes (quoted in Datalog).
-                                if isinstance(val, str):
-                                    escaped = val.replace('"', '\\"')
-                                    retract_triples.append(
-                                        f'[{entity_ident} {attr} "{escaped}"]'
-                                    )
+                        for attr, val in attr_rows:
+                            if attr == ":entity-type":
+                                continue  # already added above
+                            # Only retract string-valued attributes (quoted in Datalog).
+                            if isinstance(val, str):
+                                escaped = val.replace('"', '\\"')
+                                retract_triples.append(
+                                    f'[{entity_ident} {attr} "{escaped}"]'
+                                )
                         retract_expr = f"(retract [{' '.join(retract_triples)}])"
                         db.execute(retract_expr)
                         db.checkpoint()

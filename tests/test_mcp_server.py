@@ -967,16 +967,19 @@ class TestVulcanAudit:
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         # open_db registers SESSION_RULES (4 calls). After that, we set side_effect.
-        # handle_vulcan_audit calls handle_vulcan_query which calls db.execute.
-        # First entity type query for "decision" returns one entity.
-        # Second: attr query for that entity returns only :rationale (missing :description).
-        # Third: retract call for the invalid entity.
-        # Remaining: empty results for other entity types (preference, constraint, dependency).
+        # handle_vulcan_audit issues one join query per entity type.
+        # Join query for "decision" returns [entity, attr, val] rows.
+        # :entity-type row is filtered out before validation; :rationale alone
+        # means :description is missing → violation → retract call.
+        # Remaining entity types return empty.
         db_instance.execute.side_effect = [
-            json.dumps({"results": [[":decision/redis"]]}),  # type query for decision
-            json.dumps({"results": [[":rationale", "fast"]]}),  # attr query
+            # join query for decision: entity has :entity-type + :rationale only
+            json.dumps({"results": [
+                [":decision/redis", ":entity-type", ":type/decision"],
+                [":decision/redis", ":rationale", "fast"],
+            ]}),
             json.dumps({"tx": "10"}),  # retract call
-        ] + [json.dumps({"results": []})] * 10  # remaining type queries
+        ] + [json.dumps({"results": []})] * 10  # remaining type join queries
 
         result = mcp_server.handle_vulcan_audit()
 
@@ -998,8 +1001,11 @@ class TestVulcanAudit:
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         db_instance.execute.side_effect = [
-            json.dumps({"results": [[":decision/redis"]]}),
-            json.dumps({"results": [[":rationale", "fast"]]}),
+            # join query for decision: missing :description
+            json.dumps({"results": [
+                [":decision/redis", ":entity-type", ":type/decision"],
+                [":decision/redis", ":rationale", "fast"],
+            ]}),
         ] + [json.dumps({"results": []})] * 10
 
         result = mcp_server.handle_vulcan_audit(as_of=5)
