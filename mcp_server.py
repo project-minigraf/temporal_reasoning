@@ -43,7 +43,7 @@ _db_mtime: float = 0.0
 _server_ref: Optional[Server] = None
 
 # Ingestion state
-_ingest_task: Optional["asyncio.Task"] = None
+_ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0,
     "current_commit": "", "error": None,
@@ -1281,6 +1281,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
                 branch=arguments.get("branch", "HEAD"),
             )
             return [TextContent(type="text", text=json.dumps(result))]
+
 
         if name == "vulcan_ingest_status":
             result = handle_vulcan_ingest_status()
