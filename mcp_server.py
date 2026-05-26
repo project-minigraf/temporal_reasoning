@@ -1316,6 +1316,7 @@ def _build_code_triples(
     extracted: Dict[str, List[str]],
     commit_ts_iso: str,
     entity_valid_from: Dict[str, str],
+    file_entities: Dict[str, List[str]],
 ) -> List[str]:
     """Return Datalog triple strings for a file's extracted code entities."""
     triples: List[str] = []
@@ -1327,6 +1328,10 @@ def _build_code_triples(
         f'[{module_ident} :description "{file_path}"]',
         f'[{module_ident} :path "{file_path}"]',
     ]
+    # Track all idents for this file (for deletion cleanup)
+    idents_for_file = file_entities.setdefault(file_path, [])
+    if module_ident not in idents_for_file:
+        idents_for_file.append(module_ident)
     entity_valid_from.setdefault(module_ident, commit_ts_iso)
 
     for fn_name in extracted["functions"]:
@@ -1338,6 +1343,8 @@ def _build_code_triples(
             f'[{fn_ident} :file "{file_path}"]',
             f"[{module_ident} :contains {fn_ident}]",
         ]
+        if fn_ident not in idents_for_file:
+            idents_for_file.append(fn_ident)
         entity_valid_from.setdefault(fn_ident, commit_ts_iso)
 
     for cls_name in extracted["classes"]:
@@ -1349,6 +1356,8 @@ def _build_code_triples(
             f'[{cls_ident} :file "{file_path}"]',
             f"[{module_ident} :contains {cls_ident}]",
         ]
+        if cls_ident not in idents_for_file:
+            idents_for_file.append(cls_ident)
         entity_valid_from.setdefault(cls_ident, commit_ts_iso)
 
     for import_name in set(extracted["imports"]):
@@ -1377,6 +1386,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
         # Track valid-from timestamps for entities seen this session
         entity_valid_from: Dict[str, str] = {}
+        file_entities: Dict[str, List[str]] = {}
 
         for commit_hash, commit_ts_iso, author, subject in commits:
             _ingest_progress["current_commit"] = commit_hash
@@ -1397,11 +1407,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     module_ident = _code_ident("module", file_path)
 
                     if status == "D":
-                        # Close the module entity
-                        orig_ts = entity_valid_from.get(module_ident, commit_ts_iso)
-                        close_items.append(
-                            ([f'[{module_ident} :description "{file_path}"]'], orig_ts)
-                        )
+                        # Close module and all known child entities for this file
+                        idents = file_entities.get(file_path, [_code_ident("module", file_path)])
+                        for ident in idents:
+                            orig_ts = entity_valid_from.get(ident, commit_ts_iso)
+                            close_items.append(
+                                ([f'[{ident} :description ""]'], orig_ts)
+                            )
                     else:  # A or M
                         try:
                             content = _git_file_content(repo_path, commit_hash, file_path)
@@ -1409,7 +1421,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             continue
                         extracted = _extract_from_source(content, parser, file_path)
                         triples = _build_code_triples(
-                            file_path, extracted, commit_ts_iso, entity_valid_from
+                            file_path, extracted, commit_ts_iso, entity_valid_from, file_entities
                         )
                         add_triples.extend(triples)
 

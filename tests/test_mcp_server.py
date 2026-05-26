@@ -1453,6 +1453,7 @@ class TestRunIngestion:
         db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         mcp_server._db = None
+        mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
