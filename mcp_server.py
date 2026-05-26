@@ -50,6 +50,41 @@ _ingest_progress: Dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
+# Language detection and grammar caching
+# ---------------------------------------------------------------------------
+
+_EXT_TO_LANG: Dict[str, str] = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".tsx": "tsx", ".jsx": "javascript", ".rs": "rust",
+    ".go": "go", ".java": "java", ".c": "c", ".cpp": "cpp",
+    ".cs": "c_sharp", ".rb": "ruby", ".php": "php",
+    ".kt": "kotlin", ".swift": "swift", ".scala": "scala",
+    ".hs": "haskell", ".lua": "lua", ".ex": "elixir", ".exs": "elixir",
+}
+
+_grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
+
+
+def _get_parser(file_path: str) -> Optional[Any]:
+    """Return a cached tree_sitter.Parser for the file's language, or None if unsupported."""
+    ext = Path(file_path).suffix.lower()
+    lang_name = _EXT_TO_LANG.get(ext)
+    if not lang_name:
+        return None
+    if lang_name in _grammar_cache:
+        return _grammar_cache[lang_name]
+    try:
+        import tree_sitter_languages  # type: ignore
+        import tree_sitter            # type: ignore
+        lang = tree_sitter_languages.get_language(lang_name)
+        parser = tree_sitter.Parser()
+        parser.set_language(lang)
+        _grammar_cache[lang_name] = parser
+    except Exception:
+        _grammar_cache[lang_name] = None
+    return _grammar_cache[lang_name]
+
+# ---------------------------------------------------------------------------
 # DB lifecycle
 # ---------------------------------------------------------------------------
 

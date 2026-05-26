@@ -1116,6 +1116,52 @@ class TestPhase5Schema:
         assert any("contains" in r for r in executed)
 
 
+class TestGetParser:
+    def test_python_file_returns_parser(self):
+        import mcp_server
+        from unittest.mock import MagicMock
+        mcp_server._grammar_cache.clear()
+        # Mock tree_sitter modules
+        mock_parser = MagicMock()
+        mock_tree_sitter = MagicMock()
+        mock_tree_sitter.Parser.return_value = mock_parser
+        mock_tree_sitter_languages = MagicMock()
+        mock_tree_sitter_languages.get_language.return_value = MagicMock()
+
+        with patch.dict("sys.modules", {"tree_sitter": mock_tree_sitter, "tree_sitter_languages": mock_tree_sitter_languages}):
+            parser = mcp_server._get_parser("src/auth.py")
+            assert parser is not None
+
+    def test_unknown_extension_returns_none(self):
+        import mcp_server
+        parser = mcp_server._get_parser("data.csv")
+        assert parser is None
+
+    def test_parser_is_cached_on_second_call(self):
+        import mcp_server
+        from unittest.mock import MagicMock
+        mcp_server._grammar_cache.clear()
+        # Mock tree_sitter modules
+        mock_parser = MagicMock()
+        mock_tree_sitter = MagicMock()
+        mock_tree_sitter.Parser.return_value = mock_parser
+        mock_tree_sitter_languages = MagicMock()
+        mock_tree_sitter_languages.get_language.return_value = MagicMock()
+
+        with patch.dict("sys.modules", {"tree_sitter": mock_tree_sitter, "tree_sitter_languages": mock_tree_sitter_languages}):
+            p1 = mcp_server._get_parser("foo.py")
+            p2 = mcp_server._get_parser("bar.py")
+            assert p1 is p2  # same cached parser instance
+
+    def test_unsupported_grammar_returns_none(self):
+        import mcp_server
+        # Simulate a language in the ext map but whose grammar fails to load
+        mcp_server._grammar_cache.clear()
+        mcp_server._grammar_cache["python"] = None
+        parser = mcp_server._get_parser("foo.py")
+        assert parser is None
+
+
 class TestVulcanIngestStatus:
     def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):
         import mcp_server
