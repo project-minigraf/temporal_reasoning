@@ -236,6 +236,93 @@ def _keyword_uuid(keyword: str) -> str:
     return str(_uuid_mod.uuid5(_uuid_mod.NAMESPACE_OID, keyword))
 
 
+VULCAN_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
+    "decision": {
+        "required": {":description": str},
+        "optional": {":rationale": str, ":date": str, ":alias": str},
+    },
+    "preference": {
+        "required": {":description": str},
+        "optional": {":rationale": str, ":alias": str},
+    },
+    "constraint": {
+        "required": {":description": str},
+        "optional": {":rationale": str, ":alias": str},
+    },
+    "dependency": {
+        "required": {":description": str},
+        "optional": {":rationale": str, ":alias": str},
+    },
+}
+
+
+def _validate_facts(facts: List[Dict[str, Any]]) -> List[str]:
+    """Validate proposed facts against VULCAN_SCHEMA. Returns violation strings.
+
+    Closed-world: unknown entity types and unknown attributes are both violations.
+    Pure function — no DB access. Mirrors Schema.validate() from minigraf-schema.
+    """
+    violations: List[str] = []
+
+    # Group facts by entity to check required attributes across all facts for one entity.
+    entity_attrs: Dict[str, Dict[str, Any]] = {}
+    entity_types: Dict[str, str] = {}
+    for fact in facts:
+        entity = fact.get("entity", "")
+        entity_type = fact.get("entity_type", "")
+        attribute = fact.get("attribute", "")
+        value = fact.get("value")
+        entity_attrs.setdefault(entity, {})[attribute] = value
+        if entity_type:
+            entity_types[entity] = entity_type
+
+    for entity, attrs in entity_attrs.items():
+        entity_type = entity_types.get(entity, "")
+
+        # Closed-world: unknown entity type is a violation.
+        if entity_type not in VULCAN_SCHEMA:
+            violations.append(
+                f"entity '{entity}' has unknown type '{entity_type}' — "
+                f"allowed: {list(VULCAN_SCHEMA)}"
+            )
+            continue
+
+        schema = VULCAN_SCHEMA[entity_type]
+        required = schema["required"]
+        optional = schema["optional"]
+        allowed = set(required) | set(optional)
+
+        # Check required attributes are present with correct type.
+        for attr, expected_type in required.items():
+            if attr not in attrs:
+                violations.append(
+                    f"entity '{entity}' missing required attribute '{attr}'"
+                )
+            elif not isinstance(attrs[attr], expected_type):
+                violations.append(
+                    f"entity '{entity}' attribute '{attr}' has wrong type "
+                    f"(expected {expected_type.__name__}, got {type(attrs[attr]).__name__})"
+                )
+
+        # Check optional attributes, if present, have correct type.
+        for attr, value in attrs.items():
+            if attr in optional and not isinstance(value, optional[attr]):
+                violations.append(
+                    f"entity '{entity}' attribute '{attr}' has wrong type "
+                    f"(expected {optional[attr].__name__}, got {type(value).__name__})"
+                )
+
+        # Closed-world: unknown attributes are violations.
+        for attr in attrs:
+            if attr not in allowed:
+                violations.append(
+                    f"entity '{entity}' has unknown attribute '{attr}' — "
+                    f"allowed: {sorted(allowed)}"
+                )
+
+    return violations
+
+
 def _extract_entities(text: str) -> List[str]:
     """Extract candidate entity tokens from user message text."""
     tokens = text.lower().split()

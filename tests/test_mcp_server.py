@@ -644,3 +644,68 @@ class TestKeywordUuid:
         import mcp_server
         result = mcp_server._keyword_uuid(":decision/redis")
         assert isinstance(result, str)
+
+
+class TestValidateFacts:
+    def test_valid_fact_no_violations(self):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description", "value": "use Redis"}]
+        assert mcp_server._validate_facts(facts) == []
+
+    def test_missing_required_attribute(self):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":rationale", "value": "fast"}]
+        violations = mcp_server._validate_facts(facts)
+        assert len(violations) == 1
+        assert ":description" in violations[0]
+
+    def test_unknown_entity_type_rejected(self):
+        import mcp_server
+        facts = [{"entity": ":service/auth", "entity_type": "service",
+                  "attribute": ":description", "value": "auth service"}]
+        violations = mcp_server._validate_facts(facts)
+        assert len(violations) == 1
+        assert "service" in violations[0]
+
+    def test_unknown_attribute_rejected(self):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description", "value": "use Redis"},
+                 {"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":unknown-attr", "value": "foo"}]
+        violations = mcp_server._validate_facts(facts)
+        assert len(violations) == 1
+        assert ":unknown-attr" in violations[0]
+
+    def test_wrong_value_type_rejected(self):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description", "value": 42}]
+        violations = mcp_server._validate_facts(facts)
+        assert len(violations) == 1
+
+    def test_valid_alias_passes(self):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description", "value": "use Redis"},
+                 {"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":alias", "value": "Redis-based cache"}]
+        assert mcp_server._validate_facts(facts) == []
+
+    def test_alias_wrong_type_rejected(self):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description", "value": "use Redis"},
+                 {"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":alias", "value": 99}]
+        violations = mcp_server._validate_facts(facts)
+        assert len(violations) == 1
+
+    def test_all_four_entity_types_accepted(self):
+        import mcp_server
+        for etype in ("decision", "preference", "constraint", "dependency"):
+            facts = [{"entity": f":{etype}/x", "entity_type": etype,
+                      "attribute": ":description", "value": "test"}]
+            assert mcp_server._validate_facts(facts) == [], f"Failed for {etype}"
