@@ -850,3 +850,57 @@ class TestVulcanTransactSchema:
         )
 
         assert result["ok"] is True
+
+
+class TestQueryCanonicalEntities:
+    def test_returns_empty_string_when_no_entities(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        result = mcp_server._query_canonical_entities()
+        assert result == ""
+
+    def test_formats_entities_as_lines(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":decision/redis", "use Redis"]]
+        })
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        result = mcp_server._query_canonical_entities()
+        assert ":decision/redis" in result
+        assert "use Redis" in result
+
+    def test_caps_at_50_entities(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[f":decision/item-{i}", f"item {i}"] for i in range(60)]
+        })
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        result = mcp_server._query_canonical_entities()
+        assert result.count(":decision/") == 50
+
+    def test_injected_into_llm_prompt(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setenv("VULCAN_LLM_MODEL", "claude-haiku-4-5-20251001")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":decision/redis", "use Redis"]]
+        })
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        captured_prompt = {}
+        def fake_call_llm(model, prompt):
+            captured_prompt["prompt"] = prompt
+            return "[]"
+
+        with patch("mcp_server._call_llm", side_effect=fake_call_llm):
+            mcp_server._llm_extract_and_transact("User: test\nAgent: ok")
+
+        assert ":decision/redis" in captured_prompt.get("prompt", "")
