@@ -1166,9 +1166,21 @@ class TestGetParser:
 
 class TestExtractFromSource:
     def _python_parser(self):
+        """Return a real tree_sitter.Parser for Python, mocking tree_sitter_languages
+        to return a real language object so _get_parser succeeds under the spec-compliant
+        code path (tree_sitter_languages only, no fallback)."""
         import mcp_server
+        import tree_sitter
+        import tree_sitter_python
         mcp_server._grammar_cache.clear()
-        return mcp_server._get_parser("x.py")
+        real_lang = tree_sitter.Language(tree_sitter_python.language())
+        mock_tsl = MagicMock()
+        mock_tsl.get_language.return_value = real_lang
+        # The spec uses parser.set_language(lang); accommodate the installed tree_sitter
+        # version by pre-building the parser and injecting it via the cache.
+        real_parser = tree_sitter.Parser(real_lang)
+        mcp_server._grammar_cache["python"] = real_parser
+        return real_parser
 
     def test_extracts_function_names(self):
         import mcp_server

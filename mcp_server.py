@@ -64,20 +64,6 @@ _EXT_TO_LANG: Dict[str, str] = {
 
 _grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
 
-# Mapping from lang_name to standalone tree-sitter grammar package name
-_LANG_TO_GRAMMAR_PKG: Dict[str, str] = {
-    "python": "tree_sitter_python",
-    "javascript": "tree_sitter_javascript",
-    "typescript": "tree_sitter_typescript",
-    "rust": "tree_sitter_rust",
-    "go": "tree_sitter_go",
-    "java": "tree_sitter_java",
-    "c": "tree_sitter_c",
-    "cpp": "tree_sitter_cpp",
-    "c_sharp": "tree_sitter_c_sharp",
-    "ruby": "tree_sitter_ruby",
-}
-
 
 def _get_parser(file_path: str) -> Optional[Any]:
     """Return a cached tree_sitter.Parser for the file's language, or None if unsupported."""
@@ -95,19 +81,7 @@ def _get_parser(file_path: str) -> Optional[Any]:
         parser.set_language(lang)
         _grammar_cache[lang_name] = parser
     except Exception:
-        # Fallback: try standalone grammar packages (tree-sitter >= 0.21 API)
-        try:
-            import importlib
-            import tree_sitter  # type: ignore
-            pkg_name = _LANG_TO_GRAMMAR_PKG.get(lang_name)
-            if pkg_name is None:
-                raise ImportError(f"No standalone grammar package for {lang_name}")
-            grammar_mod = importlib.import_module(pkg_name)
-            lang = tree_sitter.Language(grammar_mod.language())
-            parser = tree_sitter.Parser(lang)
-            _grammar_cache[lang_name] = parser
-        except Exception:
-            _grammar_cache[lang_name] = None
+        _grammar_cache[lang_name] = None
     return _grammar_cache[lang_name]
 
 # ---------------------------------------------------------------------------
