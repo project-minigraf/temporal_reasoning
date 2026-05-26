@@ -1212,8 +1212,8 @@ class TestExtractFromSource:
 
     def test_parse_error_returns_empty(self):
         import mcp_server
-        parser = self._python_parser()
-        result = mcp_server._extract_from_source(b"\x00\xff\xfe", parser, "bad.py")
+        # Passing None as parser triggers AttributeError → except block returns empty dict
+        result = mcp_server._extract_from_source(b"def foo(): pass", None, "x.py")
         assert result == {"functions": [], "classes": [], "imports": [], "calls": []}
 
 

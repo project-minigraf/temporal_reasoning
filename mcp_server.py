@@ -122,24 +122,28 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
 }
 
 
-def _extract_import_name(node, lang_name: str) -> Optional[str]:
-    """Extract the top-level module name from an import node."""
+def _extract_import_name(node, lang_name: str) -> List[str]:
+    """Extract top-level module names from an import node (may return multiple)."""
+    names: List[str] = []
     if lang_name == "python":
         if node.type == "import_from_statement":
             m = node.child_by_field_name("module_name")
-            return m.text.decode("utf-8").split(".")[0] if m else None
-        # import_statement: first named child is dotted_name or aliased_import
-        for child in node.named_children:
-            if child.type == "aliased_import":
-                n = child.child_by_field_name("name")
-                return n.text.decode("utf-8").split(".")[0] if n else None
-            if child.type == "dotted_name":
-                return child.text.decode("utf-8").split(".")[0]
+            if m:
+                names.append(m.text.decode("utf-8").split(".")[0])
+        else:
+            # import_statement: collect all top-level module names
+            for child in node.named_children:
+                if child.type == "aliased_import":
+                    n = child.child_by_field_name("name")
+                    if n:
+                        names.append(n.text.decode("utf-8").split(".")[0])
+                elif child.type == "dotted_name":
+                    names.append(child.text.decode("utf-8").split(".")[0])
     elif lang_name in ("javascript", "typescript"):
         src = node.child_by_field_name("source")
         if src:
-            return src.text.decode("utf-8").strip("'\"")
-    return None
+            names.append(src.text.decode("utf-8").strip("'\""))
+    return names
 
 
 def _extract_call_name(node, lang_name: str) -> Optional[str]:
@@ -167,9 +171,8 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
             results["classes"].append(name_node.text.decode("utf-8"))
 
     elif node.type in node_types.get("imports", set()):
-        name = _extract_import_name(node, lang_name)
-        if name:
-            results["imports"].append(name)
+        names = _extract_import_name(node, lang_name)
+        results["imports"].extend(names)
 
     elif node.type in node_types.get("calls", set()):
         name = _extract_call_name(node, lang_name)
