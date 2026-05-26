@@ -857,17 +857,15 @@ def _llm_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
         raw_facts = _strip_code_fences(_call_llm(model, prompt))
         if not raw_facts or raw_facts == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "llm"}
-        valid_at, datalog = _parse_valid_at_hint(raw_facts)
+        # Strip valid-at hint comments before parsing — the hint is noted but
+        # _transact_extracted_facts stamps each fact with the current time.
+        _valid_at, datalog = _parse_valid_at_hint(raw_facts)
         if not datalog or datalog == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "llm"}
-        _refresh_if_stale()
-        db = get_db()
-        db.execute(f'(transact {datalog} {{:valid-at "{valid_at}"}})')
-        db.checkpoint()
-        _update_mtime()
-        # Approximate: count "[:" occurrences as a proxy for triple count.
-        # Entity-reference values use ":foo" not "[:foo", so false positives are rare.
-        stored_count = datalog.count("[:")
+        # Route through _transact_extracted_facts so each fact gets schema
+        # validation and an :entity-type tag — same path as heuristic extraction.
+        parsed = _parse_transact_facts(datalog)
+        stored_count = _transact_extracted_facts(parsed)
         return {"ok": True, "stored_count": stored_count, "strategy": "llm"}
     except Exception as e:
         return {"ok": False, "error": str(e), "strategy": "llm"}
