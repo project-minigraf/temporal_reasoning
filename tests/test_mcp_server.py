@@ -1437,6 +1437,24 @@ class TestIngestionWrites:
         mcp_server._ingest_close(db, [], "2025-01-01T00:00:00Z", "2025-03-01T00:00:00Z", "r")
         db_instance.execute.assert_not_called()
 
+    def test_last_run_write_transacts_correct_fields(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        db_instance.execute.reset_mock()
+
+        mcp_server._last_run_write(db, "deadbeef", "2026-05-27T10:00:00Z")
+
+        call_args = db_instance.execute.call_args[0][0]
+        assert ":ingestion/last-run-at" in call_args
+        assert ":last-run-at" in call_args
+        assert "2026-05-27T10:00:00Z" in call_args
+        assert ":last-commit" in call_args
+        assert "deadbeef" in call_args
+        assert ":type/ingestion" in call_args
+        assert ":valid-from" not in call_args
+
 
 class TestRunIngestion:
     @pytest.mark.asyncio

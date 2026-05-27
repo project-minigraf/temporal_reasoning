@@ -631,6 +631,17 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
     )
 
 
+def _last_run_write(db: Any, commit_hash: str, run_at: str) -> None:
+    """Record the wall-clock time and final commit hash of the last ingestion run."""
+    db.execute(
+        f'(transact [[:ingestion/last-run-at :entity-type :type/ingestion] '
+        f'[:ingestion/last-run-at :ident ":ingestion/last-run-at"] '
+        f'[:ingestion/last-run-at :description "last ingestion run timestamp"] '
+        f'[:ingestion/last-run-at :last-run-at "{run_at}"] '
+        f'[:ingestion/last-run-at :last-commit "{commit_hash}"]])'
+    )
+
+
 # System attributes written by _transact_extracted_facts alongside domain attributes.
 # They are invisible to schema validation and filtered from attr_facts in vulcan_audit.
 _SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})
