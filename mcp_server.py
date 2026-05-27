@@ -1399,7 +1399,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         entity_valid_from: Dict[str, str] = {}
         file_entities: Dict[str, List[str]] = {}
 
+        last_hash = watermark or ""
+
         for commit_hash, commit_ts_iso, author, subject in commits:
+            last_hash = commit_hash
             _ingest_progress["current_commit"] = commit_hash
             reason = f"git:{commit_hash} {author}: {subject}"
 
@@ -1447,6 +1450,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
             _ingest_progress["processed"] += 1
             await asyncio.sleep(0)  # yield to event loop
+
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        db = get_db()
+        try:
+            _last_run_write(db, last_hash, now)
+            db.checkpoint()
+        finally:
+            _db = None
 
         _ingest_progress["status"] = "complete"
 

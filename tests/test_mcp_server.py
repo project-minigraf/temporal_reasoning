@@ -1455,6 +1455,51 @@ class TestIngestionWrites:
         assert ":type/ingestion" in call_args
         assert ":valid-from" not in call_args
 
+    def test_run_ingestion_writes_last_run_on_completion(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
+        monkeypatch.setattr(
+            mcp_server, "_git_commits",
+            lambda repo, watermark, branch: [("abc123", "2025-01-01T00:00:00Z", "author", "msg")]
+        )
+        monkeypatch.setattr(mcp_server, "_git_changed_files", lambda repo, commit: [])
+        monkeypatch.setattr(mcp_server, "_watermark_update", lambda db, h, ts, r: None)
+
+        last_run_calls = []
+        monkeypatch.setattr(
+            mcp_server, "_last_run_write",
+            lambda db, h, t: last_run_calls.append((h, t))
+        )
+
+        asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
+
+        assert len(last_run_calls) == 1
+        assert last_run_calls[0][0] == "abc123"
+        assert last_run_calls[0][1].endswith("Z")
+
+    def test_run_ingestion_writes_last_run_when_no_commits(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: "abc123")
+        monkeypatch.setattr(mcp_server, "_git_commits", lambda repo, watermark, branch: [])
+
+        last_run_calls = []
+        monkeypatch.setattr(
+            mcp_server, "_last_run_write",
+            lambda db, h, t: last_run_calls.append((h, t))
+        )
+
+        asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
+
+        assert len(last_run_calls) == 1
+        assert last_run_calls[0][0] == "abc123"
+        assert last_run_calls[0][1].endswith("Z")
+
 
 class TestRunIngestion:
     @pytest.mark.asyncio
