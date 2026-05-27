@@ -182,7 +182,8 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 | `VULCAN_EXTRACTION_STRATEGY` | `heuristic` | Finalize strategy: `heuristic`, `llm`, or `agent` |
 | `VULCAN_PREPARE_SCAN_LIMIT` | `50` | Max rows returned by the broad fallback scan in the prepare phase |
 | `VULCAN_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model used when `VULCAN_EXTRACTION_STRATEGY=llm` |
-| `ANTHROPIC_API_KEY` | — | Required when `VULCAN_EXTRACTION_STRATEGY=llm` |
+| `ANTHROPIC_API_KEY` | — | Required when `VULCAN_EXTRACTION_STRATEGY=llm` and using a Claude model |
+| `OPENAI_API_KEY` | — | Required when `VULCAN_EXTRACTION_STRATEGY=llm` and `VULCAN_LLM_MODEL` is an OpenAI model (e.g. `gpt-4o-mini`) |
 | `MINIGRAF_GRAPH_PATH` | `memory.graph` | Override the graph file location |
 
 ## Files
@@ -199,8 +200,6 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 | `install.py` | Setup script |
 | `pyproject.toml` | Python packaging |
 | `tools/*.json` | Tool schemas |
-| `prompts/*.txt` | Behavioral prompts |
-| `tests/test_harness.py` | Validation tests |
 
 ## Tools
 
@@ -210,8 +209,9 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 - **vulcan_report_issue** — File GitHub issues
 - **memory_prepare_turn** — Retrieve relevant context for the current user message
 - **memory_finalize_turn** — Extract and store memorable facts after a turn
+- **vulcan_audit** — Audit all entities against the schema; retracts violators (history preserved)
 - **vulcan_ingest_git** — Ingest code structure from git history into the bi-temporal graph (background task)
-- **vulcan_ingest_status** — Poll progress of a running git ingestion
+- **vulcan_ingest_status** — Poll progress of a running git ingestion; reports wall-clock time and final commit hash of the last completed run (including hook-driven ingestion)
 
 ## Query Examples
 
@@ -239,52 +239,6 @@ query("[:find ?reason :where [:decision/asyncio-choice :motivated-by ?c] [?c :de
 # Typed entity query — list all stored components
 query("[:find ?name :where [?e :entity-type :type/component] [?e :name ?name]]")
 ```
-
-## Cross-Session Evaluation
-
-The repository includes a deterministic evaluation showing that persisted memory
-changes behavior in a later session without restating the original context.
-
-Run:
-
-```bash
-pytest tests/test_harness.py -q
-```
-
-Success means the harness demonstrates all of the following against the same
-graph file:
-- A decision is stored in an earlier session.
-- A later session answers a cache-strategy question using that persisted
-  decision.
-- A later session derives an action-oriented plan from the same persisted
-  decision.
-
-This evaluation is intentionally local and deterministic. It does not depend on
-live model output, so it is suitable as repeatable evidence for the skill's
-cross-session usefulness claim.
-
-## Usefulness Benchmarks
-
-The harness also reports two explicit benchmark-style metrics so usefulness
-claims are tied to measurable output rather than broad narrative assertions.
-
-- Behavior consistency:
-  verifies that persisted memory drives both a later answer and a later
-  action-oriented plan toward the same stored decision.
-- Prompt compression proxy:
-  compares a short prompt that relies on memory recall with a longer prompt
-  that repeats the same decision context inline.
-
-Run:
-
-```bash
-python tests/test_harness.py
-```
-
-The prompt-compression metric uses a simple whitespace word count as a stable
-local proxy for prompt size. It does not claim model-token exactness; it only
-shows that recalling stored context can reduce repeated prompt text in a later
-session.
 
 ## Skill Benchmarks
 

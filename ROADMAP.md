@@ -25,7 +25,7 @@
 | Heuristic extraction | Regex-based signal detection; zero API calls; no configuration required | Complete ✓ |
 | LLM extraction | Claude Haiku extracts facts; falls back to agent strategy on API failure | Complete ✓ |
 | Agent extraction | MCP sampling requests a memory block from the connected agent | Complete ✓ |
-| Bi-temporal writes | `:valid-at` recorded on every write; point-in-time queries correct | Complete ✓ |
+| Bi-temporal writes | `:valid-from` recorded on every write; point-in-time queries via `:valid-at` correct | Complete ✓ |
 
 ## Phase 3 — Finish Line (Complete ✓)
 
