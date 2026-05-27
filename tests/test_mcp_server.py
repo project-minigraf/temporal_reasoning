@@ -1221,6 +1221,8 @@ class TestExtractFromSource:
 
 class TestVulcanIngestStatus:
     def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
@@ -1231,19 +1233,40 @@ class TestVulcanIngestStatus:
         assert result["ok"] is True
         assert result["status"] == "idle"
         assert result["processed"] == 0
+        assert result["last_run_at"] is None
+        assert result["last_commit"] is None
 
-    def test_returns_running_status(self, mock_minigraf_db, tmp_path):
+    def test_returns_last_run_at_from_graph(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        db_instance.execute.return_value = json.dumps({
+            "results": [["2026-05-27T10:00:00Z", "deadbeef"]]
+        })
+        result = mcp_server.handle_vulcan_ingest_status()
+        assert result["last_run_at"] == "2026-05-27T10:00:00Z"
+        assert result["last_commit"] == "deadbeef"
+
+    def test_running_status_skips_graph_query(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "running", "processed": 3, "total": 10,
             "current_commit": "abc123", "error": None,
         }
+        db_instance.execute.reset_mock()
         result = mcp_server.handle_vulcan_ingest_status()
         assert result["status"] == "running"
         assert result["processed"] == 3
         assert result["total"] == 10
         assert result["current_commit"] == "abc123"
+        # Must not query the graph while running
+        db_instance.execute.assert_not_called()
 
 
 class TestCodeIdent:

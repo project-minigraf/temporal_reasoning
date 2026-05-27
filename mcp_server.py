@@ -1463,8 +1463,27 @@ async def handle_vulcan_ingest_git(
 
 
 def handle_vulcan_ingest_status() -> Dict[str, Any]:
-    """Return current ingestion progress."""
-    return {"ok": True, **_ingest_progress}
+    """Return current ingestion progress, augmented with graph-backed last-run info."""
+    result: Dict[str, Any] = {"ok": True, **_ingest_progress}
+    if _ingest_progress["status"] != "running":
+        try:
+            db = get_db()
+            raw = db.execute(
+                "(query [:find ?t ?h :any-valid-time "
+                ":where [:ingestion/last-run-at :last-run-at ?t] "
+                "[:ingestion/last-run-at :last-commit ?h]])"
+            )
+            rows = json.loads(raw).get("results", [])
+            if rows:
+                result["last_run_at"] = rows[0][0]
+                result["last_commit"] = rows[0][1]
+            else:
+                result["last_run_at"] = None
+                result["last_commit"] = None
+        except Exception:
+            result["last_run_at"] = None
+            result["last_commit"] = None
+    return result
 
 
 # ---------------------------------------------------------------------------
