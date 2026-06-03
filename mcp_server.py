@@ -147,6 +147,66 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
 }
 
 
+def _rust_use_root(node) -> Optional[str]:
+    """Return the root crate/module name from a Rust use_declaration node.
+
+    Rust use paths have these shapes in the tree-sitter AST:
+      use_declaration
+        scoped_identifier          → std::collections::HashMap
+        scoped_use_list            → crate::storage::{mod1, mod2}
+        identifier                 → use foo;
+        use_as_clause              → use foo as bar;
+
+    We always want the leftmost identifier in the path, which is the crate name
+    (e.g. "std", "tokio") or "crate"/"super"/"self" for intra-project paths.
+    For crate-relative paths we return the first path segment after "crate" so
+    the edge points to the local module, not the generic keyword "crate".
+    """
+    def leftmost_ident(n) -> Optional[str]:
+        """Recursively find the leftmost identifier/keyword in a path node."""
+        if n.type == "identifier":
+            return n.text.decode("utf-8")
+        if n.type in ("crate", "super", "self"):
+            # intra-project: find first real identifier among siblings/children
+            return None  # caller will try the next path segment
+        # scoped_identifier / scoped_use_list: path is in named children
+        for child in n.named_children:
+            result = leftmost_ident(child)
+            if result is not None:
+                return result
+        return None
+
+    def root_from_path(n) -> Optional[str]:
+        """Extract root module name from a path-like node."""
+        if n.type == "identifier":
+            return n.text.decode("utf-8")
+        if n.type in ("crate", "super", "self"):
+            return None  # skip; caller handles intra-project
+        if n.type in ("scoped_identifier", "scoped_use_list"):
+            children = n.named_children
+            if not children:
+                return None
+            first = children[0]
+            if first.type in ("crate", "super", "self"):
+                # intra-project: return the next segment
+                if len(children) > 1:
+                    seg = children[1]
+                    if seg.type == "identifier":
+                        return seg.text.decode("utf-8")
+                return None
+            return root_from_path(first)
+        if n.type == "use_as_clause":
+            path_node = n.child_by_field_name("path")
+            return root_from_path(path_node) if path_node else None
+        return None
+
+    for child in node.named_children:
+        result = root_from_path(child)
+        if result:
+            return result
+    return None
+
+
 def _extract_import_name(node, lang_name: str) -> List[str]:
     """Extract top-level module names from an import node (may return multiple)."""
     names: List[str] = []
@@ -168,6 +228,10 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         src = node.child_by_field_name("source")
         if src:
             names.append(src.text.decode("utf-8").strip("'\""))
+    elif lang_name == "rust":
+        name = _rust_use_root(node)
+        if name:
+            names.append(name)
     return names
 
 
@@ -524,6 +588,37 @@ def _canonical_ident(entity_type: str, value: str) -> str:
     slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
     slug = re.sub(r"-+", "-", slug).strip("-")
     return f":{entity_type}/{slug}"
+
+
+def _resolve_module_import(import_name: str, file_entities: Dict[str, List[str]]) -> str:
+    """Resolve an import name to a module ident that joins with stored module entities.
+
+    For a name like "storage", tries standard Rust source-root locations first
+    (src/storage.rs, src/storage/mod.rs) before falling back to a broader name
+    search. The ordered-priority approach prevents e.g. src/graph/storage.rs
+    from matching a top-level `use crate::storage` import.
+
+    Falls back to _canonical_ident for external crate names (std, tokio, …)
+    so they still get an edge even though they have no :path attribute.
+    """
+    # Priority 1: canonical Rust module root paths under common source roots
+    for src_root in ("src", "lib", ""):
+        prefix = f"{src_root}/" if src_root else ""
+        candidate_file = f"{prefix}{import_name}.rs"
+        candidate_mod = f"{prefix}{import_name}/mod.rs"
+        if candidate_file in file_entities:
+            return _code_ident("module", candidate_file)
+        if candidate_mod in file_entities:
+            return _code_ident("module", candidate_mod)
+
+    # Priority 2: broader search — only match files directly under a src root
+    # (parent.parent is the source root, not a nested subdir)
+    for file_path in file_entities:
+        p = Path(file_path)
+        if p.stem == "mod" and p.parent.name == import_name:
+            return _code_ident("module", file_path)
+
+    return _canonical_ident("module", import_name)
 
 
 def _code_ident(entity_type: str, file_path: str, name: Optional[str] = None) -> str:
@@ -1378,10 +1473,14 @@ def _build_code_triples(
     """Return Datalog triple strings for a file's extracted code entities.
 
     Stable attributes (:entity-type, :ident, :description, :path/:file,
-    :introduced-by, :contains, :depends-on, :calls) are written ONCE on first
-    introduction. On subsequent modifications only a :modified-in edge is added.
-    This prevents bi-temporal fact explosion from N re-assertions of the same
-    attribute joining into N² result rows.
+    :introduced-by, :contains) are written ONCE on first introduction. On
+    subsequent modifications only a :modified-in edge is added. This prevents
+    bi-temporal fact explosion from N re-assertions of the same attribute
+    joining into N² result rows.
+
+    :depends-on and :calls edges are NOT written here — they reflect current
+    state rather than a single historical moment and are written by
+    _ingest_deps_from_head() as a snapshot from HEAD after the commit walk.
     """
     triples: List[str] = []
     module_ident = _code_ident("module", file_path)
@@ -1403,13 +1502,8 @@ def _build_code_triples(
             idents_for_file.append(module_ident)
         entity_valid_from[module_ident] = commit_ts_iso
 
-        # Dependency/call edges — only written at introduction
-        for import_name in set(extracted["imports"]):
-            dep_ident = _canonical_ident("module", import_name)
-            triples.append(f"[{module_ident} :depends-on {dep_ident}]")
-        for call_name in set(extracted["calls"]):
-            callee_ident = _canonical_ident("function", call_name)
-            triples.append(f"[{module_ident} :calls {callee_ident}]")
+        # :depends-on and :calls are written by _ingest_deps_from_head() after
+        # the commit walk so they reflect HEAD state, not introduction-time state.
     else:
         # Existing module: only record that this commit modified it
         triples.append(f"[{module_ident} :modified-in {commit_ident}]")
@@ -1449,15 +1543,94 @@ def _build_code_triples(
     return triples
 
 
-def _preload_known_entities(db: Any) -> tuple:
-    """Load all existing module/function/class idents from the DB.
+def _ingest_deps_from_head(
+    db: Any,
+    repo_path: str,
+    file_entities: Dict[str, List[str]],
+    run_ts_iso: str,
+) -> None:
+    """Write :depends-on edges for all known modules from their current HEAD content.
 
-    Returns (entity_valid_from, file_entities) pre-populated so that
-    incremental ingestion runs don't re-write stable attributes for entities
-    that were already stored in a previous run.
+    Called once after the commit walk completes. Reading from HEAD gives
+    accurate current deps without the bi-temporal explosion that would result
+    from re-writing deps on every modification commit. Existing :depends-on
+    facts are retracted first so this is idempotent across incremental runs.
+    Each module's deps are transacted separately so a single bad file doesn't
+    abort the entire pass.
+    """
+    # Retract all existing :depends-on facts upfront (best-effort)
+    try:
+        raw = db.execute('(query [:find ?e ?d :where [?e :depends-on ?d]])')
+        existing = json.loads(raw).get("results", [])
+        if existing:
+            rt_parts = []
+            for e, d in existing:
+                if isinstance(d, str) and d.startswith(":"):
+                    rt_parts.append(f'[#uuid "{e}" :depends-on {d}]')
+                elif isinstance(d, str):
+                    rt_parts.append(f'[#uuid "{e}" :depends-on "{_edn_escape(d)}"]')
+            if rt_parts:
+                db.execute(f"(retract [{' '.join(rt_parts)}])")
+    except Exception:
+        pass
+
+    snap_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for file_path in sorted(file_entities.keys()):
+        parser = _get_parser(file_path)
+        if parser is None:
+            continue
+        module_ident = _code_ident("module", file_path)
+        full_path = Path(repo_path) / file_path
+        if not full_path.exists():
+            continue  # file removed from HEAD; no current deps to write
+        try:
+            content = full_path.read_bytes()
+        except OSError:
+            continue
+        extracted = _extract_from_source(content, parser, file_path)
+        dep_idents = set()
+        for name in set(extracted["imports"]):
+            dep_ident = _resolve_module_import(name, file_entities)
+            if dep_ident != module_ident:  # skip self-dependencies
+                dep_idents.add(dep_ident)
+        if not dep_idents:
+            continue
+        # Transact each dep individually — Minigraf's EAVT/AEVT pending indexes
+        # lack value bytes in the key, so batching multiple facts for the same
+        # (entity, attribute) in one transact causes index collisions that silently
+        # discard all but one dep.  One transact per dep guarantees unique tx_count.
+        for dep in dep_idents:
+            try:
+                db.execute(f'(transact [[{module_ident} :depends-on {dep}]] {{:valid-from "{snap_ts}"}})')
+            except Exception:
+                pass  # non-fatal; best-effort per dep
+
+
+def _preload_known_entities(db: Any, repo_path: str) -> tuple:
+    """Load all existing module/function/class idents from the DB, and pre-seed
+    file_entities with all currently tracked files in the repo.
+
+    Pre-seeding from `git ls-files` ensures that _resolve_module_import can
+    find any module file even when processing early commits — before those files
+    have been introduced in the chronological commit walk.
+
+    Returns (entity_valid_from, file_entities).
     """
     entity_valid_from: Dict[str, str] = {}
     file_entities: Dict[str, List[str]] = {}
+
+    # Pre-seed file_entities with all files currently in the repo
+    try:
+        result = _subprocess.run(
+            ["git", "ls-files", "--full-name"],
+            cwd=repo_path, capture_output=True, text=True, timeout=30,
+        )
+        for filepath in result.stdout.strip().splitlines():
+            if Path(filepath).suffix.lower() in _EXT_TO_LANG:
+                file_entities.setdefault(filepath, [])
+    except Exception:
+        pass
 
     for entity_type in ("module", "function", "class"):
         try:
@@ -1486,7 +1659,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # Read watermark and pre-load known entities before releasing DB
         db = get_db()
         watermark = _watermark_query(db)
-        entity_valid_from, file_entities = _preload_known_entities(db)
+        entity_valid_from, file_entities = _preload_known_entities(db, repo_path)
         _db = None  # release file lock while enumerating commits
 
         commits = _git_commits(repo_path, watermark, branch)
@@ -1543,7 +1716,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         )
                         add_triples.extend(triples)
 
-                _ingest_transact(db, add_triples, commit_ts_iso, reason)
+                # Split :contains triples out before batching.  Minigraf's EAVT
+                # pending index lacks value bytes in the key, so batching multiple
+                # [module :contains fn] facts in one transact silently drops all
+                # but the last.  Each :contains triple gets its own transact so
+                # they receive distinct tx_counts and avoid the index collision.
+                contains_triples = [t for t in add_triples if ":contains" in t]
+                other_triples = [t for t in add_triples if ":contains" not in t]
+                _ingest_transact(db, other_triples, commit_ts_iso, reason)
+                for ct in contains_triples:
+                    _ingest_transact(db, [ct], commit_ts_iso, reason)
                 for close_triples, orig_ts in close_items:
                     _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason)
                 _watermark_update(db, commit_hash, commit_ts_iso, reason)
@@ -1558,6 +1740,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         db = get_db()
         try:
+            _ingest_deps_from_head(db, repo_path, file_entities, now)
             _last_run_write(db, last_hash, now)
             db.checkpoint()
         finally:
