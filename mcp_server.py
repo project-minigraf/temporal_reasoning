@@ -67,23 +67,47 @@ _grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
 
 
 def _get_parser(file_path: str) -> Optional[Any]:
-    """Return a cached tree_sitter.Parser for the file's language, or None if unsupported."""
+    """Return a cached tree_sitter.Parser for the file's language, or None if unsupported.
+
+    Tries two backends in order:
+    1. tree_sitter_languages (bundled, requires Python <=3.12)
+    2. Individual tree-sitter-<lang> packages (e.g. tree-sitter-rust, tree-sitter-python)
+       — compatible with Python 3.13+ and tree-sitter >=0.22
+    """
     ext = Path(file_path).suffix.lower()
     lang_name = _EXT_TO_LANG.get(ext)
     if not lang_name:
         return None
     if lang_name in _grammar_cache:
         return _grammar_cache[lang_name]
+
+    parser = None
+
+    # Attempt 1: tree_sitter_languages (bundled grammars, old-style API)
     try:
         import tree_sitter_languages  # type: ignore
         import tree_sitter            # type: ignore
         lang = tree_sitter_languages.get_language(lang_name)
-        parser = tree_sitter.Parser()
-        parser.set_language(lang)
-        _grammar_cache[lang_name] = parser
+        p = tree_sitter.Parser()
+        p.set_language(lang)
+        parser = p
     except Exception:
-        _grammar_cache[lang_name] = None
-    return _grammar_cache[lang_name]
+        pass
+
+    # Attempt 2: individual tree-sitter-<lang> packages (new-style API, Python 3.13+)
+    if parser is None:
+        pkg_name = lang_name.replace("_", "-")  # c_sharp → c-sharp
+        try:
+            mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
+            from tree_sitter import Language, Parser  # type: ignore
+            lang_obj = Language(mod.language())
+            parser = Parser(lang_obj)
+        except Exception:
+            # Try with hyphenated module name variant (e.g. tree_sitter_c_sharp)
+            pass
+
+    _grammar_cache[lang_name] = parser
+    return parser
 
 # ---------------------------------------------------------------------------
 # AST extraction
@@ -566,6 +590,11 @@ def _git_changed_files(repo_path: str, commit_hash: str) -> List[tuple]:
     return changes
 
 
+def _edn_escape(s: str) -> str:
+    """Escape a string for embedding in an EDN double-quoted literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes:
     """Return raw bytes of a file at the given commit."""
     result = _subprocess.run(
@@ -665,19 +694,35 @@ VULCAN_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
     },
     "module": {
         "required": {":description": str},
-        "optional": {":path": str, ":alias": str},
+        "optional": {
+            ":path": str, ":alias": str,
+            # graph edges (keyword-valued, stored as strings)
+            ":contains": str, ":depends-on": str, ":calls": str,
+            # commit cross-references
+            ":introduced-by": str, ":modified-in": str,
+        },
     },
     "function": {
         "required": {":description": str},
-        "optional": {":file": str, ":alias": str},
+        "optional": {
+            ":file": str, ":alias": str,
+            ":introduced-by": str, ":modified-in": str,
+        },
     },
     "class": {
         "required": {":description": str},
-        "optional": {":file": str, ":alias": str},
+        "optional": {
+            ":file": str, ":alias": str,
+            ":introduced-by": str, ":modified-in": str,
+        },
     },
     "ingestion": {
         "required": {":description": str},
-        "optional": {":hash": str, ":alias": str},
+        "optional": {":hash": str, ":alias": str, ":last-run-at": str, ":last-commit": str},
+    },
+    "commit": {
+        "required": {":description": str},
+        "optional": {":hash": str, ":author": str, ":subject": str, ":date": str, ":alias": str},
     },
 }
 
@@ -1328,76 +1373,125 @@ def _build_code_triples(
     commit_ts_iso: str,
     entity_valid_from: Dict[str, str],
     file_entities: Dict[str, List[str]],
+    commit_ident: str,
 ) -> List[str]:
-    """Return Datalog triple strings for a file's extracted code entities."""
+    """Return Datalog triple strings for a file's extracted code entities.
+
+    Stable attributes (:entity-type, :ident, :description, :path/:file,
+    :introduced-by, :contains, :depends-on, :calls) are written ONCE on first
+    introduction. On subsequent modifications only a :modified-in edge is added.
+    This prevents bi-temporal fact explosion from N re-assertions of the same
+    attribute joining into N² result rows.
+    """
     triples: List[str] = []
     module_ident = _code_ident("module", file_path)
 
-    triples += [
-        f"[{module_ident} :entity-type :type/module]",
-        f'[{module_ident} :ident "{module_ident}"]',
-        f'[{module_ident} :description "{file_path}"]',
-        f'[{module_ident} :path "{file_path}"]',
-    ]
+    is_new_module = module_ident not in entity_valid_from
     # Track all idents for this file (for deletion cleanup)
     idents_for_file = file_entities.setdefault(file_path, [])
-    if module_ident not in idents_for_file:
-        idents_for_file.append(module_ident)
-    entity_valid_from.setdefault(module_ident, commit_ts_iso)
+
+    if is_new_module:
+        # Write all stable attributes once, at introduction time
+        triples += [
+            f"[{module_ident} :entity-type :type/module]",
+            f'[{module_ident} :ident "{module_ident}"]',
+            f'[{module_ident} :description "{_edn_escape(file_path)}"]',
+            f'[{module_ident} :path "{_edn_escape(file_path)}"]',
+            f"[{module_ident} :introduced-by {commit_ident}]",
+        ]
+        if module_ident not in idents_for_file:
+            idents_for_file.append(module_ident)
+        entity_valid_from[module_ident] = commit_ts_iso
+
+        # Dependency/call edges — only written at introduction
+        for import_name in set(extracted["imports"]):
+            dep_ident = _canonical_ident("module", import_name)
+            triples.append(f"[{module_ident} :depends-on {dep_ident}]")
+        for call_name in set(extracted["calls"]):
+            callee_ident = _canonical_ident("function", call_name)
+            triples.append(f"[{module_ident} :calls {callee_ident}]")
+    else:
+        # Existing module: only record that this commit modified it
+        triples.append(f"[{module_ident} :modified-in {commit_ident}]")
 
     for fn_name in extracted["functions"]:
         fn_ident = _code_ident("function", file_path, fn_name)
-        triples += [
-            f"[{fn_ident} :entity-type :type/function]",
-            f'[{fn_ident} :ident "{fn_ident}"]',
-            f'[{fn_ident} :description "{fn_name}"]',
-            f'[{fn_ident} :file "{file_path}"]',
-            f"[{module_ident} :contains {fn_ident}]",
-        ]
-        if fn_ident not in idents_for_file:
-            idents_for_file.append(fn_ident)
-        entity_valid_from.setdefault(fn_ident, commit_ts_iso)
+        if fn_ident not in entity_valid_from:
+            # New function: write all stable attributes once
+            triples += [
+                f"[{fn_ident} :entity-type :type/function]",
+                f'[{fn_ident} :ident "{fn_ident}"]',
+                f'[{fn_ident} :description "{_edn_escape(fn_name)}"]',
+                f'[{fn_ident} :file "{_edn_escape(file_path)}"]',
+                f"[{module_ident} :contains {fn_ident}]",
+                f"[{fn_ident} :introduced-by {commit_ident}]",
+            ]
+            if fn_ident not in idents_for_file:
+                idents_for_file.append(fn_ident)
+            entity_valid_from[fn_ident] = commit_ts_iso
 
     for cls_name in extracted["classes"]:
         cls_ident = _code_ident("class", file_path, cls_name)
-        triples += [
-            f"[{cls_ident} :entity-type :type/class]",
-            f'[{cls_ident} :ident "{cls_ident}"]',
-            f'[{cls_ident} :description "{cls_name}"]',
-            f'[{cls_ident} :file "{file_path}"]',
-            f"[{module_ident} :contains {cls_ident}]",
-        ]
-        if cls_ident not in idents_for_file:
-            idents_for_file.append(cls_ident)
-        entity_valid_from.setdefault(cls_ident, commit_ts_iso)
-
-    for import_name in set(extracted["imports"]):
-        dep_ident = _canonical_ident("module", import_name)
-        triples.append(f"[{module_ident} :depends-on {dep_ident}]")
-
-    for call_name in set(extracted["calls"]):
-        callee_ident = _canonical_ident("function", call_name)
-        triples.append(f"[{module_ident} :calls {callee_ident}]")
+        if cls_ident not in entity_valid_from:
+            # New class: write all stable attributes once
+            triples += [
+                f"[{cls_ident} :entity-type :type/class]",
+                f'[{cls_ident} :ident "{cls_ident}"]',
+                f'[{cls_ident} :description "{_edn_escape(cls_name)}"]',
+                f'[{cls_ident} :file "{_edn_escape(file_path)}"]',
+                f"[{module_ident} :contains {cls_ident}]",
+                f"[{cls_ident} :introduced-by {commit_ident}]",
+            ]
+            if cls_ident not in idents_for_file:
+                idents_for_file.append(cls_ident)
+            entity_valid_from[cls_ident] = commit_ts_iso
 
     return triples
+
+
+def _preload_known_entities(db: Any) -> tuple:
+    """Load all existing module/function/class idents from the DB.
+
+    Returns (entity_valid_from, file_entities) pre-populated so that
+    incremental ingestion runs don't re-write stable attributes for entities
+    that were already stored in a previous run.
+    """
+    entity_valid_from: Dict[str, str] = {}
+    file_entities: Dict[str, List[str]] = {}
+
+    for entity_type in ("module", "function", "class"):
+        try:
+            raw = db.execute(
+                f'(query [:find ?ident ?path '
+                f':where [?e :entity-type :type/{entity_type}] '
+                f'[?e :ident ?ident] '
+                f'[?e :{"path" if entity_type == "module" else "file"} ?path]])'
+            )
+            rows = json.loads(raw).get("results", [])
+            for ident, path in rows:
+                entity_valid_from[ident] = ""  # timestamp unknown, but entity exists
+                file_entities.setdefault(path, [])
+                if ident not in file_entities[path]:
+                    file_entities[path].append(ident)
+        except Exception:
+            pass
+
+    return entity_valid_from, file_entities
 
 
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure."""
     global _db, _ingest_progress
     try:
-        # Read watermark before releasing DB
+        # Read watermark and pre-load known entities before releasing DB
         db = get_db()
         watermark = _watermark_query(db)
+        entity_valid_from, file_entities = _preload_known_entities(db)
         _db = None  # release file lock while enumerating commits
 
         commits = _git_commits(repo_path, watermark, branch)
         _ingest_progress["total"] = len(commits)
         _ingest_progress["status"] = "running"
-
-        # Track valid-from timestamps for entities seen this session
-        entity_valid_from: Dict[str, str] = {}
-        file_entities: Dict[str, List[str]] = {}
 
         last_hash = watermark or ""
 
@@ -1406,19 +1500,28 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             _ingest_progress["current_commit"] = commit_hash
             reason = f"git:{commit_hash} {author}: {subject}"
 
+            # Build commit entity ident from first 12 chars of hash
+            commit_ident = f":commit/{commit_hash[:12]}"
+
             # Acquire DB fresh each commit — never hold across yield
             db = get_db()
             try:
                 changed = _git_changed_files(repo_path, commit_hash)
-                add_triples: List[str] = []
+                add_triples: List[str] = [
+                    f"[{commit_ident} :entity-type :type/commit]",
+                    f'[{commit_ident} :ident "{commit_ident}"]',
+                    f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
+                    f'[{commit_ident} :hash "{commit_hash}"]',
+                    f'[{commit_ident} :author "{_edn_escape(author)}"]',
+                    f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
+                    f'[{commit_ident} :date "{commit_ts_iso}"]',
+                ]
                 close_items: List[tuple] = []  # (triples, original_ts_iso)
 
                 for status, file_path in changed:
                     parser = _get_parser(file_path)
                     if parser is None:
                         continue
-
-                    module_ident = _code_ident("module", file_path)
 
                     if status == "D":
                         # Close module and all known child entities for this file
@@ -1435,7 +1538,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             continue
                         extracted = _extract_from_source(content, parser, file_path)
                         triples = _build_code_triples(
-                            file_path, extracted, commit_ts_iso, entity_valid_from, file_entities
+                            file_path, extracted, commit_ts_iso, entity_valid_from,
+                            file_entities, commit_ident,
                         )
                         add_triples.extend(triples)
 

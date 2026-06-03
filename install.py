@@ -75,6 +75,55 @@ def check_mcp_package():
         return False
 
 
+def check_tree_sitter_languages_package():
+    """Verify tree-sitter grammar support, installing packages if absent.
+
+    Required for git ingestion to extract code structure (functions, classes,
+    imports) from source files. Without it, ingestion runs silently but stores
+    no code entities.
+
+    Tries two options:
+    - tree-sitter-languages (bundled, Python <=3.12 only)
+    - Individual packages tree-sitter + tree-sitter-rust/python/javascript/...
+      (Python 3.13+ compatible, requires tree-sitter >=0.22)
+    """
+    try:
+        import tree_sitter_languages  # noqa: F401
+        print("✓ tree_sitter_languages package found")
+        return True
+    except ImportError:
+        pass
+
+    # Try installing tree-sitter-languages (works for Python <=3.12)
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "tree-sitter-languages"],
+        timeout=300,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        print("✓ tree_sitter_languages installed")
+        return True
+
+    # Fallback: install individual language packages (Python 3.13+)
+    print("  tree-sitter-languages unavailable (Python 3.13+?) — installing individual packages...")
+    individual = [
+        "tree-sitter>=0.22.0",
+        "tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript",
+        "tree-sitter-typescript", "tree-sitter-go", "tree-sitter-java",
+        "tree-sitter-c", "tree-sitter-cpp",
+    ]
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install"] + individual,
+        timeout=300,
+    )
+    if result.returncode == 0:
+        print("✓ Individual tree-sitter language packages installed")
+        return True
+
+    print("✗ Could not install tree-sitter grammar support — code ingestion will be disabled")
+    return False
+
+
 def check_mcp_server_importable():
     """Verify mcp_server module can be imported."""
     try:
@@ -385,6 +434,7 @@ def main(target_dir: str = "") -> None:
         ("Python version", check_python_version),
         ("minigraf package", check_minigraf_package),
         ("mcp package", check_mcp_package),
+        ("tree_sitter_languages package", check_tree_sitter_languages_package),
         ("MCP server", check_mcp_server_importable),
     ]
 
