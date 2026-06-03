@@ -1,3 +1,8 @@
+---
+name: temporal-reasoning
+description: Use when persisting decisions, preferences, or architectural facts across coding sessions, or querying what was previously decided, built, or constrained in this project.
+---
+
 # Temporal Reasoning
 
 Perfect memory. Exact reasoning. Complete history.
@@ -226,6 +231,22 @@ retract("[[:project/old-service :name \"obsolete\"]]",
         reason="Service decommissioned")
 ```
 
+### vulcan_rule
+
+Register a Datalog rule for the current server session. Rules enable recursive graph traversal and edge-type aliasing. Re-register after server restart (or add to `SESSION_RULES` in `mcp_server.py` for permanence).
+
+```python
+# Base case (register first)
+vulcan_rule("[(ancestor ?a ?d) [?a :parent ?d]]")
+# Recursive case
+vulcan_rule("[(ancestor ?a ?d) [?a :parent ?m] (ancestor ?m ?d)]")
+
+# Now query using the rule
+vulcan_query("[:find ?anc :where (ancestor :commit/abc123def456 ?anc) [?anc :subject ?s]]")
+```
+
+Returns `{"ok": true, "rule": "..."}` on success, or `{"ok": false, "error": "..."}` if the rule has a syntax error or creates a negative cycle.
+
 ### vulcan_ingest_git
 
 Start background ingestion of code structure from git history into the bi-temporal graph. Returns immediately — ingestion runs as an asyncio background task.
@@ -302,21 +323,31 @@ Cross-layer queries joining code structure with agent decisions:
 - `(not [?e :attr val])` — exclude matches
 - `(not-join [?e] [?e :attr ?x])` — existential negation
 
-### Rules (edge-type aliasing)
-Rules apply base-case matches and are useful for unifying multiple edge types
-under one name. **Recursive rule clauses are not evaluated** — use explicit
-multi-hop joins for fixed-depth traversal instead.
+### Rules and recursive traversal
+Register rules with `vulcan_rule` before querying. Rules support full recursion via semi-naive fixed-point evaluation — cycles are handled safely.
 
+```datalog
+; Base case — register first
+(rule [(ancestor ?a ?d) [?a :parent ?d]])
+; Recursive case — register second
+(rule [(ancestor ?a ?d) [?a :parent ?m] (ancestor ?m ?d)])
+
+; Now use in a query
+[:find ?anc :where (ancestor :commit/abc123 ?anc)]
 ```
-; Unify :depends-on and :calls into one relation
-(rule [(linked ?a ?d) [?a :depends-on ?d]])
-(rule [(linked ?a ?d) [?a :calls ?d]])
+
+Unify multiple edge types under one name:
+```datalog
+(rule [(linked ?a ?b) [?a :depends-on ?b]])
+(rule [(linked ?a ?b) [?a :calls ?b]])
 [:find ?name :where (linked :project/api-gateway ?svc) [?svc :name ?name]]
 ```
 
-### Multi-hop joins (fixed-depth traversal)
-For transitive impact across N hops, write explicit join patterns:
-```
+Rules registered via `vulcan_rule` persist for the server session. After a server restart, re-register them or add them to `SESSION_RULES` in `mcp_server.py` to make them permanent.
+
+### Multi-hop joins (fixed-depth, no rule needed)
+When you know the exact depth, explicit joins are simpler than registering a rule:
+```datalog
 ; 2-hop: api-gateway → auth-service → jwt-validator
 [:find ?name
  :where [:project/api-gateway :calls ?mid]
@@ -324,7 +355,17 @@ For transitive impact across N hops, write explicit join patterns:
         [?leaf :name ?name]]
 ```
 
-For advanced syntax: https://github.com/adityamukho/minigraf/wiki/Datalog-Reference
+### String and numeric comparisons
+`>`, `<`, `>=`, `<=`, `=`, `!=` work for both numbers and ISO-8601 date strings (which sort lexicographically). Always wrap in `[...]`:
+```datalog
+[(> ?date "2026-04-01T00:00:00Z")]   ; date after threshold
+[(< ?count 10)]                       ; numeric less-than
+[(= ?status "active")]               ; equality
+```
+
+**Common mistake**: `(contains? ?v "text")` returns empty — the predicate must be inside square brackets: `[(contains? ?v "text")]`.
+
+Full Datalog grammar: https://github.com/adityamukho/minigraf/wiki/Datalog-Reference
 
 ## Graph Storage
 
@@ -380,8 +421,7 @@ query("""[:find ?reason
 ### Impact analysis via multi-hop join
 User: "What breaks if I change the key-store service?"
 
-Use explicit join patterns for fixed-depth traversal (minigraf rules are
-base-case only and do not recurse):
+For fixed-depth traversal, use explicit joins:
 ```python
 # Direct dependents (1 hop)
 query("[:find ?name :where [?svc :depends-on :project/key-store] [?svc :name ?name]]")
@@ -393,14 +433,23 @@ query("""[:find ?name
                  [?svc :name ?name]]""")
 ```
 
+For unbounded transitive traversal, register a recursive rule first:
+```python
+# Register once per server session
+vulcan_rule("[(reachable ?a ?b) [?a :depends-on ?b]]")
+vulcan_rule("[(reachable ?a ?b) [?a :depends-on ?m] (reachable ?m ?b)]")
+
+# Then query — finds all transitive dependents at any depth
+query("[:find ?name :where (reachable ?svc :project/key-store) [?svc :name ?name]]")
+```
+
 Use rules to unify multiple edge types when scanning across mixed relationships:
 ```python
-query("""(rule [(linked ?a ?d) [?a :depends-on ?d]])
-         (rule [(linked ?a ?d) [?a :calls ?d]])
-         [:find ?name
+vulcan_rule("[(linked ?a ?d) [?a :depends-on ?d]]")
+vulcan_rule("[(linked ?a ?d) [?a :calls ?d]]")
+query("""[:find ?name
           :where (linked :project/auth-service ?svc)
                  [?svc :name ?name]]""")
-```
 
 ### Find all entities of a given type
 ```python
@@ -517,6 +566,7 @@ report_issue("parse_error", "query returns unexpected output",
 | `tools/query.json` | Tool schema for vulcan_query |
 | `tools/transact.json` | Tool schema for vulcan_transact |
 | `tools/retract.json` | Tool schema for vulcan_retract |
+| `tools/rule.json` | Tool schema for vulcan_rule |
 | `tools/report_issue.json` | Tool schema for vulcan_report_issue |
 | `tools/memory_prepare_turn.json` | Tool schema for memory_prepare_turn |
 | `tools/memory_finalize_turn.json` | Tool schema for memory_finalize_turn |
