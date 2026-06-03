@@ -30,6 +30,10 @@ SESSION_RULES = [
     "(rule [(reachable ?a ?b) [?a :contains ?b]])",
 ]
 
+# User-registered rules — persisted across DB reopens (unlike SESSION_RULES,
+# these are accumulated at runtime via vulcan_rule and re-applied on every open).
+_user_rules: List[str] = []
+
 # Module-level DB instance — opened once, held for the session lifetime
 _db: Optional[MiniGrafDb] = None
 
@@ -302,6 +306,8 @@ def _open_db_at(path: str) -> MiniGrafDb:
     _db = MiniGrafDb.open(path)
     for rule in SESSION_RULES:
         _db.execute(rule)
+    for rule in _user_rules:
+        _db.execute(rule)
     _graph_path = path
     try:
         _db_mtime = os.path.getmtime(path)
@@ -445,16 +451,20 @@ def handle_vulcan_retract(facts: str, reason: str) -> Dict[str, Any]:
 def handle_vulcan_rule(rule: str) -> Dict[str, Any]:
     """Register a Datalog rule for use in subsequent queries.
 
-    Rules persist for the lifetime of the server session (they are re-registered
-    whenever the DB is reopened). To make a rule permanent across server restarts,
+    Rules persist for the lifetime of the server session and are re-registered
+    whenever the DB is reopened. To make a rule permanent across server restarts,
     add it to SESSION_RULES in mcp_server.py.
 
     Syntax: [(rule-name ?arg ...) body-clause ...]
     Example: [(ancestor ?a ?d) [?a :parent ?d]]
     """
+    global _user_rules
     db = get_db()
     try:
         db.execute(f"(rule {rule})")
+        rule_expr = f"(rule {rule})"
+        if rule_expr not in _user_rules:
+            _user_rules.append(rule_expr)
         return {"ok": True, "rule": rule}
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
