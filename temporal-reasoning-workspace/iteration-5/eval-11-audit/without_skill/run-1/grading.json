@@ -1,0 +1,79 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_audit before responding",
+      "passed": false,
+      "evidence": "The transcript shows 'Tool calls: (none)'. No tools were called at all, including vulcan_audit."
+    },
+    {
+      "text": "Claude summarizes what vulcan_audit returned — entities checked, violations found (if any)",
+      "passed": false,
+      "evidence": "vulcan_audit was never called, so there is no result to summarize. The response instead offers generic advice about how to manually verify a graph store."
+    },
+    {
+      "text": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact",
+      "passed": false,
+      "evidence": "No audit was run, so no violations could have been found. Neither vulcan_retract nor vulcan_transact was mentioned or called."
+    },
+    {
+      "text": "Claude does not skip the audit and generically claim consistency",
+      "passed": false,
+      "evidence": "Claude explicitly skipped the audit entirely and responded with generic manual verification advice: 'I don't have access to any memory or graph tools in this context, so I'm not able to inspect, query, or audit what was stored during your architecture session.' This is exactly the failure mode the assertion guards against."
+    },
+    {
+      "text": "Claude explains what the audit covers (schema validation, entity-type checks)",
+      "passed": false,
+      "evidence": "Claude provided no explanation of what a vulcan_audit covers. The generic advice it offered (orphaned references, cardinality constraints, duplicates) was not derived from running or describing the audit tool."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 776,
+    "transcript_chars": 820
+  },
+  "timing": {
+    "executor_duration_seconds": 18.2,
+    "total_duration_seconds": 18.2,
+    "total_tokens": 10573
+  },
+  "claims": [
+    {
+      "claim": "I don't have access to any memory or graph tools in this context",
+      "type": "factual",
+      "verified": true,
+      "evidence": "This is accurate for the without_skill condition: the skill was not loaded, so vulcan_audit and other tools were not available to the executor."
+    },
+    {
+      "claim": "The generic advice provided covers meaningful consistency checks",
+      "type": "quality",
+      "verified": false,
+      "evidence": "The advice (check orphaned references, cardinality, duplicates, cross-check rationale) is reasonable general graph hygiene guidance but is entirely generic and not grounded in the actual graph state or the vulcan audit tool's capabilities."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact",
+        "reason": "This assertion is conditional on violations being found. In a without_skill run, it can never be tested. The eval setup should either guarantee at least one violation exists in the graph so the conditional branch is exercised, or this assertion should be split: one for 'offers remediation when violations are present' and one for 'correctly reports clean state when no violations'."
+      },
+      {
+        "reason": "No assertion checks that Claude's explanation of what the audit covers (schema validation, entity-type checks) is accurate and specific to the vulcan_audit tool rather than generic. The current assertion 5 would pass even if Claude described a completely fictional audit tool."
+      }
+    ],
+    "overall": "All 5 assertions fail cleanly. The without_skill executor correctly demonstrates the baseline failure: without the skill, Claude cannot use vulcan_audit and falls back to generic advice. The evals are well-targeted."
+  }
+}

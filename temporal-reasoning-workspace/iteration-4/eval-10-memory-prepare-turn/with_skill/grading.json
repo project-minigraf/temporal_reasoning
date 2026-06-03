@@ -1,0 +1,81 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls memory_prepare_turn as the first tool call of the turn",
+      "passed": true,
+      "evidence": "Transcript shows 'Call 1 — mcp__temporal-reasoning__memory_prepare_turn', confirming it was the very first tool call made."
+    },
+    {
+      "text": "memory_prepare_turn is passed the user's message text",
+      "passed": true,
+      "evidence": "Input to memory_prepare_turn is shown as: { \"user_message\": \"What framework are we using for the API layer?\" } — exactly matching the user's question."
+    },
+    {
+      "text": "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result",
+      "passed": true,
+      "evidence": "Response states 'We're using **FastAPI** for the API layer. Memory shows this was a deliberate decision...' The memory_prepare_turn output returned ':framework | FastAPI', and the answer explicitly attributes the answer to memory."
+    },
+    {
+      "text": "Claude does not answer from general knowledge or guess when the answer is in memory",
+      "passed": true,
+      "evidence": "The response is fully grounded in the memory result. It cites the specific decision entity and the async-over-Flask reasoning from memory, with no indication of general knowledge guessing."
+    },
+    {
+      "text": "Claude does not ask the user to repeat information that was available in memory",
+      "passed": true,
+      "evidence": "The response directly and confidently answers the question without asking the user to clarify or re-supply any information."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "mcp__temporal-reasoning__memory_prepare_turn": 1
+    },
+    "total_tool_calls": 1,
+    "total_steps": 1,
+    "errors_encountered": 0,
+    "output_chars": 659,
+    "transcript_chars": 659
+  },
+  "timing": {
+    "executor_duration_seconds": null,
+    "total_duration_seconds": 27.4,
+    "total_tokens": 18859,
+    "duration_ms": 27417
+  },
+  "claims": [
+    {
+      "claim": "The decision to use FastAPI was driven by async support being preferred over Flask",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Memory output includes ':reason | async support preferred over Flask; aligns with asyncio concurrency model' — the response accurately reflects this."
+    },
+    {
+      "claim": "Memory was the source of the answer (not general knowledge)",
+      "type": "process",
+      "verified": true,
+      "evidence": "The response explicitly says 'Memory shows this was a deliberate decision' and the memory_prepare_turn call returned the FastAPI entity before the response was given."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "reason": "Assertion 4 ('Claude does not answer from general knowledge') is difficult to fail in a well-formed transcript — if memory_prepare_turn returns the correct answer and Claude uses it, there is no visible signal distinguishing 'used memory' from 'confirmed memory matched general knowledge'. Consider adding a case where the memory answer contradicts common knowledge (e.g. 'we use Django' when FastAPI is the more expected answer) to make this assertion truly discriminating."
+      },
+      {
+        "reason": "No assertion checks that Claude accurately reports the *reason* for the decision (async over Flask), only that it names FastAPI. A response that names FastAPI but ignores or misrepresents the reasoning from memory would still pass all 5 assertions. Adding an assertion like 'Claude's answer includes the async/concurrency rationale from memory' would strengthen coverage."
+      }
+    ],
+    "overall": "All assertions pass cleanly and the transcript is a strong positive example. The main gap is that assertions 3 and 4 could both pass if Claude hallucinated FastAPI coincidentally — a memory-contradiction test case would make assertion 4 genuinely discriminating."
+  }
+}

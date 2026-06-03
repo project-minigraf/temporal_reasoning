@@ -1,0 +1,229 @@
+{
+  "metadata": {
+    "skill_name": "temporal-reasoning",
+    "skill_path": "/home/aditya/workspaces/pycharm/temporal_reasoning/.opencode/skills/temporal-reasoning",
+    "executor_model": "claude-sonnet-4-6",
+    "analyzer_model": "claude-sonnet-4-6",
+    "timestamp": "2026-05-27T00:00:00Z",
+    "evals_run": [8, 9, 10, 11],
+    "runs_per_configuration": 1
+  },
+  "runs": [
+    {
+      "eval_id": 8,
+      "eval_name": "Ingestion With Status Check",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 57.9,
+        "tokens": 20427,
+        "tool_calls": 8,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Claude calls vulcan_ingest_status before attempting to start ingestion", "passed": true, "evidence": "vulcan_ingest_status was Call 2; vulcan_ingest_git was Call 3 — correct order confirmed"},
+        {"text": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running", "passed": true, "evidence": "Status returned idle; Claude noted this explicitly before proceeding to call vulcan_ingest_git"},
+        {"text": "Claude does not attempt to manually store code entities via vulcan_transact", "passed": true, "evidence": "No vulcan_transact calls in transcript; memory_finalize_turn is conversation memory, not code entity storage"},
+        {"text": "Claude informs the user that ingestion runs in the background", "passed": true, "evidence": "Response explicitly states 'ingestion will run as a background task'"},
+        {"text": "Claude does not block or claim to wait — it starts the job and moves on", "passed": true, "evidence": "Claude attempted the call immediately, finalized memory, and responded without blocking"}
+      ],
+      "notes": ["vulcan_ingest_git was denied by environment sandbox; graded as attempted since skill behavior (deciding to call it) is what matters", "Untested branch: no variant where status returns 'running' to verify Claude would skip the ingest call"]
+    },
+    {
+      "eval_id": 8,
+      "eval_name": "Ingestion With Status Check",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.2,
+        "passed": 1,
+        "failed": 4,
+        "total": 5,
+        "time_seconds": 30.0,
+        "tokens": 10959,
+        "tool_calls": 2,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Claude calls vulcan_ingest_status before attempting to start ingestion", "passed": false, "evidence": "No tool calls made — zero MCP tools invoked"},
+        {"text": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running", "passed": false, "evidence": "vulcan_ingest_git never called; no ingestion attempted"},
+        {"text": "Claude does not attempt to manually store code entities via vulcan_transact", "passed": true, "evidence": "VACUOUS PASS — agent called nothing at all; passes only because no tools were available"},
+        {"text": "Claude informs the user that ingestion runs in the background", "passed": false, "evidence": "No mention of background ingestion; offered ctags, ast-grep, and manual file search instead"},
+        {"text": "Claude does not block or claim to wait — it starts the job and moves on", "passed": false, "evidence": "No job was started; moot"}
+      ],
+      "notes": ["Vacuous pass on assertion 3 flagged by grader — should be replaced with a positive gate ('Claude successfully initiates git ingestion')"]
+    },
+    {
+      "eval_id": 9,
+      "eval_name": "Ingest Status Polling",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 46.8,
+        "tokens": 19650,
+        "tool_calls": 8,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Claude calls vulcan_ingest_status before answering", "passed": true, "evidence": "vulcan_ingest_status was the very first tool call before any response text"},
+        {"text": "Claude reports the actual status from the tool result (running, complete, or idle)", "passed": true, "evidence": "Claude accurately reported 'status: idle' with processed: 0 and total: 0, matching raw tool output"},
+        {"text": "If status is running, Claude reports progress details (commits_done, commits_total) from the result", "passed": true, "evidence": "N/A — status was idle, condition not triggered; graded as pass per instructions"},
+        {"text": "If status is complete, Claude proceeds to answer the dependency query using vulcan_query", "passed": true, "evidence": "Status was idle/incomplete; Claude ran two follow-up vulcan_query calls to verify graph state, explained the graph is empty, offered to start ingestion, and previewed the dependency query for when ingestion completes"},
+        {"text": "Claude does not guess or assume ingestion is done without checking", "passed": true, "evidence": "Claude checked status first, correctly told user the dependency query cannot be answered yet because graph is empty"}
+      ],
+      "notes": ["Assertion 3 is untestable when status is not 'running' — a companion test with a running ingestion is needed", "Idle-case handling (offer to start ingestion + preview query) is a quality signal worth formalising as an assertion"]
+    },
+    {
+      "eval_id": 9,
+      "eval_name": "Ingest Status Polling",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 25.1,
+        "tokens": 11270,
+        "tool_calls": 4,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Claude calls vulcan_ingest_status before answering", "passed": false, "evidence": "No MCP tool calls; response states 'No tools were used'"},
+        {"text": "Claude reports the actual status from the tool result (running, complete, or idle)", "passed": false, "evidence": "No status obtained; Claude admitted ignorance and offered grep as fallback"},
+        {"text": "If status is running, Claude reports progress details (commits_done, commits_total) from the result", "passed": false, "evidence": "No progress details reported — no tool call made"},
+        {"text": "If status is complete, Claude proceeds to answer the dependency query using vulcan_query", "passed": false, "evidence": "vulcan_query never invoked; Claude offered grep as substitute"},
+        {"text": "Claude does not guess or assume ingestion is done without checking", "passed": false, "evidence": "Claude bypassed the tool entirely — neither guessed nor checked; violates spirit of assertion"}
+      ],
+      "notes": ["Assertion 5 passes vacuously when agent makes no calls — should be rewritten as positive requirement ('Claude calls vulcan_ingest_status to determine whether indexing is complete')"]
+    },
+    {
+      "eval_id": 10,
+      "eval_name": "Memory Prepare Turn",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 27.4,
+        "tokens": 18859,
+        "tool_calls": 5,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Claude calls memory_prepare_turn as the first tool call of the turn", "passed": true, "evidence": "memory_prepare_turn was Call 1, with the exact user message text passed as argument"},
+        {"text": "memory_prepare_turn is passed the user's message text", "passed": true, "evidence": "Tool called with user message: 'What framework are we using for the API layer?'"},
+        {"text": "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result", "passed": true, "evidence": "Answer: 'We're using FastAPI for the API layer. Memory shows this was a deliberate decision...'"},
+        {"text": "Claude does not answer from general knowledge or guess when the answer is in memory", "passed": true, "evidence": "Answer is entirely grounded in returned memory entity — async-over-Flask rationale cited from stored fact"},
+        {"text": "Claude does not ask the user to repeat information that was available in memory", "passed": true, "evidence": "No clarifying questions asked; answer delivered immediately from memory context"}
+      ],
+      "notes": ["Clean minimal pass — one tool call, fully grounded answer", "No assertion checks whether Claude reports the *reason* for the decision (async over Flask), only the framework name"]
+    },
+    {
+      "eval_id": 10,
+      "eval_name": "Memory Prepare Turn",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.2,
+        "passed": 1,
+        "failed": 4,
+        "total": 5,
+        "time_seconds": 24.5,
+        "tokens": 12477,
+        "tool_calls": 5,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Claude calls memory_prepare_turn as the first tool call of the turn", "passed": false, "evidence": "First tool call was 'ls' on the project root — no memory tools invoked at any point"},
+        {"text": "memory_prepare_turn is passed the user's message text", "passed": false, "evidence": "memory_prepare_turn never called"},
+        {"text": "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result", "passed": false, "evidence": "Agent answered 'MCP framework' based on reading mcp_server.py — factually wrong for the eval's intent"},
+        {"text": "Claude does not answer from general knowledge or guess when the answer is in memory", "passed": false, "evidence": "Agent substituted codebase file-reading for memory access; correct answer (FastAPI) was in memory but never retrieved"},
+        {"text": "Claude does not ask the user to repeat information that was available in memory", "passed": true, "evidence": "VACUOUS — agent answered (incorrectly) from files; never asked for clarification, but only because it had misplaced confidence in a wrong answer"}
+      ],
+      "notes": ["Notable failure mode: agent gave a confident, wrong answer backed by real code evidence ('MCP framework' from mcp_server.py). Worse than refusing — actively misleading with a plausible-looking source.", "Codebase-read substitution is undiscriminating — no assertion catches this specific failure mode"]
+    },
+    {
+      "eval_id": 11,
+      "eval_name": "Audit After Heavy Writes",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 58.8,
+        "tokens": 21954,
+        "tool_calls": 7,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Claude calls vulcan_audit before responding", "passed": true, "evidence": "vulcan_audit was the first tool call in the transcript"},
+        {"text": "Claude summarizes what vulcan_audit returned — entities checked and violations found (if any)", "passed": true, "evidence": "Response detailed all 6 violations with entity UUIDs and specific attribute names"},
+        {"text": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact", "passed": true, "evidence": "Audit itself retracted 6 facts live; response offered to re-store them correctly under proper schema"},
+        {"text": "Claude does not skip the audit and generically claim consistency", "passed": true, "evidence": "Specific violations reported; no boilerplate consistency claim anywhere"},
+        {"text": "Claude explains what the audit covers (schema validation, entity-type checks)", "passed": true, "evidence": "Coverage communicated implicitly through violation details (unknown attributes vs. per-type allowlists, missing required attributes)"}
+      ],
+      "notes": ["Seed data contained real schema violations (attributes :database, :ttl, :framework not in schema) — unintentional fidelity test that the eval passed", "Agent summary said '10 violations' but audit output showed 6 retractions — discrepancy likely due to audit counting attribute-level violations while retractions are at fact level", "Agent ran post-audit vulcan_query to show surviving graph state — quality signal not currently asserted"]
+    },
+    {
+      "eval_id": 11,
+      "eval_name": "Audit After Heavy Writes",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 19.8,
+        "tokens": 10846,
+        "tool_calls": 2,
+        "errors": 0
+      },
+      "expectations": [
+        {"text": "Claude calls vulcan_audit before responding", "passed": false, "evidence": "Zero tool calls made — no audit invoked"},
+        {"text": "Claude summarizes what vulcan_audit returned — entities checked and violations found (if any)", "passed": false, "evidence": "Nothing to summarize; no audit ran"},
+        {"text": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact", "passed": false, "evidence": "Neither tool was mentioned; no corrective action offered"},
+        {"text": "Claude does not skip the audit and generically claim consistency", "passed": false, "evidence": "Claude deflected entirely: 'I don't have access to memory tools' and offered manual fallback strategies. Avoided a false consistency claim but failed the underlying task."},
+        {"text": "Claude explains what the audit covers (schema validation, entity-type checks)", "passed": false, "evidence": "Manual suggestions offered are generic — nothing specific to what a graph audit covers"}
+      ],
+      "notes": ["Without-skill agent was honest about its limitations — did not claim consistency — but honest inability is still a full task failure"]
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {"mean": 1.0, "stddev": 0.0, "min": 1.0, "max": 1.0},
+      "time_seconds": {"mean": 47.7, "stddev": 13.8, "min": 27.4, "max": 58.8},
+      "tokens": {"mean": 20222, "stddev": 1627, "min": 18859, "max": 21954}
+    },
+    "without_skill": {
+      "pass_rate": {"mean": 0.1, "stddev": 0.1, "min": 0.0, "max": 0.2},
+      "time_seconds": {"mean": 24.9, "stddev": 4.4, "min": 19.8, "max": 30.0},
+      "tokens": {"mean": 11388, "stddev": 678, "min": 10846, "max": 12477}
+    },
+    "delta": {
+      "pass_rate": "+0.90",
+      "time_seconds": "+22.8",
+      "tokens": "+8834"
+    }
+  },
+  "notes": [
+    "All four with-skill runs passed 5/5. Without-skill pass rate is 2/20 (10%), both vacuous passes on negative-only assertions.",
+    "Eval 10 without-skill produced the strongest failure mode: confident wrong answer ('MCP framework') backed by real code evidence. Worse than refusing — actively misleading.",
+    "Eval 11 seed data contained real schema violations (unknown attributes :database, :ttl, :framework) — an unintentional fidelity test that the with-skill agent handled correctly.",
+    "Environmental discovery: hooks (UserPromptSubmit) do not fire in the subagent eval environment. Evals 8 and 10 were revised mid-run to account for this. The hook-already-running scenario (original eval 8 intent) and hook-injected-context scenario (original eval 10 intent) remain untestable via subagent runs.",
+    "Repeated grader feedback: negative-only assertions ('does not guess', 'does not call vulcan_transact') pass vacuously when without-skill agent calls nothing. Evals 8, 9, and 10 should replace these with positive gate assertions."
+  ]
+}

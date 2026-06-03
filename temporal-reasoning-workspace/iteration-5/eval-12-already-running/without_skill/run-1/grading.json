@@ -1,0 +1,83 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_ingest_status to check current ingestion state before responding to the user",
+      "passed": false,
+      "evidence": "The transcript shows 'Tool calls: (none)'. No tools were called, including vulcan_ingest_status."
+    },
+    {
+      "text": "Claude does NOT call vulcan_ingest_git a second time when status shows ingestion is already running",
+      "passed": false,
+      "evidence": "While Claude did not call vulcan_ingest_git (technically satisfying the literal assertion), this is because no tools were available at all — not because Claude checked the status and made an informed decision. The assertion is vacuously satisfied for the wrong reason. The setup instruction to call vulcan_ingest_git first was also not followed, so the precondition for this assertion was never established."
+    },
+    {
+      "text": "Claude reports commits_done and commits_total (or equivalent progress fields) from the live status result",
+      "passed": false,
+      "evidence": "No vulcan_ingest_status call was made, so no progress fields were reported. The response makes no mention of commits_done or commits_total."
+    },
+    {
+      "text": "Claude informs the user that indexing is already in progress and they do not need to start it again",
+      "passed": false,
+      "evidence": "Claude did not inform the user that indexing is already in progress. Instead it said 'I don't have a specific indexing tool or command readily available' and asked the user to clarify what indexing tool they are referring to."
+    },
+    {
+      "text": "Claude does not attempt to manually store code entities via vulcan_transact as a substitute for ingestion",
+      "passed": false,
+      "evidence": "While vulcan_transact was not called (technically satisfying the literal assertion), no tools were called at all — the condition is vacuously true. The spirit of this assertion (that Claude uses the proper ingestion pathway) is not met, since Claude failed to use any ingestion tool whatsoever."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 737,
+    "transcript_chars": 780
+  },
+  "timing": {
+    "executor_duration_seconds": 16.0,
+    "total_duration_seconds": 16.0,
+    "total_tokens": 10495
+  },
+  "claims": [
+    {
+      "claim": "I don't have a specific indexing tool or command readily available in this context",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Accurate for the without_skill condition: vulcan_ingest_git and vulcan_ingest_status were not available to the executor."
+    },
+    {
+      "claim": "Claude can kick off codebase indexing once the tool or system is clarified",
+      "type": "quality",
+      "verified": false,
+      "evidence": "Claude offered to help once the user clarifies the tool, but without the skill loaded, it cannot actually call vulcan_ingest_git regardless."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude does NOT call vulcan_ingest_git a second time when status shows ingestion is already running",
+        "reason": "This assertion is vacuously satisfied in the without_skill condition (no tools called at all) and also vacuously satisfied if vulcan_ingest_git is unavailable for any reason. The assertion should be stronger: require that vulcan_ingest_status IS called and its result explicitly shows in-progress status, THEN verify no second vulcan_ingest_git call follows. Consider splitting into two assertions."
+      },
+      {
+        "assertion": "Claude does not attempt to manually store code entities via vulcan_transact as a substitute for ingestion",
+        "reason": "Same vacuous satisfaction issue: if no tools are available, this assertion always passes. It would only be discriminating if the skill IS loaded. Consider whether this assertion adds value for the without_skill variant, or if it should only appear in the with_skill grading."
+      },
+      {
+        "reason": "The SETUP instruction in the prompt (call vulcan_ingest_git first to start background indexing) is a critical precondition for the 'already running' scenario. If the executor cannot or does not follow the SETUP, the eval's core scenario is never established. Consider verifying in grading that the setup step was actually completed before evaluating the main assertions."
+      }
+    ],
+    "overall": "All 5 assertions fail. Two (assertions 2 and 5) are vacuously satisfied in a strict reading but marked FAIL here because the underlying task outcome — using the skill correctly — was not achieved. The without_skill baseline correctly shows total failure to engage with the ingestion workflow."
+  }
+}

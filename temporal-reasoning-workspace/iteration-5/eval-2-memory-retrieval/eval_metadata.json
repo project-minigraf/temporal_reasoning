@@ -1,0 +1,22 @@
+{
+  "eval_id": 2,
+  "eval_name": "memory-retrieval",
+  "prompt": "I can't remember \u2014 what database are we using for the project? And what's the caching approach for auth tokens? We talked about it before but I don't have the chat open.",
+  "assertions": [
+    {
+      "text": "Claude calls vulcan_query before providing any answer"
+    },
+    {
+      "text": "Claude explicitly signals it is checking memory (e.g. 'Let me check memory...')"
+    },
+    {
+      "text": "Claude's answer names PostgreSQL 15 as the database, grounded in the query result"
+    },
+    {
+      "text": "Claude's answer mentions Redis and the 24-hour TTL for auth token caching, grounded in the query result"
+    },
+    {
+      "text": "Claude cites specific stored facts rather than guessing or hallucinating"
+    }
+  ]
+}

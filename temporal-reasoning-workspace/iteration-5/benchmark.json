@@ -1,0 +1,1118 @@
+{
+  "metadata": {
+    "skill_name": "temporal-reasoning",
+    "skill_path": "<path/to/skill>",
+    "executor_model": "<model-name>",
+    "analyzer_model": "<model-name>",
+    "timestamp": "2026-05-27T09:24:37Z",
+    "evals_run": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12
+    ],
+    "runs_per_configuration": 3
+  },
+  "runs": [
+    {
+      "eval_id": 1,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.83,
+        "passed": 5,
+        "failed": 1,
+        "total": 6,
+        "time_seconds": 68.4,
+        "tokens": 2450,
+        "tool_calls": 5,
+        "errors": 1
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_transact at least once",
+          "passed": true,
+          "evidence": "Two vulcan_transact calls are present: Call 3 (failed due to schema violation) and Call 4 (succeeded with all three decisions)."
+        },
+        {
+          "text": "PostgreSQL or database choice is stored as a fact",
+          "passed": true,
+          "evidence": "Call 4 stores [:decision/postgres :description \"PostgreSQL 15 as primary database\"] with :entity-type :type/decision and a rationale attribute."
+        },
+        {
+          "text": "Redis caching or session token TTL is stored as a fact",
+          "passed": true,
+          "evidence": "Call 4 stores [:decision/redis-session-cache :description \"Redis caches session tokens for the auth service with a 24-hour TTL\"] including the 24-hour TTL in both description and rationale."
+        },
+        {
+          "text": "FastAPI or API framework decision is stored as a fact",
+          "passed": true,
+          "evidence": "Call 4 stores [:decision/fastapi :description \"FastAPI chosen as the API layer, rejecting Flask\"] with rationale citing async support."
+        },
+        {
+          "text": "Each transact call includes a non-empty reason parameter",
+          "passed": true,
+          "evidence": "Call 3 reason: \"Tech stack finalized: PostgreSQL 15 (primary DB), Redis session cache (auth service, 24h TTL), FastAPI (API layer, async support over Flask)\". Call 4 reason: \"Tech stack finalized: PostgreSQL 15 (primary DB, ACID + JSON), Redis session cache (auth service, 24h TTL), FastAPI (API layer, async over Flask)\". Both are non-empty."
+        },
+        {
+          "text": "Stored attributes use the three-part :namespace/entity-name/attribute naming convention",
+          "passed": false,
+          "evidence": "Stored attributes are :description, :entity-type, and :rationale \u2014 these are single-segment names, not three-part :namespace/entity-name/attribute names. Entity identifiers (e.g. :decision/postgres) use two-part naming but the attributes themselves do not follow the three-part convention."
+        }
+      ],
+      "notes": [
+        "First transact call failed with schema violations for :tradeoff and :rejected attributes; agent retried using only schema-allowed attributes and folded the extra info into :rationale and :description"
+      ]
+    },
+    {
+      "eval_id": 10,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 28.9,
+        "tokens": 594,
+        "tool_calls": 1,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls memory_prepare_turn as the first tool call of the turn",
+          "passed": true,
+          "evidence": "Call 1 in the transcript is memory_prepare_turn, before any other tool calls or response text."
+        },
+        {
+          "text": "memory_prepare_turn is passed the user's message text",
+          "passed": true,
+          "evidence": "Input shown as: user_message=\"What framework are we using for the API layer?\" \u2014 exactly the user's question."
+        },
+        {
+          "text": "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result",
+          "passed": true,
+          "evidence": "Response states \"We are using FastAPI for the API layer. Memory records this as an explicit decision\" \u2014 directly citing the memory_prepare_turn output which returned :framework FastAPI."
+        },
+        {
+          "text": "Claude does not answer from general knowledge or guess when the answer is in memory",
+          "passed": true,
+          "evidence": "The response is explicitly attributed to memory: \"Memory records this as an explicit decision: FastAPI was chosen over Flask because async support was required \u2014 it aligns with our asyncio concurrency model.\" The rationale (asyncio over Flask) matches the memory output exactly, not general knowledge."
+        },
+        {
+          "text": "Claude provides a complete, self-contained answer using the memory context, with no follow-up questions needed",
+          "passed": true,
+          "evidence": "Response identifies the framework (FastAPI), explains the rationale (async support, asyncio concurrency model), and references it as an explicit decision. No follow-up questions are asked."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 11,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.8,
+        "passed": 4,
+        "failed": 1,
+        "total": 5,
+        "time_seconds": 126.1,
+        "tokens": 5011,
+        "tool_calls": 9,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_audit before responding",
+          "passed": true,
+          "evidence": "Call 2 is vulcan_audit (input: no arguments \u2014 full live audit), called before the final response to the user."
+        },
+        {
+          "text": "Claude summarizes what vulcan_audit returned \u2014 entities checked, violations found (if any)",
+          "passed": true,
+          "evidence": "Response states '6 violations found and retracted' and provides a table listing each violation with entity, problem, and details. The audit output shows 8 audited, 6 retracted, 10 violations listed. All are summarized in the user-facing response."
+        },
+        {
+          "text": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact",
+          "passed": true,
+          "evidence": "Claude ends with: 'Would you like me to re-transact the retracted decisions with corrected schema? I can store them cleanly using only the allowed attributes so they pass future audits.' The audit auto-retracted the violating entities; Claude explicitly offers to re-store via vulcan_transact with corrected attributes. The offer to correct via vulcan_transact is directly stated."
+        },
+        {
+          "text": "Claude does not skip the audit and generically claim consistency",
+          "passed": true,
+          "evidence": "vulcan_audit was actually called (Call 2), found real violations, retracted entities, and the response reports concrete problems \u2014 the opposite of a generic consistency claim."
+        },
+        {
+          "text": "Claude explains what the audit covers (schema validation, entity-type checks)",
+          "passed": false,
+          "evidence": "The response describes what violations were found (unknown attributes, missing required attributes) but does not explicitly explain what the audit mechanism covers \u2014 i.e., it never says something like 'the audit checks schema validation and entity-type constraints.' The explanation is implicit from the violation details, not stated directly."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 12,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.2,
+        "passed": 1,
+        "failed": 4,
+        "total": 5,
+        "time_seconds": 27.4,
+        "tokens": 799,
+        "tool_calls": 1,
+        "errors": 1
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_ingest_status to check current ingestion state before responding to the user",
+          "passed": false,
+          "evidence": "Claude made only one tool call (vulcan_ingest_git), which was blocked by the permission system. vulcan_ingest_status was never called. The response asks for permission to run vulcan_ingest_git without first checking status."
+        },
+        {
+          "text": "Claude does NOT call vulcan_ingest_git a second time when status shows ingestion is already running",
+          "passed": false,
+          "evidence": "Claude never called vulcan_ingest_status, so it never observed that ingestion was already running. It cannot have responded to that knowledge. The single vulcan_ingest_git call was blocked before execution, and Claude then asked for permission to run it again \u2014 the exact behavior the assertion aims to prevent. The assertion is not satisfied by coincidence."
+        },
+        {
+          "text": "Claude reports commits_done and commits_total (or equivalent progress fields) from the live status result",
+          "passed": false,
+          "evidence": "vulcan_ingest_status was never called. No progress fields are reported. The response only describes what the tool would do if permission were granted."
+        },
+        {
+          "text": "Claude informs the user that indexing is already in progress and they do not need to start it again",
+          "passed": false,
+          "evidence": "Claude's response says the tool call 'was denied by the permission system' and asks for permission to run it. There is no mention of existing in-progress indexing. The user is implicitly being told they need to grant permission to start it, not that it's already running."
+        },
+        {
+          "text": "Claude does not attempt to manually store code entities via vulcan_transact as a substitute for ingestion",
+          "passed": true,
+          "evidence": "No vulcan_transact calls were made. However, this passes only trivially \u2014 the entire run was halted by a permission denial, not by skill-directed behavior."
+        }
+      ],
+      "notes": [
+        "The entire eval failed due to a permission denial on the initial vulcan_ingest_git call in the SETUP phase, not due to skill behavior. The eval result reflects a harness/permission configuration issue rather than a true measure of the 'already-running' skill behavior."
+      ]
+    },
+    {
+      "eval_id": 2,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 53.4,
+        "tokens": 2200,
+        "tool_calls": 4,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before providing any answer",
+          "passed": true,
+          "evidence": "Calls 2, 3, and 4 are all vulcan_query calls. The response to the user appears after all three queries. No answer text appears before the first query call."
+        },
+        {
+          "text": "Claude explicitly signals it is checking memory (e.g. 'Let me check memory...')",
+          "passed": true,
+          "evidence": "Response begins with: 'Let me check memory...' \u2014 verbatim match of the example phrase."
+        },
+        {
+          "text": "Claude's answer names PostgreSQL 15 as the database, grounded in the query result",
+          "passed": true,
+          "evidence": "Response states 'We are using PostgreSQL 15 as the primary database.' The information originates from memory_prepare_turn context (which surfaced ':description | PostgreSQL 15 as primary database' and ':version | 15') and was corroborated by the vulcan_query call 4 that retrieved all :type/decision entities. The answer is grounded in memory \u2014 though the entity content detail came primarily from memory_prepare_turn rather than the full-entity query results."
+        },
+        {
+          "text": "Claude's answer mentions Redis and the 24-hour TTL for auth token caching, grounded in the query result",
+          "passed": true,
+          "evidence": "Response states 'We are using Redis for session token caching, with a 24-hour TTL on auth tokens.' Memory_prepare_turn surfaced ':description | Redis for session token caching with 24-hour TTL' and ':ttl-hours | 24', and query call 4 confirmed the decision entity exists."
+        },
+        {
+          "text": "Claude cites specific stored facts rather than guessing or hallucinating",
+          "passed": true,
+          "evidence": "Response explicitly references 'stored decisions' sourced from memory, with specific details (PostgreSQL 15, 24-hour TTL, ACID compliance, JSON support, fast in-memory cache rationale) that match exactly the stored memory records. No information is introduced that wasn't in the memory context."
+        }
+      ],
+      "notes": [
+        "Content-based contains? queries returned empty results; agent fell back to an entity-type query and relied on memory_prepare_turn for the actual attribute values"
+      ]
+    },
+    {
+      "eval_id": 3,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 58.1,
+        "tokens": 3900,
+        "tool_calls": 3,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before writing any test code",
+          "passed": true,
+          "evidence": "Call 2 is vulcan_query (all entities). The test code appears only in the final response section, which follows all tool calls. No test code is written before the query."
+        },
+        {
+          "text": "Claude discovers and cites the no-db-mocks preference from memory",
+          "passed": true,
+          "evidence": "memory_prepare_turn surfaced ':description | Do not use mocks for database tests \u2014 use real connections'. The vulcan_query call confirmed the same preference entity. The response explicitly quotes: 'Do not use mocks for database tests \u2014 use real connections. Reason: mocked tests passed but a prod migration failed last quarter because of mock/prod divergence.'"
+        },
+        {
+          "text": "Claude acknowledges the memory-sourced constraint before coding",
+          "passed": true,
+          "evidence": "Response states 'Let me check memory before writing anything.' then quotes the stored preference ('Memory has a stored preference that applies directly here:') before any test code is shown."
+        },
+        {
+          "text": "The proposed test uses real database connections, not mocks \u2014 consistent with the discovered preference",
+          "passed": true,
+          "evidence": "Test code uses `create_engine(DATABASE_URL)` with a real PostgreSQL URL ('postgresql://testuser:testpass@localhost:5432/testdb'), a real SQLAlchemy session, and direct DB verification (`db_session.query(User).filter_by(...)`). No MagicMock, unittest.mock.patch, or any mock library is used. A comment in the code explicitly states: '# Real DB \u2014 no mocks.'"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 4,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 49.6,
+        "tokens": 2547,
+        "tool_calls": 2,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before writing any connection code",
+          "passed": true,
+          "evidence": "Call 1 in the transcript is vulcan_query (`[:find ?e ?a ?v :where [?e ?a ?v]]`), and the response opens with 'Let me check memory before writing any connection code.' No code was written until after both queries returned."
+        },
+        {
+          "text": "Claude detects that PostgreSQL 15 is the established primary database from memory",
+          "passed": true,
+          "evidence": "Response states: 'Memory shows a finalized architecture decision: Description: PostgreSQL 15 finalized as primary database \u2014 do not switch without team alignment' \u2014 retrieved from the decision entity in the graph."
+        },
+        {
+          "text": "Claude surfaces the potential conflict (MySQL request vs. PostgreSQL decision) before proceeding",
+          "passed": true,
+          "evidence": "Response states: 'Before I write MySQL connection code, I want to flag this conflict. Memory records that PostgreSQL 15 is our finalized primary database, and the decision explicitly notes \"do not switch without team alignment.\"'"
+        },
+        {
+          "text": "Claude asks for clarification or confirmation rather than silently switching databases",
+          "passed": true,
+          "evidence": "Two explicit clarifying questions are posed: (1) 'Is this MySQL connection truly additive?' and (2) 'Or is this a direction change?' before offering the MySQL code conditionally. The response closes with 'Let me know which case this is.'"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 5,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.8,
+        "passed": 4,
+        "failed": 1,
+        "total": 5,
+        "time_seconds": 63.7,
+        "tokens": 2618,
+        "tool_calls": 4,
+        "errors": 2
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_transact at least once",
+          "passed": true,
+          "evidence": "Three vulcan_transact calls are recorded (Calls 2, 3, 4). Call 4 succeeded with '{\"ok\": true, ...}'."
+        },
+        {
+          "text": "Relationship values are entity idents (keywords starting with :project/) not quoted strings",
+          "passed": false,
+          "evidence": "The successful transaction (Call 4) uses :module/ namespace (e.g., ':module/auth-service', ':module/jwt-validator', ':module/key-store') not :project/. The :project/ namespace was rejected by the schema validator in Call 2: 'entity :project/api-gateway has unknown type project'. The spirit of the assertion (keyword idents, not strings) is satisfied, but the assertion explicitly requires :project/ namespace."
+        },
+        {
+          "text": "At least 3 entity-reference edges are stored (calls or depends-on with keyword values)",
+          "passed": true,
+          "evidence": "Call 4 stores three :calls edges with keyword values: [:module/api-gateway :calls :module/auth-service], [:module/auth-service :calls :module/jwt-validator], [:module/jwt-validator :calls :module/key-store]. All three use keyword entity references, not quoted strings."
+        },
+        {
+          "text": "Each component entity is tagged with :entity-type :type/component",
+          "passed": true,
+          "evidence": "All four entities in Call 4 include ':entity-type :type/component': api-gateway, auth-service, jwt-validator, and key-store. Confirmed in the successful transact input."
+        },
+        {
+          "text": "Claude uses flat attribute names (:calls, :depends-on, :name) not namespaced attributes",
+          "passed": true,
+          "evidence": "Call 4 uses flat attributes :description, :entity-type, and :calls \u2014 none are namespaced (e.g., no :service/calls or :arch/entity-type). Note: :name was replaced by :description due to schema enforcement (modules don't allow :name), but the attribute style remains flat and unnamespaced."
+        }
+      ],
+      "notes": [
+        "Schema rejected :project/ namespace; agent fell back to :module/ (which is a valid namespace)",
+        "Schema rejected :name on :module/ entities; agent used :description instead"
+      ]
+    },
+    {
+      "eval_id": 6,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 60.3,
+        "tokens": 2912,
+        "tool_calls": 5,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before answering",
+          "passed": true,
+          "evidence": "memory_prepare_turn (Call 1) retrieves graph context, then Calls 2-5 are all vulcan_query calls. The substantive response comes only after all queries complete. Call 2 alone answers the direct-dependency question, and Calls 3-4 extend to 2-hop and 3-hop traversals before the response is written."
+        },
+        {
+          "text": "Claude uses graph traversal (multi-hop join or rule) rather than a flat key-value scan",
+          "passed": true,
+          "evidence": "Call 3 is a 2-hop join: '[?mid :depends-on :project/key-store] [?svc :depends-on ?mid]'. Call 4 is a 3-hop join adding '[?top :calls ?svc]'. These are genuine multi-clause Datalog joins, not flat attribute scans."
+        },
+        {
+          "text": "Claude's answer includes jwt-validator as a directly affected service",
+          "passed": true,
+          "evidence": "Response: 'Direct dependent (1 hop): jwt-validator \u2014 depends directly on key-store. It reads signing keys from key-store to perform JWT validation.' Corroborated by Call 2 output: '[\"JWT Validator\"]'."
+        },
+        {
+          "text": "Claude's answer includes auth-service as a transitively affected service",
+          "passed": true,
+          "evidence": "Response: 'Indirect dependent (2 hops): auth-service \u2014 depends on jwt-validator.' Corroborated by Call 3 output: '[\"Auth Service\"]'."
+        },
+        {
+          "text": "Claude explains the impact chain, not just a flat list",
+          "passed": true,
+          "evidence": "Response provides hop-by-hop reasoning (1 hop, 2 hops, 3 hops), explains the mechanism at each hop ('If jwt-validator's behavior changes... auth-service is at risk'), includes a risk table, and provides a recommended remediation order. This is a causal chain explanation, not a flat enumeration."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 7,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 75.8,
+        "tokens": 2650,
+        "tool_calls": 6,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before answering",
+          "passed": true,
+          "evidence": "Call 2 in the transcript is vulcan_query with a datalog query traversing the decision \u2192 constraint edge, executed before the final response to the user."
+        },
+        {
+          "text": "Claude traverses the :motivated-by relationship edge in the query",
+          "passed": true,
+          "evidence": "Call 2 query contains `[?d :motivated-by ?c]`, explicitly traversing the :motivated-by edge to link the decision entity to the constraint entity."
+        },
+        {
+          "text": "Claude's answer explicitly names the GIL constraint as the driver of the asyncio decision",
+          "passed": true,
+          "evidence": "Response states: 'What drove it \u2014 the root constraint: The Python GIL (Global Interpreter Lock). Memory stores a constraint entity :rules/gil-constraint with the description: \"Python GIL limits true thread parallelism.\"'"
+        },
+        {
+          "text": "Claude presents the reasoning chain (decision \u2192 motivated-by \u2192 constraint), not just the conclusion",
+          "passed": true,
+          "evidence": "Response presents a numbered step-by-step trace: '1. Constraint identified: Python's GIL prevents threads...' followed by '2. Decision made in response: Because threading was fundamentally constrained by the GIL, asyncio was chosen...', and explicitly shows the graph edge `:project/asyncio-choice :motivated-by :rules/gil-constraint`."
+        },
+        {
+          "text": "Claude grounds its answer in the traversed graph facts, not in prior knowledge about asyncio",
+          "passed": true,
+          "evidence": "Response states: 'Memory stores a constraint entity... this is not inferred, it is directly stored and traversable' and 'Memory has the full decision chain recorded.' The query result `[[\"use asyncio over threading for concurrency\", \"Python GIL limits true thread parallelism\"]]` is cited as the source. However, the response does expand with general background knowledge about asyncio and the GIL (steps 1 and 2 in the trace go beyond the stored facts), which is a minor concern."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 8,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 41.4,
+        "tokens": 1200,
+        "tool_calls": 2,
+        "errors": 1
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_ingest_status before attempting to start ingestion",
+          "passed": true,
+          "evidence": "Call 1 in the transcript is vulcan_ingest_status with no parameters, executed before Call 2 (vulcan_ingest_git). Output was: {\"ok\": true, \"status\": \"idle\", \"processed\": 0, \"total\": 0, ...}"
+        },
+        {
+          "text": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running",
+          "passed": true,
+          "evidence": "vulcan_ingest_status returned status 'idle' (not 'running'), and Claude then called vulcan_ingest_git in Call 2. The conditional check was correctly applied."
+        },
+        {
+          "text": "Claude uses vulcan_ingest_git to start background indexing rather than manually storing code entities via vulcan_transact",
+          "passed": true,
+          "evidence": "Call 2 is vulcan_ingest_git with input {\"repo_path\": \"/home/aditya/workspaces/pycharm/temporal_reasoning\", \"branch\": \"HEAD\"}. No vulcan_transact calls appear in the transcript."
+        },
+        {
+          "text": "Claude informs the user that ingestion runs in the background",
+          "passed": true,
+          "evidence": "Response states: 'This runs as a background task \u2014 it walks the git history and ingests code structure (modules, functions, dependencies) into the bi-temporal graph.'"
+        },
+        {
+          "text": "Claude does not block or claim to wait \u2014 it starts the job and moves on",
+          "passed": true,
+          "evidence": "After starting ingestion, Claude moves directly to showing example queries the user can run once complete, and asks 'Would you like me to poll status periodically, or is there a specific part of the codebase you want to query first?' \u2014 demonstrating it did not block or wait."
+        }
+      ],
+      "notes": [
+        "vulcan_ingest_git was blocked by the evaluator sandbox ('Permission denied'), so ingestion did not actually start. The agent's response ('Ingestion is running') is factually incorrect given the tool failure, but all behavioral assertions still passed."
+      ]
+    },
+    {
+      "eval_id": 9,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.6,
+        "passed": 3,
+        "failed": 2,
+        "total": 5,
+        "time_seconds": 36.0,
+        "tokens": 830,
+        "tool_calls": 1,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_ingest_status before answering",
+          "passed": true,
+          "evidence": "Call 1 in the transcript is vulcan_ingest_status with no parameters. It is the only tool call and it precedes the response. Output: {\"ok\": true, \"status\": \"idle\", \"processed\": 0, \"total\": 0, \"current_commit\": \"\", \"error\": null}"
+        },
+        {
+          "text": "Claude reports the actual status from the tool result (running, complete, or idle)",
+          "passed": true,
+          "evidence": "Response states: 'Indexing hasn't started yet \u2014 vulcan_ingest_status returned idle with 0 commits processed.' This accurately reflects the tool result status of 'idle' with processed=0."
+        },
+        {
+          "text": "If status is 'running', Claude reports progress details (commits_done, commits_total) from the result",
+          "passed": false,
+          "evidence": "Status was 'idle', not 'running', so this conditional branch was never exercised. The assertion cannot be verified as passing \u2014 the behavior it tests was not demonstrated in this run."
+        },
+        {
+          "text": "If status is 'complete', Claude proceeds to answer the dependency query using vulcan_query",
+          "passed": false,
+          "evidence": "Status was 'idle', not 'complete', so this conditional branch was never exercised. Claude did not call vulcan_query. The assertion cannot be verified as passing."
+        },
+        {
+          "text": "Claude explicitly states its answer is based on the vulcan_ingest_status tool result, not on prior assumptions",
+          "passed": true,
+          "evidence": "Response says: 'vulcan_ingest_status returned idle with 0 commits processed. This means no git ingestion has been run for this repo in the current session.' Claude explicitly attributes the answer to the tool result."
+        }
+      ],
+      "notes": [
+        "Assertions 3 and 4 are conditional ('if running' / 'if complete') but the eval was run with status='idle', meaning neither condition was triggered. These assertions could not be evaluated in this run. The eval scenario should be designed to exercise the specific status branch being tested."
+      ]
+    },
+    {
+      "eval_id": 1,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 6,
+        "total": 6,
+        "time_seconds": 22.6,
+        "tokens": 647,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_transact at least once",
+          "passed": false,
+          "evidence": "The output explicitly states: 'None. No memory, vulcan, or external tools were used. Only base Claude Code capabilities (text generation) were applied.' No tool calls of any kind were made."
+        },
+        {
+          "text": "PostgreSQL or database choice is stored as a fact",
+          "passed": false,
+          "evidence": "No vulcan_transact call was made. The PostgreSQL decision was merely summarized in the text response but never persisted to any memory store."
+        },
+        {
+          "text": "Redis caching or session token TTL is stored as a fact",
+          "passed": false,
+          "evidence": "No vulcan_transact call was made. The Redis/24h TTL information was mentioned in the text response but never persisted to any memory store."
+        },
+        {
+          "text": "FastAPI or API framework decision is stored as a fact",
+          "passed": false,
+          "evidence": "No vulcan_transact call was made. The FastAPI choice was mentioned in the text response but never persisted to any memory store."
+        },
+        {
+          "text": "Each transact call includes a non-empty reason parameter",
+          "passed": false,
+          "evidence": "No transact calls were made at all, so this cannot be satisfied."
+        },
+        {
+          "text": "Stored attributes use the three-part :namespace/entity-name/attribute naming convention",
+          "passed": false,
+          "evidence": "No transact calls were made, so no attributes were stored in any format."
+        }
+      ],
+      "notes": [
+        "No memory tools used; fell back to pure text summarization"
+      ]
+    },
+    {
+      "eval_id": 10,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 29.9,
+        "tokens": 490,
+        "tool_calls": 5,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls memory_prepare_turn as the first tool call of the turn",
+          "passed": false,
+          "evidence": "No memory_prepare_turn call appears in the transcript. The tool calls listed are: Glob (**/*.py), Glob (**/requirements*.txt), Read (mcp_server.py), Glob (**/pyproject.toml), Read (pyproject.toml). None of these are memory_prepare_turn."
+        },
+        {
+          "text": "memory_prepare_turn is passed the user's message text",
+          "passed": false,
+          "evidence": "memory_prepare_turn was never called, so it could not have been passed the user's message text."
+        },
+        {
+          "text": "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result",
+          "passed": false,
+          "evidence": "The response names MCP (Model Context Protocol) as the API framework, not FastAPI. The answer is grounded in a code search of pyproject.toml and mcp_server.py, not in memory_prepare_turn."
+        },
+        {
+          "text": "Claude does not answer from general knowledge or guess when the answer is in memory",
+          "passed": false,
+          "evidence": "Claude answered entirely from a code search of the local filesystem (Glob and Read tool calls), bypassing memory entirely. The answer did not use memory at all."
+        },
+        {
+          "text": "Claude provides a complete, self-contained answer using the memory context, with no follow-up questions needed",
+          "passed": false,
+          "evidence": "The answer is self-contained and does not ask follow-up questions, but it is not based on memory context \u2014 it is based on filesystem search results. Since memory_prepare_turn was never called, the memory context condition is not met."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 11,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 18.2,
+        "tokens": 776,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_audit before responding",
+          "passed": false,
+          "evidence": "The transcript shows 'Tool calls: (none)'. No tools were called at all, including vulcan_audit."
+        },
+        {
+          "text": "Claude summarizes what vulcan_audit returned \u2014 entities checked, violations found (if any)",
+          "passed": false,
+          "evidence": "vulcan_audit was never called, so there is no result to summarize. The response instead offers generic advice about how to manually verify a graph store."
+        },
+        {
+          "text": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact",
+          "passed": false,
+          "evidence": "No audit was run, so no violations could have been found. Neither vulcan_retract nor vulcan_transact was mentioned or called."
+        },
+        {
+          "text": "Claude does not skip the audit and generically claim consistency",
+          "passed": false,
+          "evidence": "Claude explicitly skipped the audit entirely and responded with generic manual verification advice: 'I don't have access to any memory or graph tools in this context, so I'm not able to inspect, query, or audit what was stored during your architecture session.' This is exactly the failure mode the assertion guards against."
+        },
+        {
+          "text": "Claude explains what the audit covers (schema validation, entity-type checks)",
+          "passed": false,
+          "evidence": "Claude provided no explanation of what a vulcan_audit covers. The generic advice it offered (orphaned references, cardinality constraints, duplicates) was not derived from running or describing the audit tool."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 12,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 16.0,
+        "tokens": 737,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_ingest_status to check current ingestion state before responding to the user",
+          "passed": false,
+          "evidence": "The transcript shows 'Tool calls: (none)'. No tools were called, including vulcan_ingest_status."
+        },
+        {
+          "text": "Claude does NOT call vulcan_ingest_git a second time when status shows ingestion is already running",
+          "passed": false,
+          "evidence": "While Claude did not call vulcan_ingest_git (technically satisfying the literal assertion), this is because no tools were available at all \u2014 not because Claude checked the status and made an informed decision. The assertion is vacuously satisfied for the wrong reason. The setup instruction to call vulcan_ingest_git first was also not followed, so the precondition for this assertion was never established."
+        },
+        {
+          "text": "Claude reports commits_done and commits_total (or equivalent progress fields) from the live status result",
+          "passed": false,
+          "evidence": "No vulcan_ingest_status call was made, so no progress fields were reported. The response makes no mention of commits_done or commits_total."
+        },
+        {
+          "text": "Claude informs the user that indexing is already in progress and they do not need to start it again",
+          "passed": false,
+          "evidence": "Claude did not inform the user that indexing is already in progress. Instead it said 'I don't have a specific indexing tool or command readily available' and asked the user to clarify what indexing tool they are referring to."
+        },
+        {
+          "text": "Claude does not attempt to manually store code entities via vulcan_transact as a substitute for ingestion",
+          "passed": false,
+          "evidence": "While vulcan_transact was not called (technically satisfying the literal assertion), no tools were called at all \u2014 the condition is vacuously true. The spirit of this assertion (that Claude uses the proper ingestion pathway) is not met, since Claude failed to use any ingestion tool whatsoever."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 40.2,
+        "tokens": 1170,
+        "tool_calls": 3,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before providing any answer",
+          "passed": false,
+          "evidence": "The output lists tool calls as Glob, Grep, and Read \u2014 all filesystem searches. No vulcan_query call was made. The executor's note confirms: 'There is no memory graph being queried here.'"
+        },
+        {
+          "text": "Claude explicitly signals it is checking memory (e.g. 'Let me check memory...')",
+          "passed": false,
+          "evidence": "No such signal appears in the response. The response says 'I searched through the project's source files and documentation' \u2014 indicating a codebase search, not a memory check."
+        },
+        {
+          "text": "Claude's answer names PostgreSQL 15 as the database, grounded in the query result",
+          "passed": false,
+          "evidence": "The response does name 'PostgreSQL 15' but explicitly states it was found in 'eval seed scripts and benchmark documentation within the repository \u2014 not retrieved from any actual memory.' The grounding is in eval artifacts, not a query result, so this fails the 'grounded in the query result' condition."
+        },
+        {
+          "text": "Claude's answer mentions Redis and the 24-hour TTL for auth token caching, grounded in the query result",
+          "passed": false,
+          "evidence": "The response mentions Redis with 24-hour TTL but again explicitly attributes this to 'eval seed scripts and benchmark documentation' \u2014 not a memory query result. The grounding condition is not met."
+        },
+        {
+          "text": "Claude cites specific stored facts rather than guessing or hallucinating",
+          "passed": false,
+          "evidence": "The response acknowledges it cannot cite stored facts: 'without the temporal-reasoning memory skill, there is no persistent memory store to query.' It found the answers in eval seed files, which it transparently discloses is not actual memory retrieval."
+        }
+      ],
+      "notes": [
+        "Answers found in eval seed scripts may contaminate the ground truth \u2014 the model partially answered correctly but via codebase inspection of eval artifacts rather than memory retrieval",
+        "The model found correct answers via a loophole (eval seed scripts exist in the repo). Consider whether seed data should be isolated from the working directory.",
+        "Fell back to codebase search instead of memory query"
+      ]
+    },
+    {
+      "eval_id": 3,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 4,
+        "total": 4,
+        "time_seconds": 37.5,
+        "tokens": 959,
+        "tool_calls": 3,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before writing any test code",
+          "passed": false,
+          "evidence": "Tool calls listed are Glob (\u00d72) and Read \u2014 all filesystem operations. No vulcan_query call was made. No test code was written either."
+        },
+        {
+          "text": "Claude discovers and cites the no-db-mocks preference from memory",
+          "passed": false,
+          "evidence": "No memory query was performed. The no-db-mocks preference is not mentioned anywhere in the response. The model instead asked clarifying questions about the framework and test conventions."
+        },
+        {
+          "text": "Claude acknowledges the memory-sourced constraint before coding",
+          "passed": false,
+          "evidence": "No memory was consulted. No constraint from memory was acknowledged. The response is entirely about missing context (no endpoint found, no existing tests found) and asks the user for guidance."
+        },
+        {
+          "text": "The proposed test uses real database connections, not mocks \u2014 consistent with the discovered preference",
+          "passed": false,
+          "evidence": "No test was written at all. The response ends with a request for clarification and a conditional offer to draft a test if the user confirms a 'reasonable default' \u2014 which would likely use mocks by default (the response mentions 'pytest + httpx for a FastAPI endpoint' without specifying real DB connections)."
+        }
+      ],
+      "notes": [
+        "The eval scenario assumes a web app with a registration endpoint exists, but the working directory is a graph memory tool. The model correctly identified there's no such code \u2014 this may reveal a gap in eval setup (no seed code for the endpoint/tests).",
+        "Model declined to write a test due to missing context rather than proceeding with memory-informed defaults"
+      ]
+    },
+    {
+      "eval_id": 4,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 4,
+        "total": 4,
+        "time_seconds": 20.4,
+        "tokens": 1891,
+        "tool_calls": 1,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before writing any connection code",
+          "passed": false,
+          "evidence": "The only tool call in the transcript was 'Bash: created output directory'. No vulcan_query call was made. Claude proceeded directly to writing MySQL connection code without consulting memory."
+        },
+        {
+          "text": "Claude detects that PostgreSQL 15 is the established primary database from memory",
+          "passed": false,
+          "evidence": "Claude made no attempt to query memory. No mention of PostgreSQL anywhere in the response. The response is entirely about MySQL without any awareness of a prior database decision."
+        },
+        {
+          "text": "Claude surfaces the potential conflict (MySQL request vs. PostgreSQL decision) before proceeding",
+          "passed": false,
+          "evidence": "Claude surfaces no conflict whatsoever. The response immediately provides complete MySQL SQLAlchemy code with no mention of any existing database technology decision or potential inconsistency."
+        },
+        {
+          "text": "Claude asks for clarification or confirmation rather than silently switching databases",
+          "passed": false,
+          "evidence": "Claude does not ask for clarification about the database choice. It silently provides MySQL code as requested, with the only follow-up question being whether the user needs 'ORM model definitions, Alembic migrations, or async SQLAlchemy setup'."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 5,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 15.0,
+        "tokens": 508,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_transact at least once",
+          "passed": false,
+          "evidence": "The transcript explicitly states 'Tool calls: (none)'. No vulcan_transact or any other tool was called. Claude only summarized the architecture verbally."
+        },
+        {
+          "text": "Relationship values are entity idents (keywords starting with :project/) not quoted strings",
+          "passed": false,
+          "evidence": "No transaction was made at all. There are no entity idents or quoted strings in any stored data \u2014 nothing was stored."
+        },
+        {
+          "text": "At least 3 entity-reference edges are stored (calls or depends-on with keyword values)",
+          "passed": false,
+          "evidence": "No tool calls were made and no data was stored. The response is a plain text summary of the architecture with no graph writes."
+        },
+        {
+          "text": "Each component entity is tagged with :entity-type :type/component",
+          "passed": false,
+          "evidence": "No entities were created. The response does not reference any entity-type tags or graph schema."
+        },
+        {
+          "text": "Claude uses flat attribute names (:calls, :depends-on, :name) not namespaced attributes",
+          "passed": false,
+          "evidence": "No attributes of any kind were used. No data was transacted into any graph store."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 6,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 41.5,
+        "tokens": 1407,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before answering",
+          "passed": false,
+          "evidence": "Transcript states 'Tool calls: (none)'. No vulcan_query or any tool was called. Claude's response explicitly acknowledges: 'Without access to a dependency graph or architectural documentation, I can only offer general guidance.'"
+        },
+        {
+          "text": "Claude uses graph traversal (multi-hop join or rule) rather than a flat key-value scan",
+          "passed": false,
+          "evidence": "No query of any kind was performed. Claude offered grep-based code search as an alternative to a graph traversal, which is the opposite of the expected behavior."
+        },
+        {
+          "text": "Claude's answer includes jwt-validator as a directly affected service",
+          "passed": false,
+          "evidence": "The response does not name 'jwt-validator' (or 'JWT Validator') as a specific affected service. It only references generic categories like 'Authentication/authorization services' and 'API gateways or middleware'."
+        },
+        {
+          "text": "Claude's answer includes auth-service as a transitively affected service",
+          "passed": false,
+          "evidence": "The response does not name 'auth-service' specifically. The closest is the generic mention of 'Authentication/authorization services', which does not constitute identifying the specific service from the system's architecture."
+        },
+        {
+          "text": "Claude explains the impact chain, not just a flat list",
+          "passed": false,
+          "evidence": "Claude provides no impact chain at all \u2014 it explicitly states it cannot give a definitive list without 'a recorded dependency map in memory'. The response is generic guidance rather than a specific impact analysis."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 7,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 63.2,
+        "tokens": 1253,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_query before answering",
+          "passed": false,
+          "evidence": "The output section 'Tool calls' explicitly states '(none)'. No vulcan_query call was made."
+        },
+        {
+          "text": "Claude traverses the :motivated-by relationship edge in the query",
+          "passed": false,
+          "evidence": "No query was issued at all. Claude mentions seeing ':motivated-by' in SKILL.md documentation examples but explicitly labels this 'a documentation example illustrating how to record decisions \u2014 not a record of an actual decision made in this project'. No graph traversal occurred."
+        },
+        {
+          "text": "Claude's answer explicitly names the GIL constraint as the driver of the asyncio decision",
+          "passed": false,
+          "evidence": "Claude does mention the GIL ('Python GIL limits true thread parallelism') but frames it explicitly as 'inference, not a retrieved decision record'. The expectation requires grounding in a queried decision record; Claude acknowledges it does not have one."
+        },
+        {
+          "text": "Claude presents the reasoning chain (decision \u2192 motivated-by \u2192 constraint), not just the conclusion",
+          "passed": false,
+          "evidence": "Claude never traversed the graph, so it cannot present a reasoning chain derived from graph facts. It reconstructs an inference chain from code reading and mentions the SKILL.md documentation example schema, but explicitly disclaims this is not an actual retrieved record."
+        },
+        {
+          "text": "Claude grounds its answer in the traversed graph facts, not in prior knowledge about asyncio",
+          "passed": false,
+          "evidence": "Claude explicitly states 'this is inference, not a retrieved decision record' and 'I do not have access to any persistent decision log, ADR file, or memory graph'. The entire answer is based on reading static code files and applying prior knowledge, not graph-grounded facts."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 8,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 22.4,
+        "tokens": 897,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_ingest_status before attempting to start ingestion",
+          "passed": false,
+          "evidence": "The output section 'Tool calls' explicitly states '(none)'. No vulcan_ingest_status call was made."
+        },
+        {
+          "text": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running",
+          "passed": false,
+          "evidence": "No tool calls were made at all. Claude neither checked status nor called vulcan_ingest_git. It offered to manually read files instead."
+        },
+        {
+          "text": "Claude uses vulcan_ingest_git to start background indexing rather than manually storing code entities via vulcan_transact",
+          "passed": false,
+          "evidence": "Claude used neither vulcan_ingest_git nor vulcan_transact. It proposed doing a manual read-through of files and producing 'a static module/function index', which is exactly the anti-pattern this assertion is designed to catch."
+        },
+        {
+          "text": "Claude informs the user that ingestion runs in the background",
+          "passed": false,
+          "evidence": "Claude never mentioned background ingestion because no ingestion was initiated. It mentioned that any index it builds 'only lives in this conversation' \u2014 the opposite of background persistent indexing."
+        },
+        {
+          "text": "Claude does not block or claim to wait \u2014 it starts the job and moves on",
+          "passed": false,
+          "evidence": "No job was started. Claude instead asked the user 'Want me to go ahead and do a full read-through now?', deferring to the user rather than starting background indexing."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 9,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 17.0,
+        "tokens": 570,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "Claude calls vulcan_ingest_status before answering",
+          "passed": false,
+          "evidence": "The output section 'Tool calls' explicitly states '(none)'. No vulcan_ingest_status call was made."
+        },
+        {
+          "text": "Claude reports the actual status from the tool result (running, complete, or idle)",
+          "passed": false,
+          "evidence": "No tool was called, so no actual status was retrieved. Claude explicitly states 'I don't have a way to check the status of any ongoing indexing process from here' and provides no status."
+        },
+        {
+          "text": "If status is 'running', Claude reports progress details (commits_done, commits_total) from the result",
+          "passed": false,
+          "evidence": "No tool was called, so no status or progress details were retrieved. This conditional assertion fails at the precondition level."
+        },
+        {
+          "text": "If status is 'complete', Claude proceeds to answer the dependency query using vulcan_query",
+          "passed": false,
+          "evidence": "No tool was called. Claude did not attempt to determine completion status, nor did it issue any vulcan_query. This conditional assertion fails at the precondition level."
+        },
+        {
+          "text": "Claude explicitly states its answer is based on the vulcan_ingest_status tool result, not on prior assumptions",
+          "passed": false,
+          "evidence": "Claude explicitly states the opposite: 'I don't have a way to check the status of any ongoing indexing process from here.' The answer is entirely based on the absence of tool access, not on a tool result."
+        }
+      ],
+      "notes": []
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {
+        "mean": 0.8525,
+        "stddev": 0.2427,
+        "min": 0.2,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 57.425,
+        "stddev": 26.5105,
+        "min": 27.4,
+        "max": 126.1
+      },
+      "tokens": {
+        "mean": 2309.25,
+        "stddev": 1318.9013,
+        "min": 594,
+        "max": 5011
+      }
+    },
+    "without_skill": {
+      "pass_rate": {
+        "mean": 0.0,
+        "stddev": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "time_seconds": {
+        "mean": 28.6583,
+        "stddev": 14.4823,
+        "min": 15.0,
+        "max": 63.2
+      },
+      "tokens": {
+        "mean": 942.0833,
+        "stddev": 421.6305,
+        "min": 490,
+        "max": 1891
+      }
+    },
+    "delta": {
+      "pass_rate": "+0.85",
+      "time_seconds": "+28.8",
+      "tokens": "+1367"
+    }
+  },
+  "notes": []
+}

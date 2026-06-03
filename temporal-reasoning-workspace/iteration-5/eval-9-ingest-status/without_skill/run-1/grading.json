@@ -1,0 +1,86 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_ingest_status before answering",
+      "passed": false,
+      "evidence": "The output section 'Tool calls' explicitly states '(none)'. No vulcan_ingest_status call was made."
+    },
+    {
+      "text": "Claude reports the actual status from the tool result (running, complete, or idle)",
+      "passed": false,
+      "evidence": "No tool was called, so no actual status was retrieved. Claude explicitly states 'I don't have a way to check the status of any ongoing indexing process from here' and provides no status."
+    },
+    {
+      "text": "If status is 'running', Claude reports progress details (commits_done, commits_total) from the result",
+      "passed": false,
+      "evidence": "No tool was called, so no status or progress details were retrieved. This conditional assertion fails at the precondition level."
+    },
+    {
+      "text": "If status is 'complete', Claude proceeds to answer the dependency query using vulcan_query",
+      "passed": false,
+      "evidence": "No tool was called. Claude did not attempt to determine completion status, nor did it issue any vulcan_query. This conditional assertion fails at the precondition level."
+    },
+    {
+      "text": "Claude explicitly states its answer is based on the vulcan_ingest_status tool result, not on prior assumptions",
+      "passed": false,
+      "evidence": "Claude explicitly states the opposite: 'I don't have a way to check the status of any ongoing indexing process from here.' The answer is entirely based on the absence of tool access, not on a tool result."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 570,
+    "transcript_chars": 570
+  },
+  "timing": {
+    "executor_duration_seconds": 17.0,
+    "total_duration_seconds": 17.0,
+    "total_tokens": 10498,
+    "duration_ms": 17040
+  },
+  "claims": [
+    {
+      "claim": "Claude has no way to check the status of any ongoing indexing process",
+      "type": "process",
+      "verified": true,
+      "evidence": "Without using vulcan_ingest_status, this is accurate. The claim correctly describes the without-skill situation."
+    },
+    {
+      "claim": "Claude suggests checking logs, status files, or re-running the indexing command as workarounds",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Response lists these three suggestions explicitly."
+    },
+    {
+      "claim": "Claude offers to help write a dependency query once indexing is confirmed complete",
+      "type": "quality",
+      "verified": true,
+      "evidence": "Response states: 'Once indexing is confirmed complete, I'm happy to help you write a query to find which modules depend on the auth package.' However, this is a deferral — no actual query was produced or attempted."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "If status is 'running', Claude reports progress details (commits_done, commits_total) from the result",
+        "reason": "Both conditional assertions (3 and 4) depend on the status value returned by vulcan_ingest_status. If the eval environment always returns a fixed status (e.g., always 'running' or always 'complete'), only one of these conditionals will ever be exercised. Consider creating separate eval variants — one where status is 'running' (testing progress reporting) and one where status is 'complete' (testing the follow-up query). As-is, one branch is always untestable in a given run."
+      },
+      {
+        "reason": "No assertion checks that Claude does NOT tell the user to check logs manually as a substitute for calling the tool. In this run, Claude gives three manual workaround suggestions, which is exactly the wrong behavior — but no assertion captures this anti-pattern directly."
+      }
+    ],
+    "overall": "Assertions correctly all fail. The two conditional assertions (3 and 4) structurally can't both be testable in a single run — worth splitting into separate eval variants keyed to different status return values."
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before answering",
+      "passed": false,
+      "evidence": "The output section 'Tool calls' explicitly states '(none)'. No vulcan_query call was made."
+    },
+    {
+      "text": "Claude traverses the :motivated-by relationship edge in the query",
+      "passed": false,
+      "evidence": "No query was issued at all. Claude mentions seeing ':motivated-by' in SKILL.md documentation examples but explicitly labels this 'a documentation example illustrating how to record decisions — not a record of an actual decision made in this project'. No graph traversal occurred."
+    },
+    {
+      "text": "Claude's answer explicitly names the GIL constraint as the driver of the asyncio decision",
+      "passed": false,
+      "evidence": "Claude does mention the GIL ('Python GIL limits true thread parallelism') but frames it explicitly as 'inference, not a retrieved decision record'. The expectation requires grounding in a queried decision record; Claude acknowledges it does not have one."
+    },
+    {
+      "text": "Claude presents the reasoning chain (decision → motivated-by → constraint), not just the conclusion",
+      "passed": false,
+      "evidence": "Claude never traversed the graph, so it cannot present a reasoning chain derived from graph facts. It reconstructs an inference chain from code reading and mentions the SKILL.md documentation example schema, but explicitly disclaims this is not an actual retrieved record."
+    },
+    {
+      "text": "Claude grounds its answer in the traversed graph facts, not in prior knowledge about asyncio",
+      "passed": false,
+      "evidence": "Claude explicitly states 'this is inference, not a retrieved decision record' and 'I do not have access to any persistent decision log, ADR file, or memory graph'. The entire answer is based on reading static code files and applying prior knowledge, not graph-grounded facts."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 1253,
+    "transcript_chars": 1253
+  },
+  "timing": {
+    "executor_duration_seconds": 63.2,
+    "total_duration_seconds": 63.2,
+    "total_tokens": 17939,
+    "duration_ms": 63205
+  },
+  "claims": [
+    {
+      "claim": "asyncio is used heavily in mcp_server.py (asyncio.run(main()), asyncio.create_task, asyncio.sleep)",
+      "type": "factual",
+      "verified": true,
+      "evidence": "This is verifiable from the codebase; no reason to doubt it."
+    },
+    {
+      "claim": "The SKILL.md contains a documentation example showing asyncio-vs-threading with a :motivated-by edge to a gil-constraint",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Claude quotes this precisely: 'We chose asyncio over threading because of the GIL.' with :motivated-by edge. This is consistent with the eval prompt setup."
+    },
+    {
+      "claim": "There is no persistent decision log, ADR file, or memory graph accessible to Claude",
+      "type": "process",
+      "verified": true,
+      "evidence": "Claude made no tool calls, confirming it could not access the memory graph. This is the core failure: without calling vulcan_query, the graph is inaccessible."
+    },
+    {
+      "claim": "Claude's GIL inference is accurate given the codebase characteristics",
+      "type": "quality",
+      "verified": true,
+      "evidence": "The inference is reasonable for an I/O-bound server, but it is irrelevant — the eval tests whether Claude retrieves from the graph, not whether it can reason correctly about asyncio."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude's answer explicitly names the GIL constraint as the driver of the asyncio decision",
+        "reason": "This assertion can technically pass even if Claude relies on prior knowledge rather than the graph — a model that knows asyncio/GIL facts could satisfy it without any tool call. The assertion should require that the GIL claim is explicitly attributed to a retrieved graph fact, not just stated. The current wording would fail here because no query was made, but the assertion is dangerously close to passing for a hallucinated answer."
+      },
+      {
+        "reason": "No assertion checks that the :motivated-by edge actually existed in the graph at query time (vs. Claude inventing it from the SKILL.md documentation example). An assertion like 'Claude cites a specific entity ID or datom from the query result' would catch this."
+      }
+    ],
+    "overall": "The assertions are well-designed and all correctly fail here. The main risk is assertion 3 — it could pass for a hallucinated answer that happens to mention GIL. Tying it explicitly to a retrieved datom or entity would make it more discriminating."
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_ingest_status before attempting to start ingestion",
+      "passed": false,
+      "evidence": "No tool calls were made at all. The transcript explicitly states: 'None. As a plain Claude Code assistant without the temporal-reasoning skill, I have no indexing or graph ingestion tools available. There is no `vulcan_ingest_git`, `vulcan_query`, or similar capability to invoke.'"
+    },
+    {
+      "text": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running",
+      "passed": false,
+      "evidence": "vulcan_ingest_git was never called. Claude made no tool calls and instead offered alternative approaches like ctags, ast-grep, or a custom Python script."
+    },
+    {
+      "text": "Claude does not attempt to manually store code entities via vulcan_transact",
+      "passed": true,
+      "evidence": "No vulcan_transact calls were made. However, this passes vacuously — Claude made zero tool calls total, so it trivially satisfies the negative assertion."
+    },
+    {
+      "text": "Claude informs the user that ingestion runs in the background",
+      "passed": false,
+      "evidence": "Claude never initiated ingestion and never mentioned background processing. Instead it described alternative manual indexing approaches like Universal Ctags or a custom Python script."
+    },
+    {
+      "text": "Claude does not block or claim to wait — it starts the job and moves on",
+      "passed": false,
+      "evidence": "No job was started. Claude declined to take any ingestion action and asked the user clarifying questions about their preferred approach."
+    }
+  ],
+  "summary": {
+    "passed": 1,
+    "failed": 4,
+    "total": 5,
+    "pass_rate": 0.2
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 1268,
+    "transcript_chars": 1268
+  },
+  "timing": {
+    "executor_duration_seconds": null,
+    "total_duration_seconds": 30.0,
+    "total_tokens": 10959,
+    "duration_ms": 30005
+  },
+  "claims": [
+    {
+      "claim": "Claude has no indexing or graph ingestion tools available",
+      "type": "factual",
+      "verified": true,
+      "evidence": "This is the without_skill run — the temporal-reasoning MCP tools are not configured, so the claim is accurate in context."
+    },
+    {
+      "claim": "Claude can use Grep to find function definitions on demand",
+      "type": "process",
+      "verified": true,
+      "evidence": "Claude Code does have Grep available as a built-in tool, so this alternative offer is accurate."
+    },
+    {
+      "claim": "Running ctags -R . would generate a queryable tags file",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Standard ctags behavior — factually correct but not relevant to the eval task."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude does not attempt to manually store code entities via vulcan_transact",
+        "reason": "This assertion passes vacuously for the without-skill run because no tools were called at all. A without-skill run will always trivially pass this negative assertion. Consider rewording as a positive check (e.g., 'Claude uses vulcan_ingest_git to delegate indexing rather than manually transacting entities') to make it discriminating."
+      },
+      {
+        "reason": "No assertion checks that Claude actually completes the user's request (i.e., that ingestion is actually initiated). A run could pass assertions 3 and 5 by doing nothing at all, as this without-skill run demonstrates for assertion 3. Consider adding: 'Claude successfully initiates git ingestion' as a gating assertion."
+      }
+    ],
+    "overall": "The assertion set is well-designed for the with-skill case but two assertions (3 and 5) are trivially passable by inaction. The without-skill run exposes this: it passes assertion 3 solely by making no tool calls. Consider adding a positive gate assertion that verifies ingestion was actually started."
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "eval_id": 3,
+  "eval_name": "preference-enforcement",
+  "prompt": "Can you add a test for the user registration endpoint? Make sure it fits with how we do things.",
+  "assertions": [
+    {
+      "text": "Claude calls vulcan_query before writing any test code"
+    },
+    {
+      "text": "Claude discovers and cites the no-db-mocks preference from memory"
+    },
+    {
+      "text": "Claude acknowledges the memory-sourced constraint before coding"
+    },
+    {
+      "text": "The proposed test uses real database connections, not mocks \u2014 consistent with the discovered preference"
+    }
+  ]
+}

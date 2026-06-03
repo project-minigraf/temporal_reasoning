@@ -1,0 +1,87 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before providing any answer",
+      "passed": true,
+      "evidence": "Calls 2, 3, and 4 are all vulcan_query calls. The response to the user appears after all three queries. No answer text appears before the first query call."
+    },
+    {
+      "text": "Claude explicitly signals it is checking memory (e.g. 'Let me check memory...')",
+      "passed": true,
+      "evidence": "Response begins with: 'Let me check memory...' — verbatim match of the example phrase."
+    },
+    {
+      "text": "Claude's answer names PostgreSQL 15 as the database, grounded in the query result",
+      "passed": true,
+      "evidence": "Response states 'We are using PostgreSQL 15 as the primary database.' The information originates from memory_prepare_turn context (which surfaced ':description | PostgreSQL 15 as primary database' and ':version | 15') and was corroborated by the vulcan_query call 4 that retrieved all :type/decision entities. The answer is grounded in memory — though the entity content detail came primarily from memory_prepare_turn rather than the full-entity query results."
+    },
+    {
+      "text": "Claude's answer mentions Redis and the 24-hour TTL for auth token caching, grounded in the query result",
+      "passed": true,
+      "evidence": "Response states 'We are using Redis for session token caching, with a 24-hour TTL on auth tokens.' Memory_prepare_turn surfaced ':description | Redis for session token caching with 24-hour TTL' and ':ttl-hours | 24', and query call 4 confirmed the decision entity exists."
+    },
+    {
+      "text": "Claude cites specific stored facts rather than guessing or hallucinating",
+      "passed": true,
+      "evidence": "Response explicitly references 'stored decisions' sourced from memory, with specific details (PostgreSQL 15, 24-hour TTL, ACID compliance, JSON support, fast in-memory cache rationale) that match exactly the stored memory records. No information is introduced that wasn't in the memory context."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "memory_prepare_turn": 1,
+      "vulcan_query": 3
+    },
+    "total_tool_calls": 4,
+    "total_steps": 4,
+    "errors_encountered": 0,
+    "output_chars": 2200,
+    "transcript_chars": 2200
+  },
+  "timing": {
+    "executor_duration_seconds": 53.4,
+    "total_duration_seconds": 53.4
+  },
+  "claims": [
+    {
+      "claim": "Memory has clear records of both decisions from our prior session",
+      "type": "factual",
+      "verified": true,
+      "evidence": "memory_prepare_turn output shows three decision entities with PostgreSQL, Redis, and FastAPI data stored with descriptions, reasons, and metadata."
+    },
+    {
+      "claim": "Content-based queries (contains? for 'database' and 'Redis') returned no results",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Calls 2 and 3 both returned {\"ok\": true, \"results\": []} — the contains? predicate either isn't supported or the stored values differ from the query strings."
+    },
+    {
+      "claim": "The agent found the correct data using a by-entity-type query",
+      "type": "process",
+      "verified": true,
+      "evidence": "Call 4 queried [?e :entity-type :type/decision] and returned 3 entity IDs — the agent used these to confirm the existence of the stored decisions, while the actual content was drawn from memory_prepare_turn."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": ["Content-based contains? queries returned empty results; agent fell back to an entity-type query and relied on memory_prepare_turn for the actual attribute values"]
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude's answer names PostgreSQL 15 as the database, grounded in the query result",
+        "reason": "The assertion says 'grounded in the query result' but the actual content (PostgreSQL 15, 24h TTL) was surfaced by memory_prepare_turn before any vulcan_query call was made. The vulcan_query calls returned only entity UUIDs with :entity-type, not the actual attribute values. A stronger assertion would verify that vulcan_query returned content-bearing results (descriptions, rationale) — otherwise this passes trivially whenever memory_prepare_turn is populated."
+      },
+      {
+        "reason": "No assertion checks that the contains? predicate queries (Calls 2 and 3) failed silently — both returned empty results despite the data existing. This reveals a potential skill usability gap: the agent tried unsupported or incorrect query syntax first. An assertion like 'Agent issues a query that returns actual decision content (not just entity IDs)' would catch this failure mode."
+      }
+    ],
+    "overall": "All expectations pass, but the 'grounded in the query result' assertions are weakly satisfied — the substantive answers came from memory_prepare_turn context injection, not from vulcan_query returning attribute values. The evals would be more discriminating if they verified that vulcan_query itself returned the relevant facts."
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_transact at least once",
+      "passed": true,
+      "evidence": "Three vulcan_transact calls are recorded (Calls 2, 3, 4). Call 4 succeeded with '{\"ok\": true, ...}'."
+    },
+    {
+      "text": "Relationship values are entity idents (keywords starting with :project/) not quoted strings",
+      "passed": false,
+      "evidence": "The successful transaction (Call 4) uses :module/ namespace (e.g., ':module/auth-service', ':module/jwt-validator', ':module/key-store') not :project/. The :project/ namespace was rejected by the schema validator in Call 2: 'entity :project/api-gateway has unknown type project'. The spirit of the assertion (keyword idents, not strings) is satisfied, but the assertion explicitly requires :project/ namespace."
+    },
+    {
+      "text": "At least 3 entity-reference edges are stored (calls or depends-on with keyword values)",
+      "passed": true,
+      "evidence": "Call 4 stores three :calls edges with keyword values: [:module/api-gateway :calls :module/auth-service], [:module/auth-service :calls :module/jwt-validator], [:module/jwt-validator :calls :module/key-store]. All three use keyword entity references, not quoted strings."
+    },
+    {
+      "text": "Each component entity is tagged with :entity-type :type/component",
+      "passed": true,
+      "evidence": "All four entities in Call 4 include ':entity-type :type/component': api-gateway, auth-service, jwt-validator, and key-store. Confirmed in the successful transact input."
+    },
+    {
+      "text": "Claude uses flat attribute names (:calls, :depends-on, :name) not namespaced attributes",
+      "passed": true,
+      "evidence": "Call 4 uses flat attributes :description, :entity-type, and :calls — none are namespaced (e.g., no :service/calls or :arch/entity-type). Note: :name was replaced by :description due to schema enforcement (modules don't allow :name), but the attribute style remains flat and unnamespaced."
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 1,
+    "total": 5,
+    "pass_rate": 0.8
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "memory_prepare_turn": 1,
+      "vulcan_transact": 3
+    },
+    "total_tool_calls": 4,
+    "total_steps": 4,
+    "errors_encountered": 2,
+    "output_chars": 2618,
+    "transcript_chars": 2618
+  },
+  "timing": {
+    "executor_duration_seconds": 63.7,
+    "total_duration_seconds": 63.7,
+    "total_tokens": 21485
+  },
+  "claims": [
+    {
+      "claim": "The :calls edges are entity keyword references, making the full call-chain traversable",
+      "type": "quality",
+      "verified": true,
+      "evidence": "The stored facts use :module/auth-service etc. as keyword values, which are proper entity references in the graph, not plain strings. The response demonstrates correct multi-hop query patterns to traverse the chain."
+    },
+    {
+      "claim": "Four components were written as typed entities",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Call 4 input contains four distinct entities: :module/api-gateway, :module/auth-service, :module/jwt-validator, :module/key-store — each with :entity-type :type/component."
+    },
+    {
+      "claim": "The agent adapted correctly when :project/ and :name were rejected by the schema",
+      "type": "process",
+      "verified": true,
+      "evidence": "Call 2 rejected :project/ namespace; Call 3 rejected :name on :module/ entities; Call 4 used :module/ with :description and succeeded. Error messages are quoted verbatim in the transcript."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": [
+      "Schema rejected :project/ namespace; agent fell back to :module/ (which is a valid namespace)",
+      "Schema rejected :name on :module/ entities; agent used :description instead"
+    ]
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Relationship values are entity idents (keywords starting with :project/) not quoted strings",
+        "reason": "The :project/ namespace is not valid in this schema — the server actively rejects it. The assertion as written is impossible to pass correctly. It should be rewritten to check that relationship values are any keyword entity ident (e.g., starting with a colon and matching a known entity) rather than hardcoding :project/ specifically. Consider: 'Relationship values are keyword entity idents (e.g., :module/auth-service) not quoted strings like \"auth-service\"'."
+      },
+      {
+        "reason": "No assertion verifies that the stored entities can actually be queried/traversed after storage. The response demonstrates example queries but they are not executed. Adding an assertion that Claude runs at least one multi-hop query to verify the stored graph would strengthen the eval."
+      }
+    ],
+    "overall": "The :project/ namespace assertion is a design flaw — it expects a namespace the schema actively rejects, making it impossible to pass correctly. The other assertions are solid. The eval should be updated to use schema-valid namespace examples."
+  }
+}

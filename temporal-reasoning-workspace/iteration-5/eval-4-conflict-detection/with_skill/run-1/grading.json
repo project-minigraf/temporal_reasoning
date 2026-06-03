@@ -1,0 +1,76 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before writing any connection code",
+      "passed": true,
+      "evidence": "Call 1 in the transcript is vulcan_query (`[:find ?e ?a ?v :where [?e ?a ?v]]`), and the response opens with 'Let me check memory before writing any connection code.' No code was written until after both queries returned."
+    },
+    {
+      "text": "Claude detects that PostgreSQL 15 is the established primary database from memory",
+      "passed": true,
+      "evidence": "Response states: 'Memory shows a finalized architecture decision: Description: PostgreSQL 15 finalized as primary database — do not switch without team alignment' — retrieved from the decision entity in the graph."
+    },
+    {
+      "text": "Claude surfaces the potential conflict (MySQL request vs. PostgreSQL decision) before proceeding",
+      "passed": true,
+      "evidence": "Response states: 'Before I write MySQL connection code, I want to flag this conflict. Memory records that PostgreSQL 15 is our finalized primary database, and the decision explicitly notes \"do not switch without team alignment.\"'"
+    },
+    {
+      "text": "Claude asks for clarification or confirmation rather than silently switching databases",
+      "passed": true,
+      "evidence": "Two explicit clarifying questions are posed: (1) 'Is this MySQL connection truly additive?' and (2) 'Or is this a direction change?' before offering the MySQL code conditionally. The response closes with 'Let me know which case this is.'"
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "vulcan_query": 2
+    },
+    "total_tool_calls": 2,
+    "total_steps": 2,
+    "errors_encountered": 0,
+    "output_chars": 2547,
+    "transcript_chars": 2547
+  },
+  "timing": {
+    "executor_duration_seconds": 49.6,
+    "total_duration_seconds": 49.6,
+    "total_tokens": 19844
+  },
+  "claims": [
+    {
+      "claim": "Memory contains a finalized decision record for PostgreSQL 15",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Query output in Call 1 shows entity with ':description' = 'PostgreSQL 15 finalized as primary database — do not switch without team alignment' and ':status' = 'finalized'."
+    },
+    {
+      "claim": "Claude provides MySQL SQLAlchemy code despite the conflict",
+      "type": "quality",
+      "verified": true,
+      "evidence": "The response does provide MySQL connection code, but only after flagging the conflict and framing it as the 'additive sidecar' scenario. This is appropriate — it answers the request while surfacing the conflict."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "reason": "No assertion checks whether Claude proactively offers to record the MySQL sidecar decision in memory if it's additive — the response does offer this ('I'll also store that in memory'), which is a positive behavior the eval doesn't credit."
+      },
+      {
+        "assertion": "Claude asks for clarification or confirmation rather than silently switching databases",
+        "reason": "This assertion passes even if Claude asks a trivial or unrelated question. A stronger assertion would verify that Claude's question specifically references the PostgreSQL decision and the potential contradiction, not just any clarifying question."
+      }
+    ],
+    "overall": "Assertions are well-targeted and discriminating. The one weak point is that assertion 4 could pass for any question — tightening it to require the question reference the existing decision would be more rigorous."
+  }
+}

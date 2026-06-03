@@ -1,0 +1,13 @@
+{
+  "eval_id": 10,
+  "eval_name": "memory-prepare-turn-manual-call",
+  "prompt": "What framework are we using for the API layer?",
+  "setup": "Graph pre-seeded with FastAPI decision. Hooks do not fire in subagent environment — Claude must call memory_prepare_turn manually at turn start. without_skill runs with no graph tools available.",
+  "assertions": [
+    "Claude calls memory_prepare_turn as the first tool call of the turn",
+    "memory_prepare_turn is passed the user's message text",
+    "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result",
+    "Claude does not answer from general knowledge or guess when the answer is in memory",
+    "Claude does not ask the user to repeat information that was available in memory"
+  ]
+}

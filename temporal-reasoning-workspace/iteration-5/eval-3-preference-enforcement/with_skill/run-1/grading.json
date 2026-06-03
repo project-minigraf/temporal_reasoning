@@ -1,0 +1,88 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before writing any test code",
+      "passed": true,
+      "evidence": "Call 2 is vulcan_query (all entities). The test code appears only in the final response section, which follows all tool calls. No test code is written before the query."
+    },
+    {
+      "text": "Claude discovers and cites the no-db-mocks preference from memory",
+      "passed": true,
+      "evidence": "memory_prepare_turn surfaced ':description | Do not use mocks for database tests — use real connections'. The vulcan_query call confirmed the same preference entity. The response explicitly quotes: 'Do not use mocks for database tests — use real connections. Reason: mocked tests passed but a prod migration failed last quarter because of mock/prod divergence.'"
+    },
+    {
+      "text": "Claude acknowledges the memory-sourced constraint before coding",
+      "passed": true,
+      "evidence": "Response states 'Let me check memory before writing anything.' then quotes the stored preference ('Memory has a stored preference that applies directly here:') before any test code is shown."
+    },
+    {
+      "text": "The proposed test uses real database connections, not mocks — consistent with the discovered preference",
+      "passed": true,
+      "evidence": "Test code uses `create_engine(DATABASE_URL)` with a real PostgreSQL URL ('postgresql://testuser:testpass@localhost:5432/testdb'), a real SQLAlchemy session, and direct DB verification (`db_session.query(User).filter_by(...)`). No MagicMock, unittest.mock.patch, or any mock library is used. A comment in the code explicitly states: '# Real DB — no mocks.'"
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "memory_prepare_turn": 1,
+      "vulcan_query": 1,
+      "memory_finalize_turn": 1
+    },
+    "total_tool_calls": 3,
+    "total_steps": 3,
+    "errors_encountered": 0,
+    "output_chars": 3900,
+    "transcript_chars": 3900
+  },
+  "timing": {
+    "executor_duration_seconds": 58.1,
+    "total_duration_seconds": 58.1
+  },
+  "claims": [
+    {
+      "claim": "Memory surfaced a stored preference: do not use mocks for database tests",
+      "type": "factual",
+      "verified": true,
+      "evidence": "memory_prepare_turn output includes the preference entity with :description 'Do not use mocks for database tests — use real connections' and :reason 'mocked tests passed but prod migration failed last quarter'. vulcan_query confirmed the same entity."
+    },
+    {
+      "claim": "The test was written using real database connections consistent with the preference",
+      "type": "quality",
+      "verified": true,
+      "evidence": "Test uses create_engine with a real PostgreSQL URL, real sessionmaker, no mock imports, and includes a direct DB query to verify persistence after the HTTP call."
+    },
+    {
+      "claim": "The test covers duplicate email registration and invalid email validation",
+      "type": "quality",
+      "verified": true,
+      "evidence": "Three test functions present: test_register_user_success, test_register_user_duplicate_email (expects 409), test_register_user_invalid_email (expects 422)."
+    },
+    {
+      "claim": "Rollback-based isolation keeps tests fast without sacrificing real-DB fidelity",
+      "type": "quality",
+      "verified": true,
+      "evidence": "db_session fixture calls session.rollback() and Base.metadata.drop_all(engine) in teardown. The response explicitly calls out 'Rollback-based isolation' as a key design choice."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "reason": "No assertion checks the quality or correctness of the generated test code itself — only that it avoids mocks. The eval would be stronger with an assertion like 'The test verifies that the registered user actually exists in the database (not just that the HTTP response was 201).' This would fail for a superficial test that only checks the response status without real DB verification."
+      },
+      {
+        "reason": "No assertion checks that the stored preference entity contains a rationale explaining why real connections are required. The reason ('mocked tests passed but prod migration failed last quarter') is a meaningful piece of context that was correctly surfaced and cited — an assertion on this would verify the skill stores and retrieves richer decision context, not just the headline rule."
+      }
+    ],
+    "overall": "All four assertions pass and the output is genuinely high quality. The main gap is that assertions only check 'no mocks used' but not 'real DB verification actually performed in the test body' — a test that uses a real connection but doesn't query the DB afterward would still pass."
+  }
+}

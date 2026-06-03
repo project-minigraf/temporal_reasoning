@@ -1,0 +1,94 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_ingest_status before attempting to start ingestion",
+      "passed": true,
+      "evidence": "Call 2 is vulcan_ingest_status (returning idle status), and Call 3 is vulcan_ingest_git. The status check clearly precedes the ingestion attempt."
+    },
+    {
+      "text": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running",
+      "passed": true,
+      "evidence": "Status returned {\"status\": \"idle\"} and Claude explicitly notes 'The status is idle — the background ingestion hook had not yet started a job' before proceeding to call vulcan_ingest_git. Had the status been non-idle, the logic implies it would not have called ingest."
+    },
+    {
+      "text": "Claude does not attempt to manually store code entities via vulcan_transact",
+      "passed": true,
+      "evidence": "No vulcan_transact calls appear anywhere in the transcript. The only transact-adjacent call is memory_finalize_turn (Call 4), which stores conversation memory, not code entities."
+    },
+    {
+      "text": "Claude informs the user that ingestion runs in the background",
+      "passed": true,
+      "evidence": "The user-facing response explicitly states: 'Once that's allowed, ingestion will run as a background task and you can track progress with vulcan_ingest_status.'"
+    },
+    {
+      "text": "Claude does not block or claim to wait — it starts the job and moves on",
+      "passed": true,
+      "evidence": "Claude attempted vulcan_ingest_git immediately (Call 3), then finalized memory (Call 4) and responded. There is no polling loop, sleep, or claim to be waiting for completion. The tool was sandbox-denied, but Claude moved on to inform the user and provide example queries rather than blocking."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "memory_prepare_turn": 1,
+      "vulcan_ingest_status": 1,
+      "vulcan_ingest_git": 1,
+      "memory_finalize_turn": 1
+    },
+    "total_tool_calls": 4,
+    "total_steps": 4,
+    "errors_encountered": 1,
+    "output_chars": 1680,
+    "transcript_chars": 1847
+  },
+  "timing": {
+    "executor_duration_seconds": null,
+    "grader_duration_seconds": null,
+    "total_duration_seconds": 57.9
+  },
+  "claims": [
+    {
+      "claim": "vulcan_ingest_git should be auto-invoked by the UserPromptSubmit hook at session start",
+      "type": "factual",
+      "verified": false,
+      "evidence": "This is stated in the transcript reasoning but cannot be verified from the available outputs — it is a claim about the hook system's expected behavior, not something observable in this run."
+    },
+    {
+      "claim": "Claude attempted to kick off vulcan_ingest_git at /home/aditya/workspaces/pycharm/temporal_reasoning on branch HEAD",
+      "type": "process",
+      "verified": true,
+      "evidence": "Call 3 shows vulcan_ingest_git with repo_path='/home/aditya/workspaces/pycharm/temporal_reasoning' and branch='HEAD'."
+    },
+    {
+      "claim": "Ingestion was blocked by environment sandbox, not by agent choice",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Call 3 output is marked 'Permission denied — the tool call was blocked by the environment sandbox.'"
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running",
+        "reason": "This assertion is only tested in the idle case. The eval doesn't verify the complementary behavior — that Claude would NOT call vulcan_ingest_git if status returned 'running'. Consider adding a parallel eval variant where the status mock returns 'running' to test that branch."
+      },
+      {
+        "reason": "No assertion checks that Claude uses the correct repo_path when calling vulcan_ingest_git. An agent that passes a wrong/hardcoded path would satisfy all five assertions. The repo path used was plausible but unchecked."
+      },
+      {
+        "assertion": "Claude informs the user that ingestion runs in the background",
+        "reason": "This assertion is easy to satisfy trivially — any mention of 'background' in the response passes it. Consider tightening it to require that the explanation is clear and actionable (e.g., mentions that vulcan_ingest_status can be used to track progress), which this run did do well."
+      }
+    ],
+    "overall": "All five assertions pass with clear evidence. The eval suite covers the core happy path well. The main gaps are: (1) no test for the 'already running' branch, and (2) no verification of the repo_path parameter quality."
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls memory_prepare_turn as the first tool call of the turn",
+      "passed": true,
+      "evidence": "Call 1 in the transcript is memory_prepare_turn, before any other tool calls or response text."
+    },
+    {
+      "text": "memory_prepare_turn is passed the user's message text",
+      "passed": true,
+      "evidence": "Input shown as: user_message=\"What framework are we using for the API layer?\" — exactly the user's question."
+    },
+    {
+      "text": "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result",
+      "passed": true,
+      "evidence": "Response states \"We are using FastAPI for the API layer. Memory records this as an explicit decision\" — directly citing the memory_prepare_turn output which returned :framework FastAPI."
+    },
+    {
+      "text": "Claude does not answer from general knowledge or guess when the answer is in memory",
+      "passed": true,
+      "evidence": "The response is explicitly attributed to memory: \"Memory records this as an explicit decision: FastAPI was chosen over Flask because async support was required — it aligns with our asyncio concurrency model.\" The rationale (asyncio over Flask) matches the memory output exactly, not general knowledge."
+    },
+    {
+      "text": "Claude provides a complete, self-contained answer using the memory context, with no follow-up questions needed",
+      "passed": true,
+      "evidence": "Response identifies the framework (FastAPI), explains the rationale (async support, asyncio concurrency model), and references it as an explicit decision. No follow-up questions are asked."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "memory_prepare_turn": 1
+    },
+    "total_tool_calls": 1,
+    "total_steps": 1,
+    "errors_encountered": 0,
+    "output_chars": 594,
+    "transcript_chars": 594
+  },
+  "timing": {
+    "total_tokens": 18822,
+    "executor_duration_seconds": 28.9,
+    "total_duration_seconds": 28.9
+  },
+  "claims": [
+    {
+      "claim": "FastAPI was chosen over Flask because async support was required",
+      "type": "factual",
+      "verified": true,
+      "evidence": "memory_prepare_turn output shows :reason 'async support preferred over Flask; aligns with asyncio concurrency model' — the response accurately relays this."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude does not answer from general knowledge or guess when the answer is in memory",
+        "reason": "This assertion is hard to verify negatively — the response happens to match memory, but the eval doesn't test the counterfactual where memory is absent. Consider a paired eval where memory_prepare_turn returns nothing and asserting Claude acknowledges uncertainty rather than guessing."
+      }
+    ],
+    "overall": "Strong eval for a targeted behavior. All assertions are meaningful and discriminating. The one suggestion is about the negative case rather than a flaw in the current assertions."
+  }
+}

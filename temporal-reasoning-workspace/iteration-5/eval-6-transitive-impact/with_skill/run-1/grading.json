@@ -1,0 +1,88 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before answering",
+      "passed": true,
+      "evidence": "memory_prepare_turn (Call 1) retrieves graph context, then Calls 2-5 are all vulcan_query calls. The substantive response comes only after all queries complete. Call 2 alone answers the direct-dependency question, and Calls 3-4 extend to 2-hop and 3-hop traversals before the response is written."
+    },
+    {
+      "text": "Claude uses graph traversal (multi-hop join or rule) rather than a flat key-value scan",
+      "passed": true,
+      "evidence": "Call 3 is a 2-hop join: '[?mid :depends-on :project/key-store] [?svc :depends-on ?mid]'. Call 4 is a 3-hop join adding '[?top :calls ?svc]'. These are genuine multi-clause Datalog joins, not flat attribute scans."
+    },
+    {
+      "text": "Claude's answer includes jwt-validator as a directly affected service",
+      "passed": true,
+      "evidence": "Response: 'Direct dependent (1 hop): jwt-validator — depends directly on key-store. It reads signing keys from key-store to perform JWT validation.' Corroborated by Call 2 output: '[\"JWT Validator\"]'."
+    },
+    {
+      "text": "Claude's answer includes auth-service as a transitively affected service",
+      "passed": true,
+      "evidence": "Response: 'Indirect dependent (2 hops): auth-service — depends on jwt-validator.' Corroborated by Call 3 output: '[\"Auth Service\"]'."
+    },
+    {
+      "text": "Claude explains the impact chain, not just a flat list",
+      "passed": true,
+      "evidence": "Response provides hop-by-hop reasoning (1 hop, 2 hops, 3 hops), explains the mechanism at each hop ('If jwt-validator's behavior changes... auth-service is at risk'), includes a risk table, and provides a recommended remediation order. This is a causal chain explanation, not a flat enumeration."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "memory_prepare_turn": 1,
+      "vulcan_query": 4
+    },
+    "total_tool_calls": 5,
+    "total_steps": 5,
+    "errors_encountered": 0,
+    "output_chars": 2912,
+    "transcript_chars": 2912
+  },
+  "timing": {
+    "executor_duration_seconds": 60.3,
+    "total_duration_seconds": 60.3,
+    "total_tokens": 21083
+  },
+  "claims": [
+    {
+      "claim": "API gateway is included as a transitively affected service (3 hops)",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Call 4 output '[\"API Gateway\"]' and response section 'Transitive dependent (3 hops): api-gateway — calls auth-service.' This is a bonus depth of analysis beyond what the assertions check."
+    },
+    {
+      "claim": "Memory context from memory_prepare_turn shows :depends-on edges using :project/ namespace",
+      "type": "factual",
+      "verified": true,
+      "evidence": "memory_prepare_turn output shows ':depends-on | :project/jwt-validator' and ':depends-on | :project/key-store' — the graph was stored (in a prior session) with :project/ namespace, which is why the queries in this eval correctly use :project/key-store as the lookup target."
+    },
+    {
+      "claim": "Claude checked for :calls edges into key-store (not just :depends-on)",
+      "type": "process",
+      "verified": true,
+      "evidence": "Call 5 queries '[:find ?name :where [?svc :calls :project/key-store] [?svc :name ?name]]' and gets empty results — Claude was thorough in checking both relationship types before concluding the blast radius."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "reason": "No assertion checks that api-gateway is identified as a 3-hop transitive dependent. The response correctly identifies it and Call 4 confirms it via query, but this behavior goes unrecognized by the eval. Adding an assertion for the full 3-hop chain would make the eval more demanding and better capture the depth of traversal the skill enables."
+      },
+      {
+        "assertion": "Claude uses graph traversal (multi-hop join or rule) rather than a flat key-value scan",
+        "reason": "This assertion could be gamed by a response that includes any multi-hop query in the transcript but still answers primarily from the memory_prepare_turn context dump rather than the query results. Consider verifying that the final answer is grounded in query outputs, not just that multi-hop queries were issued."
+      }
+    ],
+    "overall": "Strong eval with well-targeted assertions. The missing 3-hop assertion for api-gateway is the main gap — the agent does the work but gets no credit for it."
+  }
+}

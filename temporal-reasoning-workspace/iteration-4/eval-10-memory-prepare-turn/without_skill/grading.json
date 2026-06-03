@@ -1,0 +1,89 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls memory_prepare_turn as the first tool call of the turn",
+      "passed": false,
+      "evidence": "The transcript shows three tool calls: ls on project root, Read of mcp_server.py, and Read of pyproject.toml. No call to memory_prepare_turn was made at any point in the turn."
+    },
+    {
+      "text": "memory_prepare_turn is passed the user's message text",
+      "passed": false,
+      "evidence": "memory_prepare_turn was never called, so it could not have been passed the user's message text."
+    },
+    {
+      "text": "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result",
+      "passed": false,
+      "evidence": "Claude answered 'MCP (Model Context Protocol) framework' based on reading mcp_server.py, not FastAPI. The answer was derived from codebase inspection, not from memory_prepare_turn which was never called."
+    },
+    {
+      "text": "Claude does not answer from general knowledge or guess when the answer is in memory",
+      "passed": false,
+      "evidence": "Claude answered from codebase file inspection (mcp_server.py and pyproject.toml) rather than from memory. The correct answer (FastAPI) was presumably stored in memory but never retrieved. The agent substituted file-reading for memory access."
+    },
+    {
+      "text": "Claude does not ask the user to repeat information that was available in memory",
+      "passed": true,
+      "evidence": "Claude did not ask the user to repeat any information — it proceeded to answer (incorrectly) by reading codebase files. The assertion is technically satisfied, though the spirit of it (trusting memory) was violated since memory was never consulted."
+    }
+  ],
+  "summary": {
+    "passed": 1,
+    "failed": 4,
+    "total": 5,
+    "pass_rate": 0.2
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "Bash": 1,
+      "Read": 2
+    },
+    "total_tool_calls": 3,
+    "total_steps": 3,
+    "errors_encountered": 0,
+    "output_chars": 768,
+    "transcript_chars": 821
+  },
+  "timing": {
+    "executor_duration_seconds": null,
+    "total_duration_seconds": 24.5,
+    "total_tokens": 12477,
+    "duration_ms": 24462
+  },
+  "claims": [
+    {
+      "claim": "The API layer uses the MCP (Model Context Protocol) framework",
+      "type": "factual",
+      "verified": false,
+      "evidence": "The prompt note says the correct answer is FastAPI (from memory). The agent read mcp_server.py and concluded MCP is the API layer, which conflates the transport protocol with the API framework. The answer is factually wrong for the purpose of this eval."
+    },
+    {
+      "claim": "Claude read mcp_server.py and pyproject.toml to determine the framework",
+      "type": "process",
+      "verified": true,
+      "evidence": "Transcript confirms both files were read: 'Read first 60 lines of mcp_server.py' and 'Read pyproject.toml'."
+    },
+    {
+      "claim": "There is no HTTP REST or GraphQL layer",
+      "type": "factual",
+      "verified": false,
+      "evidence": "The grader note states the correct answer (from memory) is FastAPI, which is an HTTP REST framework. This claim is contradicted by what memory would have returned."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude does not ask the user to repeat information that was available in memory",
+        "reason": "This assertion passes trivially whenever the agent guesses or reads files instead of using memory — which is precisely the failure mode being tested. An agent that never calls memory_prepare_turn will almost always satisfy this assertion by accident, making it a weak discriminator. Consider replacing or supplementing it with 'Claude's answer matches the value stored in memory' to catch the substitution failure."
+      },
+      {
+        "reason": "No assertion checks that the agent did NOT use codebase file-reading as a substitute for memory. The without-skill agent's specific failure mode — reading source files instead of querying memory — goes uncaught by the current assertions except indirectly through the FastAPI check. An assertion like 'Claude does not inspect codebase files to answer a question that memory_prepare_turn can answer' would directly target this failure."
+      }
+    ],
+    "overall": "Assertions 1-4 are well-targeted and correctly fail for this run. Assertion 5 is too weak — it passes for the wrong reasons. The eval would benefit from an assertion guarding against file-reading substitution."
+  }
+}

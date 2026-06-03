@@ -1,0 +1,12 @@
+{
+  "eval_id": 6,
+  "eval_name": "transitive-impact",
+  "prompt": "I need to refactor the key-store service to change how it formats signing keys. What other services might be affected by this change?",
+  "assertions": [
+    {"text": "Claude calls vulcan_query before answering"},
+    {"text": "Claude uses graph traversal (multi-hop join or rule) rather than a flat key-value scan"},
+    {"text": "Claude's answer includes jwt-validator as a directly affected service"},
+    {"text": "Claude's answer includes auth-service as a transitively affected service"},
+    {"text": "Claude explains the impact chain, not just a flat list"}
+  ]
+}

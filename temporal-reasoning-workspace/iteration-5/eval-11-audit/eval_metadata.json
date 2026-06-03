@@ -1,0 +1,22 @@
+{
+  "eval_id": 11,
+  "eval_name": "audit",
+  "prompt": "We've just finished a big architecture session \u2014 I stored a lot of decisions and relationships. Can you verify everything looks consistent before we wrap up?",
+  "assertions": [
+    {
+      "text": "Claude calls vulcan_audit before responding"
+    },
+    {
+      "text": "Claude summarizes what vulcan_audit returned \u2014 entities checked, violations found (if any)"
+    },
+    {
+      "text": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact"
+    },
+    {
+      "text": "Claude does not skip the audit and generically claim consistency"
+    },
+    {
+      "text": "Claude explains what the audit covers (schema validation, entity-type checks)"
+    }
+  ]
+}

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Seed memory for eval 7: decision traceability."""
+"""Seed for eval 7: decision traceability."""
 import sys, os
-sys.path.insert(0, "/home/aditya/workspaces/pycharm/temporal_reasoning")
-from minigraf_tool import transact, reset
+sys.path.insert(0, "/home/aditya/workspaces/pycharm/temporal_reasoning/.opencode/skills/temporal-reasoning")
+from vulcan import transact, reset
 
-graph = os.environ.get("MINIGRAF_GRAPH_PATH", "memory.graph")
+graph = os.environ.get("MINIGRAF_GRAPH_PATH", "/home/aditya/workspaces/pycharm/temporal_reasoning/memory.graph")
 reset(graph)
 
 transact(

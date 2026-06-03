@@ -1,0 +1,22 @@
+{
+  "eval_id": 12,
+  "eval_name": "already-running",
+  "prompt": "SETUP (do this before responding to the user): Call vulcan_ingest_git for the repository at /home/aditya/workspaces/pycharm/temporal_reasoning to start background indexing. Wait for confirmation it started. Then respond to this user message: 'Can you kick off the codebase indexing? I want to query function dependencies once it's done.'",
+  "assertions": [
+    {
+      "text": "Claude calls vulcan_ingest_status to check current ingestion state before responding to the user"
+    },
+    {
+      "text": "Claude does NOT call vulcan_ingest_git a second time when status shows ingestion is already running"
+    },
+    {
+      "text": "Claude reports commits_done and commits_total (or equivalent progress fields) from the live status result"
+    },
+    {
+      "text": "Claude informs the user that indexing is already in progress and they do not need to start it again"
+    },
+    {
+      "text": "Claude does not attempt to manually store code entities via vulcan_transact as a substitute for ingestion"
+    }
+  ]
+}

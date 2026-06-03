@@ -1,0 +1,87 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_ingest_status before answering",
+      "passed": false,
+      "evidence": "The transcript explicitly states: 'No tools were used.' No tool calls of any kind appear in the response, including vulcan_ingest_status."
+    },
+    {
+      "text": "Claude reports the actual status from the tool result (running, complete, or idle)",
+      "passed": false,
+      "evidence": "No tool was called, so no status was obtained. Claude instead says 'I don't have visibility into any indexing status' — this is a fallback admission of ignorance, not a reported status from the tool."
+    },
+    {
+      "text": "If status is running, Claude reports progress details (commits_done, commits_total) from the result",
+      "passed": false,
+      "evidence": "Not applicable — no tool was called and no status was obtained. Progress details were never reported."
+    },
+    {
+      "text": "If status is complete, Claude proceeds to answer the dependency query using vulcan_query",
+      "passed": false,
+      "evidence": "No tool was called. Claude instead offered to grep the codebase directly as a fallback, without invoking vulcan_query."
+    },
+    {
+      "text": "Claude does not guess or assume ingestion is done without checking",
+      "passed": false,
+      "evidence": "While Claude did not assume ingestion was done, this was because it skipped checking entirely rather than checking and reporting correctly. The spirit of this assertion — that Claude uses the tool to verify — was violated by the complete absence of any tool usage."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 784,
+    "transcript_chars": 784
+  },
+  "timing": {
+    "executor_duration_seconds": null,
+    "grader_duration_seconds": null,
+    "total_duration_seconds": 25.1,
+    "total_tokens": 11270,
+    "duration_ms": 25064
+  },
+  "claims": [
+    {
+      "claim": "There is no active indexing or graph ingestion running that Claude can check on",
+      "type": "factual",
+      "verified": false,
+      "evidence": "Claude asserts this without calling vulcan_ingest_status to check. The claim is unverified — the tool was available and could have been invoked."
+    },
+    {
+      "claim": "Without the temporal-reasoning skill, there is no indexing system, no graph database, and no way to query module dependency relationships",
+      "type": "factual",
+      "verified": true,
+      "evidence": "This is the expected behavior for a 'without_skill' eval run — the MCP tools are not wired up in this configuration."
+    },
+    {
+      "claim": "A grep pass over the source tree will give the dependency list right away",
+      "type": "quality",
+      "verified": false,
+      "evidence": "This is offered as an alternative but no grep was actually run, so the claim is unverified."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude does not guess or assume ingestion is done without checking",
+        "reason": "This assertion can technically pass in a degenerate way when no tools are used at all — Claude neither guesses nor checks, so the literal reading is satisfied. Consider rewriting as 'Claude calls vulcan_ingest_status to verify status before answering' to make the positive requirement explicit and avoid false passes."
+      },
+      {
+        "reason": "No assertion checks that Claude does NOT fall back to grep/direct file search as a substitute for the skill. In the without_skill run, Claude offered grep as an alternative — this is a meaningful behavioral difference that the evals should capture to distinguish correct fallback behavior from incorrect tool bypass."
+      }
+    ],
+    "overall": "Assertions 1 and 5 are partially redundant — both check whether vulcan_ingest_status was called, just from different angles. Assertion 5 is also ambiguous enough that it could pass for the wrong reason. Consider tightening."
+  }
+}

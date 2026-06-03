@@ -1,0 +1,12 @@
+{
+  "eval_id": 5,
+  "eval_name": "entity-ref-storage",
+  "prompt": "Our service architecture: the API gateway routes requests to the auth service for authentication. The auth service delegates token validation to the JWT validator. The JWT validator fetches signing keys from the key-store service.",
+  "assertions": [
+    {"text": "Claude calls vulcan_transact at least once"},
+    {"text": "Relationship values are entity idents (keywords starting with :project/) not quoted strings"},
+    {"text": "At least 3 entity-reference edges are stored (calls or depends-on with keyword values)"},
+    {"text": "Each component entity is tagged with :entity-type :type/component"},
+    {"text": "Claude uses flat attribute names (:calls, :depends-on, :name) not namespaced attributes"}
+  ]
+}

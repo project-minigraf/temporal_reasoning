@@ -1,0 +1,79 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_transact at least once",
+      "passed": false,
+      "evidence": "The transcript explicitly states 'Tool calls: (none)'. No vulcan_transact or any other tool was called. Claude only summarized the architecture verbally."
+    },
+    {
+      "text": "Relationship values are entity idents (keywords starting with :project/) not quoted strings",
+      "passed": false,
+      "evidence": "No transaction was made at all. There are no entity idents or quoted strings in any stored data — nothing was stored."
+    },
+    {
+      "text": "At least 3 entity-reference edges are stored (calls or depends-on with keyword values)",
+      "passed": false,
+      "evidence": "No tool calls were made and no data was stored. The response is a plain text summary of the architecture with no graph writes."
+    },
+    {
+      "text": "Each component entity is tagged with :entity-type :type/component",
+      "passed": false,
+      "evidence": "No entities were created. The response does not reference any entity-type tags or graph schema."
+    },
+    {
+      "text": "Claude uses flat attribute names (:calls, :depends-on, :name) not namespaced attributes",
+      "passed": false,
+      "evidence": "No attributes of any kind were used. No data was transacted into any graph store."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 508,
+    "transcript_chars": 522
+  },
+  "timing": {
+    "executor_duration_seconds": 15.0,
+    "total_duration_seconds": 15.0,
+    "total_tokens": 10447
+  },
+  "claims": [
+    {
+      "claim": "Claude understood the service architecture correctly",
+      "type": "quality",
+      "verified": true,
+      "evidence": "The verbal summary accurately captures the four-service chain: API Gateway → Auth Service → JWT Validator → Key-Store Service, matching the prompt."
+    },
+    {
+      "claim": "Claude deferred storage by asking what action the user wants",
+      "type": "process",
+      "verified": true,
+      "evidence": "Response ends: 'Is there something specific you'd like to do with this architecture — for example, document it, analyze dependencies, identify single points of failure, or discuss design trade-offs?' Claude treated the input as information-sharing rather than a directive to store."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Relationship values are entity idents (keywords starting with :project/) not quoted strings",
+        "reason": "This assertion and the flat-attribute-names assertion are about data format quality, but they can only be checked if vulcan_transact was called. They add value for the with_skill case but are redundant for without_skill where all five fail for the same root cause (no tool call). Consider whether the without_skill baseline needs all five assertions or just the first one."
+      },
+      {
+        "reason": "An important behavior is unchecked: without the skill, Claude asks the user what to do instead of proactively storing the architecture. This is a meaningful behavioral difference that an assertion like 'Claude proactively stores the architecture without being asked' would capture."
+      }
+    ],
+    "overall": "Assertions are well-designed for the with_skill case. For the without_skill baseline, all failures have the same root cause (no memory tool available), so the eval cleanly demonstrates the skill's necessity."
+  }
+}

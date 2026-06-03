@@ -1,0 +1,25 @@
+{
+  "eval_id": 1,
+  "eval_name": "decision-storage",
+  "prompt": "Hey, we've finalized the stack for our new service. We're going with PostgreSQL 15 as the primary database \u2014 we need strong JSON support and ACID compliance, and we're OK trading some write throughput for that. The auth service will cache session tokens in Redis with a 24-hour TTL. One more thing: the API layer will be FastAPI, not Flask, because of the async support.",
+  "assertions": [
+    {
+      "text": "Claude calls vulcan_transact at least once"
+    },
+    {
+      "text": "PostgreSQL or database choice is stored as a fact"
+    },
+    {
+      "text": "Redis caching or session token TTL is stored as a fact"
+    },
+    {
+      "text": "FastAPI or API framework decision is stored as a fact"
+    },
+    {
+      "text": "Each transact call includes a non-empty reason parameter"
+    },
+    {
+      "text": "Stored attributes use the three-part :namespace/entity-name/attribute naming convention"
+    }
+  ]
+}

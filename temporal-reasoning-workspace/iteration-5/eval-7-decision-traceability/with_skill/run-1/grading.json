@@ -1,0 +1,89 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before answering",
+      "passed": true,
+      "evidence": "Call 2 in the transcript is vulcan_query with a datalog query traversing the decision → constraint edge, executed before the final response to the user."
+    },
+    {
+      "text": "Claude traverses the :motivated-by relationship edge in the query",
+      "passed": true,
+      "evidence": "Call 2 query contains `[?d :motivated-by ?c]`, explicitly traversing the :motivated-by edge to link the decision entity to the constraint entity."
+    },
+    {
+      "text": "Claude's answer explicitly names the GIL constraint as the driver of the asyncio decision",
+      "passed": true,
+      "evidence": "Response states: 'What drove it — the root constraint: The Python GIL (Global Interpreter Lock). Memory stores a constraint entity :rules/gil-constraint with the description: \"Python GIL limits true thread parallelism.\"'"
+    },
+    {
+      "text": "Claude presents the reasoning chain (decision → motivated-by → constraint), not just the conclusion",
+      "passed": true,
+      "evidence": "Response presents a numbered step-by-step trace: '1. Constraint identified: Python's GIL prevents threads...' followed by '2. Decision made in response: Because threading was fundamentally constrained by the GIL, asyncio was chosen...', and explicitly shows the graph edge `:project/asyncio-choice :motivated-by :rules/gil-constraint`."
+    },
+    {
+      "text": "Claude grounds its answer in the traversed graph facts, not in prior knowledge about asyncio",
+      "passed": true,
+      "evidence": "Response states: 'Memory stores a constraint entity... this is not inferred, it is directly stored and traversable' and 'Memory has the full decision chain recorded.' The query result `[[\"use asyncio over threading for concurrency\", \"Python GIL limits true thread parallelism\"]]` is cited as the source. However, the response does expand with general background knowledge about asyncio and the GIL (steps 1 and 2 in the trace go beyond the stored facts), which is a minor concern."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "memory_prepare_turn": 1,
+      "vulcan_query": 4,
+      "memory_finalize_turn": 1
+    },
+    "total_tool_calls": 6,
+    "total_steps": 6,
+    "errors_encountered": 0,
+    "output_chars": 2650,
+    "transcript_chars": 2650
+  },
+  "timing": {
+    "executor_duration_seconds": 75.8,
+    "total_duration_seconds": 75.8,
+    "total_tokens": 21161
+  },
+  "claims": [
+    {
+      "claim": "Memory has the full decision chain recorded",
+      "type": "factual",
+      "verified": true,
+      "evidence": "memory_prepare_turn output shows the decision entity (f3d25e77) with :motivated-by pointing to :rules/gil-constraint, and the constraint entity (c972f0e3) with description 'Python GIL limits true thread parallelism'. The vulcan_query call confirmed the traversal returns both descriptions."
+    },
+    {
+      "claim": "The :motivated-by edge makes the decision traceable back to its root cause",
+      "type": "quality",
+      "verified": true,
+      "evidence": "Call 2 returns `[[\"use asyncio over threading for concurrency\", \"Python GIL limits true thread parallelism\"]]` demonstrating end-to-end traversal from decision to constraint via a single query."
+    },
+    {
+      "claim": "The answer goes beyond the stored facts to explain the GIL in depth",
+      "type": "quality",
+      "verified": true,
+      "evidence": "The response explains why the GIL prevents true parallelism and why asyncio avoids it — this is background knowledge, not graph-stored facts. The stored facts only say 'Python GIL limits true thread parallelism' and 'use asyncio over threading for concurrency', with no additional explanation stored."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude grounds its answer in the traversed graph facts, not in prior knowledge about asyncio",
+        "reason": "This assertion is only weakly satisfied. The response does cite the graph facts but then expands significantly with background knowledge about GIL mechanics and asyncio's event loop model — none of which is stored in the graph. A stronger version of this assertion would check that the agent does NOT add substantial prior-knowledge elaboration beyond what the graph contains."
+      },
+      {
+        "reason": "No assertion checks that the query result actually returned data (non-empty). If the graph were empty or the :motivated-by edge were missing, a hallucinating agent could still produce a plausible-sounding answer. Consider adding an assertion like: 'Claude's answer is consistent with the raw query result returned by vulcan_query.'"
+      }
+    ],
+    "overall": "All assertions pass and the agent performed well. The grounding assertion (5) needs tightening — the agent blended stored facts with prior knowledge in a way that technically satisfies the assertion but reduces its discriminating power."
+  }
+}

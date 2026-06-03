@@ -1,0 +1,22 @@
+{
+  "eval_id": 10,
+  "eval_name": "memory-prepare-turn",
+  "prompt": "What framework are we using for the API layer?",
+  "assertions": [
+    {
+      "text": "Claude calls memory_prepare_turn as the first tool call of the turn"
+    },
+    {
+      "text": "memory_prepare_turn is passed the user's message text"
+    },
+    {
+      "text": "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result"
+    },
+    {
+      "text": "Claude does not answer from general knowledge or guess when the answer is in memory"
+    },
+    {
+      "text": "Claude provides a complete, self-contained answer using the memory context, with no follow-up questions needed"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "eval_id": 9,
+  "eval_name": "ingest-status",
+  "prompt": "Is the indexing done yet? I want to start querying which modules depend on the auth package.",
+  "assertions": [
+    {
+      "text": "Claude calls vulcan_ingest_status before answering"
+    },
+    {
+      "text": "Claude reports the actual status from the tool result (running, complete, or idle)"
+    },
+    {
+      "text": "If status is 'running', Claude reports progress details (commits_done, commits_total) from the result"
+    },
+    {
+      "text": "If status is 'complete', Claude proceeds to answer the dependency query using vulcan_query"
+    },
+    {
+      "text": "Claude explicitly states its answer is based on the vulcan_ingest_status tool result, not on prior assumptions"
+    }
+  ]
+}

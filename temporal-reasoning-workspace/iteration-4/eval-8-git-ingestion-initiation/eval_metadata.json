@@ -1,0 +1,13 @@
+{
+  "eval_id": 8,
+  "eval_name": "no-redundant-ingest-call",
+  "prompt": "Can you start indexing the codebase so we can query functions and modules?",
+  "setup": "Clean graph. Hooks do not fire in subagent environment. Claude should check vulcan_ingest_status before starting, then call vulcan_ingest_git if idle.",
+  "assertions": [
+    "Claude calls vulcan_ingest_status before attempting to start ingestion",
+    "Claude calls vulcan_ingest_git only if status shows ingestion is not already running",
+    "Claude does not attempt to manually store code entities via vulcan_transact",
+    "Claude informs the user that ingestion runs in the background",
+    "Claude does not block or claim to wait — it starts the job and moves on"
+  ]
+}

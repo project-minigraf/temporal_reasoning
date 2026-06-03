@@ -1,0 +1,22 @@
+{
+  "eval_id": 8,
+  "eval_name": "git-ingestion",
+  "prompt": "Can you start indexing the codebase so we can query functions and modules?",
+  "assertions": [
+    {
+      "text": "Claude calls vulcan_ingest_status before attempting to start ingestion"
+    },
+    {
+      "text": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running"
+    },
+    {
+      "text": "Claude uses vulcan_ingest_git to start background indexing rather than manually storing code entities via vulcan_transact"
+    },
+    {
+      "text": "Claude informs the user that ingestion runs in the background"
+    },
+    {
+      "text": "Claude does not block or claim to wait \u2014 it starts the job and moves on"
+    }
+  ]
+}

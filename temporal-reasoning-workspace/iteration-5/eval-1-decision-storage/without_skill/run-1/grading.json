@@ -1,0 +1,75 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_transact at least once",
+      "passed": false,
+      "evidence": "The output explicitly states: 'None. No memory, vulcan, or external tools were used. Only base Claude Code capabilities (text generation) were applied.' No tool calls of any kind were made."
+    },
+    {
+      "text": "PostgreSQL or database choice is stored as a fact",
+      "passed": false,
+      "evidence": "No vulcan_transact call was made. The PostgreSQL decision was merely summarized in the text response but never persisted to any memory store."
+    },
+    {
+      "text": "Redis caching or session token TTL is stored as a fact",
+      "passed": false,
+      "evidence": "No vulcan_transact call was made. The Redis/24h TTL information was mentioned in the text response but never persisted to any memory store."
+    },
+    {
+      "text": "FastAPI or API framework decision is stored as a fact",
+      "passed": false,
+      "evidence": "No vulcan_transact call was made. The FastAPI choice was mentioned in the text response but never persisted to any memory store."
+    },
+    {
+      "text": "Each transact call includes a non-empty reason parameter",
+      "passed": false,
+      "evidence": "No transact calls were made at all, so this cannot be satisfied."
+    },
+    {
+      "text": "Stored attributes use the three-part :namespace/entity-name/attribute naming convention",
+      "passed": false,
+      "evidence": "No transact calls were made, so no attributes were stored in any format."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 6,
+    "total": 6,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 647,
+    "transcript_chars": 647
+  },
+  "timing": {
+    "total_duration_seconds": 22.6,
+    "total_tokens": 10530,
+    "duration_ms": 22576
+  },
+  "claims": [
+    {
+      "claim": "Decisions are 'noted'",
+      "type": "quality",
+      "verified": false,
+      "evidence": "The response says 'These decisions are noted' but no persistent storage occurred. Nothing was written to memory. The claim is false — decisions exist only in the ephemeral response text."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": ["No memory tools used; fell back to pure text summarization"]
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Stored attributes use the three-part :namespace/entity-name/attribute naming convention",
+        "reason": "This assertion is only reachable if transact calls happen. Since the first assertion (vulcan_transact called at least once) is a prerequisite, a pass on this assertion without a pass on the first is impossible. The assertions are well-layered, but the naming convention assertion adds no signal when the model completely skips transact — consider whether it's worth keeping or making the dependency explicit."
+      }
+    ],
+    "overall": "Assertions are well-targeted and clearly discriminate between skill use and non-use. The without_skill baseline fails all expectations as expected, confirming the eval is not trivially satisfiable."
+  }
+}

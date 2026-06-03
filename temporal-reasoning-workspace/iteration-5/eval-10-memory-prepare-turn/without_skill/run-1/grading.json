@@ -1,0 +1,82 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls memory_prepare_turn as the first tool call of the turn",
+      "passed": false,
+      "evidence": "No memory_prepare_turn call appears in the transcript. The tool calls listed are: Glob (**/*.py), Glob (**/requirements*.txt), Read (mcp_server.py), Glob (**/pyproject.toml), Read (pyproject.toml). None of these are memory_prepare_turn."
+    },
+    {
+      "text": "memory_prepare_turn is passed the user's message text",
+      "passed": false,
+      "evidence": "memory_prepare_turn was never called, so it could not have been passed the user's message text."
+    },
+    {
+      "text": "Claude's answer names FastAPI as the API framework, grounded in the memory_prepare_turn result",
+      "passed": false,
+      "evidence": "The response names MCP (Model Context Protocol) as the API framework, not FastAPI. The answer is grounded in a code search of pyproject.toml and mcp_server.py, not in memory_prepare_turn."
+    },
+    {
+      "text": "Claude does not answer from general knowledge or guess when the answer is in memory",
+      "passed": false,
+      "evidence": "Claude answered entirely from a code search of the local filesystem (Glob and Read tool calls), bypassing memory entirely. The answer did not use memory at all."
+    },
+    {
+      "text": "Claude provides a complete, self-contained answer using the memory context, with no follow-up questions needed",
+      "passed": false,
+      "evidence": "The answer is self-contained and does not ask follow-up questions, but it is not based on memory context — it is based on filesystem search results. Since memory_prepare_turn was never called, the memory context condition is not met."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "Glob": 3,
+      "Read": 2
+    },
+    "total_tool_calls": 5,
+    "total_steps": 5,
+    "errors_encountered": 0,
+    "output_chars": 490,
+    "transcript_chars": 560
+  },
+  "timing": {
+    "executor_duration_seconds": 29.9,
+    "total_duration_seconds": 29.9,
+    "total_tokens": 12939
+  },
+  "claims": [
+    {
+      "claim": "The API layer uses the MCP (Model Context Protocol) framework",
+      "type": "factual",
+      "verified": true,
+      "evidence": "The project does use MCP as its protocol layer (mcp_server.py, pyproject.toml dependency on mcp>=1.27.0). However, the eval expects FastAPI to be the answer stored in memory — Claude answered a different question (the transport/protocol layer rather than any REST API framework) because it searched code rather than consulting memory."
+    },
+    {
+      "claim": "The project depends on mcp>=1.27.0 from pyproject.toml",
+      "type": "factual",
+      "verified": true,
+      "evidence": "This is consistent with the actual codebase."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude does not answer from general knowledge or guess when the answer is in memory",
+        "reason": "This assertion is correct in spirit but could be sharpened: the failure mode seen here is that Claude searched the codebase instead of guessing, which is arguably worse (confident but wrong answer). Consider adding an assertion that no filesystem search tools (Glob, Read) were used to answer the question — the answer should come solely from memory_prepare_turn output."
+      },
+      {
+        "reason": "No assertion checks that memory_prepare_turn actually returns a result mentioning FastAPI. If the memory graph doesn't contain this fact, the eval setup is incomplete. Consider adding a SETUP step that stores the FastAPI decision in memory before running the eval."
+      }
+    ],
+    "overall": "All 5 assertions fail cleanly because the skill (memory_prepare_turn) was never called. The without_skill baseline behaves exactly as expected for a no-skill run: it ignores memory and searches code instead. The eval correctly captures this failure mode."
+  }
+}

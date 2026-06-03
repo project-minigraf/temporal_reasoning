@@ -1,0 +1,110 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_audit before responding",
+      "passed": true,
+      "evidence": "Transcript Call 1 is 'mcp__temporal-reasoning__vulcan_audit' with no arguments — invoked first, before the user-facing response is written."
+    },
+    {
+      "text": "Claude summarizes what vulcan_audit returned — entities checked and violations found (if any)",
+      "passed": true,
+      "evidence": "The response states 8 entities were audited and 6 facts retracted, then provides a table listing all 6 violations with entity-specific detail (unknown attributes ':database', ':motivated-by', ':ttl', ':framework', and two entities with missing ':description' plus unknown ':name'/':version')."
+    },
+    {
+      "text": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact",
+      "passed": true,
+      "evidence": "The audit output shows 'retracted: 6', confirming the agent took live corrective action. The response also explicitly offers to re-store the retracted facts: 'Let me know which of the retracted facts you'd like to re-store correctly, and I'll write them back into the graph with the right structure.'"
+    },
+    {
+      "text": "Claude does not skip the audit and generically claim consistency",
+      "passed": true,
+      "evidence": "The agent ran a real audit tool call, received 6 genuine violations, retracted 6 facts, and reported each violation specifically. No generic consistency claim was made."
+    },
+    {
+      "text": "Claude explains what the audit covers (schema validation, entity-type checks)",
+      "passed": true,
+      "evidence": "The response implicitly explains audit coverage through violation details: it describes unknown attributes relative to per-type allowlists (e.g., 'allowed: [:alias, :date, :description, :rationale]') and missing required attributes — communicating that the audit validates attribute schemas and entity-type membership rules. An explicit framing sentence was absent, but the violation descriptions make the coverage clear."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "mcp__temporal-reasoning__vulcan_audit": 1,
+      "mcp__temporal-reasoning__vulcan_query": 1
+    },
+    "total_tool_calls": 2,
+    "total_steps": 2,
+    "errors_encountered": 0,
+    "output_chars": 3042,
+    "transcript_chars": 3042
+  },
+  "timing": {
+    "executor_duration_seconds": null,
+    "total_duration_seconds": 58.8,
+    "total_tokens": 21954,
+    "duration_ms": 58780
+  },
+  "claims": [
+    {
+      "claim": "8 entities were audited",
+      "type": "factual",
+      "verified": true,
+      "evidence": "vulcan_audit output shows '\"audited\": 8'"
+    },
+    {
+      "claim": "6 facts were retracted",
+      "type": "factual",
+      "verified": true,
+      "evidence": "vulcan_audit output shows '\"retracted\": 6'"
+    },
+    {
+      "claim": "6 violations were found",
+      "type": "factual",
+      "verified": true,
+      "evidence": "The violations array in the audit output contains exactly 6 entries, each naming a specific entity UUID and a schema violation detail."
+    },
+    {
+      "claim": "Retracted facts remain queryable with :as-of",
+      "type": "factual",
+      "verified": false,
+      "evidence": "The response states 'they remain in history and are still queryable with :as-of' — this is consistent with bi-temporal graph semantics described in the skill, but was not demonstrated with an :as-of query in this transcript."
+    },
+    {
+      "claim": "4 component entities survived the audit cleanly",
+      "type": "quality",
+      "verified": true,
+      "evidence": "The vulcan_query output after audit shows 4 distinct component entities (API Gateway, Key Store, JWT Validator, Auth Service) each with :entity-type :type/component — consistent with the response's claim."
+    },
+    {
+      "claim": "The :motivated-by :constraint/gil edge is dangling after partial retraction",
+      "type": "factual",
+      "verified": true,
+      "evidence": "The post-audit query shows entity '79e1ebe3' with only '[:motivated-by :constraint/gil]' remaining — no :description or :entity-type — consistent with the response's warning about a dangling edge."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude explains what the audit covers (schema validation, entity-type checks)",
+        "reason": "This assertion is satisfiable by a response that merely paraphrases violation messages without explicitly naming the audit's coverage categories. Consider requiring the response to name 'schema validation' or 'entity-type attribute allowlist checks' by label, not just by example. Currently a response describing violations in detail but never mentioning what the audit systematically checks would still pass."
+      },
+      {
+        "reason": "No assertion checks whether the agent actually verified the post-audit state (e.g., ran a follow-up query to confirm clean entities). The agent did run vulcan_query after the audit, which is a meaningful quality signal — catching whether the agent treats audit as fire-and-forget versus confirms the result. Worth adding an assertion for this."
+      },
+      {
+        "reason": "The note says 'audit found 10 real schema violations' but the audit output shows only 6 violations and 6 retractions, with 'audited: 8'. The discrepancy between 10 expected violations and 6 reported is unexplained. An assertion checking that violation count matches the seeded data (10) would catch if the tool under-reports, or the eval note should be corrected to match the actual seeded count."
+      }
+    ],
+    "overall": "Assertions are well-targeted and discriminating for the core behaviors. The violation-count mismatch between the eval note (10) and the actual audit output (6) is the most important gap — it either means the seeding produced fewer violations than intended, or the audit tool under-detected. This should be investigated to ensure the eval is testing what it claims."
+  }
+}

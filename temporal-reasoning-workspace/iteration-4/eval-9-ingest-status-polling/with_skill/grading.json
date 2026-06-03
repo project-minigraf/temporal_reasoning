@@ -1,0 +1,99 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_ingest_status before answering",
+      "passed": true,
+      "evidence": "Call 1 in the transcript is 'mcp__temporal-reasoning__vulcan_ingest_status' with no parameters, invoked before any response text is produced."
+    },
+    {
+      "text": "Claude reports the actual status from the tool result (running, complete, or idle)",
+      "passed": true,
+      "evidence": "Response explicitly states: 'vulcan_ingest_status returned status: idle with processed: 0 and total: 0', accurately reflecting the tool output {\"ok\": true, \"status\": \"idle\", \"processed\": 0, \"total\": 0, \"current_commit\": \"\", \"error\": null}."
+    },
+    {
+      "text": "If status is running, Claude reports progress details (commits_done, commits_total) from the result",
+      "passed": true,
+      "evidence": "N/A — status was 'idle', not 'running'. This assertion does not apply. Marked PASS as the condition was not triggered and Claude correctly handled the actual status."
+    },
+    {
+      "text": "If status is complete, Claude proceeds to answer the dependency query using vulcan_query",
+      "passed": true,
+      "evidence": "Status was 'idle' (not complete), so this is evaluated on whether Claude handled the incomplete-status case appropriately. Claude did: it explained that the graph is empty (corroborated by two follow-up vulcan_query calls that both returned empty results), diagnosed the likely cause (ingestion not started or exited early), offered to start ingestion explicitly with the vulcan_ingest_git call, and showed what the dependency query would look like once ingestion completes. This is appropriate and thorough handling of the incomplete-status case."
+    },
+    {
+      "text": "Claude does not guess or assume ingestion is done without checking",
+      "passed": true,
+      "evidence": "Claude did not assume ingestion was complete. It called vulcan_ingest_status first, saw 'idle' with zero counts, then confirmed with graph queries that no data existed, and explicitly told the user why the dependency query cannot be answered yet."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "mcp__temporal-reasoning__vulcan_ingest_status": 1,
+      "mcp__temporal-reasoning__vulcan_query": 2
+    },
+    "total_tool_calls": 3,
+    "total_steps": 3,
+    "errors_encountered": 0,
+    "output_chars": 1243,
+    "transcript_chars": 1243
+  },
+  "timing": {
+    "executor_duration_seconds": 46.8,
+    "grader_duration_seconds": null,
+    "total_duration_seconds": 46.8,
+    "total_tokens": 19650,
+    "duration_ms": 46831
+  },
+  "claims": [
+    {
+      "claim": "vulcan_ingest_status returned status: idle with processed: 0 and total: 0",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Tool output in transcript Call 1: {\"ok\": true, \"status\": \"idle\", \"processed\": 0, \"total\": 0, \"current_commit\": \"\", \"error\": null}"
+    },
+    {
+      "claim": "The graph has no :module/ entities and no :ingestion/ watermark entries",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Call 2 querying :module/ entities returned {\"ok\": true, \"results\": []}; Call 3 querying :ingestion/ entities returned {\"ok\": true, \"results\": []}."
+    },
+    {
+      "claim": "The ingestion job either hasn't started yet or was started and exited before processing any commits",
+      "type": "quality",
+      "verified": true,
+      "evidence": "Consistent with idle status + zero processed count + empty graph — this is a reasonable inference, though unverifiable without logs. The claim is appropriately hedged with 'most likely'."
+    },
+    {
+      "claim": "Once ingestion completes, the dependency query can be run using :depends-on :module/src-auth-py",
+      "type": "quality",
+      "verified": false,
+      "evidence": "The exact module ident is speculative — Claude itself notes '(The exact module ident for the auth package ... will depend on how the files are named once ingestion finishes)'. The claim is appropriately flagged as provisional."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "If status is running, Claude reports progress details (commits_done, commits_total) from the result",
+        "reason": "This assertion is permanently N/A when the status is idle or complete. The eval should include a separate test case where ingestion is actually running so this path can be meaningfully exercised. As written, it can never fail in an idle/complete scenario, making it a dead assertion for this eval run."
+      },
+      {
+        "reason": "No assertion checks whether Claude's follow-up vulcan_query calls are sensible (e.g., not querying a completely unrelated schema) or whether Claude correctly refrains from calling vulcan_query to 'answer the dependency query' when the graph is known to be empty. Claude did the right thing here, but the evals don't verify it."
+      },
+      {
+        "reason": "Assertion 4's re-framing for the idle/incomplete case ('agent should have offered to start ingestion or explained why it can't answer') is reasonable but informal — consider making it a first-class assertion such as 'If status is not complete, Claude offers to start ingestion or explains the prerequisite' so graders have a clear, consistent bar."
+      }
+    ],
+    "overall": "All five assertions pass cleanly. The main eval gap is that assertion 3 is structurally untestable in any non-running scenario, and assertion 4's idle-case handling is described only in a note rather than as a formal assertion. Adding a running-state test case and formalising the idle-case behavior expectation would make the eval suite more discriminating."
+  }
+}

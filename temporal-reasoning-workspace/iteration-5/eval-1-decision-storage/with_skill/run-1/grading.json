@@ -1,0 +1,100 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_transact at least once",
+      "passed": true,
+      "evidence": "Two vulcan_transact calls are present: Call 3 (failed due to schema violation) and Call 4 (succeeded with all three decisions)."
+    },
+    {
+      "text": "PostgreSQL or database choice is stored as a fact",
+      "passed": true,
+      "evidence": "Call 4 stores [:decision/postgres :description \"PostgreSQL 15 as primary database\"] with :entity-type :type/decision and a rationale attribute."
+    },
+    {
+      "text": "Redis caching or session token TTL is stored as a fact",
+      "passed": true,
+      "evidence": "Call 4 stores [:decision/redis-session-cache :description \"Redis caches session tokens for the auth service with a 24-hour TTL\"] including the 24-hour TTL in both description and rationale."
+    },
+    {
+      "text": "FastAPI or API framework decision is stored as a fact",
+      "passed": true,
+      "evidence": "Call 4 stores [:decision/fastapi :description \"FastAPI chosen as the API layer, rejecting Flask\"] with rationale citing async support."
+    },
+    {
+      "text": "Each transact call includes a non-empty reason parameter",
+      "passed": true,
+      "evidence": "Call 3 reason: \"Tech stack finalized: PostgreSQL 15 (primary DB), Redis session cache (auth service, 24h TTL), FastAPI (API layer, async support over Flask)\". Call 4 reason: \"Tech stack finalized: PostgreSQL 15 (primary DB, ACID + JSON), Redis session cache (auth service, 24h TTL), FastAPI (API layer, async over Flask)\". Both are non-empty."
+    },
+    {
+      "text": "Stored attributes use the three-part :namespace/entity-name/attribute naming convention",
+      "passed": false,
+      "evidence": "Stored attributes are :description, :entity-type, and :rationale — these are single-segment names, not three-part :namespace/entity-name/attribute names. Entity identifiers (e.g. :decision/postgres) use two-part naming but the attributes themselves do not follow the three-part convention."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 1,
+    "total": 6,
+    "pass_rate": 0.83
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "memory_prepare_turn": 1,
+      "vulcan_query": 1,
+      "vulcan_transact": 2,
+      "memory_finalize_turn": 1
+    },
+    "total_tool_calls": 5,
+    "total_steps": 5,
+    "errors_encountered": 1,
+    "output_chars": 2450,
+    "transcript_chars": 2450
+  },
+  "timing": {
+    "executor_duration_seconds": 68.4,
+    "total_duration_seconds": 68.4
+  },
+  "claims": [
+    {
+      "claim": "Memory was empty at the start of the session",
+      "type": "factual",
+      "verified": true,
+      "evidence": "memory_prepare_turn returned '(no output — memory was empty)' and vulcan_query returned {\"ok\": true, \"results\": []}"
+    },
+    {
+      "claim": "Attempt 1 failed due to schema violations for :tradeoff and :rejected attributes",
+      "type": "process",
+      "verified": true,
+      "evidence": "Call 3 output: {\"ok\": false, \"error\": \"schema violations: entity ':decision/postgres' has unknown attribute ':tradeoff' — allowed: [':alias', ':date', ':description', ':rationale']; entity ':decision/fastapi' has unknown attribute ':rejected'...\"}"
+    },
+    {
+      "claim": "All three decisions were successfully stored in a single retried transact call",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Call 4 output: {\"ok\": true, \"tx\": \"unknown\", \"reason\": \"Tech stack finalized...\"} containing all three entities"
+    },
+    {
+      "claim": "Stored entities use the :decision/* entity-id namespace",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Entity IDs are :decision/postgres, :decision/redis-session-cache, :decision/fastapi — all under :decision namespace"
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": ["First transact call failed with schema violations for :tradeoff and :rejected attributes; agent retried using only schema-allowed attributes and folded the extra info into :rationale and :description"]
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Stored attributes use the three-part :namespace/entity-name/attribute naming convention",
+        "reason": "The assertion text says 'three-part :namespace/entity-name/attribute' but the schema actually uses two-part entity IDs (:decision/postgres) and single-segment attribute names (:description, :rationale). This assertion either describes a convention that doesn't exist in the schema, or it's checking the entity ID naming rather than the attribute naming. Clarify whether this is checking entity IDs (two-part, which passed) or attribute names (single-segment, which fails the stated expectation). The current wording is ambiguous and may not match the actual schema used."
+      },
+      {
+        "reason": "No assertion checks that the schema error on attempt 1 was handled correctly — the agent showed good error-recovery behavior (retried with schema-compliant attributes) that goes unrecognized. An assertion like 'Agent recovers from schema errors and retries without losing information' would capture this."
+      }
+    ],
+    "overall": "Assertions mostly cover the right outcomes. The three-part naming convention assertion is ambiguous and likely wrong — the actual schema uses single-segment attribute names. The error-recovery behavior (retried after schema failure) is notable but unchecked."
+  }
+}

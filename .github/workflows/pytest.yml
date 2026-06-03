@@ -47,6 +47,9 @@ jobs:
           echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
           python -c "import tests; print('tests module loads OK')"
 
+      - name: Validate evals
+        run: python evals/validate_evals.py
+
       - name: Run tests with pytest
         run: |
           python -m pytest --collect-only tests/ || echo "No tests collected"

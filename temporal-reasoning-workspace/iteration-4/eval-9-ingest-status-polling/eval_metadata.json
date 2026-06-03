@@ -1,0 +1,13 @@
+{
+  "eval_id": 9,
+  "eval_name": "ingest-status-polling",
+  "prompt": "Is the indexing done yet? I want to start querying which modules depend on the auth package.",
+  "setup": "ingest_hook has already fired vulcan_ingest_git at session start (before this message). Ingestion may be running or recently completed.",
+  "assertions": [
+    "Claude calls vulcan_ingest_status before answering",
+    "Claude reports the actual status from the tool result (running, complete, or idle)",
+    "If status is running, Claude reports progress details (commits_done, commits_total) from the result",
+    "If status is complete, Claude proceeds to answer the dependency query using vulcan_query",
+    "Claude does not guess or assume ingestion is done without checking"
+  ]
+}

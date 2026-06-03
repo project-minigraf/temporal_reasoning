@@ -1,0 +1,86 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_ingest_status before attempting to start ingestion",
+      "passed": false,
+      "evidence": "The output section 'Tool calls' explicitly states '(none)'. No vulcan_ingest_status call was made."
+    },
+    {
+      "text": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running",
+      "passed": false,
+      "evidence": "No tool calls were made at all. Claude neither checked status nor called vulcan_ingest_git. It offered to manually read files instead."
+    },
+    {
+      "text": "Claude uses vulcan_ingest_git to start background indexing rather than manually storing code entities via vulcan_transact",
+      "passed": false,
+      "evidence": "Claude used neither vulcan_ingest_git nor vulcan_transact. It proposed doing a manual read-through of files and producing 'a static module/function index', which is exactly the anti-pattern this assertion is designed to catch."
+    },
+    {
+      "text": "Claude informs the user that ingestion runs in the background",
+      "passed": false,
+      "evidence": "Claude never mentioned background ingestion because no ingestion was initiated. It mentioned that any index it builds 'only lives in this conversation' — the opposite of background persistent indexing."
+    },
+    {
+      "text": "Claude does not block or claim to wait — it starts the job and moves on",
+      "passed": false,
+      "evidence": "No job was started. Claude instead asked the user 'Want me to go ahead and do a full read-through now?', deferring to the user rather than starting background indexing."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 897,
+    "transcript_chars": 897
+  },
+  "timing": {
+    "executor_duration_seconds": 22.4,
+    "total_duration_seconds": 22.4,
+    "total_tokens": 10826,
+    "duration_ms": 22393
+  },
+  "claims": [
+    {
+      "claim": "Claude does not have a persistent indexing system available in this session",
+      "type": "process",
+      "verified": true,
+      "evidence": "Without calling vulcan_ingest_git, this is accurate — no persistent indexing was attempted. The claim correctly reflects Claude's situation when operating without the skill."
+    },
+    {
+      "claim": "Any index Claude builds 'only lives in this conversation'",
+      "type": "quality",
+      "verified": true,
+      "evidence": "True in the context of not using the skill. This is the core failure mode this eval is designed to detect: Claude falling back to session-only in-context indexing instead of the persistent graph tool."
+    },
+    {
+      "claim": "Claude offered three alternatives: browse now, answer specific queries, generate a static index",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Response lists exactly these three numbered options."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude calls vulcan_ingest_git only if status shows ingestion is not already running",
+        "reason": "This assertion is conditional — it can only be evaluated if vulcan_ingest_status was called and returned a result. When no tools are called at all (as in this run), the assertion fails on the precondition rather than the condition itself. Consider splitting into: (a) Claude calls vulcan_ingest_git at some point, and (b) Claude does not call vulcan_ingest_git if status shows already running. This makes each assertion independently evaluable."
+      },
+      {
+        "reason": "No assertion checks that Claude does NOT offer to manually read the codebase as a substitute for ingestion. This is the exact failure mode in this run (offering a manual read-through), and it goes uncaught by the existing assertions — they all fail, but none specifically names the anti-pattern."
+      }
+    ],
+    "overall": "Assertions correctly all fail. The conditional structure of assertion 2 is worth addressing — it becomes vacuously unevaluable when no tool calls happen at all."
+  }
+}

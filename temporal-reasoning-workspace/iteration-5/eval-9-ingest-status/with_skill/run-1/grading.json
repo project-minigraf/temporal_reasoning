@@ -1,0 +1,91 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_ingest_status before answering",
+      "passed": true,
+      "evidence": "Call 1 in the transcript is vulcan_ingest_status with no parameters. It is the only tool call and it precedes the response. Output: {\"ok\": true, \"status\": \"idle\", \"processed\": 0, \"total\": 0, \"current_commit\": \"\", \"error\": null}"
+    },
+    {
+      "text": "Claude reports the actual status from the tool result (running, complete, or idle)",
+      "passed": true,
+      "evidence": "Response states: 'Indexing hasn't started yet — vulcan_ingest_status returned idle with 0 commits processed.' This accurately reflects the tool result status of 'idle' with processed=0."
+    },
+    {
+      "text": "If status is 'running', Claude reports progress details (commits_done, commits_total) from the result",
+      "passed": false,
+      "evidence": "Status was 'idle', not 'running', so this conditional branch was never exercised. The assertion cannot be verified as passing — the behavior it tests was not demonstrated in this run."
+    },
+    {
+      "text": "If status is 'complete', Claude proceeds to answer the dependency query using vulcan_query",
+      "passed": false,
+      "evidence": "Status was 'idle', not 'complete', so this conditional branch was never exercised. Claude did not call vulcan_query. The assertion cannot be verified as passing."
+    },
+    {
+      "text": "Claude explicitly states its answer is based on the vulcan_ingest_status tool result, not on prior assumptions",
+      "passed": true,
+      "evidence": "Response says: 'vulcan_ingest_status returned idle with 0 commits processed. This means no git ingestion has been run for this repo in the current session.' Claude explicitly attributes the answer to the tool result."
+    }
+  ],
+  "summary": {
+    "passed": 3,
+    "failed": 2,
+    "total": 5,
+    "pass_rate": 0.6
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "vulcan_ingest_status": 1
+    },
+    "total_tool_calls": 1,
+    "total_steps": 1,
+    "errors_encountered": 0,
+    "output_chars": 830,
+    "transcript_chars": 830
+  },
+  "timing": {
+    "executor_duration_seconds": 36.0,
+    "total_duration_seconds": 36.0,
+    "total_tokens": 18706
+  },
+  "claims": [
+    {
+      "claim": "No git ingestion has been run for this repo in the current session",
+      "type": "factual",
+      "verified": true,
+      "evidence": "vulcan_ingest_status returned processed=0, total=0, current_commit='', confirming no ingestion activity."
+    },
+    {
+      "claim": "Claude offered to start ingestion",
+      "type": "process",
+      "verified": true,
+      "evidence": "Response ends with 'Would you like me to start ingestion now?' — Claude correctly identified the prerequisite and offered to address it."
+    },
+    {
+      "claim": "The example dependency query shown is correct",
+      "type": "quality",
+      "verified": false,
+      "evidence": "Query uses `:module/src-auth-py` as a named entity identifier, which is a plausible convention but unverifiable without knowing what entity names vulcan_ingest_git actually produces for the auth package."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": ["Assertions 3 and 4 are conditional ('if running' / 'if complete') but the eval was run with status='idle', meaning neither condition was triggered. These assertions could not be evaluated in this run. The eval scenario should be designed to exercise the specific status branch being tested."],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "If status is 'running', Claude reports progress details (commits_done, commits_total) from the result",
+        "reason": "This assertion requires a 'running' status to be exercised, but the eval's seeded state returns 'idle'. The eval scenario needs to be pre-configured to return a 'running' status with non-zero commit counts, otherwise this assertion can never pass and will always be graded as a non-exercised conditional."
+      },
+      {
+        "assertion": "If status is 'complete', Claude proceeds to answer the dependency query using vulcan_query",
+        "reason": "Same issue — requires 'complete' status which was not present. This is the most important behavior for the eval (can the agent pivot from ingest-status to answering the user's actual question?), but it is never tested because the scaffold returns 'idle'. This eval should be split into separate runs for each status value, or the eval scaffold should be configured to return 'complete' with appropriate graph data."
+      },
+      {
+        "reason": "An uncovered behavior: Claude offered to start ingestion instead of answering the user's query about module dependencies. While reasonable given idle status, no assertion checks whether Claude helps the user understand what to do next when indexing hasn't started — this is actually the most meaningful real-world outcome here."
+      }
+    ],
+    "overall": "The eval design has a structural problem: the most discriminating assertions (3 and 4) test conditional branches that the seeded environment never triggers. The eval should be redesigned to run separate scenarios for each status value. In the current form, a 60% pass rate is misleading — it reflects untriggered conditionals, not skill failures."
+  }
+}

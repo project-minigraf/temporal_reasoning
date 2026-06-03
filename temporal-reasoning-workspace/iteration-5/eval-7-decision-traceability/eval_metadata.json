@@ -1,0 +1,12 @@
+{
+  "eval_id": 7,
+  "eval_name": "decision-traceability",
+  "prompt": "I'm reviewing our concurrency model. Why did we go with asyncio? Can you trace the reasoning back to what drove that decision?",
+  "assertions": [
+    {"text": "Claude calls vulcan_query before answering"},
+    {"text": "Claude traverses the :motivated-by relationship edge in the query"},
+    {"text": "Claude's answer explicitly names the GIL constraint as the driver of the asyncio decision"},
+    {"text": "Claude presents the reasoning chain (decision → motivated-by → constraint), not just the conclusion"},
+    {"text": "Claude grounds its answer in the traversed graph facts, not in prior knowledge about asyncio"}
+  ]
+}

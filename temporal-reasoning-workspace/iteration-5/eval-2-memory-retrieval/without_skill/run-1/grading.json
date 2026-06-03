@@ -1,0 +1,83 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before providing any answer",
+      "passed": false,
+      "evidence": "The output lists tool calls as Glob, Grep, and Read — all filesystem searches. No vulcan_query call was made. The executor's note confirms: 'There is no memory graph being queried here.'"
+    },
+    {
+      "text": "Claude explicitly signals it is checking memory (e.g. 'Let me check memory...')",
+      "passed": false,
+      "evidence": "No such signal appears in the response. The response says 'I searched through the project's source files and documentation' — indicating a codebase search, not a memory check."
+    },
+    {
+      "text": "Claude's answer names PostgreSQL 15 as the database, grounded in the query result",
+      "passed": false,
+      "evidence": "The response does name 'PostgreSQL 15' but explicitly states it was found in 'eval seed scripts and benchmark documentation within the repository — not retrieved from any actual memory.' The grounding is in eval artifacts, not a query result, so this fails the 'grounded in the query result' condition."
+    },
+    {
+      "text": "Claude's answer mentions Redis and the 24-hour TTL for auth token caching, grounded in the query result",
+      "passed": false,
+      "evidence": "The response mentions Redis with 24-hour TTL but again explicitly attributes this to 'eval seed scripts and benchmark documentation' — not a memory query result. The grounding condition is not met."
+    },
+    {
+      "text": "Claude cites specific stored facts rather than guessing or hallucinating",
+      "passed": false,
+      "evidence": "The response acknowledges it cannot cite stored facts: 'without the temporal-reasoning memory skill, there is no persistent memory store to query.' It found the answers in eval seed files, which it transparently discloses is not actual memory retrieval."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "Glob": 1,
+      "Grep": 1,
+      "Read": 1
+    },
+    "total_tool_calls": 3,
+    "total_steps": 3,
+    "errors_encountered": 0,
+    "output_chars": 1170,
+    "transcript_chars": 1170
+  },
+  "timing": {
+    "total_duration_seconds": 40.2,
+    "total_tokens": 19289,
+    "duration_ms": 40181
+  },
+  "claims": [
+    {
+      "claim": "PostgreSQL 15 was found in eval seed scripts and benchmark documentation",
+      "type": "factual",
+      "verified": true,
+      "evidence": "The executor explicitly states the answers were found in 'seed_eval2.py and evals/benchmark.md' — source files in the repo that seed the eval scenario, not memory."
+    },
+    {
+      "claim": "There is no persistent memory store available without the skill",
+      "type": "process",
+      "verified": true,
+      "evidence": "Response states clearly: 'without the temporal-reasoning memory skill, there is no persistent memory store to query.' This is accurate — the without_skill variant has no vulcan access."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": ["Answers found in eval seed scripts may contaminate the ground truth — the model partially answered correctly but via codebase inspection of eval artifacts rather than memory retrieval"],
+    "needs_review": ["The model found correct answers via a loophole (eval seed scripts exist in the repo). Consider whether seed data should be isolated from the working directory."],
+    "workarounds": ["Fell back to codebase search instead of memory query"]
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "reason": "The without_skill baseline was able to name 'PostgreSQL 15' and 'Redis with 24-hour TTL' correctly by reading eval seed scripts in the repo. This is a contamination risk: a model that reads the right eval artifact will look like it partially succeeded even without memory. Consider placing seed data outside the working directory or in a format not easily discovered by Glob/Grep."
+      },
+      {
+        "assertion": "Claude's answer names PostgreSQL 15 as the database, grounded in the query result",
+        "reason": "The 'grounded in the query result' qualifier is important and well-chosen — it correctly causes this to fail when the answer comes from codebase scraping. This is a good discriminating assertion."
+      }
+    ],
+    "overall": "The assertions are well-written and correctly fail for the without_skill case. However, the eval has a structural vulnerability: correct answers exist in the repo's eval seed files, allowing a codebase-searching agent to partially satisfy surface-level checks. The 'grounded in the query result' qualifier saves two assertions from false-passing here, but the contamination risk deserves attention."
+  }
+}

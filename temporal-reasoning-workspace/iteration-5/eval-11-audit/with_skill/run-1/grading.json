@@ -1,0 +1,89 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_audit before responding",
+      "passed": true,
+      "evidence": "Call 2 is vulcan_audit (input: no arguments — full live audit), called before the final response to the user."
+    },
+    {
+      "text": "Claude summarizes what vulcan_audit returned — entities checked, violations found (if any)",
+      "passed": true,
+      "evidence": "Response states '6 violations found and retracted' and provides a table listing each violation with entity, problem, and details. The audit output shows 8 audited, 6 retracted, 10 violations listed. All are summarized in the user-facing response."
+    },
+    {
+      "text": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact",
+      "passed": true,
+      "evidence": "Claude ends with: 'Would you like me to re-transact the retracted decisions with corrected schema? I can store them cleanly using only the allowed attributes so they pass future audits.' The audit auto-retracted the violating entities; Claude explicitly offers to re-store via vulcan_transact with corrected attributes. The offer to correct via vulcan_transact is directly stated."
+    },
+    {
+      "text": "Claude does not skip the audit and generically claim consistency",
+      "passed": true,
+      "evidence": "vulcan_audit was actually called (Call 2), found real violations, retracted entities, and the response reports concrete problems — the opposite of a generic consistency claim."
+    },
+    {
+      "text": "Claude explains what the audit covers (schema validation, entity-type checks)",
+      "passed": false,
+      "evidence": "The response describes what violations were found (unknown attributes, missing required attributes) but does not explicitly explain what the audit mechanism covers — i.e., it never says something like 'the audit checks schema validation and entity-type constraints.' The explanation is implicit from the violation details, not stated directly."
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 1,
+    "total": 5,
+    "pass_rate": 0.8
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "memory_prepare_turn": 1,
+      "vulcan_audit": 1,
+      "vulcan_query": 7
+    },
+    "total_tool_calls": 9,
+    "total_steps": 10,
+    "errors_encountered": 0,
+    "output_chars": 5011,
+    "transcript_chars": 5011
+  },
+  "timing": {
+    "total_tokens": 28225,
+    "executor_duration_seconds": 126.1,
+    "total_duration_seconds": 126.1
+  },
+  "claims": [
+    {
+      "claim": "6 violations found and retracted",
+      "type": "factual",
+      "verified": false,
+      "evidence": "The vulcan_audit output shows 'retracted: 6' but lists 10 violation detail entries (multiple violations per entity). Claude's summary says '6 violations' which conflates violations with retracted entities. The audit shows 10 distinct violation facts across 6 entities. The claim is slightly misleading but not entirely wrong."
+    },
+    {
+      "claim": "Graph edges are intact: API Gateway → Auth Service → JWT Validator → Key Store is fully traversable",
+      "type": "quality",
+      "verified": true,
+      "evidence": "Calls 4, 5, 7, 8, 9 confirm the chain via vulcan_query: API Gateway calls :project/auth-service (verified to be Auth Service), Auth Service depends-on :project/jwt-validator (verified), JWT Validator depends-on :project/key-store (verified)."
+    },
+    {
+      "claim": "All relationship targets resolve to existing entities",
+      "type": "quality",
+      "verified": true,
+      "evidence": "Calls 7–10 explicitly verify each relationship target resolves: :project/auth-service, :project/jwt-validator, :project/key-store, :constraint/gil all return non-empty results."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude explains what the audit covers (schema validation, entity-type checks)",
+        "reason": "This assertion is marginal — a response that describes the specific violations found (unknown attributes, missing required fields) implicitly demonstrates understanding of what the audit covers. The assertion would be stronger if it required Claude to proactively frame the audit scope before showing results, rather than just inferring coverage from violation messages."
+      },
+      {
+        "reason": "No assertion checks whether Claude's offer to correct violations is concrete (e.g., provides specific corrected transact calls) vs. vague. In this run Claude provided detailed re-transact guidance, which is high-quality behavior unchecked by any assertion."
+      }
+    ],
+    "overall": "Solid eval. The failing assertion (explaining audit scope) is borderline — the evidence is implicit rather than explicit. Consider tightening it or accepting implicit coverage as passing."
+  }
+}

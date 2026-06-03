@@ -1,0 +1,19 @@
+{
+  "eval_id": 4,
+  "eval_name": "conflict-detection",
+  "prompt": "Hey, we need to connect to a MySQL database for a new analytics sidecar. Can you write the SQLAlchemy connection setup for MySQL?",
+  "assertions": [
+    {
+      "text": "Claude calls vulcan_query before writing any connection code"
+    },
+    {
+      "text": "Claude detects that PostgreSQL 15 is the established primary database from memory"
+    },
+    {
+      "text": "Claude surfaces the potential conflict (MySQL request vs. PostgreSQL decision) before proceeding"
+    },
+    {
+      "text": "Claude asks for clarification or confirmation rather than silently switching databases"
+    }
+  ]
+}

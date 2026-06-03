@@ -1,0 +1,80 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_audit before responding",
+      "passed": false,
+      "evidence": "The transcript explicitly states 'Tool calls (if any): None.' No tool calls were made whatsoever. vulcan_audit was never invoked."
+    },
+    {
+      "text": "Claude summarizes what vulcan_audit returned — entities checked and violations found (if any)",
+      "passed": false,
+      "evidence": "Since vulcan_audit was never called, there is no summary of results. The response instead generically apologizes for lacking graph access and provides manual verification suggestions."
+    },
+    {
+      "text": "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact",
+      "passed": false,
+      "evidence": "No audit was run, so no violations were surfaced. Claude never mentions vulcan_retract or vulcan_transact — it only suggests manual workarounds like 'Review your notes or documentation'."
+    },
+    {
+      "text": "Claude does not skip the audit and generically claim consistency",
+      "passed": false,
+      "evidence": "Claude explicitly skips the audit and makes a generic non-claim: 'I don't have a way to verify the consistency of what was stored.' While it does not falsely claim consistency, it completely avoids doing the work by disclaiming inability. This is functionally equivalent to skipping the audit — the user gets no actionable result."
+    },
+    {
+      "text": "Claude explains what the audit covers (schema validation, entity-type checks)",
+      "passed": false,
+      "evidence": "Claude never explains what an audit would cover in terms of schema validation or entity-type checks. The response offers generic manual checks (orphaned references, cardinality assumptions) but does not describe the specific coverage of a graph audit tool."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 1174,
+    "transcript_chars": 1174
+  },
+  "timing": {
+    "executor_duration_seconds": null,
+    "total_duration_seconds": 19.8,
+    "total_tokens": 10846,
+    "duration_ms": 19754
+  },
+  "claims": [
+    {
+      "claim": "Claude lacks access to graph or memory tools in this session",
+      "type": "process",
+      "verified": true,
+      "evidence": "This is the 'without_skill' condition, so no MCP tools were available — the claim is accurate in context."
+    },
+    {
+      "claim": "Manual steps provided are useful alternatives for verifying consistency",
+      "type": "quality",
+      "verified": false,
+      "evidence": "The suggestions (review notes, check orphaned references, validate cardinality) are generic advice that does not substitute for an actual graph audit. They do not address schema validation or entity-type checks that vulcan_audit would perform."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude does not skip the audit and generically claim consistency",
+        "reason": "This assertion is ambiguous — 'generically claim consistency' could be interpreted as passing if the model simply hedges or admits inability (as happened here). Consider splitting into two assertions: (a) Claude does not falsely claim the graph is consistent without evidence, and (b) Claude actually attempts to call vulcan_audit rather than refusing or disclaiming tool access."
+      },
+      {
+        "reason": "No assertion checks whether Claude correctly handles the 'without skill' degraded-mode scenario — i.e., whether it at least explains what vulcan_audit does conceptually and why it matters, even without tool access. This would distinguish a well-informed response from a generic one."
+      }
+    ],
+    "overall": "All five assertions fail cleanly — this is a good discriminating eval set for the without-skill condition. The one ambiguity is assertion 4, which could be tightened to distinguish 'no false positive claim' from 'actually did the work'."
+  }
+}

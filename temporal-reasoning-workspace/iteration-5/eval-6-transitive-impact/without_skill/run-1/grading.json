@@ -1,0 +1,85 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before answering",
+      "passed": false,
+      "evidence": "Transcript states 'Tool calls: (none)'. No vulcan_query or any tool was called. Claude's response explicitly acknowledges: 'Without access to a dependency graph or architectural documentation, I can only offer general guidance.'"
+    },
+    {
+      "text": "Claude uses graph traversal (multi-hop join or rule) rather than a flat key-value scan",
+      "passed": false,
+      "evidence": "No query of any kind was performed. Claude offered grep-based code search as an alternative to a graph traversal, which is the opposite of the expected behavior."
+    },
+    {
+      "text": "Claude's answer includes jwt-validator as a directly affected service",
+      "passed": false,
+      "evidence": "The response does not name 'jwt-validator' (or 'JWT Validator') as a specific affected service. It only references generic categories like 'Authentication/authorization services' and 'API gateways or middleware'."
+    },
+    {
+      "text": "Claude's answer includes auth-service as a transitively affected service",
+      "passed": false,
+      "evidence": "The response does not name 'auth-service' specifically. The closest is the generic mention of 'Authentication/authorization services', which does not constitute identifying the specific service from the system's architecture."
+    },
+    {
+      "text": "Claude explains the impact chain, not just a flat list",
+      "passed": false,
+      "evidence": "Claude provides no impact chain at all — it explicitly states it cannot give a definitive list without 'a recorded dependency map in memory'. The response is generic guidance rather than a specific impact analysis."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 5,
+    "total": 5,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {},
+    "total_tool_calls": 0,
+    "total_steps": 0,
+    "errors_encountered": 0,
+    "output_chars": 1407,
+    "transcript_chars": 1421
+  },
+  "timing": {
+    "executor_duration_seconds": 41.5,
+    "total_duration_seconds": 41.5,
+    "total_tokens": 14608
+  },
+  "claims": [
+    {
+      "claim": "Claude cannot give a definitive list of affected services without a dependency map",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Response states: 'Without a recorded dependency map in memory, I cannot give a definitive list of affected services for your specific system.' This is accurate — no memory was stored from eval 5 in this isolated run."
+    },
+    {
+      "claim": "Claude provided useful general guidance for finding affected services",
+      "type": "quality",
+      "verified": true,
+      "evidence": "The response includes four concrete investigative steps (code search, API contracts, shared libraries, dependency manifests) that are genuinely actionable, even though they don't satisfy the eval assertions."
+    },
+    {
+      "claim": "The response implicitly hints that authentication services would be affected",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Response mentions 'Authentication/authorization services — These most commonly consume signing keys to verify tokens (e.g., JWT validation)' — a generic correct guess that happens to match the architecture, but is not derived from stored graph data."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "assertion": "Claude's answer includes auth-service as a transitively affected service",
+        "reason": "The generic mention of 'Authentication/authorization services' in the without_skill response could technically be argued as matching 'auth-service', which would be a false pass. Consider tightening the assertion to require the specific identifier 'auth-service' (hyphenated, as stored) rather than accepting category descriptions."
+      },
+      {
+        "reason": "Eval 6 depends on eval 5 having populated the graph — they should be noted as sequential. If run in isolation (as without_skill does), eval 6 is guaranteed to fail regardless of skill usage. The eval design implicitly assumes a pre-populated graph from eval 5; making this dependency explicit would improve the eval suite's documentation."
+      }
+    ],
+    "overall": "The assertions are well-targeted and discriminating. The eval cleanly demonstrates that without persistent graph memory, the agent cannot perform transitive impact analysis on a specific architecture. The implicit dependency on eval 5's graph population is worth documenting."
+  }
+}

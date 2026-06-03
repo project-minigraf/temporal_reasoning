@@ -1,0 +1,83 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_ingest_status to check current ingestion state before responding to the user",
+      "passed": false,
+      "evidence": "Claude made only one tool call (vulcan_ingest_git), which was blocked by the permission system. vulcan_ingest_status was never called. The response asks for permission to run vulcan_ingest_git without first checking status."
+    },
+    {
+      "text": "Claude does NOT call vulcan_ingest_git a second time when status shows ingestion is already running",
+      "passed": false,
+      "evidence": "Claude never called vulcan_ingest_status, so it never observed that ingestion was already running. It cannot have responded to that knowledge. The single vulcan_ingest_git call was blocked before execution, and Claude then asked for permission to run it again — the exact behavior the assertion aims to prevent. The assertion is not satisfied by coincidence."
+    },
+    {
+      "text": "Claude reports commits_done and commits_total (or equivalent progress fields) from the live status result",
+      "passed": false,
+      "evidence": "vulcan_ingest_status was never called. No progress fields are reported. The response only describes what the tool would do if permission were granted."
+    },
+    {
+      "text": "Claude informs the user that indexing is already in progress and they do not need to start it again",
+      "passed": false,
+      "evidence": "Claude's response says the tool call 'was denied by the permission system' and asks for permission to run it. There is no mention of existing in-progress indexing. The user is implicitly being told they need to grant permission to start it, not that it's already running."
+    },
+    {
+      "text": "Claude does not attempt to manually store code entities via vulcan_transact as a substitute for ingestion",
+      "passed": true,
+      "evidence": "No vulcan_transact calls were made. However, this passes only trivially — the entire run was halted by a permission denial, not by skill-directed behavior."
+    }
+  ],
+  "summary": {
+    "passed": 1,
+    "failed": 4,
+    "total": 5,
+    "pass_rate": 0.2
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "vulcan_ingest_git": 1
+    },
+    "total_tool_calls": 1,
+    "total_steps": 1,
+    "errors_encountered": 1,
+    "output_chars": 799,
+    "transcript_chars": 799
+  },
+  "timing": {
+    "total_tokens": 19139,
+    "executor_duration_seconds": 27.4,
+    "total_duration_seconds": 27.4
+  },
+  "claims": [
+    {
+      "claim": "vulcan_ingest_git starts a background git ingestion job that walks the repository's commit history",
+      "type": "factual",
+      "verified": true,
+      "evidence": "This accurately describes vulcan_ingest_git's documented behavior, though it was not demonstrated in this run."
+    },
+    {
+      "claim": "The tool 'returns immediately and runs incrementally — only processing commits since the last ingestion watermark'",
+      "type": "factual",
+      "verified": true,
+      "evidence": "Claude's description of the tool behavior is accurate per the skill documentation, though it was not verified by execution in this run."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [
+      "The entire eval failed due to a permission denial on the initial vulcan_ingest_git call in the SETUP phase, not due to skill behavior. The eval result reflects a harness/permission configuration issue rather than a true measure of the 'already-running' skill behavior."
+    ],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "reason": "The eval's SETUP instructs the executor to call vulcan_ingest_git to pre-start ingestion, but this was blocked by the permission system. The eval should ensure the setup step can actually execute (e.g., by pre-seeding ingestion state in the test fixture rather than relying on a live tool call). Without a running ingestion job, the 'already-running' scenario cannot be tested at all."
+      },
+      {
+        "assertion": "Claude does not attempt to manually store code entities via vulcan_transact as a substitute for ingestion",
+        "reason": "This assertion passed trivially because the run stopped at a permission denial. It would also pass in any scenario where Claude gets stuck early. Consider gating this assertion on the run having proceeded far enough to be meaningful."
+      }
+    ],
+    "overall": "The eval is well-designed in theory but failed due to a permission system blocking the SETUP phase. The core scenario (Claude sees in-progress ingestion and doesn't double-start it) was never reached. The eval needs a fixture or environment change to ensure ingestion is actually in-flight when the agent responds to the user message."
+  }
+}

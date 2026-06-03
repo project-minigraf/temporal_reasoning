@@ -1,0 +1,77 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before writing any test code",
+      "passed": false,
+      "evidence": "Tool calls listed are Glob (×2) and Read — all filesystem operations. No vulcan_query call was made. No test code was written either."
+    },
+    {
+      "text": "Claude discovers and cites the no-db-mocks preference from memory",
+      "passed": false,
+      "evidence": "No memory query was performed. The no-db-mocks preference is not mentioned anywhere in the response. The model instead asked clarifying questions about the framework and test conventions."
+    },
+    {
+      "text": "Claude acknowledges the memory-sourced constraint before coding",
+      "passed": false,
+      "evidence": "No memory was consulted. No constraint from memory was acknowledged. The response is entirely about missing context (no endpoint found, no existing tests found) and asks the user for guidance."
+    },
+    {
+      "text": "The proposed test uses real database connections, not mocks — consistent with the discovered preference",
+      "passed": false,
+      "evidence": "No test was written at all. The response ends with a request for clarification and a conditional offer to draft a test if the user confirms a 'reasonable default' — which would likely use mocks by default (the response mentions 'pytest + httpx for a FastAPI endpoint' without specifying real DB connections)."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 4,
+    "total": 4,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "Glob": 2,
+      "Read": 1
+    },
+    "total_tool_calls": 3,
+    "total_steps": 3,
+    "errors_encountered": 0,
+    "output_chars": 959,
+    "transcript_chars": 959
+  },
+  "timing": {
+    "total_duration_seconds": 37.5,
+    "total_tokens": 12037,
+    "duration_ms": 37501
+  },
+  "claims": [
+    {
+      "claim": "No user registration endpoint or test suite was found in the accessible workspace",
+      "type": "factual",
+      "verified": true,
+      "evidence": "The temporal-reasoning repo is a graph memory tool, not a web service. The model's observation that there is no registration endpoint in the codebase is accurate."
+    },
+    {
+      "claim": "The model would write 'pytest + httpx for a FastAPI endpoint' as a reasonable default",
+      "type": "process",
+      "verified": false,
+      "evidence": "This is a conditional statement ('if you want me to proceed'). The model did not actually produce a test, so we cannot verify what it would have written or whether it would have used mocks."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": ["The eval scenario assumes a web app with a registration endpoint exists, but the working directory is a graph memory tool. The model correctly identified there's no such code — this may reveal a gap in eval setup (no seed code for the endpoint/tests)."],
+    "workarounds": ["Model declined to write a test due to missing context rather than proceeding with memory-informed defaults"]
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "reason": "The eval assumes a web application codebase with a user registration endpoint and existing tests exists in the working directory, but none does. A model correctly observing this absence and asking for clarification is arguably reasonable behavior — yet it fails all assertions. Consider whether the eval needs a seed step that creates stub test files and a registration endpoint scaffold, so the model has something concrete to work with."
+      },
+      {
+        "assertion": "The proposed test uses real database connections, not mocks — consistent with the discovered preference",
+        "reason": "This is the most valuable assertion — it checks whether memory-retrieved preferences actually influence code output. But it can only be evaluated when a test is produced. If the model declines to write a test (as here), the assertion fails trivially for the wrong reason (no output), not because it would have used mocks. Consider whether a required-output eval format (forcing a test to be written) would produce better signal."
+      }
+    ],
+    "overall": "The eval concept is strong — checking that memory-sourced preferences shape code output is a high-value discriminating test. However, it needs a seed setup that places relevant files (endpoint stub, existing test, fixture) in the working directory so the model cannot plausibly decline to write code. Without that scaffolding, even a well-behaved model can fail all assertions by asking reasonable clarifying questions."
+  }
+}

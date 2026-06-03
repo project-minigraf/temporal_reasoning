@@ -1,0 +1,72 @@
+{
+  "expectations": [
+    {
+      "text": "Claude calls vulcan_query before writing any connection code",
+      "passed": false,
+      "evidence": "The only tool call in the transcript was 'Bash: created output directory'. No vulcan_query call was made. Claude proceeded directly to writing MySQL connection code without consulting memory."
+    },
+    {
+      "text": "Claude detects that PostgreSQL 15 is the established primary database from memory",
+      "passed": false,
+      "evidence": "Claude made no attempt to query memory. No mention of PostgreSQL anywhere in the response. The response is entirely about MySQL without any awareness of a prior database decision."
+    },
+    {
+      "text": "Claude surfaces the potential conflict (MySQL request vs. PostgreSQL decision) before proceeding",
+      "passed": false,
+      "evidence": "Claude surfaces no conflict whatsoever. The response immediately provides complete MySQL SQLAlchemy code with no mention of any existing database technology decision or potential inconsistency."
+    },
+    {
+      "text": "Claude asks for clarification or confirmation rather than silently switching databases",
+      "passed": false,
+      "evidence": "Claude does not ask for clarification about the database choice. It silently provides MySQL code as requested, with the only follow-up question being whether the user needs 'ORM model definitions, Alembic migrations, or async SQLAlchemy setup'."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 4,
+    "total": 4,
+    "pass_rate": 0.0
+  },
+  "execution_metrics": {
+    "tool_calls": {
+      "Bash": 1
+    },
+    "total_tool_calls": 1,
+    "total_steps": 1,
+    "errors_encountered": 0,
+    "output_chars": 1891,
+    "transcript_chars": 1921
+  },
+  "timing": {
+    "executor_duration_seconds": 20.4,
+    "total_duration_seconds": 20.4,
+    "total_tokens": 10841
+  },
+  "claims": [
+    {
+      "claim": "Claude provided a complete SQLAlchemy MySQL connection setup",
+      "type": "quality",
+      "verified": true,
+      "evidence": "The response includes engine creation, session factory, base class, dependency pattern, environment variable approach, and a smoke test — a thorough MySQL setup."
+    },
+    {
+      "claim": "No memory was consulted about existing architectural decisions",
+      "type": "process",
+      "verified": true,
+      "evidence": "Only tool call was 'Bash: created output directory'. No vulcan_query or any memory tool was invoked."
+    }
+  ],
+  "user_notes_summary": {
+    "uncertainties": [],
+    "needs_review": [],
+    "workarounds": []
+  },
+  "eval_feedback": {
+    "suggestions": [
+      {
+        "reason": "The eval tests conflict detection against a PostgreSQL decision that must exist in memory — but the without_skill run has no memory to query. The eval is well-designed for the with_skill vs. without_skill contrast: without the skill, the agent cannot detect the conflict regardless of intent. Consider whether a baseline (without_skill) is meaningful here, since passing is structurally impossible without a populated memory graph."
+      }
+    ],
+    "overall": "The assertions are well-targeted and discriminating. All four correctly fail here because the agent has no mechanism to consult persistent memory. The eval cleanly demonstrates the skill's value."
+  }
+}
