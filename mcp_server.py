@@ -442,6 +442,24 @@ def handle_vulcan_retract(facts: str, reason: str) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
+def handle_vulcan_rule(rule: str) -> Dict[str, Any]:
+    """Register a Datalog rule for use in subsequent queries.
+
+    Rules persist for the lifetime of the server session (they are re-registered
+    whenever the DB is reopened). To make a rule permanent across server restarts,
+    add it to SESSION_RULES in mcp_server.py.
+
+    Syntax: [(rule-name ?arg ...) body-clause ...]
+    Example: [(ancestor ?a ?d) [?a :parent ?d]]
+    """
+    db = get_db()
+    try:
+        db.execute(f"(rule {rule})")
+        return {"ok": True, "rule": rule}
+    except MiniGrafError as e:
+        return {"ok": False, "error": str(e)}
+
+
 def handle_vulcan_report_issue(
     category: str,
     description: str,
@@ -1958,6 +1976,28 @@ _TOOLS: List[Tool] = [
         },
     ),
     Tool(
+        name="vulcan_rule",
+        description=(
+            "Register a Datalog rule for use in subsequent queries. "
+            "Rules enable recursive graph traversal (e.g. ancestor, reachable). "
+            "A rule persists for the server session — re-register after a server restart. "
+            "Syntax: [(rule-name ?arg ...) body-clause ...] — omit the outer (rule ...) wrapper."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "rule": {
+                    "type": "string",
+                    "description": (
+                        "Rule vector, e.g. [(ancestor ?a ?d) [?a :parent ?d]] "
+                        "or [(ancestor ?a ?d) [?a :parent ?m] (ancestor ?m ?d)]"
+                    ),
+                },
+            },
+            "required": ["rule"],
+        },
+    ),
+    Tool(
         name="vulcan_report_issue",
         description=(
             "Report an issue with Vulcan query or transact operations. "
@@ -2094,6 +2134,10 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
 
         if name == "vulcan_retract":
             result = handle_vulcan_retract(arguments["facts"], arguments["reason"])
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        if name == "vulcan_rule":
+            result = handle_vulcan_rule(arguments["rule"])
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "vulcan_report_issue":
