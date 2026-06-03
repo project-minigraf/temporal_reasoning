@@ -234,6 +234,63 @@ def setup_mcp_json(target_dir: str) -> bool:
     return True
 
 
+def setup_claude_settings_json(target_dir: str) -> bool:
+    """Idempotently write enabledPlugins, extraKnownMarketplaces, and
+    enabledMcpjsonServers into .claude/settings.json.
+
+    - Creates .claude/ and the file if absent.
+    - Merges into existing content (other keys are preserved).
+    - Always sets the marketplace path to the current REPO_DIR.
+    """
+    import json
+
+    claude_dir = os.path.join(target_dir, ".claude")
+    settings_path = os.path.join(claude_dir, "settings.json")
+
+    existing: dict = {}
+    file_existed = os.path.exists(settings_path)
+    if file_existed:
+        try:
+            with open(settings_path) as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            existing = {}
+
+    # enabledPlugins
+    plugins = existing.setdefault("enabledPlugins", {})
+    plugins["vulcan@temporal-reasoning-local"] = True
+
+    # extraKnownMarketplaces
+    marketplaces = existing.setdefault("extraKnownMarketplaces", {})
+    marketplaces["temporal-reasoning-local"] = {
+        "source": {
+            "source": "directory",
+            "path": REPO_DIR,
+        }
+    }
+
+    # enabledMcpjsonServers
+    mcp_servers = existing.setdefault("enabledMcpjsonServers", [])
+    if "temporal-reasoning" not in mcp_servers:
+        mcp_servers.append("temporal-reasoning")
+
+    os.makedirs(claude_dir, exist_ok=True)
+    try:
+        with open(settings_path, "w") as f:
+            json.dump(existing, f, indent=4)
+            f.write("\n")
+    except IOError as e:
+        print(f"✗ Could not write {settings_path}: {e}")
+        return False
+
+    verb = "Updated" if file_existed else "Created"
+    print(f"✓ {verb} {settings_path}")
+    print(f"    enabledPlugins.vulcan@temporal-reasoning-local = true")
+    print(f"    extraKnownMarketplaces.temporal-reasoning-local → {REPO_DIR}")
+    print(f"    enabledMcpjsonServers += temporal-reasoning")
+    return True
+
+
 def setup_claude_settings(target_dir: str) -> bool:
     """Idempotently write hooks and ANTHROPIC_API_KEY into .claude/settings.local.json.
 
@@ -247,6 +304,7 @@ def setup_claude_settings(target_dir: str) -> bool:
     import json
 
     prepare_cmd = f"python {os.path.join(REPO_DIR, 'hooks', 'prepare_hook.py')}"
+    ingest_cmd = f"python {os.path.join(REPO_DIR, 'hooks', 'ingest_hook.py')}"
     finalize_cmd = f"python {os.path.join(REPO_DIR, 'hooks', 'finalize_hook.py')}"
 
     claude_dir = os.path.join(target_dir, ".claude")
@@ -290,6 +348,7 @@ def setup_claude_settings(target_dir: str) -> bool:
         return "added"
 
     prepare_status = _upsert_hook("UserPromptSubmit", "prepare_hook.py", prepare_cmd, 5000)
+    ingest_status = _upsert_hook("UserPromptSubmit", "ingest_hook.py", ingest_cmd, 2000)
     finalize_status = _upsert_hook("Stop", "finalize_hook.py", finalize_cmd, 10000)
 
     os.makedirs(claude_dir, exist_ok=True)
@@ -304,6 +363,7 @@ def setup_claude_settings(target_dir: str) -> bool:
     verb = "Updated" if file_existed else "Created"
     print(f"✓ {verb} {settings_path}")
     print(f"    UserPromptSubmit hook ({prepare_status}): {prepare_cmd}")
+    print(f"    UserPromptSubmit hook ({ingest_status}): {ingest_cmd}")
     print(f"    Stop hook ({finalize_status}): {finalize_cmd}")
     if key_is_real:
         print("    env.ANTHROPIC_API_KEY = (preserved)")
@@ -338,11 +398,15 @@ def main(target_dir: str = "") -> None:
     mcp_ok = setup_mcp_json(target_dir)
     print()
 
+    print("Configuring .claude/settings.json...")
+    settings_json_ok = setup_claude_settings_json(target_dir)
+    print()
+
     print("Configuring .claude/settings.local.json...")
     settings_ok = setup_claude_settings(target_dir)
     print()
 
-    if all(results) and mcp_ok and settings_ok:
+    if all(results) and mcp_ok and settings_json_ok and settings_ok:
         print("=" * 50)
         print("✓ Setup complete!")
         print("=" * 50)

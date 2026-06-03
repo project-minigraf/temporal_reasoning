@@ -12,5 +12,6 @@
     "minigraf": ">=0.19.0"
   },
   "languages": ["python"],
-  "environments": ["claude-code", "opencode", "codex"]
+  "environments": ["claude-code", "opencode", "codex"],
+  "skills": ["skills/temporal-reasoning"]
 }
