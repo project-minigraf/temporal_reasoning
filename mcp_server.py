@@ -28,6 +28,11 @@ SESSION_RULES = [
     "(rule [(reachable ?a ?b) [?a :calls ?b]])",
     "(rule [(linked ?a ?b) [?a :contains ?b]])",
     "(rule [(reachable ?a ?b) [?a :contains ?b]])",
+    # Commit-graph traversal: (ancestor ?child ?anc) holds when ?anc is a
+    # (possibly transitive) git ancestor of ?child via :parent edges.
+    # Only evaluated when a query explicitly calls (ancestor ...).
+    "(rule [(ancestor ?child ?anc) [?child :parent ?anc]])",
+    "(rule [(ancestor ?child ?anc) [?child :parent ?mid] (ancestor ?mid ?anc)])",
 ]
 
 # User-registered rules — persisted across DB reopens (unlike SESSION_RULES,
