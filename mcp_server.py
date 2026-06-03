@@ -699,6 +699,46 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
     return result.stdout
 
 
+def _git_parent_hashes(repo_path: str, commit_hash: str) -> List[str]:
+    """Return the parent commit hashes for the given commit (empty for root commits)."""
+    result = _subprocess.run(
+        ["git", "log", "-1", "--format=%P", commit_hash],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    raw = result.stdout.strip()
+    return raw.split() if raw else []
+
+
+def _git_tags(repo_path: str) -> List[tuple]:
+    """Return list of (tag_name, commit_hash, date_iso) for all tags in the repo.
+
+    For annotated tags, returns the dereferenced commit hash.
+    For lightweight tags, returns the tagged commit directly.
+    Date is the tagger date for annotated tags, or commit date for lightweight.
+    """
+    result = _subprocess.run(
+        ["git", "tag", "-l", "--sort=version:refname",
+         "--format=%(refname:short)\t%(*objectname)\t%(objectname)\t%(creatordate:iso-strict)"],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    tags = []
+    for line in result.stdout.strip().splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 3)
+        if len(parts) < 3:
+            continue
+        tag_name = parts[0]
+        deref_hash = parts[1].strip()   # non-empty for annotated tags
+        obj_hash = parts[2].strip()
+        date_raw = parts[3].strip() if len(parts) > 3 else ""
+        commit_hash = deref_hash if deref_hash else obj_hash
+        if not commit_hash:
+            continue
+        tags.append((tag_name, commit_hash, date_raw))
+    return tags
+
+
 # ---------------------------------------------------------------------------
 # Bi-temporal write helpers
 # ---------------------------------------------------------------------------
@@ -1652,6 +1692,37 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     return entity_valid_from, file_entities
 
 
+def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
+    """Ingest git tags as :tag/<slug> entities with :tagged-commit references.
+
+    Called once after the commit walk. All tags are re-ingested on every run
+    so newly created tags pointing to previously ingested commits are picked up.
+    Re-transacting identical facts is idempotent in Minigraf.
+    """
+    try:
+        tags = _git_tags(repo_path)
+    except Exception:
+        return  # non-fatal
+
+    for tag_name, commit_hash, date_raw in tags:
+        try:
+            slug = re.sub(r"[^a-z0-9]+", "-", tag_name.lower()).strip("-")
+            tag_ident = f":tag/{slug}"
+            commit_ident = f":commit/{commit_hash[:12]}"
+            triples = [
+                f"[{tag_ident} :entity-type :type/tag]",
+                f'[{tag_ident} :name "{_edn_escape(tag_name)}"]',
+                f'[{tag_ident} :ident "{tag_ident}"]',
+                f'[{tag_ident} :description "git tag {_edn_escape(tag_name)}"]',
+                f"[{tag_ident} :tagged-commit {commit_ident}]",
+            ]
+            if date_raw:
+                triples.append(f'[{tag_ident} :date "{_edn_escape(date_raw)}"]')
+            db.execute(f'(transact [{" ".join(triples)}] {{:valid-from "{run_ts_iso}"}})')
+        except Exception:
+            pass  # non-fatal per tag
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure."""
     global _db, _ingest_progress
@@ -1728,6 +1799,19 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     _ingest_transact(db, [ct], commit_ts_iso, reason)
                 for close_triples, orig_ts in close_items:
                     _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason)
+
+                # Ingest :parent edges — one transact per parent to avoid EAVT
+                # collision for merge commits (which have two parent hashes).
+                try:
+                    for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+                        parent_ident = f":commit/{parent_hash[:12]}"
+                        db.execute(
+                            f'(transact [[{commit_ident} :parent {parent_ident}]] '
+                            f'{{:valid-from "{commit_ts_iso}"}})'
+                        )
+                except Exception:
+                    pass  # non-fatal; parent edges are best-effort
+
                 _watermark_update(db, commit_hash, commit_ts_iso, reason)
                 db.checkpoint()
 
@@ -1741,6 +1825,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         db = get_db()
         try:
             _ingest_deps_from_head(db, repo_path, file_entities, now)
+            _ingest_tags(db, repo_path, now)
             _last_run_write(db, last_hash, now)
             db.checkpoint()
         finally:
