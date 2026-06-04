@@ -6,7 +6,7 @@
 
 **Architecture:** A `FactIndex` class wraps `BM25Okapi` with a memory-fact score boost. An `IndexCache` singleton holds the live index, rebuilds asynchronously on invalidation, and serves stale results during rebuilds. `handle_memory_prepare_turn` queries the cache; `handle_vulcan_transact`, `handle_vulcan_retract`, and `_run_ingestion` invalidate it on write.
 
-**Tech Stack:** `rank-bm25>=0.7.2` (pure Python BM25, no transitive deps), Python `threading` (async rebuild), existing `mcp_server.py` DB layer.
+**Tech Stack:** `rank-bm25>=0.2.2` (pure Python BM25, no transitive deps), Python `threading` (async rebuild), existing `mcp_server.py` DB layer.
 
 ---
 
@@ -14,7 +14,7 @@
 
 | File | Change |
 |---|---|
-| `pyproject.toml` | Add `rank-bm25>=0.7.2` to `dependencies` |
+| `pyproject.toml` | Add `rank-bm25>=0.2.2` to `dependencies` |
 | `install.py` | Add `check_rank_bm25_package()`, add to checks list |
 | `mcp_server.py` | Add import guard (line ~20); add `_MEMORY_PREFIXES`, `_tokenize`, `FactIndex`, `IndexCache`, `_index_cache` (before `handle_memory_prepare_turn` ~line 1100); rename existing `handle_memory_prepare_turn` → `_handle_memory_prepare_turn_heuristic`; new `handle_memory_prepare_turn`; `invalidate()` calls in `handle_vulcan_transact` (line ~432), `handle_vulcan_retract` (line ~450), `_run_ingestion` (line ~1870) |
 | `tests/test_mcp_server.py` | Add `TestBM25Tokenize`, `TestFactIndex`, `TestIndexCache`, `TestMemoryPrepareTurnBM25`, `TestIndexCacheInvalidation`; update `reset_mcp_server_db` autouse fixture |
@@ -35,7 +35,7 @@ In `pyproject.toml`, find the `dependencies` list and add the new entry:
 dependencies = [
     "minigraf>=0.22.0",
     "mcp>=1.27.0",
-    "rank-bm25>=0.7.2",
+    "rank-bm25>=0.2.2",
 ]
 ```
 
@@ -50,7 +50,7 @@ def check_rank_bm25_package():
         print("✓ rank-bm25 package found")
         return True
     print("✗ rank-bm25 not found — installing via pip...")
-    if _venv_pip_install("rank-bm25>=0.7.2", timeout=60):
+    if _venv_pip_install("rank-bm25>=0.2.2", timeout=60):
         print("✓ rank-bm25 installed")
         return True
     print("✗ pip install rank-bm25 failed")
@@ -75,7 +75,7 @@ checks = [
 - [ ] **Step 4: Install into venv and verify**
 
 ```bash
-.venv/bin/python -m pip install rank-bm25>=0.7.2
+.venv/bin/python -m pip install rank-bm25>=0.2.2
 .venv/bin/python -c "from rank_bm25 import BM25Okapi; print('ok')"
 ```
 
