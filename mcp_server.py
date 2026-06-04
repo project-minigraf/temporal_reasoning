@@ -18,6 +18,13 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from minigraf import MiniGrafDb, MiniGrafError
 
+try:
+    from rank_bm25 import BM25Okapi as _BM25Okapi
+    _BM25_AVAILABLE = True
+except ImportError:
+    _BM25Okapi = None  # type: ignore[assignment,misc]
+    _BM25_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Session-scoped rules — registered once at startup, cached in RuleRegistry
 # ---------------------------------------------------------------------------
@@ -1097,6 +1104,23 @@ def _build_query_clauses(user_message: str) -> str:
             valid_at = date_match.group(1)
             return f':valid-at "{valid_at}"'
     return f':valid-at "{_now_utc_ms()}"'
+
+
+# ---------------------------------------------------------------------------
+# BM25 index — semantic retrieval primitives
+# ---------------------------------------------------------------------------
+
+_MEMORY_PREFIXES = (":decision/", ":preference/", ":constraint/", ":dependency/")
+
+
+def _tokenize(text: str) -> List[str]:
+    """Split text on non-alphanumeric chars, lowercase, filter empties.
+
+    Works on raw fact values and keyword idents alike:
+      ":decision/use-redis" → ["decision", "use", "redis"]
+      "use Redis for caching" → ["use", "redis", "for", "caching"]
+    """
+    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
 
 
 def handle_memory_prepare_turn(user_message: str) -> str:

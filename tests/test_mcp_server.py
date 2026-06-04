@@ -504,11 +504,11 @@ class TestMcpToolWiring:
 
         tools = asyncio.run(mcp_server.list_tools())
 
-        assert len(tools) == 9
+        assert len(tools) == 10
         names = {t.name for t in tools}
         assert names == {
             "vulcan_query", "vulcan_transact", "vulcan_retract",
-            "vulcan_report_issue", "memory_prepare_turn", "memory_finalize_turn",
+            "vulcan_rule", "vulcan_report_issue", "memory_prepare_turn", "memory_finalize_turn",
             "vulcan_audit", "vulcan_ingest_git", "vulcan_ingest_status",
         }
 
@@ -1584,3 +1584,36 @@ class TestRunIngestion:
         result = await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is False
         assert "already in progress" in result["error"]
+
+
+class TestBM25Tokenize:
+    def test_splits_keyword_ident_on_punctuation(self):
+        from mcp_server import _tokenize
+        assert _tokenize(":decision/use-redis") == ["decision", "use", "redis"]
+
+    def test_lowercases_tokens(self):
+        from mcp_server import _tokenize
+        assert _tokenize("use Redis for Caching") == ["use", "redis", "for", "caching"]
+
+    def test_filters_empty_tokens(self):
+        from mcp_server import _tokenize
+        assert _tokenize(":::") == []
+
+    def test_mixed_fact_row(self):
+        from mcp_server import _tokenize
+        assert _tokenize(":commit/abc123 :subject feat add redis") == [
+            "commit", "abc123", "subject", "feat", "add", "redis"
+        ]
+
+    def test_memory_prefix_detected(self):
+        from mcp_server import _MEMORY_PREFIXES
+        assert ":decision/use-redis".startswith(_MEMORY_PREFIXES)
+        assert ":preference/tdd".startswith(_MEMORY_PREFIXES)
+        assert ":constraint/no-js".startswith(_MEMORY_PREFIXES)
+        assert ":dependency/redis".startswith(_MEMORY_PREFIXES)
+
+    def test_git_prefix_not_memory(self):
+        from mcp_server import _MEMORY_PREFIXES
+        assert not ":commit/abc123".startswith(_MEMORY_PREFIXES)
+        assert not ":function/foo-bar".startswith(_MEMORY_PREFIXES)
+        assert not ":module/src-main".startswith(_MEMORY_PREFIXES)
