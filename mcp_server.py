@@ -819,6 +819,9 @@ def _watermark_query(db: Any) -> Optional[str]:
 
 def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str) -> None:
     """Record the last successfully ingested commit hash in the graph."""
+    existing = _watermark_query(db)
+    if existing:
+        db.execute(f'(retract [[:ingestion/watermark :hash "{existing}"]])')
     db.execute(
         f'(transact [[:ingestion/watermark :entity-type :type/ingestion] '
         f'[:ingestion/watermark :ident ":ingestion/watermark"] '
