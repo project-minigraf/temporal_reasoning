@@ -12,9 +12,32 @@ Usage (hooks/claude-code.json):
 import json
 import os
 import sys
+import time
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_DIR)
+
+# Retry parameters for acquiring the DB lock when background ingestion is active.
+# Total max wait: 0.05 + 0.10 + 0.20 + 0.40 + 0.80 = 1.55s — well within the 5s timeout.
+_LOCK_RETRY_MAX = 5
+_LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
+
+
+def _open_db_with_retry() -> bool:
+    """Open the graph DB, retrying on lock conflicts from background ingestion."""
+    import mcp_server
+    delay = _LOCK_RETRY_BASE
+    for attempt in range(_LOCK_RETRY_MAX):
+        try:
+            mcp_server.open_db()
+            return True
+        except Exception as e:
+            if "locked" in str(e).lower() and attempt < _LOCK_RETRY_MAX - 1:
+                time.sleep(delay)
+                delay *= 2
+            else:
+                return False
+    return False
 
 
 def main() -> None:
@@ -29,11 +52,8 @@ def main() -> None:
     if prompt:
         try:
             import mcp_server
-            # The persistent MCP server releases its DB handle (file lock) after every
-            # tool call via call_tool()'s finally block. This hook fires between turns
-            # when no tool call is active, so the lock is free and open_db() succeeds.
-            mcp_server.open_db()
-            context = mcp_server.handle_memory_prepare_turn(prompt)
+            if _open_db_with_retry():
+                context = mcp_server.handle_memory_prepare_turn(prompt)
         except Exception:
             pass  # Never block the turn on memory errors
 
