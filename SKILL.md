@@ -65,21 +65,20 @@ Skip transient observations, intermediate reasoning, raw code snippets, and rest
 
 Facts are stored as triples: `[entity attribute value]`. The entity ident is the organizing key — it carries all the identity and namespacing you need. Use flat, descriptive attribute names.
 
-**Entity idents** should be meaningful and namespaced: `:project/postgres`, `:preference/no-db-mocks`, `:rules/python-version`
+**Entity idents** should be meaningful and namespaced: `:decision/postgres`, `:preference/no-db-mocks`, `:constraint/python-version`
 
-**Attribute names** should be flat and self-explanatory: `:name`, `:role`, `:reason`, `:rejected`, `:description`, `:tradeoff`, `:entity-type`, `:calls`, `:depends-on`, `:motivated-by`, `:governs`
+**Attribute names** should be flat and self-explanatory: `:description`, `:rationale`, `:date`, `:alias`, `:entity-type`, `:calls`, `:depends-on`, `:motivated-by`, `:governs`
 
 ```
-[:project/postgres :name "PostgreSQL 15"]
-[:project/postgres :role "primary database"]
-[:project/postgres :tradeoff "lower write throughput"]
+[:decision/postgres :description "PostgreSQL 15 — primary database"]
+[:decision/postgres :rationale "ACID compliance + JSON support; tradeoff: lower write throughput"]
 [:preference/no-db-mocks :description "always use real DB connections in tests"]
-[:preference/no-db-mocks :reason "mock/prod divergence caused silent migration failure"]
+[:preference/no-db-mocks :rationale "mock/prod divergence caused silent migration failure"]
 ```
 
 To retrieve all facts for an entity, query by ident directly — no need to know attribute names in advance:
 ```python
-query("[:find ?a ?v :where [:project/postgres ?a ?v]]")
+query("[:find ?a ?v :where [:decision/postgres ?a ?v]]")
 ```
 
 Before adding new facts about an entity, query it first to find existing attributes and avoid duplication.
@@ -98,7 +97,7 @@ Only mint a new ident if the entity is genuinely new.
 
 Canonical ident form: lowercase, hyphens only — `:decision/redis` not `:decision/Redis_cache`.
 
-Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`, `:module/`, `:function/`, `:class/` (code structure — auto-ingested); `:ingestion/` is system-only, do not write to it directly
+Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`, `:module/`, `:function/`, `:class/` (code structure — auto-ingested); `:commit/`, `:tag/`, `:ingestion/` are system-only (written by `vulcan_ingest_git`), do not write to them directly
 Required attribute on all types: `:description`
 Optional attributes: `:rationale`, `:date`, `:alias`
 
@@ -111,15 +110,15 @@ Run `vulcan_audit` periodically or after a session with heavy writes to detect a
 Assign a type to every entity so you can query across categories without knowing individual entity names:
 
 ```python
-transact("""[[:project/auth-service :name "AuthService"]
-             [:project/auth-service :entity-type :type/component]
-             [:rules/python-version :description "must support Python 3.8 minimum"]
-             [:rules/python-version :entity-type :type/constraint]]""",
-         reason="Component and constraint with types")
+transact("""[[:dependency/auth-service :description "AuthService"]
+             [:dependency/auth-service :entity-type :type/dependency]
+             [:constraint/python-version :description "must support Python 3.8 minimum"]
+             [:constraint/python-version :entity-type :type/constraint]]""",
+         reason="Dependency and constraint with types")
 ```
 
 Use these canonical type keywords:
-- `:type/component` — service, module, library, or system component
+- `:type/dependency` — service, module, library, or system component
 - `:type/decision` — architecture or design decision
 - `:type/constraint` — rule, requirement, or invariant
 - `:type/preference` — user preference or style choice
@@ -134,10 +133,10 @@ When a value refers to another entity in memory, store it as an entity keyword �
 
 ```datalog
 ; WRONG — string dead-end, cannot traverse
-[:project/auth-service :calls "jwt-module"]
+[:dependency/auth-service :calls "jwt-module"]
 
 ; CORRECT — entity reference, edge is traversable
-[:project/auth-service :calls :project/jwt-module]
+[:dependency/auth-service :calls :dependency/jwt-module]
 ```
 
 Rule of thumb: if the value names something that IS or WILL BE an entity in memory, use its entity ident keyword.
@@ -194,10 +193,9 @@ memory_finalize_turn(conversation_delta="User: We'll use Redis for caching.\nAge
 ```python
 from vulcan import transact
 
-transact("""[[:project/postgres :name "PostgreSQL 15"]
-             [:project/postgres :role "primary database"]
-             [:project/postgres :priority "ACID compliance + JSON support"]
-             [:project/postgres :tradeoff "lower write throughput"]]""",
+transact("""[[:decision/postgres :description "PostgreSQL 15 — primary database"]
+             [:decision/postgres :entity-type :type/decision]
+             [:decision/postgres :rationale "ACID compliance + JSON support; tradeoff: lower write throughput"]]""",
          reason="Database choice finalized — JSON support required for analytics queries")
 ```
 
@@ -211,23 +209,23 @@ python vulcan.py transact '[...]' --reason "why this is worth keeping"
 from vulcan import query
 
 # All facts for a known entity
-query("[:find ?a ?v :where [:project/postgres ?a ?v]]")
+query("[:find ?a ?v :where [:decision/postgres ?a ?v]]")
 
 # Broad scan of everything in memory
 query("[:find ?e ?a ?v :where [?e ?a ?v]]")
 
 # Search stored values by content (useful when entity ident is unknown)
 query('[:find ?e ?a ?v :where [?e ?a ?v] (contains? ?v "Redis")]')
-query('[:find ?e ?v :where [?e :reason ?v] (starts-with? ?v "chosen")]')
+query('[:find ?e ?v :where [?e :rationale ?v] (starts-with? ?v "chosen")]')
 
 # Temporal — state at transaction N
-query("[:find ?a ?v :as-of 5 :where [:project/postgres ?a ?v]]")
+query("[:find ?a ?v :as-of 5 :where [:decision/postgres ?a ?v]]")
 ```
 
 ### vulcan_retract
 ```python
 from vulcan import retract
-retract("[[:project/old-service :name \"obsolete\"]]",
+retract("[[:dependency/old-service :description \"obsolete\"]]",
         reason="Service decommissioned")
 ```
 
@@ -274,6 +272,75 @@ vulcan_ingest_status()
 ```
 
 `status` is one of: `idle`, `running`, `complete`, `error`.
+
+### Git-Ingested Data Schema
+
+`vulcan_ingest_git` writes the following entity types. All relationship attributes (`:parent`, `:introduced-by`, `:modified-in`, `:contains`, `:depends-on`, `:tagged-commit`) are stored as keyword entity references — they bypass string-value schema validation by design and are directly traversable in queries.
+
+**Ident slugging:** non-alphanumeric characters in paths and names are replaced with hyphens and consecutive hyphens collapsed. Examples: `src/auth.py` → `:module/src-auth-py`; function `login` in `src/auth.py` → `:function/src-auth-py-login`.
+
+#### `:type/commit` — one per git commit
+Ident: `:commit/<first-12-chars-of-hash>`
+
+| Attribute | Notes |
+|---|---|
+| `:description` | commit subject (truncated to 120 chars) |
+| `:hash` | full 40-char hash |
+| `:author` | author email |
+| `:subject` | commit subject (truncated to 200 chars) |
+| `:date` | ISO 8601 UTC timestamp, e.g. `"2026-05-26T14:32:00Z"` |
+| `:parent` (keyword ref) | parent commit(s); merge commits have two |
+
+#### `:type/module` — one per source file, written on the commit that introduces it
+Ident: `:module/<slugified-file-path>`
+
+| Attribute | Notes |
+|---|---|
+| `:description` | file path, e.g. `"src/auth.py"` |
+| `:path` | file path |
+| `:introduced-by` (keyword ref) | commit that first added this file |
+| `:modified-in` (keyword ref) | one edge per subsequent modifying commit |
+| `:contains` (keyword ref) | functions and classes defined in this file |
+| `:depends-on` (keyword ref) | modules this file imports — written from HEAD state after the full commit walk, not per-commit |
+
+#### `:type/function` — one per top-level function or method
+Ident: `:function/<slugified-path-name>` (file path + `::` + function name, slugified together)
+
+| Attribute | Notes |
+|---|---|
+| `:description` | function name |
+| `:file` | source file path |
+| `:introduced-by` (keyword ref) | commit that first defined this function |
+| `:modified-in` (keyword ref) | one edge per subsequent modifying commit |
+
+#### `:type/class` — one per class, struct, or type definition (same ident convention as function)
+
+| Attribute | Notes |
+|---|---|
+| `:description` | class or struct name |
+| `:file` | source file path |
+| `:introduced-by` (keyword ref) | commit that first defined this class |
+| `:modified-in` (keyword ref) | one edge per subsequent modifying commit |
+
+#### `:type/tag` — one per git tag (system-only, not audited)
+Ident: `:tag/<slugified-tag-name>`
+
+| Attribute | Notes |
+|---|---|
+| `:description` | `"git tag <name>"` |
+| `:name` | original tag name |
+| `:date` | tag creation date (if available) |
+| `:tagged-commit` (keyword ref) | the commit this tag points to |
+
+**Supported languages for AST extraction:** Python, JavaScript, TypeScript (+ TSX/JSX), Rust, Go, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Scala, Haskell, Lua, Elixir. Files in other languages are tracked as modules (with `:introduced-by`/`:modified-in`) but yield no function or class entities.
+
+**Pre-registered SESSION_RULES** — these are always available; no `vulcan_rule` call needed:
+
+| Rule | Traverses | Use for |
+|---|---|---|
+| `(ancestor ?child ?anc)` | `:parent` (recursive) | commit graph ancestry |
+| `(reachable ?a ?b)` | `:depends-on`, `:calls`, `:contains` (recursive) | transitive code reachability |
+| `(linked ?a ?b)` | `:depends-on`, `:calls`, `:contains` (single hop) | direct cross-edge-type queries |
 
 ### Code Structure Query Examples
 
@@ -340,7 +407,7 @@ Unify multiple edge types under one name:
 ```datalog
 (rule [(linked ?a ?b) [?a :depends-on ?b]])
 (rule [(linked ?a ?b) [?a :calls ?b]])
-[:find ?name :where (linked :project/api-gateway ?svc) [?svc :name ?name]]
+[:find ?desc :where (linked :dependency/api-gateway ?svc) [?svc :description ?desc]]
 ```
 
 Rules registered via `vulcan_rule` persist for the server session. After a server restart, re-register them or add them to `SESSION_RULES` in `mcp_server.py` to make them permanent.
@@ -349,10 +416,10 @@ Rules registered via `vulcan_rule` persist for the server session. After a serve
 When you know the exact depth, explicit joins are simpler than registering a rule:
 ```datalog
 ; 2-hop: api-gateway → auth-service → jwt-validator
-[:find ?name
- :where [:project/api-gateway :calls ?mid]
+[:find ?desc
+ :where [:dependency/api-gateway :calls ?mid]
         [?mid :depends-on ?leaf]
-        [?leaf :name ?name]]
+        [?leaf :description ?desc]]
 ```
 
 ### String and numeric comparisons
@@ -381,33 +448,32 @@ Default: `memory.graph` in the current working directory. Run all commands from 
 ### Storing a tech stack decision
 User: "We're using FastAPI over Flask — async support is critical for our Redis calls."
 ```python
-transact("""[[:project/api-layer :name "FastAPI"]
-             [:project/api-layer :entity-type :type/decision]
-             [:project/api-layer :rejected "Flask"]
-             [:project/api-layer :reason "async support required for Redis calls"]]""",
+transact("""[[:decision/api-layer :description "use FastAPI over Flask"]
+             [:decision/api-layer :entity-type :type/decision]
+             [:decision/api-layer :rationale "async support required for Redis calls; rejected Flask"]]""",
          reason="API framework finalized")
 ```
 
 ### Storing a component relationship (entity reference, not string)
 User: "The auth service calls the JWT module for token validation."
 ```python
-transact("""[[:project/auth-service :name "AuthService"]
-             [:project/auth-service :entity-type :type/component]
-             [:project/auth-service :calls :project/jwt-module]
-             [:project/jwt-module :name "JWTModule"]
-             [:project/jwt-module :entity-type :type/component]]""",
+transact("""[[:dependency/auth-service :description "AuthService"]
+             [:dependency/auth-service :entity-type :type/dependency]
+             [:dependency/auth-service :calls :dependency/jwt-module]
+             [:dependency/jwt-module :description "JWTModule"]
+             [:dependency/jwt-module :entity-type :type/dependency]]""",
          reason="Component dependency for impact analysis")
 ```
-`:calls` holds the entity ident `:project/jwt-module` — not the string `"jwt-module"`. This makes the edge traversable.
+`:calls` holds the entity ident `:dependency/jwt-module` — not the string `"jwt-module"`. This makes the edge traversable.
 
 ### Decision motivated by a constraint
 User: "We chose asyncio over threading because of the GIL."
 ```python
-transact("""[[:rules/gil-constraint :description "Python GIL limits true thread parallelism"]
-             [:rules/gil-constraint :entity-type :type/constraint]
-             [:project/asyncio-choice :description "use asyncio over threading"]
-             [:project/asyncio-choice :entity-type :type/decision]
-             [:project/asyncio-choice :motivated-by :rules/gil-constraint]]""",
+transact("""[[:constraint/gil :description "Python GIL limits true thread parallelism"]
+             [:constraint/gil :entity-type :type/constraint]
+             [:decision/asyncio :description "use asyncio over threading"]
+             [:decision/asyncio :entity-type :type/decision]
+             [:decision/asyncio :motivated-by :constraint/gil]]""",
          reason="Decision traceability — why asyncio was chosen")
 ```
 Query: "Why asyncio?" traverses the edge:
@@ -424,13 +490,13 @@ User: "What breaks if I change the key-store service?"
 For fixed-depth traversal, use explicit joins:
 ```python
 # Direct dependents (1 hop)
-query("[:find ?name :where [?svc :depends-on :project/key-store] [?svc :name ?name]]")
+query("[:find ?desc :where [?svc :depends-on :dependency/key-store] [?svc :description ?desc]]")
 
 # 2-hop: also find services that depend on those services
-query("""[:find ?name
-          :where [?mid :depends-on :project/key-store]
+query("""[:find ?desc
+          :where [?mid :depends-on :dependency/key-store]
                  [?svc :depends-on ?mid]
-                 [?svc :name ?name]]""")
+                 [?svc :description ?desc]]""")
 ```
 
 For unbounded transitive traversal, register a recursive rule first:
@@ -440,32 +506,32 @@ vulcan_rule("[(reachable ?a ?b) [?a :depends-on ?b]]")
 vulcan_rule("[(reachable ?a ?b) [?a :depends-on ?m] (reachable ?m ?b)]")
 
 # Then query — finds all transitive dependents at any depth
-query("[:find ?name :where (reachable ?svc :project/key-store) [?svc :name ?name]]")
+query("[:find ?desc :where (reachable ?svc :dependency/key-store) [?svc :description ?desc]]")
 ```
 
 Use rules to unify multiple edge types when scanning across mixed relationships:
 ```python
 vulcan_rule("[(linked ?a ?d) [?a :depends-on ?d]]")
 vulcan_rule("[(linked ?a ?d) [?a :calls ?d]]")
-query("""[:find ?name
-          :where (linked :project/auth-service ?svc)
-                 [?svc :name ?name]]""")
+query("""[:find ?desc
+          :where (linked :dependency/auth-service ?svc)
+                 [?svc :description ?desc]]""")
 
 ### Find all entities of a given type
 ```python
-# All components
-query("[:find ?name :where [?e :entity-type :type/component] [?e :name ?name]]")
+# All dependencies/components
+query("[:find ?desc :where [?e :entity-type :type/dependency] [?e :description ?desc]]")
 
 # All constraints that govern the auth service
 query("""[:find ?desc
-          :where [?c :governs :project/auth-service]
+          :where [?c :governs :dependency/auth-service]
                  [?c :description ?desc]]""")
 ```
 
 ### Retrieving facts for a known entity
 ```python
-query("[:find ?a ?v :where [:project/api-layer ?a ?v]]")
-# Returns: :name "FastAPI", :rejected "Flask", :reason "async support..."
+query("[:find ?a ?v :where [:decision/api-layer ?a ?v]]")
+# Returns: :description "use FastAPI over Flask", :rationale "async support..."
 ```
 
 ### Searching memory by content (entity ident unknown)
@@ -485,7 +551,7 @@ result = query("[:find ?e ?a ?v :where [?e ?a ?v]]")
 ### Handling empty memory
 User: "What database did we decide on?"
 ```python
-result = query("[:find ?a ?v :where [:project/postgres ?a ?v]]")
+result = query("[:find ?a ?v :where [:decision/postgres ?a ?v]]")
 # result["results"] == []
 ```
 Response: "Let me check memory... Memory doesn't have anything recorded about a database choice. If you share the decision, I'll store it for future sessions."
@@ -494,7 +560,7 @@ Response: "Let me check memory... Memory doesn't have anything recorded about a 
 User: "Help me set up a MySQL connection."
 ```python
 result = query("[:find ?e ?a ?v :where [?e ?a ?v]]")
-# Finds [:project/postgres :name "PostgreSQL 15"] and [:project/postgres :role "primary database"]
+# Finds [:decision/postgres :description "PostgreSQL 15 — primary database"]
 ```
 Response: "Before we proceed — memory shows we're using PostgreSQL 15 as the primary database. Is this a new secondary database, or has the decision changed? If it's changed, I'll update memory to reflect that."
 
@@ -502,7 +568,7 @@ Response: "Before we proceed — memory shows we're using PostgreSQL 15 as the p
 User: "I hate mocks in DB tests — we got burned when mocked tests passed but the migration failed."
 ```python
 transact("""[[:preference/no-db-mocks :description "always use real database connections in tests"]
-             [:preference/no-db-mocks :reason "mock/prod divergence caused silent migration failure"]]""",
+             [:preference/no-db-mocks :rationale "mock/prod divergence caused silent migration failure"]]""",
          reason="Strong team preference — backed by production incident")
 ```
 
@@ -511,22 +577,22 @@ User: "We're dropping PostgreSQL, switching to CockroachDB for geo-distribution.
 
 ```python
 # 1. Check what's currently stored
-result = query("[:find ?a ?v :where [:project/db ?a ?v]]")
-# → :name "PostgreSQL", :role "primary database", :reason "ACID + JSON"
+result = query("[:find ?a ?v :where [:decision/db ?a ?v]]")
+# → :description "PostgreSQL 15 — primary database", :rationale "ACID + JSON support"
 
 # 2. Retract the old facts (they stay in history — still queryable with :as-of)
-retract("""[[:project/db :name "PostgreSQL"]
-            [:project/db :reason "ACID + JSON support"]]""",
+retract("""[[:decision/db :description "PostgreSQL 15 — primary database"]
+            [:decision/db :rationale "ACID + JSON support"]]""",
         reason="Switching to CockroachDB for geo-distribution")
 
 # 3. Store the new decision
-transact("""[[:project/db :name "CockroachDB"]
-             [:project/db :reason "geo-distribution requirement"]]""",
+transact("""[[:decision/db :description "CockroachDB — primary database"]
+             [:decision/db :rationale "geo-distribution requirement"]]""",
          reason="Switching to CockroachDB for geo-distribution")
 
 # 4. Old decision is still in history — what did we know at transaction 3?
-query("[:find ?name :as-of 3 :where [:project/db :name ?name]]")
-# → "PostgreSQL"
+query("[:find ?desc :as-of 3 :where [:decision/db :description ?desc]]")
+# → "PostgreSQL 15 — primary database"
 ```
 
 This is the key difference from a simple key-value store: changing your mind doesn't erase the record. The agent can always reconstruct what was decided and when.
