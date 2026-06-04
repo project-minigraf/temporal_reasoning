@@ -497,7 +497,7 @@ class TestAgentStrategy:
 
 
 class TestMcpToolWiring:
-    def test_list_tools_returns_nine_tools(self, mock_minigraf_db, tmp_path):
+    def test_list_tools_returns_ten_tools(self, mock_minigraf_db, tmp_path):
         import asyncio
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
