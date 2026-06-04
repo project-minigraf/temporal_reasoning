@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 UPDATE_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 LAST_UPDATE_FILE = os.path.join(REPO_DIR, ".last_update")
+VENV_DIR = os.path.join(REPO_DIR, ".venv")
+VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python")
 
 FILES_TO_SYNC = ["SKILL.md", "mcp_server.py", "skill.json"]
 DIRS_TO_SYNC = ["tools", "hooks"]
@@ -25,6 +27,23 @@ SKILL_DIRS = [
     os.path.join(".opencode", "skills", "temporal-reasoning"),
     os.path.join("skills", "temporal-reasoning"),
 ]
+
+
+def ensure_venv() -> bool:
+    """Create the virtualenv at VENV_DIR if it doesn't already exist."""
+    if os.path.exists(VENV_PYTHON):
+        print(f"✓ Virtualenv found at {VENV_DIR}")
+        return True
+    print(f"  Creating virtualenv at {VENV_DIR}...")
+    result = subprocess.run(
+        [sys.executable, "-m", "venv", VENV_DIR],
+        timeout=60,
+    )
+    if result.returncode == 0:
+        print(f"✓ Virtualenv created at {VENV_DIR}")
+        return True
+    print(f"✗ Could not create virtualenv — {result.returncode}")
+    return False
 
 
 def check_python_version():
@@ -37,42 +56,48 @@ def check_python_version():
     return True
 
 
+def _venv_has(module: str) -> bool:
+    """Return True if *module* is importable inside the venv."""
+    result = subprocess.run(
+        [VENV_PYTHON, "-c", f"import {module}"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _venv_pip_install(*specs: str, timeout: int = 300) -> bool:
+    """Install one or more pip specs into the venv. Returns True on success."""
+    result = subprocess.run(
+        [VENV_PYTHON, "-m", "pip", "install"] + list(specs),
+        timeout=timeout,
+    )
+    return result.returncode == 0
+
+
 def check_minigraf_package():
-    """Verify minigraf Python package is installed, installing via pip if absent."""
-    try:
-        import minigraf  # noqa: F401
+    """Verify minigraf Python package is installed in the venv."""
+    if _venv_has("minigraf"):
         print("✓ minigraf Python package found")
         return True
-    except ImportError:
-        print("✗ minigraf not found — installing via pip...")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "minigraf>=0.22.0"],
-            timeout=120,
-        )
-        if result.returncode == 0:
-            print("✓ minigraf installed")
-            return True
-        print("✗ pip install minigraf failed")
-        return False
+    print("✗ minigraf not found — installing via pip...")
+    if _venv_pip_install("minigraf>=0.22.0", timeout=120):
+        print("✓ minigraf installed")
+        return True
+    print("✗ pip install minigraf failed")
+    return False
 
 
 def check_mcp_package():
-    """Verify mcp Python package is installed, installing via pip if absent."""
-    try:
-        import mcp  # noqa: F401
+    """Verify mcp Python package is installed in the venv."""
+    if _venv_has("mcp"):
         print("✓ mcp Python package found")
         return True
-    except ImportError:
-        print("✗ mcp not found — installing via pip...")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "mcp>=1.27.0"],
-            timeout=120,
-        )
-        if result.returncode == 0:
-            print("✓ mcp installed")
-            return True
-        print("✗ pip install mcp failed")
-        return False
+    print("✗ mcp not found — installing via pip...")
+    if _venv_pip_install("mcp>=1.27.0", timeout=120):
+        print("✓ mcp installed")
+        return True
+    print("✗ pip install mcp failed")
+    return False
 
 
 def check_tree_sitter_languages_package():
@@ -87,16 +112,13 @@ def check_tree_sitter_languages_package():
     - Individual packages tree-sitter + tree-sitter-rust/python/javascript/...
       (Python 3.13+ compatible, requires tree-sitter >=0.22)
     """
-    try:
-        import tree_sitter_languages  # noqa: F401
+    if _venv_has("tree_sitter_languages"):
         print("✓ tree_sitter_languages package found")
         return True
-    except ImportError:
-        pass
 
     # Try installing tree-sitter-languages (works for Python <=3.12)
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "tree-sitter-languages"],
+        [VENV_PYTHON, "-m", "pip", "install", "tree-sitter-languages"],
         timeout=300,
         capture_output=True,
     )
@@ -112,11 +134,7 @@ def check_tree_sitter_languages_package():
         "tree-sitter-typescript", "tree-sitter-go", "tree-sitter-java",
         "tree-sitter-c", "tree-sitter-cpp",
     ]
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install"] + individual,
-        timeout=300,
-    )
-    if result.returncode == 0:
+    if _venv_pip_install(*individual):
         print("✓ Individual tree-sitter language packages installed")
         return True
 
@@ -125,21 +143,18 @@ def check_tree_sitter_languages_package():
 
 
 def check_mcp_server_importable():
-    """Verify mcp_server module can be imported."""
-    try:
-        try:
-            spec = importlib.util.find_spec("mcp_server")
-        except (ValueError, ModuleNotFoundError):
-            spec = None
-        if spec is None:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            sys.path.insert(0, script_dir)
-        import mcp_server  # noqa: F401
+    """Verify mcp_server module can be imported inside the venv."""
+    result = subprocess.run(
+        [VENV_PYTHON, "-c", "import sys; sys.path.insert(0, ''); import mcp_server"],
+        capture_output=True,
+        cwd=REPO_DIR,
+    )
+    if result.returncode == 0:
         print("✓ mcp_server module importable")
         return True
-    except ImportError as e:
-        print(f"✗ Cannot import mcp_server: {e}")
-        return False
+    stderr = result.stderr.decode(errors="replace").strip()
+    print(f"✗ Cannot import mcp_server: {stderr}")
+    return False
 
 
 def should_update():
@@ -226,6 +241,7 @@ def setup_mcp_json(target_dir: str) -> bool:
     - Creates the file if absent.
     - Merges into existing content if present (other servers are preserved).
     - Always updates args and MINIGRAF_GRAPH_PATH to reflect current paths.
+    - Uses the venv python as the command so the MCP server runs in the venv.
     - Preserves VULCAN_EXTRACTION_STRATEGY if already set by the user.
     - Preserves ANTHROPIC_API_KEY if already set to a real value; otherwise
       writes a placeholder and prints a reminder.
@@ -259,7 +275,7 @@ def setup_mcp_json(target_dir: str) -> bool:
     }
     existing.setdefault("mcpServers", {})["temporal-reasoning"] = {
         "type": "stdio",
-        "command": "python",
+        "command": VENV_PYTHON,
         "args": [server_script],
         "env": new_env,
     }
@@ -274,6 +290,7 @@ def setup_mcp_json(target_dir: str) -> bool:
 
     verb = "Updated" if file_existed else "Created"
     print(f"✓ {verb} {mcp_json_path}")
+    print(f"    command = {VENV_PYTHON}")
     print(f"    MINIGRAF_GRAPH_PATH = {graph_path}")
     print(f"    VULCAN_EXTRACTION_STRATEGY = {strategy}")
     if key_is_real:
@@ -349,12 +366,13 @@ def setup_claude_settings(target_dir: str) -> bool:
       that already references our hook scripts and updates the command path;
       appends a new entry only if none is found.
     - Preserves ANTHROPIC_API_KEY if already set to a real value.
+    - Hook commands use the venv python so they share the same environment.
     """
     import json
 
-    prepare_cmd = f"python {os.path.join(REPO_DIR, 'hooks', 'prepare_hook.py')}"
-    ingest_cmd = f"python {os.path.join(REPO_DIR, 'hooks', 'ingest_hook.py')}"
-    finalize_cmd = f"python {os.path.join(REPO_DIR, 'hooks', 'finalize_hook.py')}"
+    prepare_cmd = f"{VENV_PYTHON} {os.path.join(REPO_DIR, 'hooks', 'prepare_hook.py')}"
+    ingest_cmd = f"{VENV_PYTHON} {os.path.join(REPO_DIR, 'hooks', 'ingest_hook.py')}"
+    finalize_cmd = f"{VENV_PYTHON} {os.path.join(REPO_DIR, 'hooks', 'finalize_hook.py')}"
 
     claude_dir = os.path.join(target_dir, ".claude")
     settings_path = os.path.join(claude_dir, "settings.local.json")
@@ -429,6 +447,15 @@ def main(target_dir: str = "") -> None:
 
     if not target_dir:
         target_dir = _get_target_dir()
+
+    print("Checking virtualenv...")
+    venv_ok = ensure_venv()
+    print()
+    if not venv_ok:
+        print("=" * 50)
+        print("✗ Setup incomplete — fix errors above")
+        print("=" * 50)
+        sys.exit(1)
 
     checks = [
         ("Python version", check_python_version),
