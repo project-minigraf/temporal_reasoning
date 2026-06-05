@@ -126,7 +126,9 @@ class TestVulcanTransact:
 
         result = mcp_server.handle_vulcan_transact("[[:e :a :v]]", reason="test")
 
-        db_instance.execute.assert_called_once()
+        # execute is called at least once for the transact (background index rebuild may
+        # add an extra call; assert any transact call was made rather than assert_called_once)
+        assert any("transact" in str(c) for c in db_instance.execute.call_args_list)
         db_instance.checkpoint.assert_called_once()
         assert result["ok"] is True
 
@@ -1721,6 +1723,75 @@ class TestMemoryPrepareTurnBM25:
             result = mcp_server.handle_memory_prepare_turn("redis")
         lines = [l for l in result.splitlines() if "|" in l]
         assert len(lines) <= 3
+
+
+class TestIndexCacheInvalidation:
+    def test_successful_transact_triggers_invalidation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx_id": 1, "count": 1})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            mcp_server.handle_vulcan_transact(
+                '[[:decision/test :description "test"]]', reason="test"
+            )
+            mock_inv.assert_called_once()
+
+    def test_failed_transact_does_not_trigger_invalidation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        from minigraf import MiniGrafError
+        mock_class, db_instance = mock_minigraf_db
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.side_effect = MiniGrafError("bad tx")
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            mcp_server.handle_vulcan_transact(
+                '[[:decision/test :description "test"]]', reason="test"
+            )
+            mock_inv.assert_not_called()
+
+    def test_successful_retract_triggers_invalidation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx_id": 2, "count": 1})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            mcp_server.handle_vulcan_retract(
+                '[[:decision/test :description "test"]]', reason="cleanup"
+            )
+            mock_inv.assert_called_once()
+
+    def test_failed_retract_does_not_trigger_invalidation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        from minigraf import MiniGrafError
+        mock_class, db_instance = mock_minigraf_db
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.side_effect = MiniGrafError("bad retract")
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            mcp_server.handle_vulcan_retract(
+                '[[:decision/test :description "test"]]', reason="cleanup"
+            )
+            mock_inv.assert_not_called()
+
+    def test_run_ingestion_triggers_invalidation_on_completion(self, mock_minigraf_db, tmp_path, monkeypatch):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_git_commits", lambda *a, **k: [])
+        monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
+        monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}))
+        monkeypatch.setattr(mcp_server, "_ingest_deps_from_head", lambda *a, **k: None)
+        monkeypatch.setattr(mcp_server, "_ingest_tags", lambda *a, **k: None)
+        monkeypatch.setattr(mcp_server, "_last_run_write", lambda *a, **k: None)
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            import asyncio
+            asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
+            mock_inv.assert_called_once()
 
 
 class TestBM25Tokenize:

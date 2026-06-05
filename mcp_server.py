@@ -439,6 +439,7 @@ def handle_vulcan_transact(facts: str, reason: str) -> Dict[str, Any]:
         result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
+            _index_cache.invalidate()
         return result
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
@@ -457,6 +458,7 @@ def handle_vulcan_retract(facts: str, reason: str) -> Dict[str, Any]:
         result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
+            _index_cache.invalidate()
         return result
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
@@ -2029,6 +2031,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             _db = None
 
         _ingest_progress["status"] = "complete"
+        _index_cache.invalidate()
 
     except Exception as e:
         _ingest_progress["status"] = "error"
