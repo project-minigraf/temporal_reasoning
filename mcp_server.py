@@ -1210,12 +1210,12 @@ class IndexCache:
         """Trigger an async rebuild if one is not already running."""
         if self._rebuilding:
             return
+        self._rebuilding = True
         t = threading.Thread(target=self._rebuild, daemon=True)
         t.start()
 
     def _rebuild(self) -> None:
         """Fetch all currently-valid facts from the DB and swap the index."""
-        self._rebuilding = True
         try:
             db = get_db()
             boost = float(os.environ.get("VULCAN_MEMORY_BOOST", "2.0"))

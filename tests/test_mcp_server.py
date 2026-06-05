@@ -1626,6 +1626,29 @@ class TestIndexCache:
             mock_thread.assert_not_called()
         cache._rebuilding = False
 
+    def test_concurrent_invalidate_does_not_spawn_multiple_threads(self):
+        from mcp_server import IndexCache
+        from unittest.mock import patch
+        import threading as th
+        cache = IndexCache()
+        thread_count = []
+
+        original_thread_init = th.Thread.__init__
+
+        def counting_thread_init(self_thread, *args, **kwargs):
+            original_thread_init(self_thread, *args, **kwargs)
+            thread_count.append(1)
+
+        with patch.object(th.Thread, "__init__", counting_thread_init):
+            # Simulate two concurrent callers both passing the guard
+            # before either sets _rebuilding. With the fix, the first call
+            # sets _rebuilding = True before t.start(), so the second call
+            # sees it and returns without spawning.
+            cache.invalidate()
+            cache.invalidate()  # should be a no-op
+        assert len(thread_count) == 1
+        cache._rebuilding = False  # cleanup
+
     def test_rebuild_leaves_current_unchanged_on_error(self, monkeypatch):
         import mcp_server
         from mcp_server import IndexCache, FactIndex
