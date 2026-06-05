@@ -1826,17 +1826,21 @@ class TestBM25GracefulDegradation:
         # Heuristic path produces "Relevant memory context:" when facts are found
         assert "Relevant memory context:" in result
 
-    def test_index_cache_rebuild_noop_when_bm25_unavailable(self, monkeypatch):
+    def test_index_cache_rebuild_noop_when_bm25_unavailable(self, mock_minigraf_db, tmp_path, monkeypatch):
         import mcp_server
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":decision/use-redis", ":description", "use redis"]]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
         monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
-        # invalidate() and _rebuild() should not raise even if BM25 unavailable
-        # (the FactIndex constructor guards on _BM25Okapi being None)
+        monkeypatch.setattr(mcp_server, "_BM25Okapi", None)
         cache = mcp_server.IndexCache()
         cache._rebuild()  # should not raise
-        # After rebuild with _BM25_AVAILABLE=False, FactIndex._bm25 is None
-        # so get() returns either None or a FactIndex with bm25=None
         result = cache.get()
-        assert result is None or isinstance(result, mcp_server.FactIndex)
+        # When _BM25Okapi is None, FactIndex._bm25 is never initialized
+        assert isinstance(result, mcp_server.FactIndex)
+        assert result._bm25 is None
 
 
 class TestBM25Tokenize:
