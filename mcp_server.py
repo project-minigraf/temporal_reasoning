@@ -11,6 +11,8 @@ import json
 import os
 import re
 import subprocess as _subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1185,6 +1187,52 @@ class FactIndex:
             reverse=True,
         )
         return [row for _, row in ranked[:top_n]]
+
+
+class IndexCache:
+    """Module-level singleton managing the live BM25 FactIndex.
+
+    Rebuilds asynchronously in a background thread. Serves the stale index
+    during rebuilds; returns None before the first successful rebuild.
+    Invalidation is idempotent while a rebuild is in progress.
+    """
+
+    def __init__(self) -> None:
+        self._current: Optional[FactIndex] = None
+        self._rebuilding: bool = False
+        self._lock = threading.Lock()
+
+    def get(self) -> Optional[FactIndex]:
+        """Return the current index (may be stale or None)."""
+        return self._current
+
+    def invalidate(self) -> None:
+        """Trigger an async rebuild if one is not already running."""
+        if self._rebuilding:
+            return
+        t = threading.Thread(target=self._rebuild, daemon=True)
+        t.start()
+
+    def _rebuild(self) -> None:
+        """Fetch all currently-valid facts from the DB and swap the index."""
+        self._rebuilding = True
+        try:
+            db = get_db()
+            boost = float(os.environ.get("VULCAN_MEMORY_BOOST", "2.0"))
+            raw = db.execute(
+                f'(query [:find ?e ?a ?v :valid-at "{_now_utc_ms()}" :where [?e ?a ?v]])'
+            )
+            facts = json.loads(raw).get("results", [])
+            new_index = FactIndex(facts, boost=boost)
+            with self._lock:
+                self._current = new_index
+        except Exception as e:
+            print(f"[IndexCache] rebuild failed: {e}", file=sys.stderr)
+        finally:
+            self._rebuilding = False
+
+
+_index_cache = IndexCache()
 
 
 def handle_memory_prepare_turn(user_message: str) -> str:

@@ -16,13 +16,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 @pytest.fixture(autouse=True)
 def reset_mcp_server_db():
-    """Reset the module-level _db singleton and grammar cache between tests."""
+    """Reset the module-level _db singleton, grammar cache, and index cache between tests."""
     import mcp_server
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
+    mcp_server._index_cache = mcp_server.IndexCache()
     yield
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
+    mcp_server._index_cache = mcp_server.IndexCache()
 
 
 @pytest.fixture
@@ -1584,6 +1586,57 @@ class TestRunIngestion:
         result = await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is False
         assert "already in progress" in result["error"]
+
+
+class TestIndexCache:
+    def test_get_returns_none_before_any_rebuild(self):
+        from mcp_server import IndexCache
+        cache = IndexCache()
+        assert cache.get() is None
+
+    def test_rebuild_populates_index(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":decision/use-redis", ":description", "use redis"]]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        cache = mcp_server.IndexCache()
+        cache._rebuild()
+        assert cache.get() is not None
+
+    def test_stale_index_served_when_already_rebuilding(self):
+        import mcp_server
+        from mcp_server import IndexCache, FactIndex
+        cache = IndexCache()
+        stale = FactIndex([[":decision/old", ":description", "old"]], boost=2.0)
+        cache._current = stale
+        cache._rebuilding = True
+        cache.invalidate()  # no-op because _rebuilding
+        assert cache.get() is stale
+        cache._rebuilding = False
+
+    def test_invalidate_noop_when_rebuilding(self):
+        from mcp_server import IndexCache
+        from unittest.mock import patch
+        cache = IndexCache()
+        cache._rebuilding = True
+        with patch("threading.Thread") as mock_thread:
+            cache.invalidate()
+            mock_thread.assert_not_called()
+        cache._rebuilding = False
+
+    def test_rebuild_leaves_current_unchanged_on_error(self, monkeypatch):
+        import mcp_server
+        from mcp_server import IndexCache, FactIndex
+        cache = IndexCache()
+        stale = FactIndex([[":decision/old", ":description", "old"]], boost=2.0)
+        cache._current = stale
+        # Force get_db to raise
+        monkeypatch.setattr(mcp_server, "get_db", lambda: (_ for _ in ()).throw(RuntimeError("db error")))
+        cache._rebuild()
+        assert cache.get() is stale
+        assert cache._rebuilding is False
 
 
 class TestBM25Tokenize:
