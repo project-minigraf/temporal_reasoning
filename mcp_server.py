@@ -715,7 +715,7 @@ def _git_commits(
 def _git_changed_files(repo_path: str, commit_hash: str) -> List[tuple]:
     """Return list of (status_char, path) for files changed in this commit."""
     result = _subprocess.run(
-        ["git", "diff-tree", "--no-commit-id", "-r", "--name-status", commit_hash],
+        ["git", "diff-tree", "--no-commit-id", "-r", "--name-status", "--root", commit_hash],
         cwd=repo_path, capture_output=True, text=True, check=True,
     )
     changes = []
@@ -788,6 +788,26 @@ def _git_tags(repo_path: str) -> List[tuple]:
 # ---------------------------------------------------------------------------
 
 
+def _build_close_triples(
+    ident: str,
+    description: str,
+    module_ident: str,
+) -> List[str]:
+    """Return triple strings needed to bi-temporally close an entity.
+
+    Closes :ident (canonical existence fact), :description (with real value),
+    and the parent module's :contains edge.  The module's own :contains triple
+    is omitted when ident == module_ident (modules have no parent module here).
+    """
+    triples = [
+        f'[{ident} :ident "{_edn_escape(ident)}"]',
+        f'[{ident} :description "{_edn_escape(description)}"]',
+    ]
+    if ident != module_ident:
+        triples.append(f"[{module_ident} :contains {ident}]")
+    return triples
+
+
 def _ingest_transact(
     db: Any,
     triples: List[str],
@@ -810,11 +830,24 @@ def _ingest_close(
 ) -> None:
     """Close a fact's valid window at the deletion commit timestamp.
 
-    retract has no temporal options, so deletions are expressed as a
-    re-transact with explicit :valid-from (creation) and :valid-to (deletion).
+    Two-step process:
+    1. Retract each original open-ended fact so it vanishes from current-time
+       queries (retract has no temporal options, so this removes the unbounded
+       assertion from the live view while keeping it in transaction history).
+    2. Re-transact the same facts with explicit :valid-from + :valid-to so the
+       historical valid window is preserved for point-in-time queries.
+
+    Triples are retracted one-by-one to avoid EAVT collision on :contains edges
+    (Minigraf's pending index omits value bytes, so batching multiple
+    [module :contains fn] retracts could collide).
     """
     if not triples:
         return
+    for triple in triples:
+        try:
+            db.execute(f"(retract [{triple}])")
+        except Exception:
+            pass  # best-effort: original may not exist if preload was incomplete
     facts_str = "[" + " ".join(triples) + "]"
     db.execute(
         f'(transact {facts_str} {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}})'
@@ -1706,6 +1739,7 @@ def _build_code_triples(
     extracted: Dict[str, List[str]],
     commit_ts_iso: str,
     entity_valid_from: Dict[str, str],
+    entity_descriptions: Dict[str, str],
     file_entities: Dict[str, List[str]],
     commit_ident: str,
 ) -> List[str]:
@@ -1740,6 +1774,7 @@ def _build_code_triples(
         if module_ident not in idents_for_file:
             idents_for_file.append(module_ident)
         entity_valid_from[module_ident] = commit_ts_iso
+        entity_descriptions[module_ident] = file_path
 
         # :depends-on and :calls are written by _ingest_deps_from_head() after
         # the commit walk so they reflect HEAD state, not introduction-time state.
@@ -1762,6 +1797,7 @@ def _build_code_triples(
             if fn_ident not in idents_for_file:
                 idents_for_file.append(fn_ident)
             entity_valid_from[fn_ident] = commit_ts_iso
+            entity_descriptions[fn_ident] = fn_name
 
     for cls_name in extracted["classes"]:
         cls_ident = _code_ident("class", file_path, cls_name)
@@ -1778,6 +1814,7 @@ def _build_code_triples(
             if cls_ident not in idents_for_file:
                 idents_for_file.append(cls_ident)
             entity_valid_from[cls_ident] = commit_ts_iso
+            entity_descriptions[cls_ident] = cls_name
 
     return triples
 
@@ -1854,9 +1891,12 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     find any module file even when processing early commits — before those files
     have been introduced in the chronological commit walk.
 
-    Returns (entity_valid_from, file_entities).
+    Returns (entity_valid_from, entity_descriptions, file_entities).
+    entity_valid_from maps ident → git commit timestamp of first introduction.
+    entity_descriptions maps ident → human-readable name (function/class/file).
     """
     entity_valid_from: Dict[str, str] = {}
+    entity_descriptions: Dict[str, str] = {}
     file_entities: Dict[str, List[str]] = {}
 
     # Pre-seed file_entities with all files currently in the repo
@@ -1872,23 +1912,28 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
         pass
 
     for entity_type in ("module", "function", "class"):
+        path_attr = "path" if entity_type == "module" else "file"
         try:
             raw = db.execute(
-                f'(query [:find ?ident ?path '
+                f'(query [:find ?ident ?path ?desc ?date '
                 f':where [?e :entity-type :type/{entity_type}] '
                 f'[?e :ident ?ident] '
-                f'[?e :{"path" if entity_type == "module" else "file"} ?path]])'
+                f'[?e :{path_attr} ?path] '
+                f'[?e :description ?desc] '
+                f'[?e :introduced-by ?c] '
+                f'[?c :date ?date]])'
             )
             rows = json.loads(raw).get("results", [])
-            for ident, path in rows:
-                entity_valid_from[ident] = ""  # timestamp unknown, but entity exists
+            for ident, path, desc, date in rows:
+                entity_valid_from[ident] = date
+                entity_descriptions[ident] = desc
                 file_entities.setdefault(path, [])
                 if ident not in file_entities[path]:
                     file_entities[path].append(ident)
         except Exception:
             pass
 
-    return entity_valid_from, file_entities
+    return entity_valid_from, entity_descriptions, file_entities
 
 
 def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
@@ -1929,7 +1974,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # Read watermark and pre-load known entities before releasing DB
         db = get_db()
         watermark = _watermark_query(db)
-        entity_valid_from, file_entities = _preload_known_entities(db, repo_path)
+        entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
         _db = None  # release file lock while enumerating commits
 
         commits = _git_commits(repo_path, watermark, branch)
@@ -1969,12 +2014,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     if status == "D":
                         # Close module and all known child entities for this file
                         idents = file_entities.get(file_path, [_code_ident("module", file_path)])
+                        module_ident = _code_ident("module", file_path)
                         for ident in idents:
                             orig_ts = entity_valid_from.get(ident, commit_ts_iso)
+                            desc = entity_descriptions.get(ident, "")
                             close_items.append(
-                                ([f'[{ident} :description ""]'], orig_ts)
+                                (_build_close_triples(ident, desc, module_ident), orig_ts)
                             )
                     else:  # A or M
+                        previous_idents = set(file_entities.get(file_path, []))
                         try:
                             content = _git_file_content(repo_path, commit_hash, file_path)
                         except Exception:
@@ -1982,9 +2030,27 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         extracted = _extract_from_source(content, parser, file_path)
                         triples = _build_code_triples(
                             file_path, extracted, commit_ts_iso, entity_valid_from,
-                            file_entities, commit_ident,
+                            entity_descriptions, file_entities, commit_ident,
                         )
                         add_triples.extend(triples)
+                        # Detect entities removed from a modified file.
+                        # _build_code_triples only appends to file_entities, never removes.
+                        # Compare previous idents against the idents derivable from the
+                        # current extraction to find what was deleted.
+                        if status == "M":
+                            module_ident = _code_ident("module", file_path)
+                            current_extracted_idents: set = {module_ident}
+                            for fn_name in extracted.get("functions", []):
+                                current_extracted_idents.add(_code_ident("function", file_path, fn_name))
+                            for cls_name in extracted.get("classes", []):
+                                current_extracted_idents.add(_code_ident("class", file_path, cls_name))
+                            removed_idents = previous_idents - current_extracted_idents
+                            for ident in removed_idents:
+                                orig_ts = entity_valid_from.get(ident, commit_ts_iso)
+                                desc = entity_descriptions.get(ident, "")
+                                close_items.append(
+                                    (_build_close_triples(ident, desc, module_ident), orig_ts)
+                                )
 
                 # Split :contains triples out before batching.  Minigraf's EAVT
                 # pending index lacks value bytes in the key, so batching multiple

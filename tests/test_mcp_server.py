@@ -1441,6 +1441,64 @@ class TestIngestionWrites:
         mcp_server._ingest_close(db, [], "2025-01-01T00:00:00Z", "2025-03-01T00:00:00Z", "r")
         db_instance.execute.assert_not_called()
 
+    def test_build_close_triples_includes_ident_and_description(self):
+        import mcp_server
+        fn_ident = ":function/auth-py-login"
+        module_ident = ":module/auth-py"
+        triples = mcp_server._build_close_triples(fn_ident, "login", module_ident)
+        assert any(f'[{fn_ident} :ident "{fn_ident}"]' in t for t in triples)
+        assert any(f'[{fn_ident} :description "login"]' in t for t in triples)
+
+    def test_build_close_triples_includes_contains_edge_for_child_entity(self):
+        import mcp_server
+        fn_ident = ":function/auth-py-login"
+        module_ident = ":module/auth-py"
+        triples = mcp_server._build_close_triples(fn_ident, "login", module_ident)
+        assert any(f'[{module_ident} :contains {fn_ident}]' in t for t in triples)
+
+    def test_build_close_triples_for_module_excludes_contains(self):
+        import mcp_server
+        module_ident = ":module/auth-py"
+        triples = mcp_server._build_close_triples(module_ident, "auth.py", module_ident)
+        assert not any(":contains" in t for t in triples)
+
+    def test_build_code_triples_populates_entity_descriptions(self):
+        import mcp_server
+        entity_valid_from: dict = {}
+        entity_descriptions: dict = {}
+        file_entities: dict = {}
+        mcp_server._build_code_triples(
+            "auth.py",
+            {"functions": ["login"], "classes": ["User"], "imports": []},
+            "2025-01-01T00:00:00Z",
+            entity_valid_from,
+            entity_descriptions,
+            file_entities,
+            ":commit/abc123456789",
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        cls_ident = mcp_server._code_ident("class", "auth.py", "User")
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        assert entity_descriptions.get(fn_ident) == "login"
+        assert entity_descriptions.get(cls_ident) == "User"
+        assert entity_descriptions.get(module_ident) == "auth.py"
+
+    def test_preload_known_entities_loads_descriptions_and_valid_from(
+        self, mock_minigraf_db, git_repo
+    ):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "t.graph"))
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":function/auth-py-login", "auth.py", "login", "2025-01-15T10:00:00Z"]]
+        })
+        db = mcp_server.get_db()
+        entity_valid_from, entity_descriptions, file_entities = (
+            mcp_server._preload_known_entities(db, str(git_repo))
+        )
+        assert entity_valid_from.get(":function/auth-py-login") == "2025-01-15T10:00:00Z"
+        assert entity_descriptions.get(":function/auth-py-login") == "login"
+
     def test_last_run_write_transacts_correct_fields(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
@@ -1784,7 +1842,7 @@ class TestIndexCacheInvalidation:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         monkeypatch.setattr(mcp_server, "_git_commits", lambda *a, **k: [])
         monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
-        monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}))
+        monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}, {}))
         monkeypatch.setattr(mcp_server, "_ingest_deps_from_head", lambda *a, **k: None)
         monkeypatch.setattr(mcp_server, "_ingest_tags", lambda *a, **k: None)
         monkeypatch.setattr(mcp_server, "_last_run_write", lambda *a, **k: None)
@@ -1928,3 +1986,178 @@ class TestFactIndex:
         results = index.query("redis", top_n=10)
         assert len(results) == 1
         assert results[0][0] == ":decision/use-redis"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures for bi-temporal close integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def git_repo_with_deletion(tmp_path):
+    """Repo: commit 1 adds auth.py (def login), commit 2 deletes it."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "auth.py").write_text("def login(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "auth.py").unlink()
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "delete auth"], cwd=repo, check=True, capture_output=True)
+
+    return repo
+
+
+@pytest.fixture
+def git_repo_with_intra_file_deletion(tmp_path):
+    """Repo: commit 1 adds auth.py (def login + def logout), commit 2 removes logout."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "auth.py").write_text("def login(): pass\ndef logout(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "auth.py").write_text("def login(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "remove logout"], cwd=repo, check=True, capture_output=True)
+
+    return repo
+
+
+@pytest.fixture
+def git_repo_with_rename(tmp_path):
+    """Repo: commit 1 adds old_auth.py (def login), commit 2 renames to new_auth.py."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "old_auth.py").write_text("def login(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+
+    _subprocess.run(["git", "mv", "old_auth.py", "new_auth.py"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "rename auth"], cwd=repo, check=True, capture_output=True)
+
+    return repo
+
+
+class TestRunIngestionBitemporalClose:
+    """Integration tests verifying bi-temporal correctness of entity lifecycle handling."""
+
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+    @pytest.mark.asyncio
+    async def test_file_deletion_closes_with_real_description_not_empty_string(
+        self, mock_minigraf_db, git_repo_with_deletion, monkeypatch
+    ):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo_with_deletion / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(git_repo_with_deletion), "HEAD")
+
+        assert close_triples_seen, "Expected _ingest_close to be called on file deletion"
+        assert not any(':description ""' in t for t in close_triples_seen), \
+            "Close triples must not use empty string as description placeholder"
+        assert any(':description "login"' in t for t in close_triples_seen), \
+            "Close triples must carry the real description of the deleted function"
+
+    @pytest.mark.asyncio
+    async def test_file_deletion_close_includes_ident_and_contains_triples(
+        self, mock_minigraf_db, git_repo_with_deletion, monkeypatch
+    ):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo_with_deletion / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(git_repo_with_deletion), "HEAD")
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        assert any(":ident" in t and fn_ident in t for t in close_triples_seen), \
+            "Close triples must include :ident fact for the deleted function"
+        assert any(":contains" in t and fn_ident in t and module_ident in t
+                   for t in close_triples_seen), \
+            "Close triples must include the module :contains edge for the deleted function"
+
+    @pytest.mark.asyncio
+    async def test_intra_file_deletion_closes_removed_function(
+        self, mock_minigraf_db, git_repo_with_intra_file_deletion, monkeypatch
+    ):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo_with_intra_file_deletion / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(git_repo_with_intra_file_deletion), "HEAD")
+
+        logout_ident = mcp_server._code_ident("function", "auth.py", "logout")
+        login_ident = mcp_server._code_ident("function", "auth.py", "login")
+
+        assert any(logout_ident in t for t in close_triples_seen), \
+            "logout() removed from modified file must trigger a close"
+        assert not any(login_ident in t and ":ident" in t for t in close_triples_seen), \
+            "login() still present in file must not be closed"
+
+    @pytest.mark.asyncio
+    async def test_renamed_file_closes_old_entities_and_opens_new(
+        self, mock_minigraf_db, git_repo_with_rename, monkeypatch
+    ):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo_with_rename / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(git_repo_with_rename), "HEAD")
+
+        old_module_ident = mcp_server._code_ident("module", "old_auth.py")
+        new_fn_ident = mcp_server._code_ident("function", "new_auth.py", "login")
+
+        assert any(old_module_ident in t for t in close_triples_seen), \
+            "Old module entities must be closed when file is renamed"
+
+        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
+        assert new_fn_ident in transact_calls, \
+            "New module entities must be created after file is renamed"
