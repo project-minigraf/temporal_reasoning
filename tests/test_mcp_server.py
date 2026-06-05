@@ -1617,3 +1617,54 @@ class TestBM25Tokenize:
         assert not ":commit/abc123".startswith(_MEMORY_PREFIXES)
         assert not ":function/foo-bar".startswith(_MEMORY_PREFIXES)
         assert not ":module/src-main".startswith(_MEMORY_PREFIXES)
+
+
+class TestFactIndex:
+    def test_empty_facts_returns_empty_query(self):
+        from mcp_server import FactIndex
+        index = FactIndex([], boost=2.0)
+        assert index.query("redis", top_n=10) == []
+
+    def test_query_returns_matching_fact(self):
+        from mcp_server import FactIndex
+        facts = [[":decision/use-redis", ":description", "use redis for caching"]]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("redis caching", top_n=10)
+        assert len(results) == 1
+        assert results[0] == [":decision/use-redis", ":description", "use redis for caching"]
+
+    def test_memory_fact_outscores_git_fact(self):
+        from mcp_server import FactIndex
+        facts = [
+            [":decision/use-redis", ":description", "use redis for caching"],
+            [":commit/abc123def456", ":subject", "feat use redis for caching layer"],
+        ]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("redis caching", top_n=10)
+        assert results[0][0] == ":decision/use-redis"
+
+    def test_zero_score_results_excluded(self):
+        from mcp_server import FactIndex
+        facts = [[":decision/use-redis", ":description", "use redis for caching"]]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("elephants trombone completely unrelated", top_n=10)
+        assert results == []
+
+    def test_top_n_respected(self):
+        from mcp_server import FactIndex
+        facts = [[f":decision/item-{i}", ":description", f"redis item {i}"] for i in range(20)]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("redis", top_n=5)
+        assert len(results) <= 5
+
+    def test_facts_with_no_tokens_skipped(self):
+        from mcp_server import FactIndex
+        # A fact whose text tokenises to [] should not crash
+        facts = [
+            [":::", ":::", ":::"],
+            [":decision/use-redis", ":description", "use redis"],
+        ]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("redis", top_n=10)
+        assert len(results) == 1
+        assert results[0][0] == ":decision/use-redis"

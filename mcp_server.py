@@ -1123,6 +1123,71 @@ def _tokenize(text: str) -> List[str]:
     return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
 
 
+class FactIndex:
+    """Immutable BM25 snapshot over a set of graph facts.
+
+    Each fact row [e, a, v] is tokenised as a single document.
+    Memory facts (entity idents with a known memory prefix) receive
+    a configurable score multiplier at query time.
+    """
+
+    def __init__(self, facts: List[List], boost: float = 2.0) -> None:
+        self._boost = boost
+        docs = [_tokenize(" ".join(str(x) for x in row)) for row in facts]
+        # Filter out rows whose full text produces no tokens
+        valid = [
+            (row, doc, any(str(row[0]).startswith(p) for p in _MEMORY_PREFIXES))
+            for row, doc in zip(facts, docs)
+            if doc
+        ]
+        if not valid or _BM25Okapi is None:
+            self._bm25 = None
+            self._facts: List[List] = []
+            self._is_memory: List[bool] = []
+            self._docs: List[List[str]] = []
+            return
+        rows, valid_docs, memory_flags = zip(*valid)
+        self._facts = list(rows)
+        self._is_memory = list(memory_flags)
+        self._docs: List[List[str]] = list(valid_docs)
+        self._bm25 = _BM25Okapi(self._docs)
+
+    def query(self, text: str, top_n: int = 50) -> List[List]:
+        """Return up to top_n facts ranked by BM25 score (memory boost applied).
+
+        Zero-score results are excluded. Returns [] if the index is empty
+        or no tokens in text overlap with the corpus.
+        """
+        if self._bm25 is None or not self._facts:
+            return []
+        tokens = _tokenize(text)
+        if not tokens:
+            return []
+        raw_scores = self._bm25.get_scores(tokens).tolist()
+        # Identify docs with any token overlap before score adjustment.
+        # BM25Okapi can return negative scores in small corpora (negative IDF),
+        # so we detect overlap via a per-token presence check rather than relying on score > 0.
+        token_set = set(tokens)
+        has_overlap = [bool(token_set & set(doc)) for doc in self._docs]
+        # Normalise: shift all scores so the lowest overlapping score becomes 1.0.
+        # This ensures the boost multiplier always moves memory facts upward in rank,
+        # even when BM25 produces negative scores (small corpus, high term frequency).
+        overlapping = [raw_scores[i] for i in range(len(raw_scores)) if has_overlap[i]]
+        if not overlapping:
+            return []
+        shift = min(overlapping) - 1.0
+        scores = [raw_scores[i] - shift for i in range(len(raw_scores))]
+        for i, is_mem in enumerate(self._is_memory):
+            if is_mem:
+                scores[i] *= self._boost
+        ranked = sorted(
+            [(scores[i], self._facts[i]) for i in range(len(self._facts)) if has_overlap[i]],
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        return [row for _, row in ranked[:top_n]]
+
+
 def handle_memory_prepare_turn(user_message: str) -> str:
     """
     Query graph for facts relevant to the user message.
