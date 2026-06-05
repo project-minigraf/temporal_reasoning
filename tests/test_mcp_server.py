@@ -1794,6 +1794,51 @@ class TestIndexCacheInvalidation:
             mock_inv.assert_called_once()
 
 
+class TestBM25GracefulDegradation:
+    def test_falls_back_to_heuristic_when_bm25_unavailable(self, mock_minigraf_db, tmp_path, monkeypatch):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        # The heuristic extracts entities from "decided to use redis":
+        #   "decided" (7 chars) and "redis" (5 chars) pass the _MIN_ENTITY_LEN=4 filter.
+        # For each entity it calls db.execute() with a contains? query.
+        # Using side_effect so the first entity query returns a match and the
+        # second returns empty (deduplication handles any overlap).
+        session_rule_count = len(mcp_server.SESSION_RULES)
+        call_count = 0
+
+        def side_effect(query_str):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= session_rule_count:
+                # SESSION_RULES registrations during open_db
+                return json.dumps({"ok": True})
+            # First entity query ("decided") — return a matching fact
+            if call_count == session_rule_count + 1:
+                return json.dumps({"results": [["use", "decided to use redis"]]})
+            # Subsequent entity queries — return empty
+            return json.dumps({"results": []})
+
+        db_instance.execute.side_effect = side_effect
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
+        result = mcp_server.handle_memory_prepare_turn("decided to use redis")
+        # Heuristic path produces "Relevant memory context:" when facts are found
+        assert "Relevant memory context:" in result
+
+    def test_index_cache_rebuild_noop_when_bm25_unavailable(self, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
+        # invalidate() and _rebuild() should not raise even if BM25 unavailable
+        # (the FactIndex constructor guards on _BM25Okapi being None)
+        cache = mcp_server.IndexCache()
+        cache._rebuild()  # should not raise
+        # After rebuild with _BM25_AVAILABLE=False, FactIndex._bm25 is None
+        # so get() returns either None or a FactIndex with bm25=None
+        result = cache.get()
+        assert result is None or isinstance(result, mcp_server.FactIndex)
+
+
 class TestBM25Tokenize:
     def test_splits_keyword_ident_on_punctuation(self):
         from mcp_server import _tokenize
