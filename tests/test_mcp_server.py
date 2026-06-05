@@ -204,7 +204,7 @@ class TestMemoryPrepareTurn:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
-        result = mcp_server.handle_memory_prepare_turn("what database are we using?")
+        result = mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
 
         assert isinstance(result, str)
 
@@ -219,7 +219,7 @@ class TestMemoryPrepareTurn:
             return json.dumps({"results": []})
 
         db_instance.execute.side_effect = execute_side_effect
-        result = mcp_server.handle_memory_prepare_turn("what did we decide about postgres?")
+        result = mcp_server._handle_memory_prepare_turn_heuristic("what did we decide about postgres?")
 
         assert "PostgreSQL" in result or "postgres" in result.lower() or result == ""
 
@@ -238,7 +238,7 @@ class TestMemoryPrepareTurn:
             return json.dumps({"results": [[":e", ":name", "FastAPI"]]})
 
         db_instance.execute.side_effect = execute_side_effect
-        result = mcp_server.handle_memory_prepare_turn("tell me about our framework")
+        result = mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
 
         # Broad scan should have been called
         assert call_count[0] > 0
@@ -250,7 +250,7 @@ class TestMemoryPrepareTurn:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        mcp_server.handle_memory_prepare_turn("hello")
+        mcp_server._handle_memory_prepare_turn_heuristic("hello")
         # Should not raise; limit is respected internally
 
     def test_uses_valid_at_for_message_with_explicit_iso_date(self, mock_minigraf_db, tmp_path):
@@ -260,7 +260,7 @@ class TestMemoryPrepareTurn:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
-        mcp_server.handle_memory_prepare_turn("what did we decide before 2026-01-15?")
+        mcp_server._handle_memory_prepare_turn_heuristic("what did we decide before 2026-01-15?")
 
         calls = [str(c) for c in db_instance.execute.call_args_list]
         assert any(':valid-at "2026-01-15"' in c for c in calls)
@@ -272,7 +272,7 @@ class TestMemoryPrepareTurn:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
-        mcp_server.handle_memory_prepare_turn("what database are we using?")
+        mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
 
         calls = [str(c) for c in db_instance.execute.call_args_list]
         # Should contain a UTC timestamp like 2026-05-02T15:44:52.184Z
@@ -1660,6 +1660,66 @@ class TestIndexCache:
         cache._rebuild()
         assert cache.get() is stale
         assert cache._rebuilding is False
+
+
+class TestMemoryPrepareTurnBM25:
+    def test_returns_empty_when_no_index(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        fresh_cache = mcp_server.IndexCache()  # no index built yet
+        with patch.object(mcp_server, "_index_cache", fresh_cache):
+            result = mcp_server.handle_memory_prepare_turn("redis caching")
+        assert result == ""
+
+    def test_returns_empty_for_unmatched_query(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":decision/use-redis", ":description", "use redis"]]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        cache = mcp_server.IndexCache()
+        cache._rebuild()
+        with patch.object(mcp_server, "_index_cache", cache):
+            result = mcp_server.handle_memory_prepare_turn("elephants trombone")
+        assert result == ""
+
+    def test_memory_facts_rank_above_git_facts(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [
+                [":decision/use-redis", ":description", "use redis for caching"],
+                [":commit/abc123def456", ":subject", "feat use redis caching layer"],
+                [":function/unrelated", ":name", "some other thing entirely"],
+            ]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        cache = mcp_server.IndexCache()
+        cache._rebuild()
+        with patch.object(mcp_server, "_index_cache", cache):
+            result = mcp_server.handle_memory_prepare_turn("redis caching")
+        assert "Relevant memory context:" in result
+        assert result.index(":decision/use-redis") < result.index(":commit/abc123def456")
+
+    def test_respects_scan_limit(self, mock_minigraf_db, tmp_path, monkeypatch):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[f":decision/item-{i}", ":description", f"redis item {i}"] for i in range(20)]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        monkeypatch.setenv("VULCAN_PREPARE_SCAN_LIMIT", "3")
+        cache = mcp_server.IndexCache()
+        cache._rebuild()
+        with patch.object(mcp_server, "_index_cache", cache):
+            result = mcp_server.handle_memory_prepare_turn("redis")
+        lines = [l for l in result.splitlines() if "|" in l]
+        assert len(lines) <= 3
 
 
 class TestBM25Tokenize:

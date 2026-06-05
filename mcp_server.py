@@ -1235,10 +1235,12 @@ class IndexCache:
 _index_cache = IndexCache()
 
 
-def handle_memory_prepare_turn(user_message: str) -> str:
-    """
-    Query graph for facts relevant to the user message.
-    Returns a formatted context block string for injection as additionalContext.
+def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
+    """Heuristic fallback for handle_memory_prepare_turn.
+
+    Used when rank_bm25 is unavailable. Queries the graph using substring
+    token matching (contains?) for entities extracted from the user message,
+    falling back to a broad scan when no targeted results are found.
 
     For current-state queries, uses :valid-at with the current UTC ms timestamp
     (via _build_query_clauses) so facts whose valid window includes right now
@@ -1284,6 +1286,29 @@ def handle_memory_prepare_turn(user_message: str) -> str:
 
     block = _format_facts(collected)
     return f"Relevant memory context:\n{block}"
+
+
+def handle_memory_prepare_turn(user_message: str) -> str:
+    """Query graph for facts relevant to the user message.
+
+    Uses BM25-ranked retrieval over a cached FactIndex when rank_bm25 is
+    available. Falls back to the heuristic (substring token) implementation
+    when rank_bm25 is not installed.
+
+    Returns a formatted context block string for injection as additionalContext,
+    or an empty string if no relevant facts are found.
+    """
+    if not _BM25_AVAILABLE:
+        return _handle_memory_prepare_turn_heuristic(user_message)
+
+    scan_limit = int(os.environ.get("VULCAN_PREPARE_SCAN_LIMIT", "50"))
+    index = _index_cache.get()
+    if index is None:
+        return ""
+    results = index.query(user_message, top_n=scan_limit)
+    if not results:
+        return ""
+    return f"Relevant memory context:\n{_format_facts(results)}"
 
 
 # ---------------------------------------------------------------------------
