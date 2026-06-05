@@ -1155,8 +1155,8 @@ class FactIndex:
     def query(self, text: str, top_n: int = 50) -> List[List]:
         """Return up to top_n facts ranked by BM25 score (memory boost applied).
 
-        Zero-score results are excluded. Returns [] if the index is empty
-        or no tokens in text overlap with the corpus.
+        Facts with no token overlap with the query are excluded. Returns []
+        if the index is empty or no query tokens appear in any indexed fact.
         """
         if self._bm25 is None or not self._facts:
             return []
@@ -1169,9 +1169,13 @@ class FactIndex:
         # so we detect overlap via a per-token presence check rather than relying on score > 0.
         token_set = set(tokens)
         has_overlap = [bool(token_set & set(doc)) for doc in self._docs]
-        if not any(has_overlap):
+        overlapping_scores = [raw_scores[i] for i in range(len(raw_scores)) if has_overlap[i]]
+        if not overlapping_scores:
             return []
-        scores = list(raw_scores)
+        # Shift so minimum overlapping score is 1.0 — ensures boost always raises
+        # memory facts in rank, even when BM25 produces negative IDF in small corpora.
+        shift = max(0.0, 1.0 - min(overlapping_scores))
+        scores = [raw_scores[i] + shift for i in range(len(raw_scores))]
         for i, is_mem in enumerate(self._is_memory):
             if is_mem:
                 scores[i] *= self._boost

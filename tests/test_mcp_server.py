@@ -1646,7 +1646,7 @@ class TestFactIndex:
         results = index.query("redis caching", top_n=10)
         assert results[0][0] == ":decision/use-redis"
 
-    def test_zero_score_results_excluded(self):
+    def test_no_overlap_query_returns_empty(self):
         from mcp_server import FactIndex
         facts = [[":decision/use-redis", ":description", "use redis for caching"]]
         index = FactIndex(facts, boost=2.0)
