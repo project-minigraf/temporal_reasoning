@@ -1635,9 +1635,12 @@ class TestFactIndex:
 
     def test_memory_fact_outscores_git_fact(self):
         from mcp_server import FactIndex
+        # Include a third unrelated fact so BM25 IDF is positive (avoids negative-score
+        # small-corpus edge case that would invert the boost when multiplied).
         facts = [
             [":decision/use-redis", ":description", "use redis for caching"],
             [":commit/abc123def456", ":subject", "feat use redis for caching layer"],
+            [":commit/xyz789", ":subject", "fix typo in readme"],
         ]
         index = FactIndex(facts, boost=2.0)
         results = index.query("redis caching", top_n=10)

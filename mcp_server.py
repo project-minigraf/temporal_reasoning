@@ -1164,19 +1164,14 @@ class FactIndex:
         if not tokens:
             return []
         raw_scores = self._bm25.get_scores(tokens).tolist()
-        # Identify docs with any token overlap before score adjustment.
+        # Identify docs with any token overlap.
         # BM25Okapi can return negative scores in small corpora (negative IDF),
         # so we detect overlap via a per-token presence check rather than relying on score > 0.
         token_set = set(tokens)
         has_overlap = [bool(token_set & set(doc)) for doc in self._docs]
-        # Normalise: shift all scores so the lowest overlapping score becomes 1.0.
-        # This ensures the boost multiplier always moves memory facts upward in rank,
-        # even when BM25 produces negative scores (small corpus, high term frequency).
-        overlapping = [raw_scores[i] for i in range(len(raw_scores)) if has_overlap[i]]
-        if not overlapping:
+        if not any(has_overlap):
             return []
-        shift = min(overlapping) - 1.0
-        scores = [raw_scores[i] - shift for i in range(len(raw_scores))]
+        scores = list(raw_scores)
         for i, is_mem in enumerate(self._is_memory):
             if is_mem:
                 scores[i] *= self._boost
