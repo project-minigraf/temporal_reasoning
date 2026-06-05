@@ -1668,7 +1668,8 @@ class TestMemoryPrepareTurnBM25:
         from unittest.mock import patch
         mcp_server.open_db(str(tmp_path / "t.graph"))
         fresh_cache = mcp_server.IndexCache()  # no index built yet
-        with patch.object(mcp_server, "_index_cache", fresh_cache):
+        with patch.object(mcp_server, "_index_cache", fresh_cache), \
+             patch.object(mcp_server, "_BM25_AVAILABLE", True):
             result = mcp_server.handle_memory_prepare_turn("redis caching")
         assert result == ""
 
