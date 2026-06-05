@@ -326,6 +326,9 @@ def setup_claude_settings_json(target_dir: str) -> bool:
     if "temporal-reasoning" not in mcp_servers:
         mcp_servers.append("temporal-reasoning")
 
+    # Hooks belong in settings.local.json, not here — remove any stale entry
+    existing.pop("hooks", None)
+
     os.makedirs(claude_dir, exist_ok=True)
     try:
         with open(settings_path, "w") as f:
@@ -360,7 +363,6 @@ def setup_claude_settings(target_dir: str) -> bool:
     import json
 
     prepare_cmd = f"{VENV_PYTHON} {os.path.join(REPO_DIR, 'hooks', 'prepare_hook.py')}"
-    ingest_cmd = f"{VENV_PYTHON} {os.path.join(REPO_DIR, 'hooks', 'ingest_hook.py')}"
     finalize_cmd = f"{VENV_PYTHON} {os.path.join(REPO_DIR, 'hooks', 'finalize_hook.py')}"
 
     claude_dir = os.path.join(target_dir, ".claude")
@@ -406,7 +408,6 @@ def setup_claude_settings(target_dir: str) -> bool:
         return "added"
 
     prepare_status = _upsert_hook("UserPromptSubmit", "prepare_hook.py", prepare_cmd, 5000)
-    ingest_status = _upsert_hook("UserPromptSubmit", "ingest_hook.py", ingest_cmd, 2000)
     finalize_status = _upsert_hook("Stop", "finalize_hook.py", finalize_cmd, 10000)
 
     os.makedirs(claude_dir, exist_ok=True)
@@ -421,7 +422,6 @@ def setup_claude_settings(target_dir: str) -> bool:
     verb = "Updated" if file_existed else "Created"
     print(f"✓ {verb} {settings_path}")
     print(f"    UserPromptSubmit hook ({prepare_status}): {prepare_cmd}")
-    print(f"    UserPromptSubmit hook ({ingest_status}): {ingest_cmd}")
     print(f"    Stop hook ({finalize_status}): {finalize_cmd}")
     print(f"    env.VULCAN_EXTRACTION_STRATEGY = {env_block['VULCAN_EXTRACTION_STRATEGY']}")
     if key_is_real:
