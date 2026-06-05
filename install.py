@@ -242,9 +242,9 @@ def setup_mcp_json(target_dir: str) -> bool:
     - Merges into existing content if present (other servers are preserved).
     - Always updates args and MINIGRAF_GRAPH_PATH to reflect current paths.
     - Uses the venv python as the command so the MCP server runs in the venv.
-    - Preserves VULCAN_EXTRACTION_STRATEGY if already set by the user.
-    - Preserves ANTHROPIC_API_KEY if already set to a real value; otherwise
-      writes a placeholder and prints a reminder.
+    - Only MINIGRAF_GRAPH_PATH is set here; ANTHROPIC_API_KEY and
+      VULCAN_EXTRACTION_STRATEGY belong in .claude/settings.local.json so
+      they are available to hook subprocesses as well as the MCP server.
     """
     import json
 
@@ -261,17 +261,8 @@ def setup_mcp_json(target_dir: str) -> bool:
         except (json.JSONDecodeError, IOError):
             existing = {}
 
-    prev_env: dict = existing.get("mcpServers", {}).get("temporal-reasoning", {}).get("env", {})
-
-    strategy = prev_env.get("VULCAN_EXTRACTION_STRATEGY", "heuristic")
-    prev_key = prev_env.get("ANTHROPIC_API_KEY", "")
-    key_is_real = bool(prev_key) and prev_key != _PLACEHOLDER_KEY
-    api_key = prev_key if key_is_real else _PLACEHOLDER_KEY
-
     new_env = {
         "MINIGRAF_GRAPH_PATH": graph_path,
-        "VULCAN_EXTRACTION_STRATEGY": strategy,
-        "ANTHROPIC_API_KEY": api_key,
     }
     existing.setdefault("mcpServers", {})["temporal-reasoning"] = {
         "type": "stdio",
@@ -292,11 +283,6 @@ def setup_mcp_json(target_dir: str) -> bool:
     print(f"✓ {verb} {mcp_json_path}")
     print(f"    command = {VENV_PYTHON}")
     print(f"    MINIGRAF_GRAPH_PATH = {graph_path}")
-    print(f"    VULCAN_EXTRACTION_STRATEGY = {strategy}")
-    if key_is_real:
-        print("    ANTHROPIC_API_KEY = (preserved)")
-    else:
-        print(f"    ANTHROPIC_API_KEY = {_PLACEHOLDER_KEY}  ← replace with your key")
     return True
 
 
@@ -358,7 +344,7 @@ def setup_claude_settings_json(target_dir: str) -> bool:
 
 
 def setup_claude_settings(target_dir: str) -> bool:
-    """Idempotently write hooks and ANTHROPIC_API_KEY into .claude/settings.local.json.
+    """Idempotently write hooks and env vars into .claude/settings.local.json.
 
     - Creates .claude/ and the file if absent.
     - Merges into existing content (permissions and other keys are preserved).
@@ -366,7 +352,10 @@ def setup_claude_settings(target_dir: str) -> bool:
       that already references our hook scripts and updates the command path;
       appends a new entry only if none is found.
     - Preserves ANTHROPIC_API_KEY if already set to a real value.
+    - Sets VULCAN_EXTRACTION_STRATEGY=llm (default); preserves existing value.
     - Hook commands use the venv python so they share the same environment.
+    - These env vars are written here (not in .mcp.json) so that hook
+      subprocesses inherit them from the Claude Code process environment.
     """
     import json
 
@@ -386,12 +375,14 @@ def setup_claude_settings(target_dir: str) -> bool:
         except (json.JSONDecodeError, IOError):
             existing = {}
 
-    # --- env.ANTHROPIC_API_KEY ---
+    # --- env block ---
     env_block = existing.setdefault("env", {})
     prev_key = env_block.get("ANTHROPIC_API_KEY", "")
     key_is_real = bool(prev_key) and prev_key != _PLACEHOLDER_KEY
     if not key_is_real:
         env_block["ANTHROPIC_API_KEY"] = _PLACEHOLDER_KEY
+    if "VULCAN_EXTRACTION_STRATEGY" not in env_block:
+        env_block["VULCAN_EXTRACTION_STRATEGY"] = "llm"
 
     # --- hooks ---
     hooks_block = existing.setdefault("hooks", {})
@@ -432,6 +423,7 @@ def setup_claude_settings(target_dir: str) -> bool:
     print(f"    UserPromptSubmit hook ({prepare_status}): {prepare_cmd}")
     print(f"    UserPromptSubmit hook ({ingest_status}): {ingest_cmd}")
     print(f"    Stop hook ({finalize_status}): {finalize_cmd}")
+    print(f"    env.VULCAN_EXTRACTION_STRATEGY = {env_block['VULCAN_EXTRACTION_STRATEGY']}")
     if key_is_real:
         print("    env.ANTHROPIC_API_KEY = (preserved)")
     else:
@@ -489,8 +481,7 @@ def main(target_dir: str = "") -> None:
         print("=" * 50)
         print()
         print("Replace any 'your-api-key-here' placeholders in:")
-        print("  .mcp.json                      — MCP server process")
-        print("  .claude/settings.local.json    — hook subprocesses (llm strategy only)")
+        print("  .claude/settings.local.json    — hooks + Claude Code env (ANTHROPIC_API_KEY)")
         print()
         print("Other agents (manual config — see hooks/ for templates):")
         print("    hooks/codex.toml    — Codex CLI")

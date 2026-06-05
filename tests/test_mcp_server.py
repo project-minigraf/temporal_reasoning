@@ -16,13 +16,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 @pytest.fixture(autouse=True)
 def reset_mcp_server_db():
-    """Reset the module-level _db singleton and grammar cache between tests."""
+    """Reset the module-level _db singleton, grammar cache, and index cache between tests."""
     import mcp_server
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
+    mcp_server._index_cache = mcp_server.IndexCache()
     yield
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
+    mcp_server._index_cache = mcp_server.IndexCache()
 
 
 @pytest.fixture
@@ -124,7 +126,9 @@ class TestVulcanTransact:
 
         result = mcp_server.handle_vulcan_transact("[[:e :a :v]]", reason="test")
 
-        db_instance.execute.assert_called_once()
+        # execute is called at least once for the transact (background index rebuild may
+        # add an extra call; assert any transact call was made rather than assert_called_once)
+        assert any("transact" in str(c) for c in db_instance.execute.call_args_list)
         db_instance.checkpoint.assert_called_once()
         assert result["ok"] is True
 
@@ -202,7 +206,7 @@ class TestMemoryPrepareTurn:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
-        result = mcp_server.handle_memory_prepare_turn("what database are we using?")
+        result = mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
 
         assert isinstance(result, str)
 
@@ -217,7 +221,7 @@ class TestMemoryPrepareTurn:
             return json.dumps({"results": []})
 
         db_instance.execute.side_effect = execute_side_effect
-        result = mcp_server.handle_memory_prepare_turn("what did we decide about postgres?")
+        result = mcp_server._handle_memory_prepare_turn_heuristic("what did we decide about postgres?")
 
         assert "PostgreSQL" in result or "postgres" in result.lower() or result == ""
 
@@ -236,7 +240,7 @@ class TestMemoryPrepareTurn:
             return json.dumps({"results": [[":e", ":name", "FastAPI"]]})
 
         db_instance.execute.side_effect = execute_side_effect
-        result = mcp_server.handle_memory_prepare_turn("tell me about our framework")
+        result = mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
 
         # Broad scan should have been called
         assert call_count[0] > 0
@@ -248,7 +252,7 @@ class TestMemoryPrepareTurn:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        mcp_server.handle_memory_prepare_turn("hello")
+        mcp_server._handle_memory_prepare_turn_heuristic("hello")
         # Should not raise; limit is respected internally
 
     def test_uses_valid_at_for_message_with_explicit_iso_date(self, mock_minigraf_db, tmp_path):
@@ -258,7 +262,7 @@ class TestMemoryPrepareTurn:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
-        mcp_server.handle_memory_prepare_turn("what did we decide before 2026-01-15?")
+        mcp_server._handle_memory_prepare_turn_heuristic("what did we decide before 2026-01-15?")
 
         calls = [str(c) for c in db_instance.execute.call_args_list]
         assert any(':valid-at "2026-01-15"' in c for c in calls)
@@ -270,7 +274,7 @@ class TestMemoryPrepareTurn:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
-        mcp_server.handle_memory_prepare_turn("what database are we using?")
+        mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
 
         calls = [str(c) for c in db_instance.execute.call_args_list]
         # Should contain a UTC timestamp like 2026-05-02T15:44:52.184Z
@@ -497,18 +501,18 @@ class TestAgentStrategy:
 
 
 class TestMcpToolWiring:
-    def test_list_tools_returns_nine_tools(self, mock_minigraf_db, tmp_path):
+    def test_list_tools_returns_ten_tools(self, mock_minigraf_db, tmp_path):
         import asyncio
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         tools = asyncio.run(mcp_server.list_tools())
 
-        assert len(tools) == 9
+        assert len(tools) == 10
         names = {t.name for t in tools}
         assert names == {
             "vulcan_query", "vulcan_transact", "vulcan_retract",
-            "vulcan_report_issue", "memory_prepare_turn", "memory_finalize_turn",
+            "vulcan_rule", "vulcan_report_issue", "memory_prepare_turn", "memory_finalize_turn",
             "vulcan_audit", "vulcan_ingest_git", "vulcan_ingest_status",
         }
 
@@ -1584,3 +1588,343 @@ class TestRunIngestion:
         result = await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is False
         assert "already in progress" in result["error"]
+
+
+class TestIndexCache:
+    def test_get_returns_none_before_any_rebuild(self):
+        from mcp_server import IndexCache
+        cache = IndexCache()
+        assert cache.get() is None
+
+    def test_rebuild_populates_index(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":decision/use-redis", ":description", "use redis"]]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        cache = mcp_server.IndexCache()
+        cache._rebuild()
+        assert cache.get() is not None
+
+    def test_stale_index_served_when_already_rebuilding(self):
+        import mcp_server
+        from mcp_server import IndexCache, FactIndex
+        cache = IndexCache()
+        stale = FactIndex([[":decision/old", ":description", "old"]], boost=2.0)
+        cache._current = stale
+        cache._rebuilding = True
+        cache.invalidate()  # no-op because _rebuilding
+        assert cache.get() is stale
+        cache._rebuilding = False
+
+    def test_invalidate_noop_when_rebuilding(self):
+        from mcp_server import IndexCache
+        from unittest.mock import patch
+        cache = IndexCache()
+        cache._rebuilding = True
+        with patch("threading.Thread") as mock_thread:
+            cache.invalidate()
+            mock_thread.assert_not_called()
+        cache._rebuilding = False
+
+    def test_concurrent_invalidate_does_not_spawn_multiple_threads(self):
+        from mcp_server import IndexCache
+        from unittest.mock import patch
+        import threading as th
+        cache = IndexCache()
+        thread_count = []
+
+        original_thread_init = th.Thread.__init__
+
+        def counting_thread_init(self_thread, *args, **kwargs):
+            original_thread_init(self_thread, *args, **kwargs)
+            thread_count.append(1)
+
+        with patch.object(th.Thread, "__init__", counting_thread_init):
+            # Simulate two concurrent callers both passing the guard
+            # before either sets _rebuilding. With the fix, the first call
+            # sets _rebuilding = True before t.start(), so the second call
+            # sees it and returns without spawning.
+            cache.invalidate()
+            cache.invalidate()  # should be a no-op
+        assert len(thread_count) == 1
+        cache._rebuilding = False  # cleanup
+
+    def test_rebuild_leaves_current_unchanged_on_error(self, monkeypatch):
+        import mcp_server
+        from mcp_server import IndexCache, FactIndex
+        cache = IndexCache()
+        stale = FactIndex([[":decision/old", ":description", "old"]], boost=2.0)
+        cache._current = stale
+        # Force get_db to raise
+        monkeypatch.setattr(mcp_server, "get_db", lambda: (_ for _ in ()).throw(RuntimeError("db error")))
+        cache._rebuild()
+        assert cache.get() is stale
+        assert cache._rebuilding is False
+
+
+class TestMemoryPrepareTurnBM25:
+    def test_returns_empty_when_no_index(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        fresh_cache = mcp_server.IndexCache()  # no index built yet
+        with patch.object(mcp_server, "_index_cache", fresh_cache), \
+             patch.object(mcp_server, "_BM25_AVAILABLE", True):
+            result = mcp_server.handle_memory_prepare_turn("redis caching")
+        assert result == ""
+
+    def test_returns_empty_for_unmatched_query(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":decision/use-redis", ":description", "use redis"]]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        cache = mcp_server.IndexCache()
+        cache._rebuild()
+        with patch.object(mcp_server, "_index_cache", cache):
+            result = mcp_server.handle_memory_prepare_turn("elephants trombone")
+        assert result == ""
+
+    def test_memory_facts_rank_above_git_facts(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [
+                [":decision/use-redis", ":description", "use redis for caching"],
+                [":commit/abc123def456", ":subject", "feat use redis caching layer"],
+                [":function/unrelated", ":name", "some other thing entirely"],
+            ]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        cache = mcp_server.IndexCache()
+        cache._rebuild()
+        with patch.object(mcp_server, "_index_cache", cache):
+            result = mcp_server.handle_memory_prepare_turn("redis caching")
+        assert "Relevant memory context:" in result
+        assert result.index(":decision/use-redis") < result.index(":commit/abc123def456")
+
+    def test_respects_scan_limit(self, mock_minigraf_db, tmp_path, monkeypatch):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[f":decision/item-{i}", ":description", f"redis item {i}"] for i in range(20)]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        monkeypatch.setenv("VULCAN_PREPARE_SCAN_LIMIT", "3")
+        cache = mcp_server.IndexCache()
+        cache._rebuild()
+        with patch.object(mcp_server, "_index_cache", cache):
+            result = mcp_server.handle_memory_prepare_turn("redis")
+        lines = [l for l in result.splitlines() if "|" in l]
+        assert len(lines) <= 3
+
+
+class TestIndexCacheInvalidation:
+    def test_successful_transact_triggers_invalidation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx_id": 1, "count": 1})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            mcp_server.handle_vulcan_transact(
+                '[[:decision/test :description "test"]]', reason="test"
+            )
+            mock_inv.assert_called_once()
+
+    def test_failed_transact_does_not_trigger_invalidation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        from minigraf import MiniGrafError
+        mock_class, db_instance = mock_minigraf_db
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.side_effect = MiniGrafError("bad tx")
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            mcp_server.handle_vulcan_transact(
+                '[[:decision/test :description "test"]]', reason="test"
+            )
+            mock_inv.assert_not_called()
+
+    def test_successful_retract_triggers_invalidation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"tx_id": 2, "count": 1})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            mcp_server.handle_vulcan_retract(
+                '[[:decision/test :description "test"]]', reason="cleanup"
+            )
+            mock_inv.assert_called_once()
+
+    def test_failed_retract_does_not_trigger_invalidation(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        from unittest.mock import patch
+        from minigraf import MiniGrafError
+        mock_class, db_instance = mock_minigraf_db
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.side_effect = MiniGrafError("bad retract")
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            mcp_server.handle_vulcan_retract(
+                '[[:decision/test :description "test"]]', reason="cleanup"
+            )
+            mock_inv.assert_not_called()
+
+    def test_run_ingestion_triggers_invalidation_on_completion(self, mock_minigraf_db, tmp_path, monkeypatch):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_git_commits", lambda *a, **k: [])
+        monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
+        monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}))
+        monkeypatch.setattr(mcp_server, "_ingest_deps_from_head", lambda *a, **k: None)
+        monkeypatch.setattr(mcp_server, "_ingest_tags", lambda *a, **k: None)
+        monkeypatch.setattr(mcp_server, "_last_run_write", lambda *a, **k: None)
+        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
+            import asyncio
+            asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
+            mock_inv.assert_called_once()
+
+
+class TestBM25GracefulDegradation:
+    def test_falls_back_to_heuristic_when_bm25_unavailable(self, mock_minigraf_db, tmp_path, monkeypatch):
+        import mcp_server
+        from unittest.mock import patch
+        mock_class, db_instance = mock_minigraf_db
+        # The heuristic extracts entities from "decided to use redis":
+        #   "decided" (7 chars) and "redis" (5 chars) pass the _MIN_ENTITY_LEN=4 filter.
+        # For each entity it calls db.execute() with a contains? query.
+        # Using side_effect so the first entity query returns a match and the
+        # second returns empty (deduplication handles any overlap).
+        session_rule_count = len(mcp_server.SESSION_RULES)
+        call_count = 0
+
+        def side_effect(query_str):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= session_rule_count:
+                # SESSION_RULES registrations during open_db
+                return json.dumps({"ok": True})
+            # First entity query ("decided") — return a matching fact
+            if call_count == session_rule_count + 1:
+                return json.dumps({"results": [["use", "decided to use redis"]]})
+            # Subsequent entity queries — return empty
+            return json.dumps({"results": []})
+
+        db_instance.execute.side_effect = side_effect
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
+        result = mcp_server.handle_memory_prepare_turn("decided to use redis")
+        # Heuristic path produces "Relevant memory context:" when facts are found
+        assert "Relevant memory context:" in result
+
+    def test_index_cache_rebuild_noop_when_bm25_unavailable(self, mock_minigraf_db, tmp_path, monkeypatch):
+        import mcp_server
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":decision/use-redis", ":description", "use redis"]]
+        })
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
+        monkeypatch.setattr(mcp_server, "_BM25Okapi", None)
+        cache = mcp_server.IndexCache()
+        cache._rebuild()  # should not raise
+        result = cache.get()
+        # When _BM25Okapi is None, FactIndex._bm25 is never initialized
+        assert isinstance(result, mcp_server.FactIndex)
+        assert result._bm25 is None
+
+
+class TestBM25Tokenize:
+    def test_splits_keyword_ident_on_punctuation(self):
+        from mcp_server import _tokenize
+        assert _tokenize(":decision/use-redis") == ["decision", "use", "redis"]
+
+    def test_lowercases_tokens(self):
+        from mcp_server import _tokenize
+        assert _tokenize("use Redis for Caching") == ["use", "redis", "for", "caching"]
+
+    def test_filters_empty_tokens(self):
+        from mcp_server import _tokenize
+        assert _tokenize(":::") == []
+
+    def test_mixed_fact_row(self):
+        from mcp_server import _tokenize
+        assert _tokenize(":commit/abc123 :subject feat add redis") == [
+            "commit", "abc123", "subject", "feat", "add", "redis"
+        ]
+
+    def test_memory_prefix_detected(self):
+        from mcp_server import _MEMORY_PREFIXES
+        assert ":decision/use-redis".startswith(_MEMORY_PREFIXES)
+        assert ":preference/tdd".startswith(_MEMORY_PREFIXES)
+        assert ":constraint/no-js".startswith(_MEMORY_PREFIXES)
+        assert ":dependency/redis".startswith(_MEMORY_PREFIXES)
+
+    def test_git_prefix_not_memory(self):
+        from mcp_server import _MEMORY_PREFIXES
+        assert not ":commit/abc123".startswith(_MEMORY_PREFIXES)
+        assert not ":function/foo-bar".startswith(_MEMORY_PREFIXES)
+        assert not ":module/src-main".startswith(_MEMORY_PREFIXES)
+
+
+class TestFactIndex:
+    def test_empty_facts_returns_empty_query(self):
+        from mcp_server import FactIndex
+        index = FactIndex([], boost=2.0)
+        assert index.query("redis", top_n=10) == []
+
+    def test_query_returns_matching_fact(self):
+        from mcp_server import FactIndex
+        facts = [[":decision/use-redis", ":description", "use redis for caching"]]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("redis caching", top_n=10)
+        assert len(results) == 1
+        assert results[0] == [":decision/use-redis", ":description", "use redis for caching"]
+
+    def test_memory_fact_outscores_git_fact(self):
+        from mcp_server import FactIndex
+        # Include a third unrelated fact so BM25 IDF is positive (avoids negative-score
+        # small-corpus edge case that would invert the boost when multiplied).
+        facts = [
+            [":decision/use-redis", ":description", "use redis for caching"],
+            [":commit/abc123def456", ":subject", "feat use redis for caching layer"],
+            [":commit/xyz789", ":subject", "fix typo in readme"],
+        ]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("redis caching", top_n=10)
+        assert results[0][0] == ":decision/use-redis"
+
+    def test_no_overlap_query_returns_empty(self):
+        from mcp_server import FactIndex
+        facts = [[":decision/use-redis", ":description", "use redis for caching"]]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("elephants trombone completely unrelated", top_n=10)
+        assert results == []
+
+    def test_top_n_respected(self):
+        from mcp_server import FactIndex
+        facts = [[f":decision/item-{i}", ":description", f"redis item {i}"] for i in range(20)]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("redis", top_n=5)
+        assert len(results) <= 5
+
+    def test_facts_with_no_tokens_skipped(self):
+        from mcp_server import FactIndex
+        # A fact whose text tokenises to [] should not crash
+        facts = [
+            [":::", ":::", ":::"],
+            [":decision/use-redis", ":description", "use redis"],
+        ]
+        index = FactIndex(facts, boost=2.0)
+        results = index.query("redis", top_n=10)
+        assert len(results) == 1
+        assert results[0][0] == ":decision/use-redis"
