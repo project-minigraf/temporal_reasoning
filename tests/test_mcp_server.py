@@ -1506,7 +1506,7 @@ class TestIngestionWrites:
         db = mcp_server.get_db()
         db_instance.execute.reset_mock()
 
-        mcp_server._last_run_write(db, "deadbeef", "2026-05-27T10:00:00Z")
+        mcp_server._last_run_write(db, "deadbeef", "2026-05-27T10:00:00Z", 1017)
 
         call_args = db_instance.execute.call_args[0][0]
         assert ":ingestion/last-run-at" in call_args
@@ -1515,6 +1515,8 @@ class TestIngestionWrites:
         assert ":last-commit" in call_args
         assert "deadbeef" in call_args
         assert ":type/ingestion" in call_args
+        assert ":total-ingested" in call_args
+        assert "1017" in call_args
         assert ":valid-from" not in call_args
 
     def test_run_ingestion_writes_last_run_on_completion(self, mock_minigraf_db, tmp_path, monkeypatch):
