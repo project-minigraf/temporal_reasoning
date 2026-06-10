@@ -882,7 +882,7 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
     )
 
 
-def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int = 0) -> None:
+def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int) -> None:
     """Record the wall-clock time, final commit hash, and cumulative ingested count."""
     db.execute(
         f'(transact [[:ingestion/last-run-at :entity-type :type/ingestion] '
