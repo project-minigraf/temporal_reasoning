@@ -1751,9 +1751,8 @@ def _build_code_triples(
     bi-temporal fact explosion from N re-assertions of the same attribute
     joining into N² result rows.
 
-    :depends-on and :calls edges are NOT written here — they reflect current
-    state rather than a single historical moment and are written by
-    _ingest_deps_from_head() as a snapshot from HEAD after the commit walk.
+    :depends-on edges are written in the commit loop by _run_ingestion as the
+    file's imports change, giving them proper bi-temporal bounds.
     """
     triples: List[str] = []
     module_ident = _code_ident("module", file_path)
@@ -1776,8 +1775,6 @@ def _build_code_triples(
         entity_valid_from[module_ident] = commit_ts_iso
         entity_descriptions[module_ident] = file_path
 
-        # :depends-on and :calls are written by _ingest_deps_from_head() after
-        # the commit walk so they reflect HEAD state, not introduction-time state.
     else:
         # Existing module: only record that this commit modified it
         triples.append(f"[{module_ident} :modified-in {commit_ident}]")
@@ -1817,70 +1814,6 @@ def _build_code_triples(
             entity_descriptions[cls_ident] = cls_name
 
     return triples
-
-
-def _ingest_deps_from_head(
-    db: Any,
-    repo_path: str,
-    file_entities: Dict[str, List[str]],
-    run_ts_iso: str,
-) -> None:
-    """Write :depends-on edges for all known modules from their current HEAD content.
-
-    Called once after the commit walk completes. Reading from HEAD gives
-    accurate current deps without the bi-temporal explosion that would result
-    from re-writing deps on every modification commit. Existing :depends-on
-    facts are retracted first so this is idempotent across incremental runs.
-    Each module's deps are transacted separately so a single bad file doesn't
-    abort the entire pass.
-    """
-    # Retract all existing :depends-on facts upfront (best-effort)
-    try:
-        raw = db.execute('(query [:find ?e ?d :where [?e :depends-on ?d]])')
-        existing = json.loads(raw).get("results", [])
-        if existing:
-            rt_parts = []
-            for e, d in existing:
-                if isinstance(d, str) and d.startswith(":"):
-                    rt_parts.append(f'[#uuid "{e}" :depends-on {d}]')
-                elif isinstance(d, str):
-                    rt_parts.append(f'[#uuid "{e}" :depends-on "{_edn_escape(d)}"]')
-            if rt_parts:
-                db.execute(f"(retract [{' '.join(rt_parts)}])")
-    except Exception:
-        pass
-
-    snap_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    for file_path in sorted(file_entities.keys()):
-        parser = _get_parser(file_path)
-        if parser is None:
-            continue
-        module_ident = _code_ident("module", file_path)
-        full_path = Path(repo_path) / file_path
-        if not full_path.exists():
-            continue  # file removed from HEAD; no current deps to write
-        try:
-            content = full_path.read_bytes()
-        except OSError:
-            continue
-        extracted = _extract_from_source(content, parser, file_path)
-        dep_idents = set()
-        for name in set(extracted["imports"]):
-            dep_ident = _resolve_module_import(name, file_entities)
-            if dep_ident != module_ident:  # skip self-dependencies
-                dep_idents.add(dep_ident)
-        if not dep_idents:
-            continue
-        # Transact each dep individually — Minigraf's EAVT/AEVT pending indexes
-        # lack value bytes in the key, so batching multiple facts for the same
-        # (entity, attribute) in one transact causes index collisions that silently
-        # discard all but one dep.  One transact per dep guarantees unique tx_count.
-        for dep in dep_idents:
-            try:
-                db.execute(f'(transact [[{module_ident} :depends-on {dep}]] {{:valid-from "{snap_ts}"}})')
-            except Exception:
-                pass  # non-fatal; best-effort per dep
 
 
 def _preload_known_entities(db: Any, repo_path: str) -> tuple:
@@ -1975,6 +1908,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         db = get_db()
         watermark = _watermark_query(db)
         entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
+        file_deps: Dict[str, set] = {}  # file_path -> set of dep module idents
+        dep_valid_from: Dict[tuple, str] = {}  # (src_ident, dep_ident) -> intro commit ts
         _db = None  # release file lock while enumerating commits
 
         commits = _git_commits(repo_path, watermark, branch)
@@ -2005,6 +1940,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     f'[{commit_ident} :date "{commit_ts_iso}"]',
                 ]
                 close_items: List[tuple] = []  # (triples, original_ts_iso)
+                dep_add_triples: List[str] = []  # :depends-on triples to transact individually
 
                 for status, file_path in changed:
                     parser = _get_parser(file_path)
@@ -2021,6 +1957,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             close_items.append(
                                 (_build_close_triples(ident, desc, module_ident), orig_ts)
                             )
+                        # Close all :depends-on edges for the deleted module
+                        for dep_ident in file_deps.get(file_path, set()):
+                            orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
+                            close_items.append(
+                                ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+                            )
+                        file_deps.pop(file_path, None)
                     else:  # A or M
                         previous_idents = set(file_entities.get(file_path, []))
                         try:
@@ -2051,6 +1994,24 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 close_items.append(
                                     (_build_close_triples(ident, desc, module_ident), orig_ts)
                                 )
+                        # Compute dep edges for this file and diff against previous
+                        module_ident = _code_ident("module", file_path)
+                        current_deps: set = set()
+                        for import_name in set(extracted.get("imports", [])):
+                            dep_ident = _resolve_module_import(import_name, file_entities)
+                            if dep_ident != module_ident:
+                                current_deps.add(dep_ident)
+                        previous_deps = file_deps.get(file_path, set())
+                        for dep_ident in current_deps - previous_deps:
+                            dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
+                            dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
+                        if status == "M":
+                            for dep_ident in previous_deps - current_deps:
+                                orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
+                                close_items.append(
+                                    ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+                                )
+                        file_deps[file_path] = current_deps
 
                 # Split :contains triples out before batching.  Minigraf's EAVT
                 # pending index lacks value bytes in the key, so batching multiple
@@ -2062,6 +2023,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 _ingest_transact(db, other_triples, commit_ts_iso, reason)
                 for ct in contains_triples:
                     _ingest_transact(db, [ct], commit_ts_iso, reason)
+                # :depends-on triples transacted individually — same EAVT collision risk
+                # as :contains when multiple deps share the same source module
+                for dt in dep_add_triples:
+                    _ingest_transact(db, [dt], commit_ts_iso, reason)
                 for close_triples, orig_ts in close_items:
                     _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason)
 
@@ -2089,7 +2054,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         db = get_db()
         try:
-            _ingest_deps_from_head(db, repo_path, file_entities, now)
             _ingest_tags(db, repo_path, now)
             _last_run_write(db, last_hash, now)
             db.checkpoint()

@@ -1843,7 +1843,6 @@ class TestIndexCacheInvalidation:
         monkeypatch.setattr(mcp_server, "_git_commits", lambda *a, **k: [])
         monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
         monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}, {}))
-        monkeypatch.setattr(mcp_server, "_ingest_deps_from_head", lambda *a, **k: None)
         monkeypatch.setattr(mcp_server, "_ingest_tags", lambda *a, **k: None)
         monkeypatch.setattr(mcp_server, "_last_run_write", lambda *a, **k: None)
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
@@ -2161,3 +2160,114 @@ class TestRunIngestionBitemporalClose:
         transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
         assert new_fn_ident in transact_calls, \
             "New module entities must be created after file is renamed"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures for bi-temporal :depends-on integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def git_repo_with_deps(tmp_path):
+    """Repo: commit 1 adds mod_a.py (imports mod_b) and mod_b.py."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "mod_b.py").write_text("def helper(): pass\n")
+    (repo / "mod_a.py").write_text("import mod_b\n\ndef main(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add modules"], cwd=repo, check=True, capture_output=True)
+
+    return repo
+
+
+@pytest.fixture
+def git_repo_with_dep_removal(tmp_path):
+    """Repo: commit 1 adds mod_a.py (imports mod_b) + mod_b.py, commit 2 removes the import."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "mod_b.py").write_text("def helper(): pass\n")
+    (repo / "mod_a.py").write_text("import mod_b\n\ndef main(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add modules with dep"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "mod_a.py").write_text("def main(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "remove import"], cwd=repo, check=True, capture_output=True)
+
+    return repo
+
+
+class TestRunIngestionBitemporalDeps:
+    """Tests verifying that :depends-on edges are written/closed bi-temporally in the commit loop."""
+
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+    @pytest.mark.asyncio
+    async def test_new_import_writes_depends_on_via_ingest_transact(
+        self, mock_minigraf_db, git_repo_with_deps, monkeypatch
+    ):
+        """Adding a file with an import must call _ingest_transact with a :depends-on triple
+        using the git commit timestamp."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo_with_deps / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+
+        await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
+
+        mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
+        # _resolve_module_import is Rust-focused; for Python `import mod_b` it falls back
+        # to _canonical_ident("module", "mod_b") since mod_b.py != mod_b.rs
+        mod_b_resolved = mcp_server._canonical_ident("module", "mod_b")
+        dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
+        assert any(dep_triple in t for t in transact_calls), (
+            f"Expected _ingest_transact to be called with '{dep_triple}' during commit loop, "
+            f"got: {transact_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_removed_import_closes_depends_on_edge(
+        self, mock_minigraf_db, git_repo_with_dep_removal, monkeypatch
+    ):
+        """Removing an import in a modified file must call _ingest_close with the
+        :depends-on triple so the edge gets a :valid-to bound."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo_with_dep_removal / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen: list = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(git_repo_with_dep_removal), "HEAD")
+
+        mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
+        mod_b_resolved = mcp_server._canonical_ident("module", "mod_b")
+        dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
+        assert any(dep_triple in t for t in close_triples_seen), (
+            f"Expected _ingest_close to be called with '{dep_triple}' when import removed, "
+            f"got: {close_triples_seen}"
+        )
