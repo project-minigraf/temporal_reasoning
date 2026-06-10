@@ -863,7 +863,7 @@ def _watermark_query(db: Any) -> Optional[str]:
 
 def _total_ingested_query(db: Any) -> int:
     """Return the cumulative number of commits ingested across all runs, or 0."""
-    raw = db.execute("(query [:find ?n :where [:ingestion/last-run-at :total-ingested ?n]])")
+    raw = db.execute("(query [:find ?n :any-valid-time :where [:ingestion/last-run-at :total-ingested ?n]])")
     results = json.loads(raw).get("results", [])
     return int(results[0][0]) if results else 0
 

@@ -1239,6 +1239,7 @@ class TestVulcanIngestStatus:
         assert result["processed"] == 0
         assert result["last_run_at"] is None
         assert result["last_commit"] is None
+        assert result["total_ingested"] is None
 
     def test_returns_last_run_at_from_graph(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
