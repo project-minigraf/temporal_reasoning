@@ -52,13 +52,17 @@ class TestCheckMcpPackage:
 
 class TestCheckMcpServerImportable:
     def test_returns_true_when_mcp_server_importable(self):
-        with patch.dict("sys.modules", {"mcp_server": MagicMock()}):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        with patch("subprocess.run", return_value=mock_result):
             assert install.check_mcp_server_importable() is True
 
     def test_returns_false_when_import_fails(self):
-        with patch("importlib.util.find_spec", return_value=None):
-            with patch("builtins.__import__", side_effect=ImportError):
-                assert install.check_mcp_server_importable() is False
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = b"No module named 'mcp_server'"
+        with patch("subprocess.run", return_value=mock_result):
+            assert install.check_mcp_server_importable() is False
 
 
 class TestSyncLists:
