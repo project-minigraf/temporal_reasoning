@@ -2063,7 +2063,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         db = get_db()
         try:
             _ingest_tags(db, repo_path, now)
-            _last_run_write(db, last_hash, now)
+            _last_run_write(db, last_hash, now, _ingest_progress["processed"])
             db.checkpoint()
         finally:
             _db = None
