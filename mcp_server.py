@@ -1915,14 +1915,21 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # Read watermark and pre-load known entities before releasing DB
         db = get_db()
         watermark = _watermark_query(db)
+        prior_ingested = _total_ingested_query(db)
         entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
         file_deps: Dict[str, set] = {}  # file_path -> set of dep module idents
         dep_valid_from: Dict[tuple, str] = {}  # (src_ident, dep_ident) -> intro commit ts
         _db = None  # release file lock while enumerating commits
 
         commits = _git_commits(repo_path, watermark, branch)
-        _ingest_progress["total"] = len(commits)
+        repo_total_result = _subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"],
+            cwd=repo_path, capture_output=True, text=True,
+        )
+        repo_total = int(repo_total_result.stdout.strip()) if repo_total_result.returncode == 0 else len(commits)
+        _ingest_progress["total"] = repo_total
         _ingest_progress["status"] = "running"
+        _ingest_progress["processed"] = prior_ingested
 
         last_hash = watermark or ""
 

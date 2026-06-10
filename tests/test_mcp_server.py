@@ -1535,7 +1535,7 @@ class TestIngestionWrites:
         last_run_calls = []
         monkeypatch.setattr(
             mcp_server, "_last_run_write",
-            lambda db, h, t: last_run_calls.append((h, t))
+            lambda db, h, t, n: last_run_calls.append((h, t, n))
         )
 
         asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
@@ -1543,6 +1543,7 @@ class TestIngestionWrites:
         assert len(last_run_calls) == 1
         assert last_run_calls[0][0] == "abc123"
         assert last_run_calls[0][1].endswith("Z")
+        assert last_run_calls[0][2] == 1  # 1 commit processed
 
     def test_run_ingestion_writes_last_run_when_no_commits(self, mock_minigraf_db, tmp_path, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
@@ -1555,7 +1556,7 @@ class TestIngestionWrites:
         last_run_calls = []
         monkeypatch.setattr(
             mcp_server, "_last_run_write",
-            lambda db, h, t: last_run_calls.append((h, t))
+            lambda db, h, t, n: last_run_calls.append((h, t, n))
         )
 
         asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
@@ -1563,6 +1564,7 @@ class TestIngestionWrites:
         assert len(last_run_calls) == 1
         assert last_run_calls[0][0] == "abc123"
         assert last_run_calls[0][1].endswith("Z")
+        assert last_run_calls[0][2] == 0  # no commits processed this run, prior was 0
 
 
 class TestTotalIngestedQuery:
@@ -1666,6 +1668,27 @@ class TestRunIngestion:
         result = await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is False
         assert "already in progress" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_processed_seeded_from_prior_ingested(self, mock_minigraf_db, git_repo, monkeypatch):
+        """processed starts at prior_ingested and increments cumulatively."""
+        mock_class, db_instance = mock_minigraf_db
+        # _total_ingested_query returns 462 (prior runs), all other queries return []
+        def execute_side_effect(query, *args, **kwargs):
+            if ":total-ingested" in query:
+                return json.dumps({"results": [[462]]})
+            return json.dumps({"results": []})
+        db_instance.execute.side_effect = execute_side_effect
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        # git_repo fixture has 2 commits; prior was 462 → final should be 464
+        assert mcp_server._ingest_progress["processed"] == 464
+        assert mcp_server._ingest_progress["total"] == 2  # git_repo has 2 commits
 
 
 class TestIndexCache:
