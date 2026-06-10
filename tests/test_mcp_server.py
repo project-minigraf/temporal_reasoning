@@ -1563,6 +1563,24 @@ class TestIngestionWrites:
         assert last_run_calls[0][1].endswith("Z")
 
 
+class TestTotalIngestedQuery:
+    def test_returns_zero_when_absent(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        assert mcp_server._total_ingested_query(db) == 0
+
+    def test_returns_stored_count(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": [[462]]})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        assert mcp_server._total_ingested_query(db) == 462
+
+
 class TestRunIngestion:
     @pytest.mark.asyncio
     async def test_ingestion_processes_all_commits(self, mock_minigraf_db, git_repo):

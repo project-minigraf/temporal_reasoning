@@ -861,6 +861,13 @@ def _watermark_query(db: Any) -> Optional[str]:
     return results[0][0] if results else None
 
 
+def _total_ingested_query(db: Any) -> int:
+    """Return the cumulative number of commits ingested across all runs, or 0."""
+    raw = db.execute("(query [:find ?n :where [:ingestion/last-run-at :total-ingested ?n]])")
+    results = json.loads(raw).get("results", [])
+    return int(results[0][0]) if results else 0
+
+
 def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str) -> None:
     """Record the last successfully ingested commit hash in the graph."""
     existing = _watermark_query(db)
