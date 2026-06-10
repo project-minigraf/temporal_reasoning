@@ -384,7 +384,7 @@ def setup_claude_settings(target_dir: str) -> bool:
     if not key_is_real:
         env_block["ANTHROPIC_API_KEY"] = _PLACEHOLDER_KEY
     if "VULCAN_EXTRACTION_STRATEGY" not in env_block:
-        env_block["VULCAN_EXTRACTION_STRATEGY"] = "llm"
+        env_block["VULCAN_EXTRACTION_STRATEGY"] = "heuristic"
 
     # --- hooks ---
     hooks_block = existing.setdefault("hooks", {})

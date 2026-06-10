@@ -107,21 +107,28 @@ Add to your Claude Code `settings.json`:
 }
 ```
 
-Then enable the `temporal-reasoning` plugin in Claude Code. Once enabled, run once to download the minigraf binary:
+Then enable the `temporal-reasoning` plugin in Claude Code. Once enabled, run once from your project root to finish setup:
 
 ```bash
-python install.py
+python /path/to/temporal_reasoning/install.py
 ```
 
-`install.py` auto-detects your platform and downloads the correct pre-built binary (Linux x86_64/aarch64, macOS arm64/x86_64, Windows). Falls back to `cargo install minigraf` on unsupported platforms.
+`install.py` installs the `minigraf` pip package, which fetches the platform-appropriate binary automatically (Linux x86_64/aarch64, macOS arm64/x86_64, Windows).
 
 ### Manual install
 
 ```bash
 git clone https://github.com/adityamukho/temporal_reasoning
-cd temporal_reasoning
-python install.py
 ```
+
+Then, from your project root:
+
+```bash
+cd /your/project
+python /path/to/temporal_reasoning/install.py
+```
+
+This writes `.mcp.json` and `.claude/settings*.json` into your project directory.
 
 ### OpenCode
 
