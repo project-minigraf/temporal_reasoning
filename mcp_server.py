@@ -2119,9 +2119,12 @@ def handle_vulcan_ingest_status() -> Dict[str, Any]:
             else:
                 result["last_run_at"] = None
                 result["last_commit"] = None
+            n = _total_ingested_query(db)
+            result["total_ingested"] = n if n > 0 else None
         except Exception:
             result["last_run_at"] = None
             result["last_commit"] = None
+            result["total_ingested"] = None
     return result
 
 

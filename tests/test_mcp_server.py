@@ -1248,9 +1248,11 @@ class TestVulcanIngestStatus:
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        db_instance.execute.return_value = json.dumps({
-            "results": [["2026-05-27T10:00:00Z", "deadbeef"]]
-        })
+        def execute_side_effect(query, *args, **kwargs):
+            if ":last-run-at" in query and ":last-commit" in query:
+                return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
+            return json.dumps({"results": []})
+        db_instance.execute.side_effect = execute_side_effect
         result = mcp_server.handle_vulcan_ingest_status()
         assert result["last_run_at"] == "2026-05-27T10:00:00Z"
         assert result["last_commit"] == "deadbeef"
@@ -1271,6 +1273,36 @@ class TestVulcanIngestStatus:
         assert result["current_commit"] == "abc123"
         # Must not query the graph while running
         db_instance.execute.assert_not_called()
+
+    def test_returns_total_ingested_from_graph(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        def execute_side_effect(query, *args, **kwargs):
+            if ":last-run-at" in query and ":last-commit" in query:
+                return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
+            if ":total-ingested" in query:
+                return json.dumps({"results": [[1017]]})
+            return json.dumps({"results": []})
+        db_instance.execute.side_effect = execute_side_effect
+        result = mcp_server.handle_vulcan_ingest_status()
+        assert result["total_ingested"] == 1017
+
+    def test_total_ingested_absent_returns_none(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        result = mcp_server.handle_vulcan_ingest_status()
+        assert result["total_ingested"] is None
 
 
 class TestCodeIdent:
