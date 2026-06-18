@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    {name = "Aditya Mukhopadhyay", email = "github@adityamukho.invalid"}
+    {name = "Aditya Mukhopadhyay", email = "webmaster@adityamukho.com"}
 ]
 keywords = ["ai-agents", "graph-database", "datalog", "knowledge-graph", "persistent-memory", "temporal-reasoning"]
 classifiers = [
