@@ -31,3 +31,6 @@ skills/
 
 # Git worktrees
 .worktrees/
+
+#IDEs
+.idea
