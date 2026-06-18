@@ -2396,3 +2396,62 @@ class TestRunIngestionBitemporalDeps:
             f"Expected _ingest_close to be called with '{dep_triple}' when import removed, "
             f"got: {close_triples_seen}"
         )
+
+# ---------------------------------------------------------------------------
+# Helpers for TestExtractImportName
+# ---------------------------------------------------------------------------
+
+def _find_node(root, node_type: str):
+    """DFS search for the first node matching node_type."""
+    if root.type == node_type:
+        return root
+    for child in root.children:
+        found = _find_node(child, node_type)
+        if found:
+            return found
+    return None
+
+
+def _parse_import_node(lang_name: str, source: bytes, node_type: str, tmp_path):
+    """Parse source for lang_name, return first node of node_type or skip."""
+    import mcp_server
+    ext = {
+        "go": ".go", "java": ".java", "c": ".c", "cpp": ".cpp",
+        "c_sharp": ".cs", "ruby": ".rb", "php": ".php", "kotlin": ".kt",
+        "swift": ".swift", "scala": ".scala", "haskell": ".hs",
+        "lua": ".lua", "elixir": ".ex",
+    }[lang_name]
+    tmp_file = tmp_path / f"test{ext}"
+    tmp_file.write_bytes(source)
+    parser = mcp_server._get_parser(str(tmp_file))
+    if parser is None:
+        pytest.skip(f"No tree-sitter parser available for {lang_name}")
+    tree = parser.parse(source)
+    node = _find_node(tree.root_node, node_type)
+    if node is None:
+        pytest.fail(
+            f"No {node_type!r} node found in AST.\n"
+            f"Full AST sexp:\n{tree.root_node.sexp()}"
+        )
+    return node
+
+
+class TestExtractImportName:
+    """Unit tests for _extract_import_name — one per language, using real parsers."""
+
+    def test_go_single_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_go")
+        import mcp_server
+        source = b'package main\nimport "fmt"'
+        node = _parse_import_node("go", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "go")
+        assert result == ["fmt"]
+
+    def test_go_grouped_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_go")
+        import mcp_server
+        source = b'package main\nimport (\n\t"os"\n\t"github.com/user/pkg"\n)'
+        node = _parse_import_node("go", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "go")
+        assert "os" in result
+        assert "pkg" in result

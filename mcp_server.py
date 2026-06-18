@@ -248,6 +248,20 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         name = _rust_use_root(node)
         if name:
             names.append(name)
+    elif lang_name == "go":
+        def _go_spec(spec_node):
+            path = spec_node.child_by_field_name("path")
+            if path:
+                val = path.text.decode("utf-8").strip('"')
+                names.append(val.split("/")[-1])
+
+        for child in node.named_children:
+            if child.type == "import_spec":
+                _go_spec(child)
+            elif child.type == "import_spec_list":
+                for spec in child.named_children:
+                    if spec.type == "import_spec":
+                        _go_spec(spec)
     return names
 
 
