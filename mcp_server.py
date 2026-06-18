@@ -205,6 +205,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "imports": {"import"},
         "calls": {"call_expression"},
     },
+    "swift": {
+        "functions": {"function_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"import_declaration"},
+        "calls": {"call_expression"},
+    },
 }
 
 
@@ -414,6 +420,11 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         result = _kotlin_first_seg(node)
         if result:
             names.append(result)
+    elif lang_name == "swift":
+        for child in node.named_children:
+            if child.type in ("identifier", "simple_identifier"):
+                names.append(child.text.decode("utf-8"))
+                break
     return names
 
 

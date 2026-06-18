@@ -2551,3 +2551,11 @@ class TestExtractImportName:
         node = _parse_import_node("kotlin", source, "import", tmp_path)
         result = mcp_server._extract_import_name(node, "kotlin")
         assert result == ["kotlin"]
+
+    def test_swift_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_swift")
+        import mcp_server
+        source = b'import Foundation'
+        node = _parse_import_node("swift", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "swift")
+        assert result == ["Foundation"]
