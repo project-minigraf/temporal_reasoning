@@ -2487,3 +2487,19 @@ class TestExtractImportName:
         node = _parse_import_node("cpp", source, "preproc_include", tmp_path)
         result = mcp_server._extract_import_name(node, "cpp")
         assert result == ["iostream"]
+
+    def test_csharp_using_simple(self, tmp_path):
+        pytest.importorskip("tree_sitter_c_sharp")
+        import mcp_server
+        source = b'using System;'
+        node = _parse_import_node("c_sharp", source, "using_directive", tmp_path)
+        result = mcp_server._extract_import_name(node, "c_sharp")
+        assert result == ["System"]
+
+    def test_csharp_using_dotted(self, tmp_path):
+        pytest.importorskip("tree_sitter_c_sharp")
+        import mcp_server
+        source = b'using System.Collections.Generic;'
+        node = _parse_import_node("c_sharp", source, "using_directive", tmp_path)
+        result = mcp_server._extract_import_name(node, "c_sharp")
+        assert result == ["System"]

@@ -178,6 +178,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "imports": {"preproc_include"},
         "calls": {"call_expression"},
     },
+    "c_sharp": {
+        "functions": {"method_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"using_directive"},
+        "calls": {"invocation_expression"},
+    },
 }
 
 
@@ -256,6 +262,24 @@ def _c_include_name(node) -> Optional[str]:
     return None
 
 
+def _csharp_using_name(node) -> Optional[str]:
+    """Return the root namespace from a C# using_directive node.
+
+    using System;                     → "System"
+    using System.Collections.Generic; → "System"
+    """
+    def _first_ident(n) -> Optional[str]:
+        if n.type == "identifier":
+            return n.text.decode("utf-8")
+        for c in n.named_children:
+            result = _first_ident(c)
+            if result:
+                return result
+        return None
+
+    return _first_ident(node)
+
+
 def _extract_import_name(node, lang_name: str) -> List[str]:
     """Extract top-level module names from an import node (may return multiple)."""
     names: List[str] = []
@@ -310,6 +334,10 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
             names.append(result)
     elif lang_name in ("c", "cpp"):
         name = _c_include_name(node)
+        if name:
+            names.append(name)
+    elif lang_name == "c_sharp":
+        name = _csharp_using_name(node)
         if name:
             names.append(name)
     return names
