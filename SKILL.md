@@ -17,7 +17,7 @@ Every session starts from zero — you ask questions already answered, write cod
 - **Write immediately** when the user establishes something worth keeping (decision, preference, constraint)
 - **Read before acting** when the user asks about the past, or when you're about to modify something where past decisions might apply
 
-## When to Write (vulcan_transact)
+## When to Write (minigraf_transact)
 
 Write to memory when the user's words signal a durable fact:
 
@@ -33,7 +33,7 @@ Store the *why* when you have it — a reason like "chosen for async support" is
 
 After every write, say: "I've stored that in memory." and summarize what was stored.
 
-## When to Read (vulcan_query)
+## When to Read (minigraf_query)
 
 Query memory before you answer or act, when:
 - The user asks about past decisions, architecture, preferences, or constraints
@@ -48,7 +48,7 @@ Say "Let me check memory..." before querying. Then:
 
 **Query first, answer second.** The reason: a confident answer that contradicts a stored decision is far more damaging than taking a moment to check.
 
-## When to Retract (vulcan_retract)
+## When to Retract (minigraf_retract)
 
 Retract when:
 - The user explicitly says "remove", "delete", "retract", "forget", "that's no longer true"
@@ -97,11 +97,11 @@ Only mint a new ident if the entity is genuinely new.
 
 Canonical ident form: lowercase, hyphens only — `:decision/redis` not `:decision/Redis_cache`.
 
-Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`, `:module/`, `:function/`, `:class/` (code structure — auto-ingested); `:commit/`, `:tag/`, `:ingestion/` are system-only (written by `vulcan_ingest_git`), do not write to them directly
+Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`, `:module/`, `:function/`, `:class/` (code structure — auto-ingested); `:commit/`, `:tag/`, `:ingestion/` are system-only (written by `minigraf_ingest_git`), do not write to them directly
 Required attribute on all types: `:description`
 Optional attributes: `:rationale`, `:date`, `:alias`
 
-Run `vulcan_audit` periodically or after a session with heavy writes to detect and retract any schema violations.
+Run `minigraf_audit` periodically or after a session with heavy writes to detect and retract any schema violations.
 
 ## Entity Types and Graph Relationships
 
@@ -189,9 +189,9 @@ memory_finalize_turn(conversation_delta="User: We'll use Redis for caching.\nAge
 
 ## Tools
 
-### vulcan_transact
+### minigraf_transact
 ```python
-from vulcan import transact
+from minigraf import transact
 
 transact("""[[:decision/postgres :description "PostgreSQL 15 — primary database"]
              [:decision/postgres :entity-type :type/decision]
@@ -201,12 +201,12 @@ transact("""[[:decision/postgres :description "PostgreSQL 15 — primary databas
 
 Or via CLI (from project directory):
 ```bash
-python vulcan.py transact '[...]' --reason "why this is worth keeping"
+python minigraf.py transact '[...]' --reason "why this is worth keeping"
 ```
 
-### vulcan_query
+### minigraf_query
 ```python
-from vulcan import query
+from minigraf import query
 
 # All facts for a known entity
 query("[:find ?a ?v :where [:decision/postgres ?a ?v]]")
@@ -222,51 +222,51 @@ query('[:find ?e ?v :where [?e :rationale ?v] (starts-with? ?v "chosen")]')
 query("[:find ?a ?v :as-of 5 :where [:decision/postgres ?a ?v]]")
 ```
 
-### vulcan_retract
+### minigraf_retract
 ```python
-from vulcan import retract
+from minigraf import retract
 retract("[[:dependency/old-service :description \"obsolete\"]]",
         reason="Service decommissioned")
 ```
 
-### vulcan_rule
+### minigraf_rule
 
 Register a Datalog rule for the current server session. Rules enable recursive graph traversal and edge-type aliasing. Re-register after server restart (or add to `SESSION_RULES` in `mcp_server.py` for permanence).
 
 ```python
 # Base case (register first)
-vulcan_rule("[(ancestor ?a ?d) [?a :parent ?d]]")
+minigraf_rule("[(ancestor ?a ?d) [?a :parent ?d]]")
 # Recursive case
-vulcan_rule("[(ancestor ?a ?d) [?a :parent ?m] (ancestor ?m ?d)]")
+minigraf_rule("[(ancestor ?a ?d) [?a :parent ?m] (ancestor ?m ?d)]")
 
 # Now query using the rule
-vulcan_query("[:find ?anc :where (ancestor :commit/abc123def456 ?anc) [?anc :subject ?s]]")
+minigraf_query("[:find ?anc :where (ancestor :commit/abc123def456 ?anc) [?anc :subject ?s]]")
 ```
 
 Returns `{"ok": true, "rule": "..."}` on success, or `{"ok": false, "error": "..."}` if the rule has a syntax error or creates a negative cycle.
 
-### vulcan_ingest_git
+### minigraf_ingest_git
 
 Start background ingestion of code structure from git history into the bi-temporal graph. Returns immediately — ingestion runs as an asyncio background task.
 
 ```python
-vulcan_ingest_git(repo_path="/path/to/repo", branch="HEAD")
+minigraf_ingest_git(repo_path="/path/to/repo", branch="HEAD")
 # → {"ok": true, "job_id": "git-ingest", "message": "Ingestion started for /path/to/repo"}
 
 # If already running:
 # → {"ok": false, "error": "ingestion already in progress"}
 ```
 
-Auto-invoked at session start via the `UserPromptSubmit` hook. The hook fires `vulcan_ingest_git` with no arguments, defaulting to `cwd` and `HEAD`. Incremental: reads the `:ingestion/watermark` entity to determine the last ingested commit, then only processes new commits.
+Auto-invoked at session start via the `UserPromptSubmit` hook. The hook fires `minigraf_ingest_git` with no arguments, defaulting to `cwd` and `HEAD`. Incremental: reads the `:ingestion/watermark` entity to determine the last ingested commit, then only processes new commits.
 
 Do not write to `:ingestion/watermark` or any `:ingestion/` entity directly.
 
-### vulcan_ingest_status
+### minigraf_ingest_status
 
 Poll the current git ingestion progress.
 
 ```python
-vulcan_ingest_status()
+minigraf_ingest_status()
 # → {"ok": true, "status": "running", "processed": 12, "total": 47,
 #    "current_commit": "a3f2bc...", "error": null}
 ```
@@ -275,7 +275,7 @@ vulcan_ingest_status()
 
 ### Git-Ingested Data Schema
 
-`vulcan_ingest_git` writes the following entity types. All relationship attributes (`:parent`, `:introduced-by`, `:modified-in`, `:contains`, `:depends-on`, `:tagged-commit`) are stored as keyword entity references — they bypass string-value schema validation by design and are directly traversable in queries.
+`minigraf_ingest_git` writes the following entity types. All relationship attributes (`:parent`, `:introduced-by`, `:modified-in`, `:contains`, `:depends-on`, `:tagged-commit`) are stored as keyword entity references — they bypass string-value schema validation by design and are directly traversable in queries.
 
 **Ident slugging:** non-alphanumeric characters in paths and names are replaced with hyphens and consecutive hyphens collapsed. Examples: `src/auth.py` → `:module/src-auth-py`; function `login` in `src/auth.py` → `:function/src-auth-py-login`.
 
@@ -334,7 +334,7 @@ Ident: `:tag/<slugified-tag-name>`
 
 **Supported languages for AST extraction:** Python, JavaScript, TypeScript (+ TSX/JSX), Rust, Go, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Scala, Haskell, Lua, Elixir. Files in other languages are tracked as modules (with `:introduced-by`/`:modified-in`) but yield no function or class entities.
 
-**Pre-registered SESSION_RULES** — these are always available; no `vulcan_rule` call needed:
+**Pre-registered SESSION_RULES** — these are always available; no `minigraf_rule` call needed:
 
 | Rule | Traverses | Use for |
 |---|---|---|
@@ -391,7 +391,7 @@ Cross-layer queries joining code structure with agent decisions:
 - `(not-join [?e] [?e :attr ?x])` — existential negation
 
 ### Rules and recursive traversal
-Register rules with `vulcan_rule` before querying. Rules support full recursion via semi-naive fixed-point evaluation — cycles are handled safely.
+Register rules with `minigraf_rule` before querying. Rules support full recursion via semi-naive fixed-point evaluation — cycles are handled safely.
 
 ```datalog
 ; Base case — register first
@@ -410,7 +410,7 @@ Unify multiple edge types under one name:
 [:find ?desc :where (linked :dependency/api-gateway ?svc) [?svc :description ?desc]]
 ```
 
-Rules registered via `vulcan_rule` persist for the server session. After a server restart, re-register them or add them to `SESSION_RULES` in `mcp_server.py` to make them permanent.
+Rules registered via `minigraf_rule` persist for the server session. After a server restart, re-register them or add them to `SESSION_RULES` in `mcp_server.py` to make them permanent.
 
 ### Multi-hop joins (fixed-depth, no rule needed)
 When you know the exact depth, explicit joins are simpler than registering a rule:
@@ -502,8 +502,8 @@ query("""[:find ?desc
 For unbounded transitive traversal, register a recursive rule first:
 ```python
 # Register once per server session
-vulcan_rule("[(reachable ?a ?b) [?a :depends-on ?b]]")
-vulcan_rule("[(reachable ?a ?b) [?a :depends-on ?m] (reachable ?m ?b)]")
+minigraf_rule("[(reachable ?a ?b) [?a :depends-on ?b]]")
+minigraf_rule("[(reachable ?a ?b) [?a :depends-on ?m] (reachable ?m ?b)]")
 
 # Then query — finds all transitive dependents at any depth
 query("[:find ?desc :where (reachable ?svc :dependency/key-store) [?svc :description ?desc]]")
@@ -511,8 +511,8 @@ query("[:find ?desc :where (reachable ?svc :dependency/key-store) [?svc :descrip
 
 Use rules to unify multiple edge types when scanning across mixed relationships:
 ```python
-vulcan_rule("[(linked ?a ?d) [?a :depends-on ?d]]")
-vulcan_rule("[(linked ?a ?d) [?a :calls ?d]]")
+minigraf_rule("[(linked ?a ?d) [?a :depends-on ?d]]")
+minigraf_rule("[(linked ?a ?d) [?a :calls ?d]]")
 query("""[:find ?desc
           :where (linked :dependency/auth-service ?svc)
                  [?svc :description ?desc]]""")
@@ -605,7 +605,7 @@ All functions return `{"ok": bool, ...}`. Common errors:
 - `as_of requires :as-of clause` — include `:as-of N` in query
 - `reason is required for all writes` — provide non-empty reason
 
-If an error persists after checking syntax and installation, use `vulcan_report_issue` to file a structured bug report with the failing query and error message:
+If an error persists after checking syntax and installation, use `minigraf_report_issue` to file a structured bug report with the failing query and error message:
 
 ```python
 from report_issue import report_issue
@@ -619,7 +619,7 @@ report_issue("parse_error", "query returns unexpected output",
 | File | Purpose |
 |------|---------|
 | `mcp_server.py` | Persistent MCP server — primary interface via MCP tools |
-| `vulcan.py` | Python wrapper (import or CLI — for direct use outside MCP) |
+| `minigraf.py` | Python wrapper (import or CLI — for direct use outside MCP) |
 | `report_issue.py` | GitHub issue reporter for errors |
 | `hooks/claude-code.json` | Claude Code settings fragment (MCP server + auto-memory hooks) |
 | `hooks/prepare_hook.py` | UserPromptSubmit hook script for Claude Code |
@@ -629,11 +629,11 @@ report_issue("parse_error", "query returns unexpected output",
 | `hooks/openclaw.json` | OpenClaw MCP config (degraded mode — issue #28596) |
 | `hooks/codex.toml` | Codex CLI MCP config with commented hook stubs |
 | `hooks/hermes.yaml` | Hermes MCP config with commented hook stubs |
-| `tools/query.json` | Tool schema for vulcan_query |
-| `tools/transact.json` | Tool schema for vulcan_transact |
-| `tools/retract.json` | Tool schema for vulcan_retract |
-| `tools/rule.json` | Tool schema for vulcan_rule |
-| `tools/report_issue.json` | Tool schema for vulcan_report_issue |
+| `tools/query.json` | Tool schema for minigraf_query |
+| `tools/transact.json` | Tool schema for minigraf_transact |
+| `tools/retract.json` | Tool schema for minigraf_retract |
+| `tools/rule.json` | Tool schema for minigraf_rule |
+| `tools/report_issue.json` | Tool schema for minigraf_report_issue |
 | `tools/memory_prepare_turn.json` | Tool schema for memory_prepare_turn |
 | `tools/memory_finalize_turn.json` | Tool schema for memory_finalize_turn |
 | `install.py` | Setup script |

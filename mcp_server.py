@@ -45,7 +45,7 @@ SESSION_RULES = [
 ]
 
 # User-registered rules — persisted across DB reopens (unlike SESSION_RULES,
-# these are accumulated at runtime via vulcan_rule and re-applied on every open).
+# these are accumulated at runtime via minigraf_rule and re-applied on every open).
 _user_rules: List[str] = []
 
 # Module-level DB instance — opened once, held for the session lifetime
@@ -403,7 +403,7 @@ def _parse_tx_result(raw_json: str) -> Dict[str, Any]:
 # Explicit agent tool handlers
 # ---------------------------------------------------------------------------
 
-def handle_vulcan_query(datalog: str) -> Dict[str, Any]:
+def handle_minigraf_query(datalog: str) -> Dict[str, Any]:
     """Query the graph. Returns {ok, results} or {ok, error}."""
     db = get_db()
     try:
@@ -413,7 +413,7 @@ def handle_vulcan_query(datalog: str) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-def handle_vulcan_transact(facts: str, reason: str) -> Dict[str, Any]:
+def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     """Transact facts into the graph. reason is required.
 
     :valid-at is set to the current UTC ms timestamp so every agent-initiated
@@ -445,7 +445,7 @@ def handle_vulcan_transact(facts: str, reason: str) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-def handle_vulcan_retract(facts: str, reason: str) -> Dict[str, Any]:
+def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
     """Retract facts from the graph. reason is required."""
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for retract"}
@@ -464,7 +464,7 @@ def handle_vulcan_retract(facts: str, reason: str) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-def handle_vulcan_rule(rule: str) -> Dict[str, Any]:
+def handle_minigraf_rule(rule: str) -> Dict[str, Any]:
     """Register a Datalog rule for use in subsequent queries.
 
     Rules persist for the lifetime of the server session and are re-registered
@@ -486,7 +486,7 @@ def handle_vulcan_rule(rule: str) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-def handle_vulcan_report_issue(
+def handle_minigraf_report_issue(
     category: str,
     description: str,
     datalog: Optional[str] = None,
@@ -501,7 +501,7 @@ def handle_vulcan_report_issue(
         return {"ok": False, "error": str(e)}
 
 
-def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
+def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
     """Audit graph entities against VULCAN_SCHEMA.
 
     Current state (as_of=None): validates all entities and retracts violators.
@@ -524,7 +524,7 @@ def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
             f":where [?e :entity-type :type/{entity_type}]]"
         )
         try:
-            type_result = handle_vulcan_query(type_query)
+            type_result = handle_minigraf_query(type_query)
             type_rows = type_result.get("results", [])
         except Exception:
             continue
@@ -544,7 +544,7 @@ def handle_vulcan_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
                 f':where [#uuid "{entity_uuid}" ?a ?v]]'
             )
             try:
-                attr_result = handle_vulcan_query(attr_query)
+                attr_result = handle_minigraf_query(attr_query)
                 attr_rows = attr_result.get("results", [])
             except Exception:
                 continue
@@ -895,7 +895,7 @@ def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int)
 
 
 # System attributes written by _transact_extracted_facts alongside domain attributes.
-# They are invisible to schema validation and filtered from attr_facts in vulcan_audit.
+# They are invisible to schema validation and filtered from attr_facts in minigraf_audit.
 _SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})
 
 VULCAN_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
@@ -1055,7 +1055,7 @@ def _query_canonical_entities() -> str:
     internal UUIDs that join-variable queries would return for ?e.
     """
     try:
-        ident_result = handle_vulcan_query("[:find ?id :where [?e :ident ?id]]")
+        ident_result = handle_minigraf_query("[:find ?id :where [?e :ident ?id]]")
         ident_rows = ident_result.get("results", [])
     except Exception:
         return ""
@@ -1067,7 +1067,7 @@ def _query_canonical_entities() -> str:
         if not isinstance(kw_ident, str) or not kw_ident.startswith(":"):
             continue
         try:
-            desc_result = handle_vulcan_query(
+            desc_result = handle_minigraf_query(
                 f"[:find ?desc :where [{kw_ident} :description ?desc]]"
             )
             desc_rows = desc_result.get("results", [])
@@ -1437,7 +1437,7 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
             # Combine main fact, :entity-type tag, and :ident into one transact so
             # all triples are written atomically — a single (transact [...]) is one
             # transaction. :ident stores the keyword ident as a string value so that
-            # handle_vulcan_audit and _query_canonical_entities can surface it for
+            # handle_minigraf_audit and _query_canonical_entities can surface it for
             # display without knowing the UUID (audits retract via #uuid "..." syntax).
             if entity_type:
                 triples = (
@@ -2084,7 +2084,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _db = None
 
 
-async def handle_vulcan_ingest_git(
+async def handle_minigraf_ingest_git(
     repo_path: Optional[str] = None,
     branch: str = "HEAD",
 ) -> Dict[str, Any]:
@@ -2101,7 +2101,7 @@ async def handle_vulcan_ingest_git(
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
 
 
-def handle_vulcan_ingest_status() -> Dict[str, Any]:
+def handle_minigraf_ingest_status() -> Dict[str, Any]:
     """Return current ingestion progress, augmented with graph-backed last-run info."""
     result: Dict[str, Any] = {"ok": True, **_ingest_progress}
     if _ingest_progress["status"] != "running":
@@ -2138,7 +2138,7 @@ server = Server("temporal-reasoning")
 
 _TOOLS: List[Tool] = [
     Tool(
-        name="vulcan_query",
+        name="minigraf_query",
         description=(
             "Query Vulcan's persistent bi-temporal graph memory using Datalog. "
             "Call this BEFORE answering anything about past decisions, architecture, "
@@ -2157,7 +2157,7 @@ _TOOLS: List[Tool] = [
         },
     ),
     Tool(
-        name="vulcan_transact",
+        name="minigraf_transact",
         description=(
             "Store a durable fact in Vulcan's graph memory. Only call this for decisions, "
             "architecture, dependencies, constraints, or preferences — NOT for transient "
@@ -2185,7 +2185,7 @@ _TOOLS: List[Tool] = [
         },
     ),
     Tool(
-        name="vulcan_retract",
+        name="minigraf_retract",
         description=(
             "Retract a fact from Vulcan's graph memory. Retraction records a new fact with "
             "asserted=false — the original stays in history for bi-temporal auditing."
@@ -2206,7 +2206,7 @@ _TOOLS: List[Tool] = [
         },
     ),
     Tool(
-        name="vulcan_rule",
+        name="minigraf_rule",
         description=(
             "Register a Datalog rule for use in subsequent queries. "
             "Rules enable recursive graph traversal (e.g. ancestor, reachable). "
@@ -2228,7 +2228,7 @@ _TOOLS: List[Tool] = [
         },
     ),
     Tool(
-        name="vulcan_report_issue",
+        name="minigraf_report_issue",
         description=(
             "Report an issue with Vulcan query or transact operations. "
             "Use this when Vulcan returns errors to file a GitHub issue for tracking."
@@ -2294,7 +2294,7 @@ _TOOLS: List[Tool] = [
         },
     ),
     Tool(
-        name="vulcan_audit",
+        name="minigraf_audit",
         description=(
             "Audit all graph entities against the built-in schema. "
             "Retracts entities with schema violations (missing required attributes, "
@@ -2313,11 +2313,11 @@ _TOOLS: List[Tool] = [
         },
     ),
     Tool(
-        name="vulcan_ingest_git",
+        name="minigraf_ingest_git",
         description=(
             "Ingest code structure from git history into the bi-temporal graph. "
             "Starts a background task and returns immediately. "
-            "Call vulcan_ingest_status to poll progress."
+            "Call minigraf_ingest_status to poll progress."
         ),
         inputSchema={
             "type": "object",
@@ -2335,7 +2335,7 @@ _TOOLS: List[Tool] = [
         },
     ),
     Tool(
-        name="vulcan_ingest_status",
+        name="minigraf_ingest_status",
         description=(
             "Return the current git ingestion progress. "
             "status is one of: idle, running, complete, error."
@@ -2354,24 +2354,24 @@ async def list_tools() -> List[Tool]:
 async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
     global _db
     try:
-        if name == "vulcan_query":
-            result = handle_vulcan_query(arguments["datalog"])
+        if name == "minigraf_query":
+            result = handle_minigraf_query(arguments["datalog"])
             return [TextContent(type="text", text=json.dumps(result))]
 
-        if name == "vulcan_transact":
-            result = handle_vulcan_transact(arguments["facts"], arguments["reason"])
+        if name == "minigraf_transact":
+            result = handle_minigraf_transact(arguments["facts"], arguments["reason"])
             return [TextContent(type="text", text=json.dumps(result))]
 
-        if name == "vulcan_retract":
-            result = handle_vulcan_retract(arguments["facts"], arguments["reason"])
+        if name == "minigraf_retract":
+            result = handle_minigraf_retract(arguments["facts"], arguments["reason"])
             return [TextContent(type="text", text=json.dumps(result))]
 
-        if name == "vulcan_rule":
-            result = handle_vulcan_rule(arguments["rule"])
+        if name == "minigraf_rule":
+            result = handle_minigraf_rule(arguments["rule"])
             return [TextContent(type="text", text=json.dumps(result))]
 
-        if name == "vulcan_report_issue":
-            result = handle_vulcan_report_issue(
+        if name == "minigraf_report_issue":
+            result = handle_minigraf_report_issue(
                 arguments["issue_type"],
                 arguments["description"],
                 datalog=arguments.get("datalog"),
@@ -2387,21 +2387,21 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             result = await handle_memory_finalize_turn(arguments["conversation_delta"])
             return [TextContent(type="text", text=json.dumps(result))]
 
-        if name == "vulcan_audit":
+        if name == "minigraf_audit":
             as_of = arguments.get("as_of")
-            result = handle_vulcan_audit(as_of=as_of)
+            result = handle_minigraf_audit(as_of=as_of)
             return [TextContent(type="text", text=json.dumps(result))]
 
-        if name == "vulcan_ingest_git":
-            result = await handle_vulcan_ingest_git(
+        if name == "minigraf_ingest_git":
+            result = await handle_minigraf_ingest_git(
                 repo_path=arguments.get("repo_path"),
                 branch=arguments.get("branch", "HEAD"),
             )
             return [TextContent(type="text", text=json.dumps(result))]
 
 
-        if name == "vulcan_ingest_status":
-            result = handle_vulcan_ingest_status()
+        if name == "minigraf_ingest_status":
+            result = handle_minigraf_ingest_status()
             return [TextContent(type="text", text=json.dumps(result))]
 
         raise ValueError(f"Unknown tool: {name}")

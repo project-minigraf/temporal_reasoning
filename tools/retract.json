@@ -1,5 +1,5 @@
 {
-  "name": "vulcan_retract",
+  "name": "minigraf_retract",
   "description": "Retract a fact from Vulcan's graph memory. Retraction records a new fact with asserted=false — the original stays in history for bi-temporal auditing.",
   "parameters": {
     "type": "object",

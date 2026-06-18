@@ -1,5 +1,5 @@
 {
-  "name": "vulcan_report_issue",
+  "name": "minigraf_report_issue",
   "description": "Report an issue with Vulcan query or transact operations. Use this when Vulcan returns errors to file a GitHub issue for tracking.",
   "parameters": {
     "type": "object",

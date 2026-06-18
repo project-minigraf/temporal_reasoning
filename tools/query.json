@@ -1,5 +1,5 @@
 {
-  "name": "vulcan_query",
+  "name": "minigraf_query",
   "description": "Query Vulcan's persistent bi-temporal graph memory using Datalog. Call this BEFORE answering anything about past decisions, architecture, dependencies, or preferences. Supports :as-of for temporal queries to see what the graph contained at a past transaction time.",
   "parameters": {
     "type": "object",

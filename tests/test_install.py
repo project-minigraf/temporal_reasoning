@@ -69,8 +69,8 @@ class TestSyncLists:
     def test_mcp_server_in_files_to_sync(self):
         assert "mcp_server.py" in install.FILES_TO_SYNC
 
-    def test_vulcan_not_in_files_to_sync(self):
-        assert "vulcan.py" not in install.FILES_TO_SYNC
+    def test_minigraf_not_in_files_to_sync(self):
+        assert "minigraf.py" not in install.FILES_TO_SYNC
 
     def test_hooks_in_dirs_to_sync(self):
         assert "hooks" in install.DIRS_TO_SYNC

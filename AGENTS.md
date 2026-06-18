@@ -23,16 +23,16 @@ Persistent bi-temporal graph memory for AI coding agents. Prevents context drift
 
 | File | Purpose |
 |------|---------|
-| `vulcan.py` | Python CLI wrapper (import or run as CLI) |
-| `tools/query.json` | Tool schema for `vulcan_query` |
-| `tools/transact.json` | Tool schema for `vulcan_transact` |
+| `minigraf.py` | Python CLI wrapper (import or run as CLI) |
+| `tools/query.json` | Tool schema for `minigraf_query` |
+| `tools/transact.json` | Tool schema for `minigraf_transact` |
 | `skill.json` | Portable skill manifest |
 
 ## Usage
 
 ### As Python module:
 ```python
-from vulcan import query, transact
+from minigraf import query, transact
 
 transact("[[:decision/cache-strategy :decision/description \"use Redis\"]]",
          reason="Architecture decision for low-latency caching")
@@ -41,8 +41,8 @@ result = query("[:find ?desc :where [?e :decision/description ?desc]]")
 
 ### As CLI:
 ```bash
-python vulcan.py transact "[[:test :person/name \"Alice\"]]"
-python vulcan.py query "[:find ?name :where [:test :person/name ?name]]"
+python minigraf.py transact "[[:test :person/name \"Alice\"]]"
+python minigraf.py query "[:find ?name :where [:test :person/name ?name]]"
 ```
 
 ### With minigraf directly (REPL):

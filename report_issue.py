@@ -16,7 +16,7 @@ import logging
 import json
 from typing import Dict, Optional
 
-logger = logging.getLogger("vulcan.report_issue")
+logger = logging.getLogger("minigraf.report_issue")
 logger.addHandler(logging.NullHandler())
 
 VALID_ISSUE_TYPES = ["invalid_query", "transact_failure", "parse_error", "minigraf_bug"]
@@ -43,7 +43,7 @@ def _is_minigraf_related(description: str, error: str = "", datalog: str = "") -
     ]
 
     wrapper_indicators = [
-        "vulcan.py",
+        "minigraf.py",
         "python wrapper",
         "import error",
         "subprocess",
@@ -147,7 +147,7 @@ def report_issue(
         body_parts.append(f"\n*Auto-routed to minigraf repo based on content*")
 
     body = "\n".join(body_parts)
-    title = f"[vulcan] {issue_type}: {description[:50]}"
+    title = f"[minigraf] {issue_type}: {description[:50]}"
 
     gh_available = _check_gh_available()
 

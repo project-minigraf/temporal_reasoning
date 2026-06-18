@@ -9,7 +9,7 @@ Temporal Reasoning provides persistent bi-temporal graph memory for AI coding ag
 python install.py
 
 # Use in code
-from vulcan import query, transact
+from minigraf import query, transact
 
 transact("[[:decision/cache :decision/description \"use Redis\"]]", reason="Caching strategy")
 result = query("[:find ?d :where [?e :decision/description ?d]]")
@@ -18,7 +18,7 @@ result = query("[:find ?d :where [?e :decision/description ?d]]")
 ## Key Files
 
 - `mcp_server.py` - Persistent MCP server (primary interface)
-- `vulcan.py` - Python wrapper for direct use outside MCP
+- `minigraf.py` - Python wrapper for direct use outside MCP
 - `SKILL.md` - Skill definition with all query syntax
 - `install.py` - Setup script (runs weekly updates)
 - `hooks/claude-code.json` - Claude Code MCP + auto-memory hook config

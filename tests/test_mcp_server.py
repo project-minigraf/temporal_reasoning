@@ -88,7 +88,7 @@ class TestVulcanQuery:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
-        result = mcp_server.handle_vulcan_query("[:find ?n :where [?e :name ?n]]")
+        result = mcp_server.handle_minigraf_query("[:find ?n :where [?e :name ?n]]")
 
         db_instance.execute.assert_called_once()
         assert result["ok"] is True
@@ -100,7 +100,7 @@ class TestVulcanQuery:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.side_effect = MiniGrafError("bad datalog")
 
-        result = mcp_server.handle_vulcan_query("[:bad]")
+        result = mcp_server.handle_minigraf_query("[:bad]")
 
         assert result["ok"] is False
         assert "bad datalog" in result["error"]
@@ -112,7 +112,7 @@ class TestVulcanTransact:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        result = mcp_server.handle_vulcan_transact("[[:e :a :v]]", reason="")
+        result = mcp_server.handle_minigraf_transact("[[:e :a :v]]", reason="")
 
         assert result["ok"] is False
         assert "reason" in result["error"].lower()
@@ -124,7 +124,7 @@ class TestVulcanTransact:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
-        result = mcp_server.handle_vulcan_transact("[[:e :a :v]]", reason="test")
+        result = mcp_server.handle_minigraf_transact("[[:e :a :v]]", reason="test")
 
         # execute is called at least once for the transact (background index rebuild may
         # add an extra call; assert any transact call was made rather than assert_called_once)
@@ -138,7 +138,7 @@ class TestVulcanTransact:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.side_effect = MiniGrafError("bad facts")
 
-        result = mcp_server.handle_vulcan_transact("[[:bad]]", reason="test")
+        result = mcp_server.handle_minigraf_transact("[[:bad]]", reason="test")
 
         assert result["ok"] is False
         assert "bad facts" in result["error"]
@@ -150,7 +150,7 @@ class TestVulcanRetract:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        result = mcp_server.handle_vulcan_retract("[[:e :a :v]]", reason="")
+        result = mcp_server.handle_minigraf_retract("[[:e :a :v]]", reason="")
 
         assert result["ok"] is False
 
@@ -161,7 +161,7 @@ class TestVulcanRetract:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
-        result = mcp_server.handle_vulcan_retract("[[:e :a :v]]", reason="gone")
+        result = mcp_server.handle_minigraf_retract("[[:e :a :v]]", reason="gone")
 
         db_instance.checkpoint.assert_called_once()
         assert result["ok"] is True
@@ -172,7 +172,7 @@ class TestVulcanRetract:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.side_effect = MiniGrafError("bad retract")
 
-        result = mcp_server.handle_vulcan_retract("[[:e :a :v]]", reason="gone")
+        result = mcp_server.handle_minigraf_retract("[[:e :a :v]]", reason="gone")
 
         assert result["ok"] is False
         assert "bad retract" in result["error"]
@@ -184,7 +184,7 @@ class TestVulcanReportIssue:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         mock_module = MagicMock()
         with patch.dict("sys.modules", {"report_issue": mock_module}):
-            result = mcp_server.handle_vulcan_report_issue("bug", "something broke")
+            result = mcp_server.handle_minigraf_report_issue("bug", "something broke")
         assert result["ok"] is True
         mock_module.report_issue.assert_called_once_with(
             "bug", "something broke", datalog=None, error=None
@@ -194,7 +194,7 @@ class TestVulcanReportIssue:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
         with patch.dict("sys.modules", {"report_issue": None}):
-            result = mcp_server.handle_vulcan_report_issue("bug", "something broke")
+            result = mcp_server.handle_minigraf_report_issue("bug", "something broke")
         assert result["ok"] is False
 
 
@@ -511,12 +511,12 @@ class TestMcpToolWiring:
         assert len(tools) == 10
         names = {t.name for t in tools}
         assert names == {
-            "vulcan_query", "vulcan_transact", "vulcan_retract",
-            "vulcan_rule", "vulcan_report_issue", "memory_prepare_turn", "memory_finalize_turn",
-            "vulcan_audit", "vulcan_ingest_git", "vulcan_ingest_status",
+            "minigraf_query", "minigraf_transact", "minigraf_retract",
+            "minigraf_rule", "minigraf_report_issue", "memory_prepare_turn", "memory_finalize_turn",
+            "minigraf_audit", "minigraf_ingest_git", "minigraf_ingest_status",
         }
 
-    def test_call_tool_vulcan_query(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_minigraf_query(self, mock_minigraf_db, tmp_path):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": [["FastAPI"]]})
@@ -525,7 +525,7 @@ class TestMcpToolWiring:
         db_instance.execute.reset_mock()
 
         result = asyncio.run(mcp_server.call_tool(
-            "vulcan_query", {"datalog": "[:find ?n :where [?e :name ?n]]"}
+            "minigraf_query", {"datalog": "[:find ?n :where [?e :name ?n]]"}
         ))
 
         assert len(result) == 1
@@ -533,7 +533,7 @@ class TestMcpToolWiring:
         assert data["ok"] is True
         assert data["results"] == [["FastAPI"]]
 
-    def test_call_tool_vulcan_transact(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_minigraf_transact(self, mock_minigraf_db, tmp_path):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"tx": "10"})
@@ -542,7 +542,7 @@ class TestMcpToolWiring:
         db_instance.execute.reset_mock()
 
         result = asyncio.run(mcp_server.call_tool(
-            "vulcan_transact",
+            "minigraf_transact",
             {"facts": '[[:decision/cache :description "Redis"]]', "reason": "caching strategy"},
         ))
 
@@ -579,7 +579,7 @@ class TestMcpToolWiring:
         data = json.loads(result[0].text)
         assert data["ok"] is True
 
-    def test_call_tool_vulcan_retract(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_minigraf_retract(self, mock_minigraf_db, tmp_path):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"tx": "12"})
@@ -588,7 +588,7 @@ class TestMcpToolWiring:
         db_instance.execute.reset_mock()
 
         result = asyncio.run(mcp_server.call_tool(
-            "vulcan_retract",
+            "minigraf_retract",
             {"facts": '[[:decision/cache :description "Redis"]]', "reason": "no longer needed"},
         ))
 
@@ -604,7 +604,7 @@ class TestMcpToolWiring:
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         asyncio.run(mcp_server.call_tool(
-            "vulcan_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
+            "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
         ))
 
         assert mcp_server._db is None, "lock must be released after call_tool so prepare_hook can open the DB"
@@ -851,7 +851,7 @@ class TestVulcanTransactSchema:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        result = mcp_server.handle_vulcan_transact(
+        result = mcp_server.handle_minigraf_transact(
             '[[:service/auth :description "auth service"]]',
             reason="test"
         )
@@ -865,7 +865,7 @@ class TestVulcanTransactSchema:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        result = mcp_server.handle_vulcan_transact(
+        result = mcp_server.handle_minigraf_transact(
             '[[:decision/redis :description "use Redis"]]',
             reason="test"
         )
@@ -879,7 +879,7 @@ class TestVulcanTransactSchema:
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
         # Keyword-only triple (no quoted string values) — not schema-validated by design
-        result = mcp_server.handle_vulcan_transact(
+        result = mcp_server.handle_minigraf_transact(
             '[[:service/auth :calls :component/jwt]]',
             reason="test relationship edge"
         )
@@ -972,7 +972,7 @@ class TestVulcanAudit:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        result = mcp_server.handle_vulcan_audit()
+        result = mcp_server.handle_minigraf_audit()
 
         assert result["ok"] is True
         assert result["retracted"] == 0
@@ -983,7 +983,7 @@ class TestVulcanAudit:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        # handle_vulcan_audit uses type query → UUID, then #uuid attr query.
+        # handle_minigraf_audit uses type query → UUID, then #uuid attr query.
         # Step 1: type query for "decision" returns UUID.
         # Step 2: attr query using #uuid tagged literal returns all attributes.
         # Entity has :ident + :entity-type (system) + :rationale (domain).
@@ -1000,7 +1000,7 @@ class TestVulcanAudit:
             json.dumps({"tx": "10"}),                  # retract call
         ] + [json.dumps({"results": []})] * 10         # remaining type queries
 
-        result = mcp_server.handle_vulcan_audit()
+        result = mcp_server.handle_minigraf_audit()
 
         assert result["ok"] is True
         assert result["retracted"] == 1
@@ -1029,7 +1029,7 @@ class TestVulcanAudit:
             ]}),
         ] + [json.dumps({"results": []})] * 10
 
-        result = mcp_server.handle_vulcan_audit(as_of=5)
+        result = mcp_server.handle_minigraf_audit(as_of=5)
 
         assert result["ok"] is True
         assert result["retracted"] == 0  # read-only when as_of provided
@@ -1052,7 +1052,7 @@ class TestVulcanAudit:
             json.dumps({"tx": "10"}),
         ] + [json.dumps({"results": []})] * 10
 
-        result = mcp_server.handle_vulcan_audit()
+        result = mcp_server.handle_minigraf_audit()
 
         assert result["retracted"] == 1
         assert result["violations"][0]["entity"] == kw  # keyword ident in report
@@ -1069,7 +1069,7 @@ class TestVulcanAudit:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        result = mcp_server.handle_vulcan_audit()
+        result = mcp_server.handle_minigraf_audit()
 
         assert "ok" in result
         assert "audited" in result
@@ -1233,7 +1233,7 @@ class TestVulcanIngestStatus:
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        result = mcp_server.handle_vulcan_ingest_status()
+        result = mcp_server.handle_minigraf_ingest_status()
         assert result["ok"] is True
         assert result["status"] == "idle"
         assert result["processed"] == 0
@@ -1254,7 +1254,7 @@ class TestVulcanIngestStatus:
                 return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
             return json.dumps({"results": []})
         db_instance.execute.side_effect = execute_side_effect
-        result = mcp_server.handle_vulcan_ingest_status()
+        result = mcp_server.handle_minigraf_ingest_status()
         assert result["last_run_at"] == "2026-05-27T10:00:00Z"
         assert result["last_commit"] == "deadbeef"
 
@@ -1267,7 +1267,7 @@ class TestVulcanIngestStatus:
             "current_commit": "abc123", "error": None,
         }
         db_instance.execute.reset_mock()
-        result = mcp_server.handle_vulcan_ingest_status()
+        result = mcp_server.handle_minigraf_ingest_status()
         assert result["status"] == "running"
         assert result["processed"] == 3
         assert result["total"] == 10
@@ -1290,7 +1290,7 @@ class TestVulcanIngestStatus:
                 return json.dumps({"results": [[1017]]})
             return json.dumps({"results": []})
         db_instance.execute.side_effect = execute_side_effect
-        result = mcp_server.handle_vulcan_ingest_status()
+        result = mcp_server.handle_minigraf_ingest_status()
         assert result["total_ingested"] == 1017
 
     def test_total_ingested_absent_returns_none(self, mock_minigraf_db, tmp_path):
@@ -1302,7 +1302,7 @@ class TestVulcanIngestStatus:
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        result = mcp_server.handle_vulcan_ingest_status()
+        result = mcp_server.handle_minigraf_ingest_status()
         assert result["total_ingested"] is None
 
 
@@ -1674,7 +1674,7 @@ class TestRunIngestion:
         assert all(db_none_snapshots), f"_db was not None at yield: {db_none_snapshots}"
 
     @pytest.mark.asyncio
-    async def test_handle_vulcan_ingest_git_returns_immediately(self, mock_minigraf_db, git_repo):
+    async def test_handle_minigraf_ingest_git_returns_immediately(self, mock_minigraf_db, git_repo):
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
@@ -1683,7 +1683,7 @@ class TestRunIngestion:
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        result = await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is True
         assert "job_id" in result
 
@@ -1697,8 +1697,8 @@ class TestRunIngestion:
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
-        result = await mcp_server.handle_vulcan_ingest_git(repo_path=str(git_repo))
+        await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is False
         assert "already in progress" in result["error"]
 
@@ -1867,7 +1867,7 @@ class TestIndexCacheInvalidation:
         db_instance.execute.return_value = json.dumps({"tx_id": 1, "count": 1})
         mcp_server.open_db(str(tmp_path / "t.graph"))
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_vulcan_transact(
+            mcp_server.handle_minigraf_transact(
                 '[[:decision/test :description "test"]]', reason="test"
             )
             mock_inv.assert_called_once()
@@ -1880,7 +1880,7 @@ class TestIndexCacheInvalidation:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.side_effect = MiniGrafError("bad tx")
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_vulcan_transact(
+            mcp_server.handle_minigraf_transact(
                 '[[:decision/test :description "test"]]', reason="test"
             )
             mock_inv.assert_not_called()
@@ -1892,7 +1892,7 @@ class TestIndexCacheInvalidation:
         db_instance.execute.return_value = json.dumps({"tx_id": 2, "count": 1})
         mcp_server.open_db(str(tmp_path / "t.graph"))
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_vulcan_retract(
+            mcp_server.handle_minigraf_retract(
                 '[[:decision/test :description "test"]]', reason="cleanup"
             )
             mock_inv.assert_called_once()
@@ -1905,7 +1905,7 @@ class TestIndexCacheInvalidation:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.side_effect = MiniGrafError("bad retract")
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_vulcan_retract(
+            mcp_server.handle_minigraf_retract(
                 '[[:decision/test :description "test"]]', reason="cleanup"
             )
             mock_inv.assert_not_called()

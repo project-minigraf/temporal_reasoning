@@ -1,5 +1,5 @@
 {
-  "name": "vulcan_transact",
+  "name": "minigraf_transact",
   "description": "Store a durable fact in Vulcan's graph memory. Only call this for decisions, architecture, dependencies, constraints, or preferences — NOT for transient observations or intermediate reasoning.",
   "parameters": {
     "type": "object",

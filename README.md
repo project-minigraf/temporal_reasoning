@@ -67,7 +67,7 @@ query("[:find ?name :where [:project/db :name ?name]]")
 │                 (Claude Code, OpenCode, Codex)                   │
 └──────────┬───────────────────────────────────────┬───────────────┘
            │ MCP tool calls                        │ per-turn hooks
-           │ (vulcan_query, vulcan_transact, …)    │ (UserPromptSubmit / Stop)
+           │ (minigraf_query, minigraf_transact, …)    │ (UserPromptSubmit / Stop)
            ▼                                       ▼
 ┌──────────────────────────┐         ┌─────────────────────────────┐
 │   MCP Server             │         │   Hook scripts              │
@@ -141,7 +141,7 @@ This syncs the skill into `.opencode/skills/temporal-reasoning`.
 ## Quick Start
 
 ```python
-from vulcan import query, transact
+from minigraf import query, transact
 
 # Store a decision
 transact("[[:decision/cache-strategy :decision/description \"use Redis\"]]", 
@@ -198,7 +198,7 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 | File | Purpose |
 |------|---------|
 | `mcp_server.py` | Persistent stdio MCP server — primary interface to the graph |
-| `vulcan.py` | Python CLI wrapper (direct use outside MCP) |
+| `minigraf.py` | Python CLI wrapper (direct use outside MCP) |
 | `hooks/prepare_hook.py` | Claude Code UserPromptSubmit hook — injects memory context |
 | `hooks/ingest_hook.py` | Claude Code UserPromptSubmit hook — triggers background git ingestion |
 | `hooks/finalize_hook.py` | Claude Code Stop hook — extracts and stores facts |
@@ -210,15 +210,15 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 
 ## Tools
 
-- **vulcan_query** — Query memory with Datalog
-- **vulcan_transact** — Store facts (reason required)
-- **vulcan_retract** — Retract facts (original stays in history)
-- **vulcan_report_issue** — File GitHub issues
+- **minigraf_query** — Query memory with Datalog
+- **minigraf_transact** — Store facts (reason required)
+- **minigraf_retract** — Retract facts (original stays in history)
+- **minigraf_report_issue** — File GitHub issues
 - **memory_prepare_turn** — Retrieve relevant context for the current user message
 - **memory_finalize_turn** — Extract and store memorable facts after a turn
-- **vulcan_audit** — Audit all entities against the schema; retracts violators (history preserved)
-- **vulcan_ingest_git** — Ingest code structure from git history into the bi-temporal graph (background task)
-- **vulcan_ingest_status** — Poll progress of a running git ingestion; reports wall-clock time and final commit hash of the last completed run (including hook-driven ingestion)
+- **minigraf_audit** — Audit all entities against the schema; retracts violators (history preserved)
+- **minigraf_ingest_git** — Ingest code structure from git history into the bi-temporal graph (background task)
+- **minigraf_ingest_status** — Poll progress of a running git ingestion; reports wall-clock time and final commit hash of the last completed run (including hook-driven ingestion)
 
 ## Query Examples
 
@@ -273,6 +273,6 @@ See [`evals/benchmark.md`](evals/benchmark.md) for full results and per-eval bre
 - **Phase 1** — Python skill layer ✓
 - **Phase 2** — Write policy, report_issue, install, skill benchmarks ✓
 - **Phase 3** — MCP server, per-turn auto-memory hooks ✓
-- **Phase 4** — Entity normalization, schema-aware extraction, vulcan_audit ✓
-- **Phase 5** — Code structure ingestion from git history, vulcan_ingest_git ✓
+- **Phase 4** — Entity normalization, schema-aware extraction, minigraf_audit ✓
+- **Phase 5** — Code structure ingestion from git history, minigraf_ingest_git ✓
 - **Phase 6** — Observability and trust for automatic memory (planned)

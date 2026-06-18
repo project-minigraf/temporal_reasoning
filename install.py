@@ -310,7 +310,7 @@ def setup_claude_settings_json(target_dir: str) -> bool:
 
     # enabledPlugins
     plugins = existing.setdefault("enabledPlugins", {})
-    plugins["vulcan@temporal-reasoning-local"] = True
+    plugins["minigraf@temporal-reasoning-local"] = True
 
     # extraKnownMarketplaces
     marketplaces = existing.setdefault("extraKnownMarketplaces", {})
@@ -340,7 +340,7 @@ def setup_claude_settings_json(target_dir: str) -> bool:
 
     verb = "Updated" if file_existed else "Created"
     print(f"✓ {verb} {settings_path}")
-    print(f"    enabledPlugins.vulcan@temporal-reasoning-local = true")
+    print(f"    enabledPlugins.minigraf@temporal-reasoning-local = true")
     print(f"    extraKnownMarketplaces.temporal-reasoning-local → {REPO_DIR}")
     print(f"    enabledMcpjsonServers += temporal-reasoning")
     return True

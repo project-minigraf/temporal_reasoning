@@ -19,7 +19,7 @@
 | Item | Description | Status |
 |------|-------------|--------|
 | Persistent MCP server | `mcp_server.py` — replaces CLI wrapper; single-process, stdio, minigraf Python binding | Complete ✓ |
-| 6 MCP tools | `vulcan_query`, `vulcan_transact`, `vulcan_retract`, `vulcan_report_issue`, `memory_prepare_turn`, `memory_finalize_turn` | Complete ✓ |
+| 6 MCP tools | `minigraf_query`, `minigraf_transact`, `minigraf_retract`, `minigraf_report_issue`, `memory_prepare_turn`, `memory_finalize_turn` | Complete ✓ |
 | Auto-memory hooks (Claude Code) | `UserPromptSubmit` injects context; `Stop` hook extracts facts — `hooks/prepare_hook.py`, `hooks/finalize_hook.py` | Complete ✓ |
 | Hook config templates | `hooks/claude-code.json`, `hooks/codex.toml`, `hooks/hermes.yaml`, `hooks/opencode.json` (degraded), `hooks/openclaw.json` (degraded) | Complete ✓ |
 | Heuristic extraction | Regex-based signal detection; zero API calls; no configuration required | Complete ✓ |
@@ -38,11 +38,11 @@
 | Item | Description | Status |
 |------|-------------|--------|
 | Slug canonicalization | `_canonical_ident` + `_keyword_uuid`; heuristic extractor updated | Complete ✓ |
-| Closed-world schema | `VULCAN_SCHEMA` (4 entity types) + `_validate_facts`; pre-transact enforcement in extraction pipeline and `handle_vulcan_transact` | Complete ✓ |
+| Closed-world schema | `VULCAN_SCHEMA` (4 entity types) + `_validate_facts`; pre-transact enforcement in extraction pipeline and `handle_minigraf_transact` | Complete ✓ |
 | Alias datoms | `:alias` declared as optional attribute on all entity types | Complete ✓ |
 | Schema-aware prompts | `_query_canonical_entities` injects existing idents into LLM and agent extraction prompts | Complete ✓ |
-| `vulcan_audit` | 7th MCP tool; audits all entities against schema, retracts violators (bi-temporal — history preserved) | Complete ✓ |
-| Entity Resolution section | `SKILL.md` updated with resolution guidance and `vulcan_audit` instructions | Complete ✓ |
+| `minigraf_audit` | 7th MCP tool; audits all entities against schema, retracts violators (bi-temporal — history preserved) | Complete ✓ |
+| Entity Resolution section | `SKILL.md` updated with resolution guidance and `minigraf_audit` instructions | Complete ✓ |
 
 ## Phase 5 (Complete ✓) — Code Structure Evolution from Git History
 
@@ -115,7 +115,7 @@ For a local single-user developer tool (the current Phase 5 target), stored data
 
 - **Port Datalog grammar additions from minigraf 1.2.0 into `SKILL.md`** — minigraf#288 and its child issue #289 are fixed and will land in v1.2.0. That release adds two new Datalog query sections (`max-derived-facts-section` and `max-results-section`) that make the `ancestor` recursive rule usable on real repos. The inline Datalog reference in `SKILL.md` must be updated to document these sections once 1.2.0 is published. **Blocked on minigraf 1.2.0 release; no action until then.**
 
-- `vulcan_ingest_docs` (experiment) — ingest plain text/markdown files from git history using the existing heuristic/llm/agent extraction strategies, with commit timestamps as `:valid-from`. Enables backdated decision entities from committed ADRs and design docs. Risk: duplication against conversation-extracted entities; quality depends on extraction strategy. Spec before building.
+- `minigraf_ingest_docs` (experiment) — ingest plain text/markdown files from git history using the existing heuristic/llm/agent extraction strategies, with commit timestamps as `:valid-from`. Enables backdated decision entities from committed ADRs and design docs. Risk: duplication against conversation-extracted entities; quality depends on extraction strategy. Spec before building.
 - WASM bindings (browser + edge) — no spec or concrete driver yet
 - Mobile embedding — no spec or concrete driver yet
 - Vector store / embedding-based disambiguation — add only when at least two of: (a) entity volume exceeds prompt injection limits, (b) cross-session resolution fails on canonical lookup, (c) free-text search is explicitly requested. Preferred shape: embedded co-located index (`sqlite-vec` or `lancedb`), not a separate service.
