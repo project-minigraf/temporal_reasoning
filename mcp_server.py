@@ -217,6 +217,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "imports": {"import_declaration"},
         "calls": {"call_expression"},
     },
+    "haskell": {
+        "functions": {"function"},
+        "classes": {"data_type"},
+        "imports": {"import"},
+        "calls": {"apply"},
+    },
 }
 
 
@@ -436,6 +442,12 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
             txt = child.text.decode("utf-8")
             names.append(txt.split(".")[0])
             break
+    elif lang_name == "haskell":
+        for child in node.named_children:
+            if child.type in ("module", "qualified_module", "constructor"):
+                txt = child.text.decode("utf-8")
+                names.append(txt.split(".")[0])
+                break
     return names
 
 
