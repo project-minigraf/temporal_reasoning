@@ -211,6 +211,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "imports": {"import_declaration"},
         "calls": {"call_expression"},
     },
+    "scala": {
+        "functions": {"function_definition"},
+        "classes": {"class_definition"},
+        "imports": {"import_declaration"},
+        "calls": {"call_expression"},
+    },
 }
 
 
@@ -425,6 +431,11 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
             if child.type in ("identifier", "simple_identifier"):
                 names.append(child.text.decode("utf-8"))
                 break
+    elif lang_name == "scala":
+        for child in node.named_children:
+            txt = child.text.decode("utf-8")
+            names.append(txt.split(".")[0])
+            break
     return names
 
 

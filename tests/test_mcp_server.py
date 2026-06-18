@@ -2559,3 +2559,11 @@ class TestExtractImportName:
         node = _parse_import_node("swift", source, "import_declaration", tmp_path)
         result = mcp_server._extract_import_name(node, "swift")
         assert result == ["Foundation"]
+
+    def test_scala_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_scala")
+        import mcp_server
+        source = b'import scala.collection.mutable'
+        node = _parse_import_node("scala", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "scala")
+        assert result == ["scala"]
