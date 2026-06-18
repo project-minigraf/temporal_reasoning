@@ -1,11 +1,50 @@
 # Skill Benchmark: temporal-reasoning
 
-**Date**: 2026-06-03  
+**Date**: 2026-06-18  
 **Model**: claude-sonnet-4-6  
-**Iterations**: 5 (iteration-1 baseline → iteration-2 hardened evals → iteration-3 graph capabilities → iteration-4 ingestion + hooks → iteration-5 all 12 evals re-run with fixed assertions)  
-**Tests**: 142 passing
+**Iterations**: 6 (iteration-1 baseline → iteration-2 hardened evals → iteration-3 graph capabilities → iteration-4 ingestion + hooks → iteration-5 all 12 evals re-run with fixed assertions → iteration-6 minigraf rebrand + eval fixes + product bug fix)  
+**Tests**: 188 passing
 
 ## Summary
+
+### Iteration-6 (all 12 evals)
+
+| Metric | With Skill | Without Skill | Delta |
+|--------|-----------|---------------|-------|
+| Pass Rate | **92%** (54/59 assertions) | **24%** (14/59) | **+0.68** |
+
+**Per-eval pass rates (iteration-6):**
+
+| Eval | With Skill | Without Skill | Notes |
+|------|-----------|---------------|-------|
+| 1 — decision-storage | 5/5 (100%) | 0/5 (0%) | Clean |
+| 2 — memory-retrieval | 5/5 (100%) | 0/5 (0%) | Clean |
+| 3 — preference-enforcement | 4/4 (100%) | 0/4 (0%) | Clean |
+| 4 — conflict-detection | 4/4 (100%) | 0/4 (0%) | Clean |
+| 5 — entity-ref-storage | 5/5 (100%) | 0/5 (0%) | Clean; `:project/` namespace assertion rewritten — now passes |
+| 6 — transitive-impact | 5/5 (100%) | 0/5 (0%) | Clean |
+| 7 — decision-traceability | 5/5 (100%) | 2/5 (40%) | Without-skill found seed data via filesystem; named GIL correctly but not from graph |
+| 8 — git-ingestion | 4/6 (67%) | 2/6 (33%) | Status returned `complete` not `idle`; E3/E4 failed (Claude skipped fresh ingest) |
+| 9 — ingest-status | 3/5 (60%) | 3/5 (60%) | Live server returned `complete` — idle-branch assertions unreachable; see note |
+| 10 — memory-prepare-turn | 5/5 (100%) | 0/5 (0%) | Without-skill answered "MCP framework" (confident wrong answer from codebase) |
+| 11 — audit | 4/5 (80%) | 4/5 (80%) | Without-skill discovered audit via ToolSearch — passed 4/5 but also destroyed 259 entities |
+| 12 — already-running | 5/5 (100%) | 3/5 (60%) | SETUP succeeded; without-skill re-triggered ingest despite `complete` status |
+
+**Iteration-6 changes from iteration-5:**
+- Rebrand: all `vulcan_*` references updated to `minigraf_*` in evals.json and validate_evals.py
+- Eval 1: removed assertion 6 (non-existent three-part naming convention)
+- Eval 5: rewrote assertion 2 (keyword ident test, not specific `:project/` namespace)
+- Eval 8: added assertion 6 (error-surfacing behavior when tool denied/fails)
+- Eval 9: redesigned to test idle-branch behavior (all 5 assertions now apply to `idle` state)
+- Eval 12: fixed SETUP prompt; sandbox allowed `minigraf_ingest_git` this iteration
+- mcp_server.py: `handle_minigraf_ingest_git` now validates repo with `git rev-parse` before starting — returns `ok: false` on invalid repo/git failure
+- mcp_server.py: `MINIGRAF_SCHEMA` `:commit` type now includes `:parent` — audit no longer falsely flags commit parent edges
+- New test: `test_returns_error_for_invalid_repo` (total: 188 tests)
+
+**Infrastructure issues discovered in iteration-6:**
+- **Eval 9 seed/live mismatch**: The live MCP server's ingest had completed (from earlier in the same session), so both with_skill and without_skill saw `status: complete` rather than the expected `idle` seed. Idle-branch assertions 4 and 5 were unreachable. This is an eval-isolation gap — evals 8, 9, and 12 share ingest state with the live server.
+- **Eval 11 without_skill destructive audit**: The without_skill agent discovered `minigraf_audit` via ToolSearch and ran it with retractions enabled. It deleted 259 entities (primarily ~240 commit entities whose `:parent` edges were flagged as unknown by the schema — now fixed). This is a real data-loss event caused by eval-infrastructure isolation failure. Re-ingestion restored the data; schema was patched.
+- **ToolSearch contamination**: Without_skill agents use ToolSearch to discover MCP tools, making the without_skill baseline less clean. Eval 11 without_skill got 4/5 this way. The without_skill baseline measures "Claude without skill guidance" not "Claude without MCP tools."
 
 ### Iteration-5 (all 12 evals)
 
@@ -36,10 +75,14 @@
 
 | Iteration | With Skill | Without Skill | Delta |
 |-----------|-----------|---------------|-------|
+| iteration-6 (all 12 evals) | **92%** (54/59) | **24%** (14/59) | **+0.68** |
+| iteration-5 (all 12 evals) | 85% ± 24% (46/54) | 0% (0/54) | +0.85 |
 | iteration-3 (evals 1–7) | 100% (34/34) | 0% (0/34) | +1.00 |
 | iteration-4 (evals 8–11) | 100% (20/20) | 10% (2/20)* | +0.90 |
 
 *iteration-4 without-skill passes were vacuous (negative-only assertions passing when agent calls nothing) — fixed in iteration-5.
+
+**Why the delta shrank from +0.85 to +0.68**: Two factors. First, without-skill agents now use ToolSearch to discover MCP tools, raising the without-skill baseline from 0% to 24%. Second, the live-server ingest state contaminated evals 8, 9, and 12 — the idle-branch assertions for eval 9 were unreachable. The with-skill score also rose from 85% to 92% (fixed assertions, plus eval 12 SETUP now succeeds).
 
 ## Evals
 
@@ -202,15 +245,19 @@
 
 ## Observations
 
-- **Eval 3 is the most discriminating for memory recall**: it tests cross-session retrieval of an *implicit* constraint — the prompt gives no hint that a relevant preference exists. Only memory makes it visible.
-- **Eval 4 demonstrates harm prevention**: the baseline isn't merely unhelpful, it's actively dangerous — silently overriding an architectural decision with no flag.
-- **Eval 6 is the most discriminating for graph traversal**: the baseline correctly identified it lacked context rather than hallucinating. The gap is structural — without a stored graph, no traversal is possible regardless of model capability. The with-skill agent also surfaced a 3-hop result (api-gateway) beyond the minimum assertion scope.
-- **Eval 10 without-skill produced the strongest failure mode**: the agent gave a confident, wrong answer ("MCP framework") backed by real code evidence from `mcp_server.py`. This is worse than refusing — actively misleading with a plausible-sounding source.
-- **Eval 8 has a quality gap not caught by assertions**: `vulcan_ingest_git` was sandbox-denied, yet the agent told the user "Ingestion is running." All 5 behavioral assertions passed. A tool-error-handling assertion is needed.
-- **Eval 9 assertions 3/4 are mutually exclusive conditionals**: both test unreachable branches when status is `idle`. These should be separate eval scenarios with `running` and `complete` seeds.
-- **Eval 12 cannot be tested with a live SETUP call**: the sandboxed evaluator blocks `vulcan_ingest_git`. Requires test-fixture seeding of ingestion state.
-- **Eval 11 unintentionally tested real schema violations**: the seed data used disallowed attributes (`:database`, `:ttl`, `:framework`). The with-skill agent found and retracted them — an unplanned fidelity test that the skill passed correctly.
-- **Schema does not allow `:project/` namespace**: agents attempting to use it (as SKILL.md examples show) get rejected and fall back to `:module/`. Eval 5 assertion 2 should be rewritten to test keyword-vs-string, not a specific namespace prefix.
-- **Eval 1 assertion 6 tests a non-existent naming convention**: "three-part :namespace/entity-name/attribute" is not a schema requirement. Attribute names are flat single-segment (`:description`, `:rationale`). This assertion should be removed.
+### Iteration-6 findings
+
+- **Eval 10 without-skill: confident wrong answer confirmed (both iterations)**: Without the skill, the agent answered "MCP framework" based on `mcp_server.py` code evidence. This is the benchmark's strongest failure mode — actively misleading with a plausible source, worse than refusing.
+- **ToolSearch contamination of without-skill baseline**: Without-skill agents in iteration-6 discovered MCP tools via ToolSearch, making the without-skill baseline 24% rather than 0%. This inflates apparent without-skill competence. The without-skill baseline now measures "Claude without skill *guidance*" not "Claude without MCP tool *access*." Eval 11 without-skill got 4/5 this way — and caused real data loss.
+- **Eval 11 without-skill caused destructive data loss (iteration-6)**: The without-skill agent discovered `minigraf_audit` via ToolSearch and ran it against the live project graph. It retracted 259 entities (primarily commit entities whose `:parent` edges were incorrectly flagged as schema violations). Root cause: MINIGRAF_SCHEMA `:commit` type was missing the `:parent` attribute. **Both problems are now fixed**: schema patched, data re-ingested, 249 commit entities restored.
+- **Eval 9 requires eval-environment isolation**: The live MCP server returned `complete` (from earlier in-session ingestion) rather than the `idle` seed state. Both variants got 3/5. The idle-branch assertions (E4, E5) were unreachable. Evals 8, 9, and 12 all share ingest state with the live server — a critical eval infrastructure gap.
+- **Eval 12 SETUP succeeded in iteration-6**: The sandbox allowed `minigraf_ingest_git`, establishing the "already running" precondition. With-skill got 5/5. Without-skill checked status first (good) but re-triggered ingest despite `complete` status — 3/5.
+- **New product fix (iteration-6)**: `handle_minigraf_ingest_git` previously returned `ok: True` before validating the repo. Now validates with `git rev-parse --git-dir` and returns `ok: False` with an explicit error on invalid repos or missing git. Test coverage added (188 total tests).
+
+### Persistent observations (all iterations)
+
+- **Eval 3 is the most discriminating for memory recall**: tests cross-session retrieval of an *implicit* constraint — the prompt gives no hint a relevant preference exists. Only memory makes it visible.
+- **Eval 4 demonstrates harm prevention**: the baseline silently overrides an architectural decision with no flag. Without memory, architectural consistency can be broken in a single prompt.
+- **Eval 6 is the most discriminating for graph traversal**: the gap is structural — without a stored graph, no traversal is possible regardless of model capability.
 - **Recursive rules are not supported** (base-case only). Fixed-depth transitive queries use explicit multi-hop joins. Rules are useful for unifying multiple edge types under a single named relation.
-- **Environmental discovery (iteration-4, confirmed iteration-5)**: hooks (`UserPromptSubmit`) do not fire in the subagent benchmark environment. Evals that depend on hook-injected state (evals 8, 12) must use test fixtures instead.
+- **Environmental discovery (iteration-4+)**: hooks (`UserPromptSubmit`) do not fire in the subagent benchmark environment. Evals that depend on hook-injected state must use test fixtures instead.

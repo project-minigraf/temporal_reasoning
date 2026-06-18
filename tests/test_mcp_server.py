@@ -1703,6 +1703,14 @@ class TestRunIngestion:
         assert "already in progress" in result["error"]
 
     @pytest.mark.asyncio
+    async def test_returns_error_for_invalid_repo(self, mock_minigraf_db):
+        import mcp_server
+        mcp_server._ingest_task = None
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path="/nonexistent/path")
+        assert result["ok"] is False
+        assert "Not a git repository" in result["error"]
+
+    @pytest.mark.asyncio
     async def test_processed_seeded_from_prior_ingested(self, mock_minigraf_db, git_repo, monkeypatch):
         """processed starts at prior_ingested and increments cumulatively."""
         mock_class, db_instance = mock_minigraf_db

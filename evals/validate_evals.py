@@ -5,7 +5,7 @@ Checks:
   - Valid JSON with required top-level keys
   - Each eval has id, prompt, expected_output, files, expectations
   - eval ids are sequential starting from 1
-  - No stale tool names (e.g. minigraf_transact, minigraf_query)
+  - No stale tool names (e.g. vulcan_transact, vulcan_query)
   - All tool names referenced in expectations/expected_output are registered tools
 """
 
@@ -16,22 +16,25 @@ from pathlib import Path
 EVALS_PATH = Path(__file__).parent / "evals.json"
 
 KNOWN_TOOLS = {
-    "vulcan_query",
-    "vulcan_transact",
-    "vulcan_retract",
-    "vulcan_audit",
-    "vulcan_ingest_git",
-    "vulcan_ingest_status",
-    "vulcan_report_issue",
+    "minigraf_query",
+    "minigraf_transact",
+    "minigraf_retract",
+    "minigraf_audit",
+    "minigraf_ingest_git",
+    "minigraf_ingest_status",
+    "minigraf_report_issue",
     "memory_prepare_turn",
     "memory_finalize_turn",
 }
 
 STALE_TOOL_NAMES = {
-    "minigraf_transact",
-    "minigraf_query",
-    "minigraf_retract",
-    "minigraf_audit",
+    "vulcan_transact",
+    "vulcan_query",
+    "vulcan_retract",
+    "vulcan_audit",
+    "vulcan_ingest_git",
+    "vulcan_ingest_status",
+    "vulcan_report_issue",
 }
 
 REQUIRED_EVAL_KEYS = {"id", "prompt", "expected_output", "files", "expectations"}
@@ -77,7 +80,7 @@ def validate():
 
         for stale in STALE_TOOL_NAMES:
             if stale in all_text:
-                errors.append(f"{prefix}: stale tool name '{stale}' found — rename to vulcan_* equivalent")
+                errors.append(f"{prefix}: stale tool name '{stale}' found — rename to minigraf_* equivalent")
 
         referenced_tools = [t for t in KNOWN_TOOLS | STALE_TOOL_NAMES if t in all_text]
         unknown = [t for t in referenced_tools if t not in KNOWN_TOOLS]

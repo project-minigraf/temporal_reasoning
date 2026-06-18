@@ -945,7 +945,11 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
     },
     "commit": {
         "required": {":description": str},
-        "optional": {":hash": str, ":author": str, ":subject": str, ":date": str, ":alias": str},
+        "optional": {
+            ":hash": str, ":author": str, ":subject": str, ":date": str, ":alias": str,
+            # parent commit reference (keyword-valued edge, stored as string)
+            ":parent": str,
+        },
     },
 }
 
@@ -2093,6 +2097,19 @@ async def handle_minigraf_ingest_git(
     if _ingest_task and not _ingest_task.done():
         return {"ok": False, "error": "ingestion already in progress"}
     repo = repo_path or str(Path.cwd())
+    try:
+        check = _subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        valid = check.returncode == 0
+    except OSError:
+        valid = False
+    if not valid:
+        return {
+            "ok": False,
+            "error": f"Not a git repository (or git not found): {repo}",
+        }
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0,
         "current_commit": "", "error": None,

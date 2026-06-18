@@ -4,15 +4,14 @@
     {
       "id": 1,
       "prompt": "Hey, we've finalized the stack for our new service. We're going with PostgreSQL 15 as the primary database — we need strong JSON support and ACID compliance, and we're OK trading some write throughput for that. The auth service will cache session tokens in Redis with a 24-hour TTL. One more thing: the API layer will be FastAPI, not Flask, because of the async support.",
-      "expected_output": "Claude stores all 3 decisions (PostgreSQL, Redis, FastAPI) using vulcan_transact with proper three-part attribute naming and meaningful reasons.",
+      "expected_output": "Claude stores all 3 decisions (PostgreSQL, Redis, FastAPI) using minigraf_transact with proper attribute naming and meaningful reasons.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_transact at least once",
+        "Claude calls minigraf_transact at least once",
         "PostgreSQL or database choice is stored as a fact",
         "Redis caching or session token TTL is stored as a fact",
         "FastAPI or API framework decision is stored as a fact",
-        "Each transact call includes a non-empty reason parameter",
-        "Stored attributes use the three-part :namespace/entity-name/attribute naming convention"
+        "Each transact call includes a non-empty reason parameter"
       ]
     },
     {
@@ -21,7 +20,7 @@
       "expected_output": "Memory is pre-populated with PostgreSQL 15, Redis (24h TTL), and FastAPI decisions. Claude must query memory first, then cite the specific stored facts in its answer.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_query before providing any answer",
+        "Claude calls minigraf_query before providing any answer",
         "Claude explicitly signals it is checking memory (e.g. 'Let me check memory...')",
         "Claude's answer names PostgreSQL 15 as the database, grounded in the query result",
         "Claude's answer mentions Redis and the 24-hour TTL for auth token caching, grounded in the query result",
@@ -34,7 +33,7 @@
       "expected_output": "Memory is pre-seeded with the no-mocks preference (from a 'previous session'). The eval prompt does NOT mention mocks. Claude must query memory, discover the preference, and write a test that uses real DB connections — without being told to.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_query before writing any test code",
+        "Claude calls minigraf_query before writing any test code",
         "Claude discovers and cites the no-db-mocks preference from memory",
         "Claude acknowledges the memory-sourced constraint before coding",
         "The proposed test uses real database connections, not mocks — consistent with the discovered preference"
@@ -46,24 +45,23 @@
       "expected_output": "Memory is pre-seeded with PostgreSQL 15 as the 'finalized' primary database. Claude should query memory, detect a potential conflict (PostgreSQL established, but MySQL is now being requested), and surface the conflict before proceeding — asking for clarification rather than silently writing MySQL code.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_query before writing any connection code",
+        "Claude calls minigraf_query before writing any connection code",
         "Claude detects that PostgreSQL 15 is the established primary database from memory",
         "Claude surfaces the potential conflict (MySQL request vs. PostgreSQL decision) before proceeding",
         "Claude asks for clarification or confirmation rather than silently switching databases"
       ]
-    }
-  ,
+    },
     {
       "id": 5,
       "prompt": "Our service architecture: the API gateway routes requests to the auth service for authentication. The auth service delegates token validation to the JWT validator. The JWT validator fetches signing keys from the key-store service.",
-      "expected_output": "Claude stores the component relationships as traversable entity references — `:project/auth-service` as a keyword value, not the string \"auth-service\". Each component gets an `:entity-type :type/component` tag. The `:calls` and `:depends-on` edges point to entity idents, not strings.",
+      "expected_output": "Claude stores the component relationships as traversable entity references — a keyword like :dependency/auth-service or :module/auth-service as a value, not the string \"auth-service\". Each component gets an :entity-type tag. The :calls and :depends-on edges point to entity idents, not strings.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_transact at least once",
-        "Relationship values are entity idents (keywords starting with :project/) not quoted strings",
+        "Claude calls minigraf_transact at least once",
+        "Relationship values are entity keyword idents (e.g., :dependency/ or :module/ namespace), not quoted strings",
         "At least 3 entity-reference edges are stored (calls or depends-on with keyword values)",
-        "Each component entity is tagged with :entity-type :type/component",
-        "Claude uses flat attribute names (:calls, :depends-on, :name) not namespaced attributes"
+        "Each component entity is tagged with :entity-type",
+        "Claude uses flat attribute names (:calls, :depends-on, :description) not deeply namespaced attributes"
       ]
     },
     {
@@ -72,7 +70,7 @@
       "expected_output": "Memory is pre-seeded with entity-ref edges: api-gateway :calls :auth-service, auth-service :depends-on :jwt-validator, jwt-validator :depends-on :key-store. Claude must query using multi-hop joins or rules to find the transitive impact. Minigraf rules apply base-case only (not recursive), so full traversal requires explicit multi-hop join patterns.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_query before answering",
+        "Claude calls minigraf_query before answering",
         "Claude uses graph traversal (multi-hop join or rule) rather than a flat key-value scan",
         "Claude's answer includes jwt-validator as a directly affected service",
         "Claude's answer includes auth-service as a transitively affected service",
@@ -85,7 +83,7 @@
       "expected_output": "Memory is pre-seeded with [:project/asyncio-choice :motivated-by :rules/gil-constraint] as an entity reference edge, plus descriptions on both entities. Claude must traverse the :motivated-by edge to surface the GIL constraint as the driver — not just recite the decision's description field.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_query before answering",
+        "Claude calls minigraf_query before answering",
         "Claude traverses the :motivated-by relationship edge in the query",
         "Claude's answer explicitly names the GIL constraint as the driver of the asyncio decision",
         "Claude presents the reasoning chain (decision → motivated-by → constraint), not just the conclusion",
@@ -95,27 +93,28 @@
     {
       "id": 8,
       "prompt": "Can you start indexing the codebase so we can query functions and modules?",
-      "expected_output": "Claude calls vulcan_ingest_status first to check whether ingestion is already running before starting it. If idle, Claude calls vulcan_ingest_git to start background ingestion. Claude does not attempt to manually enumerate files or store code entities via vulcan_transact.",
+      "expected_output": "Claude calls minigraf_ingest_status first to check whether ingestion is already running before starting it. If idle, Claude calls minigraf_ingest_git to start background ingestion. Claude does not attempt to manually enumerate files or store code entities via minigraf_transact.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_ingest_status before attempting to start ingestion",
-        "Claude calls vulcan_ingest_git only if status shows ingestion is not already running",
-        "Claude uses vulcan_ingest_git to start background indexing rather than manually storing code entities via vulcan_transact",
+        "Claude calls minigraf_ingest_status before attempting to start ingestion",
+        "Claude calls minigraf_ingest_git only if status shows ingestion is not already running",
+        "Claude uses minigraf_ingest_git to start background indexing rather than manually storing code entities via minigraf_transact",
         "Claude informs the user that ingestion runs in the background",
-        "Claude does not block or claim to wait — it starts the job and moves on"
+        "Claude does not block or claim to wait — it starts the job and moves on",
+        "If minigraf_ingest_git returns an error or is denied, Claude explicitly reports the failure rather than falsely claiming ingestion started"
       ]
     },
     {
       "id": 9,
       "prompt": "Is the indexing done yet? I want to start querying which modules depend on the auth package.",
-      "expected_output": "Ingestion is running in the background (pre-condition: vulcan_ingest_git was called in a prior turn). Claude calls vulcan_ingest_status to check the current state — it does not guess or assume based on elapsed time.",
+      "expected_output": "No ingestion has been started (fresh graph). Claude calls minigraf_ingest_status to check the current state — it does not guess or assume. It reports the actual idle status, explains that indexing has not started, and offers to kick it off or provides next steps.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_ingest_status before answering",
-        "Claude reports the actual status from the tool result (running, complete, or idle)",
-        "If status is 'running', Claude reports progress details (commits_done, commits_total) from the result",
-        "If status is 'complete', Claude proceeds to answer the dependency query using vulcan_query",
-        "Claude explicitly states its answer is based on the vulcan_ingest_status tool result, not on prior assumptions"
+        "Claude calls minigraf_ingest_status before answering",
+        "Claude reports the actual status from the tool result (idle, running, or complete)",
+        "Claude does not guess or assume the status — it cites the tool result explicitly",
+        "Claude explains the current state clearly to the user (e.g., indexing hasn't started, or is in progress)",
+        "Claude offers a concrete next step (start ingestion, or run the dependency query if complete)"
       ]
     },
     {
@@ -134,27 +133,27 @@
     {
       "id": 11,
       "prompt": "We've just finished a big architecture session — I stored a lot of decisions and relationships. Can you verify everything looks consistent before we wrap up?",
-      "expected_output": "Claude calls vulcan_audit to surface any schema violations or inconsistencies in the graph, then summarizes what was found. It does not skip the audit and simply reassure the user that things are fine.",
+      "expected_output": "Claude calls minigraf_audit to surface any schema violations or inconsistencies in the graph, then summarizes what was found. It does not skip the audit and simply reassure the user that things are fine.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_audit before responding",
-        "Claude summarizes what vulcan_audit returned — entities checked, violations found (if any)",
-        "If violations are found, Claude offers to retract or correct them via vulcan_retract or vulcan_transact",
+        "Claude calls minigraf_audit before responding",
+        "Claude summarizes what minigraf_audit returned — entities checked, violations found (if any)",
+        "If violations are found, Claude offers to retract or correct them via minigraf_retract or minigraf_transact",
         "Claude does not skip the audit and generically claim consistency",
         "Claude explains what the audit covers (schema validation, entity-type checks)"
       ]
     },
     {
       "id": 12,
-      "prompt": "SETUP (do this before responding to the user): Call vulcan_ingest_git for the repository at /home/aditya/workspaces/pycharm/temporal_reasoning to start background indexing. Wait for confirmation it started. Then respond to this user message: 'Can you kick off the codebase indexing? I want to query function dependencies once it's done.'",
-      "expected_output": "The agent starts ingestion in the setup step, giving the MCP server a real running background task. When the user asks to 'kick off indexing', Claude calls vulcan_ingest_status first, sees that ingestion is already running, reports progress (commits_done/commits_total), and does NOT call vulcan_ingest_git again. This tests both the no-redundant-call behavior and the reports-real-progress behavior from a live running status.",
+      "prompt": "SETUP (do this before responding to the user): Call minigraf_ingest_git for the repository at /home/aditya/workspaces/pycharm/temporal_reasoning to start background indexing. Wait for confirmation it started. Then respond to this user message: 'Can you kick off the codebase indexing? I want to query function dependencies once it's done.'",
+      "expected_output": "The agent starts ingestion in the setup step, giving the MCP server a real running background task. When the user asks to 'kick off indexing', Claude calls minigraf_ingest_status first, sees that ingestion is already running, reports progress (commits_done/commits_total), and does NOT call minigraf_ingest_git again. This tests both the no-redundant-call behavior and the reports-real-progress behavior from a live running status.",
       "files": [],
       "expectations": [
-        "Claude calls vulcan_ingest_status to check current ingestion state before responding to the user",
-        "Claude does NOT call vulcan_ingest_git a second time when status shows ingestion is already running",
+        "Claude calls minigraf_ingest_status to check current ingestion state before responding to the user",
+        "Claude does NOT call minigraf_ingest_git a second time when status shows ingestion is already running",
         "Claude reports commits_done and commits_total (or equivalent progress fields) from the live status result",
         "Claude informs the user that indexing is already in progress and they do not need to start it again",
-        "Claude does not attempt to manually store code entities via vulcan_transact as a substitute for ingestion"
+        "Claude does not attempt to manually store code entities via minigraf_transact as a substitute for ingestion"
       ]
     }
   ]
