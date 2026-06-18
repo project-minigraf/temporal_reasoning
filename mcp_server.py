@@ -1805,6 +1805,9 @@ def _build_code_triples(
                 idents_for_file.append(fn_ident)
             entity_valid_from[fn_ident] = commit_ts_iso
             entity_descriptions[fn_ident] = fn_name
+        else:
+            # Pre-existing function: record that this commit modified it
+            triples.append(f"[{fn_ident} :modified-in {commit_ident}]")
 
     for cls_name in extracted["classes"]:
         cls_ident = _code_ident("class", file_path, cls_name)
@@ -1822,6 +1825,9 @@ def _build_code_triples(
                 idents_for_file.append(cls_ident)
             entity_valid_from[cls_ident] = commit_ts_iso
             entity_descriptions[cls_ident] = cls_name
+        else:
+            # Pre-existing class: record that this commit modified it
+            triples.append(f"[{cls_ident} :modified-in {commit_ident}]")
 
     return triples
 

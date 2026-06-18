@@ -1495,6 +1495,47 @@ class TestIngestionWrites:
         triples = mcp_server._build_close_triples(module_ident, "auth.py", module_ident)
         assert not any(":contains" in t for t in triples)
 
+    def test_build_code_triples_writes_modified_in_for_preexisting_functions(self):
+        import mcp_server
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        cls_ident = mcp_server._code_ident("class", "auth.py", "User")
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        entity_valid_from = {
+            module_ident: "2025-01-01T00:00:00Z",
+            fn_ident: "2025-01-01T00:00:00Z",
+            cls_ident: "2025-01-01T00:00:00Z",
+        }
+        commit_ident = ":commit/deadbeef12345678"
+        triples = mcp_server._build_code_triples(
+            "auth.py",
+            {"functions": ["login"], "classes": ["User"], "imports": []},
+            "2025-02-01T00:00:00Z",
+            entity_valid_from,
+            {},
+            {},
+            commit_ident,
+        )
+        assert any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
+        assert any(f"[{cls_ident} :modified-in {commit_ident}]" in t for t in triples)
+
+    def test_build_code_triples_does_not_write_modified_in_for_new_functions(self):
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        entity_valid_from = {module_ident: "2025-01-01T00:00:00Z"}
+        commit_ident = ":commit/deadbeef12345678"
+        triples = mcp_server._build_code_triples(
+            "auth.py",
+            {"functions": ["new_func"], "classes": [], "imports": []},
+            "2025-02-01T00:00:00Z",
+            entity_valid_from,
+            {},
+            {},
+            commit_ident,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "new_func")
+        assert not any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
+        assert any(f"[{fn_ident} :introduced-by {commit_ident}]" in t for t in triples)
+
     def test_build_code_triples_populates_entity_descriptions(self):
         import mcp_server
         entity_valid_from: dict = {}
