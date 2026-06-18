@@ -2434,11 +2434,13 @@ async def main() -> None:
     # Auto-start incremental ingest on server startup so ingestion begins
     # immediately without waiting for a user prompt.  Runs as a background
     # asyncio task — never blocks the message loop.
+    # Set MINIGRAF_NO_AUTO_INGEST=1 to skip auto-start (used by eval sandboxes).
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0,
         "current_commit": "", "error": None,
     }
-    _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
+    if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
+        _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,

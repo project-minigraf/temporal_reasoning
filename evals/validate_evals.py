@@ -3,8 +3,9 @@ Validate evals/evals.json structure and tool name consistency.
 
 Checks:
   - Valid JSON with required top-level keys
-  - Each eval has id, prompt, expected_output, files, expectations
+  - Each eval has id, name, prompt, expected_output, files, expectations
   - eval ids are sequential starting from 1
+  - eval names are unique, lowercase, hyphen-separated strings
   - No stale tool names (e.g. vulcan_transact, vulcan_query)
   - All tool names referenced in expectations/expected_output are registered tools
 """
@@ -37,7 +38,7 @@ STALE_TOOL_NAMES = {
     "vulcan_report_issue",
 }
 
-REQUIRED_EVAL_KEYS = {"id", "prompt", "expected_output", "files", "expectations"}
+REQUIRED_EVAL_KEYS = {"id", "name", "prompt", "expected_output", "files", "expectations"}
 
 
 def validate():
@@ -72,6 +73,12 @@ def validate():
         if ev.get("id") != expected_id:
             errors.append(f"{prefix}: id={ev.get('id')!r}, expected {expected_id}")
 
+        name = ev.get("name", "")
+        if not isinstance(name, str) or not name:
+            errors.append(f"{prefix}: 'name' must be a non-empty string")
+        elif not all(c.isalnum() or c == "-" for c in name) or name != name.lower():
+            errors.append(f"{prefix}: 'name' must be lowercase alphanumeric with hyphens only, got {name!r}")
+
         if not isinstance(ev.get("expectations"), list):
             errors.append(f"{prefix}: 'expectations' must be a list")
             continue
@@ -86,6 +93,14 @@ def validate():
         unknown = [t for t in referenced_tools if t not in KNOWN_TOOLS]
         if unknown:
             errors.append(f"{prefix}: unknown tool(s) referenced: {unknown}")
+
+    names = [ev.get("name") for ev in evals if isinstance(ev.get("name"), str)]
+    if len(names) != len(set(names)):
+        seen = set()
+        for name in names:
+            if name in seen:
+                errors.append(f"Duplicate eval name: {name!r}")
+            seen.add(name)
 
     return errors
 
