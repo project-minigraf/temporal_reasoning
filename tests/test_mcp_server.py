@@ -2463,3 +2463,27 @@ class TestExtractImportName:
         node = _parse_import_node("java", source, "import_declaration", tmp_path)
         result = mcp_server._extract_import_name(node, "java")
         assert result == ["java"]
+
+    def test_c_system_include(self, tmp_path):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b'#include <stdio.h>'
+        node = _parse_import_node("c", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "c")
+        assert result == ["stdio"]
+
+    def test_c_local_include(self, tmp_path):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b'#include "myheader.h"'
+        node = _parse_import_node("c", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "c")
+        assert result == ["myheader"]
+
+    def test_cpp_include(self, tmp_path):
+        pytest.importorskip("tree_sitter_cpp")
+        import mcp_server
+        source = b'#include <iostream>'
+        node = _parse_import_node("cpp", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "cpp")
+        assert result == ["iostream"]

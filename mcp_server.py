@@ -166,6 +166,18 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "imports": {"import_declaration"},
         "calls": {"method_invocation"},
     },
+    "c": {
+        "functions": {"function_definition"},
+        "classes": {"struct_specifier"},
+        "imports": {"preproc_include"},
+        "calls": {"call_expression"},
+    },
+    "cpp": {
+        "functions": {"function_definition"},
+        "classes": {"class_specifier", "struct_specifier"},
+        "imports": {"preproc_include"},
+        "calls": {"call_expression"},
+    },
 }
 
 
@@ -229,6 +241,21 @@ def _rust_use_root(node) -> Optional[str]:
     return None
 
 
+def _c_include_name(node) -> Optional[str]:
+    """Return the header name (no path, no extension) from a C/C++ preproc_include node.
+
+    Handles both:
+      #include <stdio.h>    → system_lib_string → "stdio"
+      #include "myheader.h" → string_literal    → "myheader"
+    """
+    import os
+    for child in node.children:
+        if child.type in ("system_lib_string", "string_literal"):
+            raw = child.text.decode("utf-8").strip("<>\"'")
+            return os.path.splitext(os.path.basename(raw))[0]
+    return None
+
+
 def _extract_import_name(node, lang_name: str) -> List[str]:
     """Extract top-level module names from an import node (may return multiple)."""
     names: List[str] = []
@@ -281,6 +308,10 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         result = _java_leftmost(node)
         if result:
             names.append(result)
+    elif lang_name in ("c", "cpp"):
+        name = _c_include_name(node)
+        if name:
+            names.append(name)
     return names
 
 
