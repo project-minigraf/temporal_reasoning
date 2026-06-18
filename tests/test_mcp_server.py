@@ -2527,3 +2527,19 @@ class TestExtractImportName:
         node = _parse_import_node("ruby", source, "call", tmp_path)
         result = mcp_server._extract_import_name(node, "ruby")
         assert result == []
+
+    def test_php_require(self, tmp_path):
+        pytest.importorskip("tree_sitter_php")
+        import mcp_server
+        source = b"<?php\nrequire 'config.php';"
+        node = _parse_import_node("php", source, "require_expression", tmp_path)
+        result = mcp_server._extract_import_name(node, "php")
+        assert result == ["config"]
+
+    def test_php_include(self, tmp_path):
+        pytest.importorskip("tree_sitter_php")
+        import mcp_server
+        source = b"<?php\ninclude 'header.php';"
+        node = _parse_import_node("php", source, "include_expression", tmp_path)
+        result = mcp_server._extract_import_name(node, "php")
+        assert result == ["header"]

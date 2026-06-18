@@ -117,7 +117,9 @@ def _get_parser(file_path: str) -> Optional[Any]:
         try:
             mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
             from tree_sitter import Language, Parser  # type: ignore
-            lang_obj = Language(mod.language())
+            # PHP exposes language_php() instead of language()
+            lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
+            lang_obj = Language(lang_fn())
             parser = Parser(lang_obj)
         except Exception:
             pass
@@ -189,6 +191,13 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "classes": {"class"},
         "imports": {"call"},
         "calls": set(),
+    },
+    "php": {
+        "functions": {"function_definition", "method_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"require_expression", "include_expression",
+                    "require_once_expression", "include_once_expression"},
+        "calls": {"function_call_expression"},
     },
 }
 
@@ -379,6 +388,13 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         name = _ruby_require_name(node)
         if name:
             names.append(name)
+    elif lang_name == "php":
+        import os
+        for child in node.children:
+            if child.type in ("string", "encapsed_string", "string_literal"):
+                val = child.text.decode("utf-8").strip("'\"")
+                names.append(os.path.splitext(os.path.basename(val))[0])
+                break
     return names
 
 
