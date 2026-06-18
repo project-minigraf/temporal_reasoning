@@ -7,8 +7,8 @@ command = ["python", "PATH_TO_REPO/mcp_server.py"]
 
 [mcp_servers."temporal-reasoning".env]
 MINIGRAF_GRAPH_PATH = "PATH_TO_PROJECT/memory.graph"
-VULCAN_EXTRACTION_STRATEGY = "llm"
-VULCAN_LLM_MODEL = "gpt-4o-mini"
+MINIGRAF_EXTRACTION_STRATEGY = "llm"
+MINIGRAF_LLM_MODEL = "gpt-4o-mini"
 OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
 
 [hooks.pre_turn]

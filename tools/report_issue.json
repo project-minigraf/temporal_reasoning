@@ -1,6 +1,6 @@
 {
   "name": "minigraf_report_issue",
-  "description": "Report an issue with Vulcan query or transact operations. Use this when Vulcan returns errors to file a GitHub issue for tracking.",
+  "description": "Report an issue with Minigraf query or transact operations. Use this when Minigraf returns errors to file a GitHub issue for tracking.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -19,7 +19,7 @@
       },
       "error": {
         "type": "string",
-        "description": "Optional error message returned by Vulcan"
+        "description": "Optional error message returned by Minigraf"
       }
     },
     "required": ["issue_type", "description"]

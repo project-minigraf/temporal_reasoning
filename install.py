@@ -243,7 +243,7 @@ def setup_mcp_json(target_dir: str) -> bool:
     - Always updates args and MINIGRAF_GRAPH_PATH to reflect current paths.
     - Uses the venv python as the command so the MCP server runs in the venv.
     - Only MINIGRAF_GRAPH_PATH is set here; ANTHROPIC_API_KEY and
-      VULCAN_EXTRACTION_STRATEGY belong in .claude/settings.local.json so
+      MINIGRAF_EXTRACTION_STRATEGY belong in .claude/settings.local.json so
       they are available to hook subprocesses as well as the MCP server.
     """
     import json
@@ -355,7 +355,7 @@ def setup_claude_settings(target_dir: str) -> bool:
       that already references our hook scripts and updates the command path;
       appends a new entry only if none is found.
     - Preserves ANTHROPIC_API_KEY if already set to a real value.
-    - Sets VULCAN_EXTRACTION_STRATEGY=llm (default); preserves existing value.
+    - Sets MINIGRAF_EXTRACTION_STRATEGY=llm (default); preserves existing value.
     - Hook commands use the venv python so they share the same environment.
     - These env vars are written here (not in .mcp.json) so that hook
       subprocesses inherit them from the Claude Code process environment.
@@ -383,8 +383,8 @@ def setup_claude_settings(target_dir: str) -> bool:
     key_is_real = bool(prev_key) and prev_key != _PLACEHOLDER_KEY
     if not key_is_real:
         env_block["ANTHROPIC_API_KEY"] = _PLACEHOLDER_KEY
-    if "VULCAN_EXTRACTION_STRATEGY" not in env_block:
-        env_block["VULCAN_EXTRACTION_STRATEGY"] = "heuristic"
+    if "MINIGRAF_EXTRACTION_STRATEGY" not in env_block:
+        env_block["MINIGRAF_EXTRACTION_STRATEGY"] = "heuristic"
 
     # --- hooks ---
     hooks_block = existing.setdefault("hooks", {})
@@ -423,7 +423,7 @@ def setup_claude_settings(target_dir: str) -> bool:
     print(f"✓ {verb} {settings_path}")
     print(f"    UserPromptSubmit hook ({prepare_status}): {prepare_cmd}")
     print(f"    Stop hook ({finalize_status}): {finalize_cmd}")
-    print(f"    env.VULCAN_EXTRACTION_STRATEGY = {env_block['VULCAN_EXTRACTION_STRATEGY']}")
+    print(f"    env.MINIGRAF_EXTRACTION_STRATEGY = {env_block['MINIGRAF_EXTRACTION_STRATEGY']}")
     if key_is_real:
         print("    env.ANTHROPIC_API_KEY = (preserved)")
     else:

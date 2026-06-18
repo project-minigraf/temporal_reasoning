@@ -12,7 +12,7 @@
       "args": ["PATH_TO_REPO/mcp_server.py"],
       "env": {
         "MINIGRAF_GRAPH_PATH": "PATH_TO_PROJECT/memory.graph",
-        "VULCAN_EXTRACTION_STRATEGY": "heuristic"
+        "MINIGRAF_EXTRACTION_STRATEGY": "heuristic"
       }
     }
   },

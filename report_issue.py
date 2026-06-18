@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-report_issue.py - Report Vulcan errors as GitHub issues.
+report_issue.py - Report Minigraf errors as GitHub issues.
 
-Provides a tool to file issues when Vulcan queries/transacts fail.
+Provides a tool to file issues when Minigraf queries/transacts fail.
 Uses GitHub CLI (gh) if available, otherwise falls back to logging.
 
 Automatically routes issues to the correct repo:
 - minigraf core bugs -> https://github.com/project-minigraf/minigraf
-- Vulcan skill bugs -> current repo
+- Minigraf skill bugs -> current repo
 """
 
 import subprocess

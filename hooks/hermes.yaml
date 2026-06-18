@@ -9,7 +9,7 @@ mcp_servers:
       - PATH_TO_REPO/mcp_server.py
     env:
       MINIGRAF_GRAPH_PATH: PATH_TO_PROJECT/memory.graph
-      VULCAN_EXTRACTION_STRATEGY: heuristic
+      MINIGRAF_EXTRACTION_STRATEGY: heuristic
 
 # Auto-memory hooks — uncomment if your Hermes version supports pre/post-turn hooks:
 hooks:

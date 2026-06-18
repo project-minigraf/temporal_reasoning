@@ -167,7 +167,7 @@ When running under Claude Code with the hook configuration in `hooks/claude-code
 
 1. Extracts candidate entity tokens from the user's message (stop-word filtered, minimum 4 characters).
 2. Queries the graph for facts whose values contain those tokens, using `:valid-at` set to the current UTC timestamp so only currently-valid facts are returned.
-3. Falls back to a broad scan (capped by `VULCAN_PREPARE_SCAN_LIMIT`, default 50 rows) when no entity-specific results are found.
+3. Falls back to a broad scan (capped by `MINIGRAF_PREPARE_SCAN_LIMIT`, default 50 rows) when no entity-specific results are found.
 4. Returns the results as `additionalContext` prepended to the agent's working context for that turn.
 
 For messages containing temporal signals (e.g. "before", "last week", "as of") with an explicit ISO date, `:valid-at` is set to that date instead (midnight UTC), enabling point-in-time recall.
@@ -186,11 +186,11 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 
 | Environment variable | Default | Effect |
 |----------------------|---------|--------|
-| `VULCAN_EXTRACTION_STRATEGY` | `heuristic` | Finalize strategy: `heuristic`, `llm`, or `agent` |
-| `VULCAN_PREPARE_SCAN_LIMIT` | `50` | Max rows returned by the broad fallback scan in the prepare phase |
-| `VULCAN_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model used when `VULCAN_EXTRACTION_STRATEGY=llm` |
-| `ANTHROPIC_API_KEY` | — | Required when `VULCAN_EXTRACTION_STRATEGY=llm` and using a Claude model |
-| `OPENAI_API_KEY` | — | Required when `VULCAN_EXTRACTION_STRATEGY=llm` and `VULCAN_LLM_MODEL` is an OpenAI model (e.g. `gpt-4o-mini`) |
+| `MINIGRAF_EXTRACTION_STRATEGY` | `heuristic` | Finalize strategy: `heuristic`, `llm`, or `agent` |
+| `MINIGRAF_PREPARE_SCAN_LIMIT` | `50` | Max rows returned by the broad fallback scan in the prepare phase |
+| `MINIGRAF_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model used when `MINIGRAF_EXTRACTION_STRATEGY=llm` |
+| `ANTHROPIC_API_KEY` | — | Required when `MINIGRAF_EXTRACTION_STRATEGY=llm` and using a Claude model |
+| `OPENAI_API_KEY` | — | Required when `MINIGRAF_EXTRACTION_STRATEGY=llm` and `MINIGRAF_LLM_MODEL` is an OpenAI model (e.g. `gpt-4o-mini`) |
 | `MINIGRAF_GRAPH_PATH` | `memory.graph` | Override the graph file location |
 
 ## Files

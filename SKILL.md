@@ -162,7 +162,7 @@ When the MCP server is configured and hooks are enabled, memory is managed autom
 - **Before each turn** — `memory_prepare_turn` is called with the user's message and the result is injected as `additionalContext`.
 - **After each turn** — `memory_finalize_turn` is called with the user+agent exchange; facts are extracted and stored.
 
-Extraction strategy is controlled by `VULCAN_EXTRACTION_STRATEGY` (env var):
+Extraction strategy is controlled by `MINIGRAF_EXTRACTION_STRATEGY` (env var):
 - `heuristic` (default) — regex signal detection, zero API calls
 - `llm` — Claude Haiku extracts facts; falls back to agent on API failure
 - `agent` — MCP sampling asks the connected agent to identify facts

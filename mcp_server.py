@@ -424,7 +424,7 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     # Schema validation — closed-world enforcement on parseable string-valued triples.
     # Only string-valued triples are schema-validated. Keyword-valued triples
     # (e.g. relationship edges like [:service/auth :calls :component/jwt]) are
-    # not covered by VULCAN_SCHEMA and pass through unvalidated by design.
+    # not covered by MINIGRAF_SCHEMA and pass through unvalidated by design.
     parsed = _parse_transact_facts(facts)
     if parsed:
         violations = _validate_facts(parsed)
@@ -502,7 +502,7 @@ def handle_minigraf_report_issue(
 
 
 def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
-    """Audit graph entities against VULCAN_SCHEMA.
+    """Audit graph entities against MINIGRAF_SCHEMA.
 
     Current state (as_of=None): validates all entities and retracts violators.
     Point-in-time (as_of=N): reports violations only — no retractions.
@@ -517,7 +517,7 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
 
     as_of_clause = f":as-of {as_of} " if as_of is not None else ""
 
-    for entity_type in VULCAN_SCHEMA:
+    for entity_type in MINIGRAF_SCHEMA:
         # Step 1: Find all entity UUIDs of this type.
         type_query = (
             f"[:find ?e {as_of_clause}"
@@ -898,7 +898,7 @@ def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int)
 # They are invisible to schema validation and filtered from attr_facts in minigraf_audit.
 _SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})
 
-VULCAN_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
+MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
     "decision": {
         "required": {":description": str},
         "optional": {":rationale": str, ":date": str, ":alias": str},
@@ -951,7 +951,7 @@ VULCAN_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
 
 
 def _validate_facts(facts: List[Dict[str, Any]]) -> List[str]:
-    """Validate proposed facts against VULCAN_SCHEMA. Returns violation strings.
+    """Validate proposed facts against MINIGRAF_SCHEMA. Returns violation strings.
 
     Closed-world: unknown entity types and unknown attributes are both violations.
     System attributes (_SYSTEM_ATTRS) are silently skipped — they are internal
@@ -978,14 +978,14 @@ def _validate_facts(facts: List[Dict[str, Any]]) -> List[str]:
         entity_type = entity_types.get(entity, "")
 
         # Closed-world: unknown entity type is a violation.
-        if entity_type not in VULCAN_SCHEMA:
+        if entity_type not in MINIGRAF_SCHEMA:
             violations.append(
                 f"entity '{entity}' has unknown type '{entity_type}' — "
-                f"allowed: {list(VULCAN_SCHEMA)}"
+                f"allowed: {list(MINIGRAF_SCHEMA)}"
             )
             continue
 
-        schema = VULCAN_SCHEMA[entity_type]
+        schema = MINIGRAF_SCHEMA[entity_type]
         required = schema["required"]
         optional = schema["optional"]
         allowed = set(required) | set(optional)
@@ -1261,7 +1261,7 @@ class IndexCache:
         """Fetch all currently-valid facts from the DB and swap the index."""
         try:
             db = get_db()
-            boost = float(os.environ.get("VULCAN_MEMORY_BOOST", "2.0"))
+            boost = float(os.environ.get("MINIGRAF_MEMORY_BOOST", "2.0"))
             raw = db.execute(
                 f'(query [:find ?e ?a ?v :valid-at "{_now_utc_ms()}" :where [?e ?a ?v]])'
             )
@@ -1291,7 +1291,7 @@ def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
     in the user message, :valid-at is set to that date (midnight UTC).
     """
     db = get_db()
-    scan_limit = int(os.environ.get("VULCAN_PREPARE_SCAN_LIMIT", "50"))
+    scan_limit = int(os.environ.get("MINIGRAF_PREPARE_SCAN_LIMIT", "50"))
     temporal_clauses = _build_query_clauses(user_message)
 
     entities = _extract_entities(user_message)
@@ -1344,7 +1344,7 @@ def handle_memory_prepare_turn(user_message: str) -> str:
     if not _BM25_AVAILABLE:
         return _handle_memory_prepare_turn_heuristic(user_message)
 
-    scan_limit = int(os.environ.get("VULCAN_PREPARE_SCAN_LIMIT", "50"))
+    scan_limit = int(os.environ.get("MINIGRAF_PREPARE_SCAN_LIMIT", "50"))
     index = _index_cache.get()
     if index is None:
         return ""
@@ -1548,18 +1548,18 @@ def _llm_missing_package_warning(error: str) -> str:
     the correct pip install command based on the configured model.
     Returns an empty string when the error is not a missing-package error.
     """
-    model = os.environ.get("VULCAN_LLM_MODEL", "claude-haiku-4-5-20251001")
+    model = os.environ.get("MINIGRAF_LLM_MODEL", "claude-haiku-4-5-20251001")
     if "anthropic package not installed" in error:
         return (
             "ACTION REQUIRED: pip install anthropic\n"
             f"  The configured model '{model}' requires the anthropic package.\n"
-            "  Set VULCAN_LLM_MODEL in .mcp.json if you want to use an OpenAI model instead."
+            "  Set MINIGRAF_LLM_MODEL in .mcp.json if you want to use an OpenAI model instead."
         )
     if "openai package not installed" in error:
         return (
             "ACTION REQUIRED: pip install openai\n"
             f"  The configured model '{model}' requires the openai package.\n"
-            "  Set VULCAN_LLM_MODEL in .mcp.json if you want to use an Anthropic model instead."
+            "  Set MINIGRAF_LLM_MODEL in .mcp.json if you want to use an Anthropic model instead."
         )
     return ""
 
@@ -1606,7 +1606,7 @@ def _parse_valid_at_hint(raw: str):
 def _llm_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
     """Call a lightweight LLM to extract facts. Returns {ok, stored_count, strategy}."""
     try:
-        model = os.environ.get("VULCAN_LLM_MODEL", "claude-haiku-4-5-20251001")
+        model = os.environ.get("MINIGRAF_LLM_MODEL", "claude-haiku-4-5-20251001")
         canonical = _query_canonical_entities()
         if canonical:
             canonical_entities_section = (
@@ -1706,9 +1706,9 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
 async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]:
     """
     Extract facts from conversation_delta and transact them.
-    Strategy selected via VULCAN_EXTRACTION_STRATEGY env var (default: heuristic).
+    Strategy selected via MINIGRAF_EXTRACTION_STRATEGY env var (default: heuristic).
     """
-    strategy = os.environ.get("VULCAN_EXTRACTION_STRATEGY", "heuristic")
+    strategy = os.environ.get("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
 
     if strategy == "heuristic":
         facts = heuristic_extract(conversation_delta)
@@ -2140,7 +2140,7 @@ _TOOLS: List[Tool] = [
     Tool(
         name="minigraf_query",
         description=(
-            "Query Vulcan's persistent bi-temporal graph memory using Datalog. "
+            "Query Minigraf's persistent bi-temporal graph memory using Datalog. "
             "Call this BEFORE answering anything about past decisions, architecture, "
             "dependencies, or preferences. Supports :as-of for temporal queries to see "
             "what the graph contained at a past transaction time."
@@ -2159,7 +2159,7 @@ _TOOLS: List[Tool] = [
     Tool(
         name="minigraf_transact",
         description=(
-            "Store a durable fact in Vulcan's graph memory. Only call this for decisions, "
+            "Store a durable fact in Minigraf's graph memory. Only call this for decisions, "
             "architecture, dependencies, constraints, or preferences — NOT for transient "
             "observations or intermediate reasoning."
         ),
@@ -2187,7 +2187,7 @@ _TOOLS: List[Tool] = [
     Tool(
         name="minigraf_retract",
         description=(
-            "Retract a fact from Vulcan's graph memory. Retraction records a new fact with "
+            "Retract a fact from Minigraf's graph memory. Retraction records a new fact with "
             "asserted=false — the original stays in history for bi-temporal auditing."
         ),
         inputSchema={
@@ -2230,8 +2230,8 @@ _TOOLS: List[Tool] = [
     Tool(
         name="minigraf_report_issue",
         description=(
-            "Report an issue with Vulcan query or transact operations. "
-            "Use this when Vulcan returns errors to file a GitHub issue for tracking."
+            "Report an issue with Minigraf query or transact operations. "
+            "Use this when Minigraf returns errors to file a GitHub issue for tracking."
         ),
         inputSchema={
             "type": "object",
@@ -2251,7 +2251,7 @@ _TOOLS: List[Tool] = [
                 },
                 "error": {
                     "type": "string",
-                    "description": "Optional error message returned by Vulcan",
+                    "description": "Optional error message returned by Minigraf",
                 },
             },
             "required": ["issue_type", "description"],

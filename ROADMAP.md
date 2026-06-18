@@ -31,14 +31,14 @@
 
 | Item | Description | Status |
 |------|-------------|--------|
-| OpenAI/Codex support | `VULCAN_LLM_MODEL=gpt-4o-mini` selects OpenAI client automatically; Codex hook wiring fully enabled. Spec: `docs/superpowers/specs/2026-05-26-openai-llm-strategy-design.md` | Complete ✓ |
+| OpenAI/Codex support | `MINIGRAF_LLM_MODEL=gpt-4o-mini` selects OpenAI client automatically; Codex hook wiring fully enabled. Spec: `docs/superpowers/specs/2026-05-26-openai-llm-strategy-design.md` | Complete ✓ |
 
 ## Phase 4 (Complete ✓) — Entity Normalization and Schema-Aware Extraction
 
 | Item | Description | Status |
 |------|-------------|--------|
 | Slug canonicalization | `_canonical_ident` + `_keyword_uuid`; heuristic extractor updated | Complete ✓ |
-| Closed-world schema | `VULCAN_SCHEMA` (4 entity types) + `_validate_facts`; pre-transact enforcement in extraction pipeline and `handle_minigraf_transact` | Complete ✓ |
+| Closed-world schema | `MINIGRAF_SCHEMA` (4 entity types) + `_validate_facts`; pre-transact enforcement in extraction pipeline and `handle_minigraf_transact` | Complete ✓ |
 | Alias datoms | `:alias` declared as optional attribute on all entity types | Complete ✓ |
 | Schema-aware prompts | `_query_canonical_entities` injects existing idents into LLM and agent extraction prompts | Complete ✓ |
 | `minigraf_audit` | 7th MCP tool; audits all entities against schema, retracts violators (bi-temporal — history preserved) | Complete ✓ |

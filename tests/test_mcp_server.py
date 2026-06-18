@@ -80,7 +80,7 @@ class TestOpenDb:
         mock_class.open.assert_called_once_with(custom_path)
 
 
-class TestVulcanQuery:
+class TestMinigrafQuery:
     def test_returns_results_on_success(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": [["FastAPI", ":decision"]]})
@@ -106,7 +106,7 @@ class TestVulcanQuery:
         assert "bad datalog" in result["error"]
 
 
-class TestVulcanTransact:
+class TestMinigrafTransact:
     def test_requires_reason(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
@@ -144,7 +144,7 @@ class TestVulcanTransact:
         assert "bad facts" in result["error"]
 
 
-class TestVulcanRetract:
+class TestMinigrafRetract:
     def test_requires_reason(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
@@ -178,7 +178,7 @@ class TestVulcanRetract:
         assert "bad retract" in result["error"]
 
 
-class TestVulcanReportIssue:
+class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, mock_minigraf_db, tmp_path):
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -247,7 +247,7 @@ class TestMemoryPrepareTurn:
 
     def test_respects_scan_limit_env_var(self, mock_minigraf_db, tmp_path, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setenv("VULCAN_PREPARE_SCAN_LIMIT", "10")
+        monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "10")
         db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -316,7 +316,7 @@ class TestMemoryFinalizeTurnHeuristic:
     def test_transacts_extracted_facts(self, mock_minigraf_db, tmp_path, monkeypatch):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "heuristic")
+        monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
         db_instance.execute.return_value = json.dumps({"tx": "5"})
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -332,7 +332,7 @@ class TestMemoryFinalizeTurnHeuristic:
     def test_returns_zero_stored_when_no_signals(self, mock_minigraf_db, tmp_path, monkeypatch):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "heuristic")
+        monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
@@ -406,8 +406,8 @@ class TestCallLlm:
 class TestLlmStrategyOpenAI:
     def test_calls_openai_api(self, mock_minigraf_db, tmp_path, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "llm")
-        monkeypatch.setenv("VULCAN_LLM_MODEL", "gpt-4o-mini")
+        monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
+        monkeypatch.setenv("MINIGRAF_LLM_MODEL", "gpt-4o-mini")
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
         db_instance.execute.return_value = json.dumps({"tx": "6"})
         import mcp_server
@@ -431,8 +431,8 @@ class TestLlmStrategyOpenAI:
     def test_falls_back_to_heuristic_on_openai_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "llm")
-        monkeypatch.setenv("VULCAN_LLM_MODEL", "gpt-4o-mini")
+        monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
+        monkeypatch.setenv("MINIGRAF_LLM_MODEL", "gpt-4o-mini")
         db_instance.execute.return_value = json.dumps({"tx": "7"})
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -447,7 +447,7 @@ class TestLlmStrategyOpenAI:
 class TestLlmStrategy:
     def test_calls_anthropic_api(self, mock_minigraf_db, tmp_path, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "llm")
+        monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         db_instance.execute.return_value = json.dumps({"tx": "6"})
         import mcp_server
@@ -470,7 +470,7 @@ class TestLlmStrategy:
     def test_falls_back_to_heuristic_on_api_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "llm")
+        monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
         db_instance.execute.return_value = json.dumps({"tx": "7"})
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -487,7 +487,7 @@ class TestAgentStrategy:
     def test_returns_ok_result(self, mock_minigraf_db, tmp_path, monkeypatch):
         import asyncio
         mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "agent")
+        monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "agent")
         db_instance.execute.return_value = json.dumps({"tx": "8"})
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -845,7 +845,7 @@ class TestParseTransactFacts:
         assert facts[0]["entity"] == ":service/auth"
 
 
-class TestVulcanTransactSchema:
+class TestMinigrafTransactSchema:
     def test_rejects_unknown_entity_type(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
@@ -930,7 +930,7 @@ class TestQueryCanonicalEntities:
 
     def test_injected_into_llm_prompt(self, mock_minigraf_db, tmp_path, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setenv("VULCAN_LLM_MODEL", "claude-haiku-4-5-20251001")
+        monkeypatch.setenv("MINIGRAF_LLM_MODEL", "claude-haiku-4-5-20251001")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -964,7 +964,7 @@ class TestQueryCanonicalEntities:
         assert ":decision/redis" in captured.get("canonical_entities_section", "")
 
 
-class TestVulcanAudit:
+class TestMinigrafAudit:
     def test_clean_db_returns_zero_retracted(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         # No entities of any known type
@@ -1223,7 +1223,7 @@ class TestExtractFromSource:
         assert result == {"functions": [], "classes": [], "imports": [], "calls": []}
 
 
-class TestVulcanIngestStatus:
+class TestMinigrafIngestStatus:
     def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})
@@ -1850,7 +1850,7 @@ class TestMemoryPrepareTurnBM25:
             "results": [[f":decision/item-{i}", ":description", f"redis item {i}"] for i in range(20)]
         })
         mcp_server.open_db(str(tmp_path / "t.graph"))
-        monkeypatch.setenv("VULCAN_PREPARE_SCAN_LIMIT", "3")
+        monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "3")
         cache = mcp_server.IndexCache()
         cache._rebuild()
         with patch.object(mcp_server, "_index_cache", cache):
