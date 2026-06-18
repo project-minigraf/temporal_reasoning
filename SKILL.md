@@ -432,7 +432,7 @@ When you know the exact depth, explicit joins are simpler than registering a rul
 
 **Common mistake**: `(contains? ?v "text")` returns empty — the predicate must be inside square brackets: `[(contains? ?v "text")]`.
 
-Full Datalog grammar: https://github.com/adityamukho/minigraf/wiki/Datalog-Reference
+Full Datalog grammar: https://github.com/project-minigraf/minigraf/wiki/Datalog-Reference
 
 ## Graph Storage
 

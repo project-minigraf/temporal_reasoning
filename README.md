@@ -78,7 +78,7 @@ query("[:find ?name :where [:project/db :name ?name]]")
            ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │              MiniGrafDb Python binding (minigraf package)         │
-│              https://github.com/adityamukho/minigraf              │
+│              https://github.com/project-minigraf/minigraf              │
 │   - Bi-temporal Datalog engine                                   │
 │   - Transaction time + Valid time                                │
 └──────────┬───────────────────────────────────────────────────────┘
@@ -101,7 +101,7 @@ Add to your Claude Code `settings.json`:
   "temporal-reasoning": {
     "source": {
       "source": "git",
-      "url": "https://github.com/adityamukho/temporal_reasoning"
+      "url": "https://github.com/project-minigraf/temporal_reasoning"
     }
   }
 }
@@ -118,7 +118,7 @@ python /path/to/temporal_reasoning/install.py
 ### Manual install
 
 ```bash
-git clone https://github.com/adityamukho/temporal_reasoning
+git clone https://github.com/project-minigraf/temporal_reasoning
 ```
 
 Then, from your project root:

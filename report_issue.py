@@ -6,7 +6,7 @@ Provides a tool to file issues when Vulcan queries/transacts fail.
 Uses GitHub CLI (gh) if available, otherwise falls back to logging.
 
 Automatically routes issues to the correct repo:
-- minigraf core bugs -> https://github.com/adityamukho/minigraf
+- minigraf core bugs -> https://github.com/project-minigraf/minigraf
 - Vulcan skill bugs -> current repo
 """
 
@@ -21,7 +21,7 @@ logger.addHandler(logging.NullHandler())
 
 VALID_ISSUE_TYPES = ["invalid_query", "transact_failure", "parse_error", "minigraf_bug"]
 
-MINIGRAF_REPO = "adityamukho/minigraf"
+MINIGRAF_REPO = "project-minigraf/minigraf"
 
 
 def _is_minigraf_related(description: str, error: str = "", datalog: str = "") -> bool:
