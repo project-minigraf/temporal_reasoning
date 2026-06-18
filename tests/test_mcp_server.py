@@ -2455,3 +2455,11 @@ class TestExtractImportName:
         result = mcp_server._extract_import_name(node, "go")
         assert "os" in result
         assert "pkg" in result
+
+    def test_java_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_java")
+        import mcp_server
+        source = b'import java.util.List;'
+        node = _parse_import_node("java", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "java")
+        assert result == ["java"]

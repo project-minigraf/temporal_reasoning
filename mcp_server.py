@@ -160,6 +160,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "imports": {"import_declaration"},
         "calls": {"call_expression"},
     },
+    "java": {
+        "functions": {"method_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"import_declaration"},
+        "calls": {"method_invocation"},
+    },
 }
 
 
@@ -262,6 +268,19 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
                 for spec in child.named_children:
                     if spec.type == "import_spec":
                         _go_spec(spec)
+    elif lang_name == "java":
+        def _java_leftmost(n) -> Optional[str]:
+            if n.type == "identifier":
+                return n.text.decode("utf-8")
+            for c in n.named_children:
+                result = _java_leftmost(c)
+                if result:
+                    return result
+            return None
+
+        result = _java_leftmost(node)
+        if result:
+            names.append(result)
     return names
 
 
