@@ -34,3 +34,7 @@ skills/
 
 #IDEs
 .idea
+
+# Eval artifacts (generated outputs and side-effects from eval runs)
+evals/workspace/
+analytics/
