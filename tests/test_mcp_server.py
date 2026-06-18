@@ -2543,3 +2543,11 @@ class TestExtractImportName:
         node = _parse_import_node("php", source, "include_expression", tmp_path)
         result = mcp_server._extract_import_name(node, "php")
         assert result == ["header"]
+
+    def test_kotlin_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_kotlin")
+        import mcp_server
+        source = b'import kotlin.collections.List'
+        node = _parse_import_node("kotlin", source, "import", tmp_path)
+        result = mcp_server._extract_import_name(node, "kotlin")
+        assert result == ["kotlin"]

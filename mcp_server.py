@@ -199,6 +199,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
                     "require_once_expression", "include_once_expression"},
         "calls": {"function_call_expression"},
     },
+    "kotlin": {
+        "functions": {"function_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"import"},
+        "calls": {"call_expression"},
+    },
 }
 
 
@@ -395,6 +401,19 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
                 val = child.text.decode("utf-8").strip("'\"")
                 names.append(os.path.splitext(os.path.basename(val))[0])
                 break
+    elif lang_name == "kotlin":
+        def _kotlin_first_seg(n) -> Optional[str]:
+            if n.type in ("simple_identifier", "identifier"):
+                return n.text.decode("utf-8")
+            for c in n.named_children:
+                result = _kotlin_first_seg(c)
+                if result:
+                    return result
+            return None
+
+        result = _kotlin_first_seg(node)
+        if result:
+            names.append(result)
     return names
 
 
