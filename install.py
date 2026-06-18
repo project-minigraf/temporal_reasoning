@@ -133,6 +133,9 @@ def check_tree_sitter_languages_package():
         "tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript",
         "tree-sitter-typescript", "tree-sitter-go", "tree-sitter-java",
         "tree-sitter-c", "tree-sitter-cpp",
+        "tree-sitter-c-sharp", "tree-sitter-ruby", "tree-sitter-php",
+        "tree-sitter-kotlin", "tree-sitter-swift", "tree-sitter-scala",
+        "tree-sitter-haskell", "tree-sitter-lua", "tree-sitter-elixir",
     ]
     if _venv_pip_install(*individual):
         print("✓ Individual tree-sitter language packages installed")
