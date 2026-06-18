@@ -2503,3 +2503,27 @@ class TestExtractImportName:
         node = _parse_import_node("c_sharp", source, "using_directive", tmp_path)
         result = mcp_server._extract_import_name(node, "c_sharp")
         assert result == ["System"]
+
+    def test_ruby_require(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"require 'rails'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == ["rails"]
+
+    def test_ruby_require_relative(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"require_relative 'my_module'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == ["my_module"]
+
+    def test_ruby_non_require_call_ignored(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"puts 'hello'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == []

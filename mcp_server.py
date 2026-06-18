@@ -184,6 +184,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "imports": {"using_directive"},
         "calls": {"invocation_expression"},
     },
+    "ruby": {
+        "functions": {"method"},
+        "classes": {"class"},
+        "imports": {"call"},
+        "calls": set(),
+    },
 }
 
 
@@ -280,6 +286,35 @@ def _csharp_using_name(node) -> Optional[str]:
     return _first_ident(node)
 
 
+def _ruby_require_name(node) -> Optional[str]:
+    """Return the required module name from a Ruby call node.
+
+    Handles:
+      require 'rails'            → "rails"
+      require_relative 'my_mod' → "my_mod"
+    Returns None for non-require calls.
+    """
+    import os
+    method = node.child_by_field_name("method")
+    if method is None or method.text.decode("utf-8") not in ("require", "require_relative"):
+        return None
+    args = node.child_by_field_name("arguments")
+    if args is None:
+        return None
+    for child in args.named_children:
+        if child.type == "string":
+            content_node = next(
+                (c for c in child.named_children if c.type == "string_content"),
+                None,
+            )
+            if content_node:
+                val = content_node.text.decode("utf-8")
+            else:
+                val = child.text.decode("utf-8").strip("'\"")
+            return os.path.splitext(os.path.basename(val))[0]
+    return None
+
+
 def _extract_import_name(node, lang_name: str) -> List[str]:
     """Extract top-level module names from an import node (may return multiple)."""
     names: List[str] = []
@@ -338,6 +373,10 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
             names.append(name)
     elif lang_name == "c_sharp":
         name = _csharp_using_name(node)
+        if name:
+            names.append(name)
+    elif lang_name == "ruby":
+        name = _ruby_require_name(node)
         if name:
             names.append(name)
     return names
