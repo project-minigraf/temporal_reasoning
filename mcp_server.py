@@ -114,14 +114,12 @@ def _get_parser(file_path: str) -> Optional[Any]:
 
     # Attempt 2: individual tree-sitter-<lang> packages (new-style API, Python 3.13+)
     if parser is None:
-        pkg_name = lang_name.replace("_", "-")  # c_sharp → c-sharp
         try:
             mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
             from tree_sitter import Language, Parser  # type: ignore
             lang_obj = Language(mod.language())
             parser = Parser(lang_obj)
         except Exception:
-            # Try with hyphenated module name variant (e.g. tree_sitter_c_sharp)
             pass
 
     _grammar_cache[lang_name] = parser
