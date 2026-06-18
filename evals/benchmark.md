@@ -2,10 +2,49 @@
 
 **Date**: 2026-06-18  
 **Model**: claude-sonnet-4-6  
-**Iterations**: 6 (iteration-1 baseline → iteration-2 hardened evals → iteration-3 graph capabilities → iteration-4 ingestion + hooks → iteration-5 all 12 evals re-run with fixed assertions → iteration-6 minigraf rebrand + eval fixes + product bug fix)  
+**Iterations**: 7 (iteration-1 baseline → iteration-2 hardened evals → iteration-3 graph capabilities → iteration-4 ingestion + hooks → iteration-5 all 12 evals re-run with fixed assertions → iteration-6 minigraf rebrand + eval fixes + product bug fix → iteration-7 eval isolation framework)  
 **Tests**: 188 passing
 
 ## Summary
+
+### Iteration-7 (all 12 evals — isolated sandboxes)
+
+| Metric | With Skill | Without Skill | Delta |
+|--------|-----------|---------------|-------|
+| Pass Rate | **88%** (52/59 assertions) | **17%** (10/59) | **+0.71** |
+
+**Per-eval pass rates (iteration-7):**
+
+| Eval | With Skill | Without Skill | Notes |
+|------|-----------|---------------|-------|
+| 1 — decision-storage | 5/5 (100%) | 0/5 (0%) | Clean |
+| 2 — memory-retrieval | 4/5 (80%) | 3/5 (60%) | with_skill missed explicit "checking memory" signal; without_skill queried live graph via Bash |
+| 3 — preference-enforcement | 4/4 (100%) | 0/4 (0%) | without_skill wrote mock-based test |
+| 4 — conflict-detection | 4/4 (100%) | 0/4 (0%) | without_skill wrote MySQL code without checking history |
+| 5 — entity-ref-storage | 5/5 (100%) | 0/5 (0%) | Clean |
+| 6 — transitive-impact | 5/5 (100%) | 4/5 (80%) | without_skill found answers via Bash + live graph; missed minigraf_query expectation |
+| 7 — decision-traceability | 5/5 (100%) | 1/5 (20%) | without_skill reconstructed reasoning from code/docs, not graph; found GIL mention in SKILL.md |
+| 8 — git-ingestion | 2/6 (33%) | 0/6 (0%) | Regression: with_skill called ingest_git before checking status; polled/waited instead of moving on |
+| 9 — ingest-status | 5/5 (100%) | 0/5 (0%) | **Isolation fixed**: isolated server shows true idle state; eval-9 works as designed |
+| 10 — memory-prepare-turn | 5/5 (100%) | 0/5 (0%) | Clean |
+| 11 — audit | 4/5 (80%) | 0/5 (0%) | Missed explicitly naming audit scope; without_skill now isolated — no more ToolSearch contamination |
+| 12 — already-running | 4/5 (80%) | 2/5 (40%) | with_skill called ingest_git again (E2 fail); without_skill 2/5 are vacuous (no tools) |
+
+**Iteration-7 changes from iteration-6:**
+- Added eval isolation framework (`evals/run_isolated.py`): each eval runs against a fresh temp `memory.graph` via `claude --bare --mcp-config <isolated>`
+- `with_skill` variant: isolated MCP server + `--append-system-prompt-file SKILL.md`
+- `without_skill` variant: `claude --bare` only — **no MCP tools available at all** (eliminates ToolSearch contamination)
+- `MINIGRAF_NO_AUTO_INGEST=1` env var added to MCP server: isolated servers no longer auto-start ingestion
+- Added `name` and `seed` fields to all evals in `evals.json`; validate_evals.py updated to require `name`
+- Evals 2, 3, 4, 6, 7, 10, 11 now receive pre-seeded graph data automatically before each with_skill run
+- Eval 9 now reliably sees `idle` status (previously saw `complete` or `running` from live server)
+- Eval 11 without_skill no longer touches the live graph (isolation prevents destructive audit)
+
+**Eval 8 regression (with_skill 2/6 vs 4/6 in iteration-6):**
+The agent called `minigraf_ingest_git` before calling `minigraf_ingest_status`, violating the skill's "check status first" instruction. It then polled status 4 times and waited for completion rather than starting the job and moving on. The skill guidance on this specific sequence needs reinforcement.
+
+**Remaining without_skill contamination (Bash path):**
+Without_skill agents still have access to Bash, which they use to query the live `memory.graph` directly via `python3 -c "from minigraf import MiniGrafDb; ..."`. This is why eval-2 (3/5) and eval-6 (4/5) scored higher than expected for without_skill. The live graph contains architecture data from prior sessions.
 
 ### Iteration-6 (all 12 evals)
 
@@ -75,6 +114,7 @@
 
 | Iteration | With Skill | Without Skill | Delta |
 |-----------|-----------|---------------|-------|
+| iteration-7 (all 12 evals, isolated) | **88%** (52/59) | **17%** (10/59) | **+0.71** |
 | iteration-6 (all 12 evals) | **92%** (54/59) | **24%** (14/59) | **+0.68** |
 | iteration-5 (all 12 evals) | 85% ± 24% (46/54) | 0% (0/54) | +0.85 |
 | iteration-3 (evals 1–7) | 100% (34/34) | 0% (0/34) | +1.00 |
@@ -244,6 +284,14 @@
 **Eval design issue (iteration-5)**: The SETUP calls `vulcan_ingest_git` as a live tool, which is blocked by the evaluator sandbox. The "already running" precondition is never established, so the test can never exercise the intended behavior. The fix is to pre-seed the ingestion state via a test fixture (write a watermark entity + last-run-at timestamp directly with `vulcan_transact`) rather than relying on a live background task.
 
 ## Observations
+
+### Iteration-7 findings
+
+- **Eval isolation works**: Eval-9 now correctly sees `idle` status in every run. The ToolSearch contamination path that let eval-11 without_skill destroy 259 entities is closed — without_skill has zero MCP tool access. The live project graph is never touched by any eval run.
+- **Eval 8 is the weakest with_skill eval (2/6, 33%)**: The agent called `minigraf_ingest_git` directly without checking status first, then polled status repeatedly and reported "ready" only after ingestion completed — violating both the status-first and background-and-move-on expectations. This specific sequencing behavior needs stronger reinforcement in the skill.
+- **Without_skill Bash path is a remaining contamination vector**: Without_skill agents have no MCP tools but do have Bash. Evals 2 and 6 showed without_skill agents querying the live `memory.graph` directly via Python (`MiniGrafDb.open('memory.graph')`). This inflates without_skill scores on retrieval/traversal evals because the live graph contains real architecture data. A full fix requires either restricting filesystem access or using a network-isolated sandbox.
+- **Seed data confirmed working**: Evals 2, 3, 4, 6, 7, 10, 11 all used pre-seeded graphs. With_skill agents correctly found and cited the seeded facts in all cases except eval-8 (which has no seed, tests ingestion flow).
+- **Without_skill score drop (24% → 17%)**: The ToolSearch contamination is gone. Iteration-6's 24% was inflated by without_skill agents discovering and calling MCP tools. Iteration-7's 17% is cleaner — most passes are vacuous (expectations about not calling tools that aren't available anyway) or Bash-path findings.
 
 ### Iteration-6 findings
 
