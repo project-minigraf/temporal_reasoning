@@ -117,7 +117,9 @@ def _get_parser(file_path: str) -> Optional[Any]:
         try:
             mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
             from tree_sitter import Language, Parser  # type: ignore
-            lang_obj = Language(mod.language())
+            # PHP exposes language_php() instead of language()
+            lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
+            lang_obj = Language(lang_fn())
             parser = Parser(lang_obj)
         except Exception:
             pass
@@ -159,6 +161,79 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "classes": {"type_declaration"},
         "imports": {"import_declaration"},
         "calls": {"call_expression"},
+    },
+    "java": {
+        "functions": {"method_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"import_declaration"},
+        "calls": {"method_invocation"},
+    },
+    "c": {
+        "functions": {"function_definition"},
+        "classes": {"struct_specifier"},
+        "imports": {"preproc_include"},
+        "calls": {"call_expression"},
+    },
+    "cpp": {
+        "functions": {"function_definition"},
+        "classes": {"class_specifier", "struct_specifier"},
+        "imports": {"preproc_include"},
+        "calls": {"call_expression"},
+    },
+    "c_sharp": {
+        "functions": {"method_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"using_directive"},
+        "calls": {"invocation_expression"},
+    },
+    "ruby": {
+        "functions": {"method"},
+        "classes": {"class"},
+        "imports": {"call"},
+        "calls": set(),
+    },
+    "php": {
+        "functions": {"function_definition", "method_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"require_expression", "include_expression",
+                    "require_once_expression", "include_once_expression"},
+        "calls": {"function_call_expression"},
+    },
+    "kotlin": {
+        "functions": {"function_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"import"},
+        "calls": {"call_expression"},
+    },
+    "swift": {
+        "functions": {"function_declaration"},
+        "classes": {"class_declaration"},
+        "imports": {"import_declaration"},
+        "calls": {"call_expression"},
+    },
+    "scala": {
+        "functions": {"function_definition"},
+        "classes": {"class_definition"},
+        "imports": {"import_declaration"},
+        "calls": {"call_expression"},
+    },
+    "haskell": {
+        "functions": {"function"},
+        "classes": {"data_type"},
+        "imports": {"import"},
+        "calls": {"apply"},
+    },
+    "lua": {
+        "functions": {"function_definition"},
+        "classes": set(),
+        "imports": {"function_call"},
+        "calls": set(),
+    },
+    "elixir": {
+        "functions": {"def", "defp"},
+        "classes": {"defmodule"},
+        "imports": {"call"},
+        "calls": set(),
     },
 }
 
@@ -223,6 +298,125 @@ def _rust_use_root(node) -> Optional[str]:
     return None
 
 
+def _c_include_name(node) -> Optional[str]:
+    """Return the header name (no path, no extension) from a C/C++ preproc_include node.
+
+    Handles both:
+      #include <stdio.h>    → system_lib_string → "stdio"
+      #include "myheader.h" → string_literal    → "myheader"
+    """
+    import os
+    for child in node.children:
+        if child.type in ("system_lib_string", "string_literal"):
+            raw = child.text.decode("utf-8").strip("<>\"'")
+            return os.path.splitext(os.path.basename(raw))[0]
+    return None
+
+
+def _csharp_using_name(node) -> Optional[str]:
+    """Return the root namespace from a C# using_directive node.
+
+    using System;                     → "System"
+    using System.Collections.Generic; → "System"
+    """
+    def _first_ident(n) -> Optional[str]:
+        if n.type == "identifier":
+            return n.text.decode("utf-8")
+        for c in n.named_children:
+            result = _first_ident(c)
+            if result:
+                return result
+        return None
+
+    return _first_ident(node)
+
+
+def _ruby_require_name(node) -> Optional[str]:
+    """Return the required module name from a Ruby call node.
+
+    Handles:
+      require 'rails'            → "rails"
+      require_relative 'my_mod' → "my_mod"
+    Returns None for non-require calls.
+    """
+    import os
+    method = node.child_by_field_name("method")
+    if method is None or method.text.decode("utf-8") not in ("require", "require_relative"):
+        return None
+    args = node.child_by_field_name("arguments")
+    if args is None:
+        return None
+    for child in args.named_children:
+        if child.type == "string":
+            content_node = next(
+                (c for c in child.named_children if c.type == "string_content"),
+                None,
+            )
+            if content_node:
+                val = content_node.text.decode("utf-8")
+            else:
+                val = child.text.decode("utf-8").strip("'\"")
+            return os.path.splitext(os.path.basename(val))[0]
+    return None
+
+
+def _lua_require_name(node) -> Optional[str]:
+    """Return the module name from a Lua function_call to require().
+
+    require("socket")  → "socket"
+    Returns None for non-require calls.
+
+    AST shape:
+      function_call
+        identifier  b'require'
+        arguments
+          (  b'('
+          string  b'"socket"'
+          )  b')'
+    """
+    fn_node = None
+    for child in node.children:
+        if child.type == "identifier":
+            fn_node = child
+            break
+    if fn_node is None or fn_node.text.decode("utf-8") != "require":
+        return None
+    for child in node.children:
+        if child.type == "arguments":
+            for arg in child.children:
+                if arg.type == "string":
+                    return arg.text.decode("utf-8").strip("'\"")
+    return None
+
+
+def _elixir_module_name(node) -> Optional[str]:
+    """Return the root module name from an Elixir alias/import/use/require call.
+
+    alias MyApp.Router     → "MyApp"
+    import Ecto.Query      → "Ecto"
+    use Phoenix.Controller → "Phoenix"
+    require Logger         → "Logger"
+    Returns None for non-module calls (e.g. IO.puts/1 where target is a dot node).
+    """
+    _ELIXIR_MODULE_CALLS = {"alias", "import", "use", "require"}
+    # The call target is the field named "target" — an identifier for alias/import/use/require,
+    # or a dot node for things like IO.puts/1.
+    target = node.child_by_field_name("target")
+    if target is None or target.type != "identifier":
+        return None
+    if target.text.decode("utf-8") not in _ELIXIR_MODULE_CALLS:
+        return None
+    # The module argument is in an "arguments" child (unnamed field).
+    # It contains an "alias" node whose text is the full dotted module name.
+    for child in node.children:
+        if child.type == "arguments":
+            for arg in child.children:
+                if arg.type == "alias":
+                    txt = arg.text.decode("utf-8")
+                    return txt.split(".")[0]
+    return None
+
+
 def _extract_import_name(node, lang_name: str) -> List[str]:
     """Extract top-level module names from an import node (may return multiple)."""
     names: List[str] = []
@@ -246,6 +440,89 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
             names.append(src.text.decode("utf-8").strip("'\""))
     elif lang_name == "rust":
         name = _rust_use_root(node)
+        if name:
+            names.append(name)
+    elif lang_name == "go":
+        def _go_spec(spec_node):
+            path = spec_node.child_by_field_name("path")
+            if path:
+                val = path.text.decode("utf-8").strip('"')
+                names.append(val.split("/")[-1])
+
+        for child in node.named_children:
+            if child.type == "import_spec":
+                _go_spec(child)
+            elif child.type == "import_spec_list":
+                for spec in child.named_children:
+                    if spec.type == "import_spec":
+                        _go_spec(spec)
+    elif lang_name == "java":
+        def _java_leftmost(n) -> Optional[str]:
+            if n.type == "identifier":
+                return n.text.decode("utf-8")
+            for c in n.named_children:
+                result = _java_leftmost(c)
+                if result:
+                    return result
+            return None
+
+        result = _java_leftmost(node)
+        if result:
+            names.append(result)
+    elif lang_name in ("c", "cpp"):
+        name = _c_include_name(node)
+        if name:
+            names.append(name)
+    elif lang_name == "c_sharp":
+        name = _csharp_using_name(node)
+        if name:
+            names.append(name)
+    elif lang_name == "ruby":
+        name = _ruby_require_name(node)
+        if name:
+            names.append(name)
+    elif lang_name == "php":
+        import os
+        for child in node.children:
+            if child.type in ("string", "encapsed_string", "string_literal"):
+                val = child.text.decode("utf-8").strip("'\"")
+                names.append(os.path.splitext(os.path.basename(val))[0])
+                break
+    elif lang_name == "kotlin":
+        def _kotlin_first_seg(n) -> Optional[str]:
+            if n.type in ("simple_identifier", "identifier"):
+                return n.text.decode("utf-8")
+            for c in n.named_children:
+                result = _kotlin_first_seg(c)
+                if result:
+                    return result
+            return None
+
+        result = _kotlin_first_seg(node)
+        if result:
+            names.append(result)
+    elif lang_name == "swift":
+        for child in node.named_children:
+            if child.type in ("identifier", "simple_identifier"):
+                names.append(child.text.decode("utf-8"))
+                break
+    elif lang_name == "scala":
+        for child in node.named_children:
+            txt = child.text.decode("utf-8")
+            names.append(txt.split(".")[0])
+            break
+    elif lang_name == "haskell":
+        for child in node.named_children:
+            if child.type in ("module", "qualified_module", "constructor"):
+                txt = child.text.decode("utf-8")
+                names.append(txt.split(".")[0])
+                break
+    elif lang_name == "lua":
+        name = _lua_require_name(node)
+        if name:
+            names.append(name)
+    elif lang_name == "elixir":
+        name = _elixir_module_name(node)
         if name:
             names.append(name)
     return names
