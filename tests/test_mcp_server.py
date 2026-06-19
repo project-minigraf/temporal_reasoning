@@ -2575,3 +2575,19 @@ class TestExtractImportName:
         node = _parse_import_node("haskell", source, "import", tmp_path)
         result = mcp_server._extract_import_name(node, "haskell")
         assert result == ["Data"]
+
+    def test_lua_require(self, tmp_path):
+        pytest.importorskip("tree_sitter_lua")
+        import mcp_server
+        source = b'require("socket")'
+        node = _parse_import_node("lua", source, "function_call", tmp_path)
+        result = mcp_server._extract_import_name(node, "lua")
+        assert result == ["socket"]
+
+    def test_lua_non_require_ignored(self, tmp_path):
+        pytest.importorskip("tree_sitter_lua")
+        import mcp_server
+        source = b'print("hello")'
+        node = _parse_import_node("lua", source, "function_call", tmp_path)
+        result = mcp_server._extract_import_name(node, "lua")
+        assert result == []

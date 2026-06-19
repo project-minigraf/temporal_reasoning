@@ -223,6 +223,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "imports": {"import"},
         "calls": {"apply"},
     },
+    "lua": {
+        "functions": {"function_definition"},
+        "classes": set(),
+        "imports": {"function_call"},
+        "calls": set(),
+    },
 }
 
 
@@ -348,6 +354,35 @@ def _ruby_require_name(node) -> Optional[str]:
     return None
 
 
+def _lua_require_name(node) -> Optional[str]:
+    """Return the module name from a Lua function_call to require().
+
+    require("socket")  → "socket"
+    Returns None for non-require calls.
+
+    AST shape:
+      function_call
+        identifier  b'require'
+        arguments
+          (  b'('
+          string  b'"socket"'
+          )  b')'
+    """
+    fn_node = None
+    for child in node.children:
+        if child.type == "identifier":
+            fn_node = child
+            break
+    if fn_node is None or fn_node.text.decode("utf-8") != "require":
+        return None
+    for child in node.children:
+        if child.type == "arguments":
+            for arg in child.children:
+                if arg.type == "string":
+                    return arg.text.decode("utf-8").strip("'\"")
+    return None
+
+
 def _extract_import_name(node, lang_name: str) -> List[str]:
     """Extract top-level module names from an import node (may return multiple)."""
     names: List[str] = []
@@ -448,6 +483,10 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
                 txt = child.text.decode("utf-8")
                 names.append(txt.split(".")[0])
                 break
+    elif lang_name == "lua":
+        name = _lua_require_name(node)
+        if name:
+            names.append(name)
     return names
 
 
