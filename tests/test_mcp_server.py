@@ -2396,3 +2396,227 @@ class TestRunIngestionBitemporalDeps:
             f"Expected _ingest_close to be called with '{dep_triple}' when import removed, "
             f"got: {close_triples_seen}"
         )
+
+# ---------------------------------------------------------------------------
+# Helpers for TestExtractImportName
+# ---------------------------------------------------------------------------
+
+def _find_node(root, node_type: str):
+    """DFS search for the first node matching node_type."""
+    if root.type == node_type:
+        return root
+    for child in root.children:
+        found = _find_node(child, node_type)
+        if found:
+            return found
+    return None
+
+
+def _parse_import_node(lang_name: str, source: bytes, node_type: str, tmp_path):
+    """Parse source for lang_name, return first node of node_type or skip."""
+    import mcp_server
+    ext = {
+        "go": ".go", "java": ".java", "c": ".c", "cpp": ".cpp",
+        "c_sharp": ".cs", "ruby": ".rb", "php": ".php", "kotlin": ".kt",
+        "swift": ".swift", "scala": ".scala", "haskell": ".hs",
+        "lua": ".lua", "elixir": ".ex",
+    }[lang_name]
+    tmp_file = tmp_path / f"test{ext}"
+    tmp_file.write_bytes(source)
+    parser = mcp_server._get_parser(str(tmp_file))
+    if parser is None:
+        pytest.skip(f"No tree-sitter parser available for {lang_name}")
+    tree = parser.parse(source)
+    node = _find_node(tree.root_node, node_type)
+    if node is None:
+        pytest.fail(
+            f"No {node_type!r} node found in AST.\n"
+            f"Full AST sexp:\n{tree.root_node.sexp()}"
+        )
+    return node
+
+
+class TestExtractImportName:
+    """Unit tests for _extract_import_name — one per language, using real parsers."""
+
+    def test_go_single_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_go")
+        import mcp_server
+        source = b'package main\nimport "fmt"'
+        node = _parse_import_node("go", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "go")
+        assert result == ["fmt"]
+
+    def test_go_grouped_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_go")
+        import mcp_server
+        source = b'package main\nimport (\n\t"os"\n\t"github.com/user/pkg"\n)'
+        node = _parse_import_node("go", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "go")
+        assert "os" in result
+        assert "pkg" in result
+
+    def test_java_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_java")
+        import mcp_server
+        source = b'import java.util.List;'
+        node = _parse_import_node("java", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "java")
+        assert result == ["java"]
+
+    def test_c_system_include(self, tmp_path):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b'#include <stdio.h>'
+        node = _parse_import_node("c", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "c")
+        assert result == ["stdio"]
+
+    def test_c_local_include(self, tmp_path):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b'#include "myheader.h"'
+        node = _parse_import_node("c", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "c")
+        assert result == ["myheader"]
+
+    def test_cpp_include(self, tmp_path):
+        pytest.importorskip("tree_sitter_cpp")
+        import mcp_server
+        source = b'#include <iostream>'
+        node = _parse_import_node("cpp", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "cpp")
+        assert result == ["iostream"]
+
+    def test_csharp_using_simple(self, tmp_path):
+        pytest.importorskip("tree_sitter_c_sharp")
+        import mcp_server
+        source = b'using System;'
+        node = _parse_import_node("c_sharp", source, "using_directive", tmp_path)
+        result = mcp_server._extract_import_name(node, "c_sharp")
+        assert result == ["System"]
+
+    def test_csharp_using_dotted(self, tmp_path):
+        pytest.importorskip("tree_sitter_c_sharp")
+        import mcp_server
+        source = b'using System.Collections.Generic;'
+        node = _parse_import_node("c_sharp", source, "using_directive", tmp_path)
+        result = mcp_server._extract_import_name(node, "c_sharp")
+        assert result == ["System"]
+
+    def test_ruby_require(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"require 'rails'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == ["rails"]
+
+    def test_ruby_require_relative(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"require_relative 'my_module'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == ["my_module"]
+
+    def test_ruby_non_require_call_ignored(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"puts 'hello'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == []
+
+    def test_php_require(self, tmp_path):
+        pytest.importorskip("tree_sitter_php")
+        import mcp_server
+        source = b"<?php\nrequire 'config.php';"
+        node = _parse_import_node("php", source, "require_expression", tmp_path)
+        result = mcp_server._extract_import_name(node, "php")
+        assert result == ["config"]
+
+    def test_php_include(self, tmp_path):
+        pytest.importorskip("tree_sitter_php")
+        import mcp_server
+        source = b"<?php\ninclude 'header.php';"
+        node = _parse_import_node("php", source, "include_expression", tmp_path)
+        result = mcp_server._extract_import_name(node, "php")
+        assert result == ["header"]
+
+    def test_kotlin_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_kotlin")
+        import mcp_server
+        source = b'import kotlin.collections.List'
+        node = _parse_import_node("kotlin", source, "import", tmp_path)
+        result = mcp_server._extract_import_name(node, "kotlin")
+        assert result == ["kotlin"]
+
+    def test_swift_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_swift")
+        import mcp_server
+        source = b'import Foundation'
+        node = _parse_import_node("swift", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "swift")
+        assert result == ["Foundation"]
+
+    def test_scala_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_scala")
+        import mcp_server
+        source = b'import scala.collection.mutable'
+        node = _parse_import_node("scala", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "scala")
+        assert result == ["scala"]
+
+    def test_haskell_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_haskell")
+        import mcp_server
+        source = b'import Data.List'
+        node = _parse_import_node("haskell", source, "import", tmp_path)
+        result = mcp_server._extract_import_name(node, "haskell")
+        assert result == ["Data"]
+
+    def test_lua_require(self, tmp_path):
+        pytest.importorskip("tree_sitter_lua")
+        import mcp_server
+        source = b'require("socket")'
+        node = _parse_import_node("lua", source, "function_call", tmp_path)
+        result = mcp_server._extract_import_name(node, "lua")
+        assert result == ["socket"]
+
+    def test_lua_non_require_ignored(self, tmp_path):
+        pytest.importorskip("tree_sitter_lua")
+        import mcp_server
+        source = b'print("hello")'
+        node = _parse_import_node("lua", source, "function_call", tmp_path)
+        result = mcp_server._extract_import_name(node, "lua")
+        assert result == []
+
+    def test_elixir_alias(self, tmp_path):
+        pytest.importorskip("tree_sitter_elixir")
+        import mcp_server
+        source = b'alias MyApp.Router'
+        node = _parse_import_node("elixir", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "elixir")
+        assert result == ["MyApp"]
+
+    def test_elixir_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_elixir")
+        import mcp_server
+        source = b'import Ecto.Query'
+        node = _parse_import_node("elixir", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "elixir")
+        assert result == ["Ecto"]
+
+    def test_elixir_non_module_call_ignored(self, tmp_path):
+        pytest.importorskip("tree_sitter_elixir")
+        import mcp_server
+        # A plain expression that's not alias/import/use
+        source = b'IO.puts("hello")'
+        # If this produces no "call" node, the test should just pass with []
+        try:
+            node = _parse_import_node("elixir", source, "call", tmp_path)
+        except Exception:
+            return  # no call node found — that's fine
+        result = mcp_server._extract_import_name(node, "elixir")
+        assert result == []
