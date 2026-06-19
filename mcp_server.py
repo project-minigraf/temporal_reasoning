@@ -229,6 +229,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "imports": {"function_call"},
         "calls": set(),
     },
+    "elixir": {
+        "functions": {"def", "defp"},
+        "classes": {"defmodule"},
+        "imports": {"call"},
+        "calls": set(),
+    },
 }
 
 
@@ -383,6 +389,34 @@ def _lua_require_name(node) -> Optional[str]:
     return None
 
 
+def _elixir_module_name(node) -> Optional[str]:
+    """Return the root module name from an Elixir alias/import/use/require call.
+
+    alias MyApp.Router     → "MyApp"
+    import Ecto.Query      → "Ecto"
+    use Phoenix.Controller → "Phoenix"
+    require Logger         → "Logger"
+    Returns None for non-module calls (e.g. IO.puts/1 where target is a dot node).
+    """
+    _ELIXIR_MODULE_CALLS = {"alias", "import", "use", "require"}
+    # The call target is the field named "target" — an identifier for alias/import/use/require,
+    # or a dot node for things like IO.puts/1.
+    target = node.child_by_field_name("target")
+    if target is None or target.type != "identifier":
+        return None
+    if target.text.decode("utf-8") not in _ELIXIR_MODULE_CALLS:
+        return None
+    # The module argument is in an "arguments" child (unnamed field).
+    # It contains an "alias" node whose text is the full dotted module name.
+    for child in node.children:
+        if child.type == "arguments":
+            for arg in child.children:
+                if arg.type == "alias":
+                    txt = arg.text.decode("utf-8")
+                    return txt.split(".")[0]
+    return None
+
+
 def _extract_import_name(node, lang_name: str) -> List[str]:
     """Extract top-level module names from an import node (may return multiple)."""
     names: List[str] = []
@@ -485,6 +519,10 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
                 break
     elif lang_name == "lua":
         name = _lua_require_name(node)
+        if name:
+            names.append(name)
+    elif lang_name == "elixir":
+        name = _elixir_module_name(node)
         if name:
             names.append(name)
     return names

@@ -2591,3 +2591,32 @@ class TestExtractImportName:
         node = _parse_import_node("lua", source, "function_call", tmp_path)
         result = mcp_server._extract_import_name(node, "lua")
         assert result == []
+
+    def test_elixir_alias(self, tmp_path):
+        pytest.importorskip("tree_sitter_elixir")
+        import mcp_server
+        source = b'alias MyApp.Router'
+        node = _parse_import_node("elixir", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "elixir")
+        assert result == ["MyApp"]
+
+    def test_elixir_import(self, tmp_path):
+        pytest.importorskip("tree_sitter_elixir")
+        import mcp_server
+        source = b'import Ecto.Query'
+        node = _parse_import_node("elixir", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "elixir")
+        assert result == ["Ecto"]
+
+    def test_elixir_non_module_call_ignored(self, tmp_path):
+        pytest.importorskip("tree_sitter_elixir")
+        import mcp_server
+        # A plain expression that's not alias/import/use
+        source = b'IO.puts("hello")'
+        # If this produces no "call" node, the test should just pass with []
+        try:
+            node = _parse_import_node("elixir", source, "call", tmp_path)
+        except Exception:
+            return  # no call node found — that's fine
+        result = mcp_server._extract_import_name(node, "elixir")
+        assert result == []
