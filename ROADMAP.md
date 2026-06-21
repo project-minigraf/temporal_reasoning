@@ -118,7 +118,7 @@ For a local single-user developer tool (the current Phase 5 target), stored data
 - `minigraf_ingest_docs` (experiment) — ingest plain text/markdown files from git history using the existing heuristic/llm/agent extraction strategies, with commit timestamps as `:valid-from`. Enables backdated decision entities from committed ADRs and design docs. Risk: duplication against conversation-extracted entities; quality depends on extraction strategy. Spec before building.
 - WASM bindings (browser + edge) — no spec or concrete driver yet
 - Mobile embedding — no spec or concrete driver yet
-- Vector store / embedding-based disambiguation — add only when at least two of: (a) entity volume exceeds prompt injection limits, (b) cross-session resolution fails on canonical lookup, (c) free-text search is explicitly requested. Preferred shape: embedded co-located index (`sqlite-vec` or `lancedb`), not a separate service.
+- **Embedding-based disambiguation** — sub-points (a) and (c) are addressed by the BM25 index (`FactIndex` / `IndexCache`, `rank-bm25`, in-memory). The remaining open question is (b): cross-session resolution failures where the user references an entity by description rather than ident (e.g. "Redis cache" → `:decision/redis`) — BM25 keyword overlap does not handle this; it would require semantic embedding. Add embedding support only if (b) becomes a demonstrated pain point. Preferred shape remains an embedded co-located index (`sqlite-vec` or `lancedb`), not a separate service.
 
 ---
 
@@ -126,4 +126,4 @@ For a local single-user developer tool (the current Phase 5 target), stored data
 
 Published as a GitHub-hosted Claude Code plugin. Users add the repo to `extraKnownMarketplaces` in `settings.json` — see README for instructions.
 
-Pre-built binary support landed in minigraf v0.19.0 (2026-04-14), removing the `cargo`/Rust installation barrier. `install.py` now downloads the correct binary automatically for Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, and Windows. Skill description reframed to lead with user benefit.
+`install.py` installs the `minigraf` Python package via pip (`>=0.22.0`, which introduced the Python binding). Rust/`cargo` is no longer required. Supported platforms: Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows.
