@@ -92,51 +92,23 @@ query("[:find ?name :where [:project/db :name ?name]]")
 
 ## Install
 
-### Claude Code (plugin — recommended)
-
-Add to your Claude Code `settings.json`:
-
-```json
-"extraKnownMarketplaces": {
-  "temporal-reasoning": {
-    "source": {
-      "source": "git",
-      "url": "https://github.com/project-minigraf/temporal_reasoning"
-    }
-  }
-}
-```
-
-Then enable the `temporal-reasoning` plugin in Claude Code. Once enabled, run once from your project root to finish setup:
-
-```bash
-python /path/to/temporal_reasoning/install.py
-```
-
-`install.py` installs the `minigraf` pip package, which fetches the platform-appropriate binary automatically (Linux x86_64/aarch64, macOS arm64/x86_64, Windows).
-
-### Manual install
-
 ```bash
 git clone https://github.com/project-minigraf/temporal_reasoning
-```
-
-Then, from your project root:
-
-```bash
 cd /your/project
 python /path/to/temporal_reasoning/install.py
 ```
 
-This writes `.mcp.json` and `.claude/settings*.json` into your project directory.
+Run `install.py` from your project root. It creates a virtualenv, installs dependencies, and writes `.mcp.json` and `.claude/settings*.json` into your project directory. That's it.
+
+**Optional — LLM extraction strategy:** `install.py` defaults to heuristic (regex) extraction, which requires no API key. To use LLM-based extraction, set `MINIGRAF_EXTRACTION_STRATEGY=llm` and `ANTHROPIC_API_KEY=<your key>` in `.claude/settings.local.json` after running the script.
 
 ### OpenCode
 
 ```bash
-python install.py
+python /path/to/temporal_reasoning/install.py
 ```
 
-This syncs the skill into `.opencode/skills/temporal-reasoning`.
+This also syncs the skill into `.opencode/skills/temporal-reasoning`.
 
 ## Quick Start
 
@@ -249,18 +221,23 @@ query("[:find ?name :where [?e :entity-type :type/component] [?e :name ?name]]")
 
 ## Skill Benchmarks
 
-Seven evals measure how the skill changes behavior versus a no-skill baseline. Each eval is seeded with a specific memory state and tests a distinct capability.
+Twelve evals run in isolated sandboxes measure how the skill changes behavior versus a no-skill baseline. Each eval uses a fresh graph with pre-seeded state where relevant.
 
 | Eval | What it tests | With Skill | Without Skill |
 |------|--------------|-----------|---------------|
-| Decision storage | Persists architectural decisions with correct naming + reasons | 6/6 | 0/6 |
-| Populated retrieval | Queries memory and cites stored facts by name | 5/5 | 0/5 |
-| Cross-session preference | Discovers and applies a constraint never stated in the current conversation | 4/4 | 0/4 |
-| Conflict detection | Surfaces architectural conflicts before silently overriding decisions | 4/4 | 0/4 |
-| Entity reference storage | Stores relationships as traversable graph edges, not dead-end strings | 5/5 | 0/5 |
-| Transitive impact analysis | Traverses a multi-hop dependency chain to find all affected services | 5/5 | 0/5 |
-| Decision traceability | Follows a `:motivated-by` edge to surface the constraint behind a decision | 5/5 | 0/5 |
-| **Total** | | **34/34 (100%)** | **0/34 (0%)** |
+| 1 — Decision storage | Persists architectural decisions with correct naming + reasons | 5/5 | 0/5 |
+| 2 — Memory retrieval | Queries memory and cites stored facts by name | 4/5 | 3/5 |
+| 3 — Cross-session preference | Discovers and applies a constraint never stated in the current conversation | 4/4 | 0/4 |
+| 4 — Conflict detection | Surfaces architectural conflicts before silently overriding decisions | 4/4 | 0/4 |
+| 5 — Entity reference storage | Stores relationships as traversable graph edges, not dead-end strings | 5/5 | 0/5 |
+| 6 — Transitive impact analysis | Traverses a multi-hop dependency chain to find all affected services | 5/5 | 4/5 |
+| 7 — Decision traceability | Follows a `:motivated-by` edge to surface the constraint behind a decision | 5/5 | 1/5 |
+| 8 — Git ingestion | Checks status before starting ingestion; moves on without polling | 6/6 | 0/6 |
+| 9 — Ingest status | Reports idle/running/complete accurately; surfaces errors | 5/5 | 0/5 |
+| 10 — Memory prepare-turn | Injects relevant context before the agent responds | 5/5 | 0/5 |
+| 11 — Audit | Detects and retracts schema violations | 4/5 | 0/5 |
+| 12 — Already running | Does not re-trigger ingestion when already in progress | 4/5 | 2/5 |
+| **Total** | | **56/59 (95%)** | **10/59 (17%)** |
 
 The cross-session preference eval is the most discriminating for memory recall: the prompt says "make sure it fits with how we do things" with no hint that a relevant constraint exists. The skill queries memory, finds a stored no-mocks preference, and writes a test using real database connections.
 

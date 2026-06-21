@@ -249,13 +249,22 @@ Returns `{"ok": true, "rule": "..."}` on success, or `{"ok": false, "error": "..
 
 Start background ingestion of code structure from git history into the bi-temporal graph. Returns immediately — ingestion runs as an asyncio background task.
 
+**Always call `minigraf_ingest_status` first.** Only call `minigraf_ingest_git` if status shows `idle`. If status is `running` or `complete`, do not start a new ingestion — report the current status to the user instead.
+
 ```python
+# Step 1: check status
+minigraf_ingest_status()
+# → {"ok": true, "status": "idle", ...}
+
+# Step 2: start only if idle
 minigraf_ingest_git(repo_path="/path/to/repo", branch="HEAD")
 # → {"ok": true, "job_id": "git-ingest", "message": "Ingestion started for /path/to/repo"}
 
 # If already running:
 # → {"ok": false, "error": "ingestion already in progress"}
 ```
+
+Once started, inform the user that ingestion is running in the background and move on — do not poll or wait for completion.
 
 Auto-invoked at session start via the `UserPromptSubmit` hook. The hook fires `minigraf_ingest_git` with no arguments, defaulting to `cwd` and `HEAD`. Incremental: reads the `:ingestion/watermark` entity to determine the last ingested commit, then only processes new commits.
 
