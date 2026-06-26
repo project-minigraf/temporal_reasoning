@@ -243,6 +243,10 @@ def _get_target_dir() -> str:
         idx = sys.argv.index("--target")
         if idx + 1 < len(sys.argv):
             return os.path.abspath(sys.argv[idx + 1])
+    # Accept a bare positional path argument (e.g. `python install.py /path/to/project`)
+    for arg in sys.argv[1:]:
+        if not arg.startswith("-"):
+            return os.path.abspath(arg)
     return os.getcwd()
 
 
@@ -492,6 +496,18 @@ def _build_plugin_stub() -> str:
             shutil.copytree(src, dst)
         else:
             shutil.copy2(src, dst)
+
+    # Remove stale versioned cache directories (other than the current version).
+    cache_plugin_dir = os.path.join(
+        home_claude, "plugins", "cache", "temporal-reasoning-local", "temporal-reasoning",
+    )
+    if os.path.isdir(cache_plugin_dir):
+        for entry in os.listdir(cache_plugin_dir):
+            if entry != PLUGIN_VERSION:
+                stale = os.path.join(cache_plugin_dir, entry)
+                if os.path.isdir(stale):
+                    shutil.rmtree(stale)
+                    print(f"  Removed stale cache {stale}")
 
     print(f"✓ Plugin stub built at {stub_dir}")
     return stub_dir
