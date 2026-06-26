@@ -35,6 +35,7 @@ PLUGIN_VERSION = _plugin_version()
 FILES_TO_SYNC = ["SKILL.md", "mcp_server.py", "skill.json"]
 DIRS_TO_SYNC = ["tools", "hooks"]
 SKILL_DIRS = [
+    os.path.join(".codex", "skills", "temporal-reasoning"),
     os.path.join(".opencode", "skills", "temporal-reasoning"),
     os.path.join("skills", "temporal-reasoning"),
 ]
