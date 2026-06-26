@@ -21,6 +21,17 @@ LAST_UPDATE_FILE = os.path.join(REPO_DIR, ".last_update")
 VENV_DIR = os.path.join(REPO_DIR, ".venv")
 VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python")
 
+def _plugin_version() -> str:
+    """Read the canonical version from .claude-plugin/plugin.json."""
+    import json
+    path = os.path.join(REPO_DIR, ".claude-plugin", "plugin.json")
+    try:
+        return json.load(open(path))["version"]
+    except Exception:
+        return "0.3.0"
+
+PLUGIN_VERSION = _plugin_version()
+
 FILES_TO_SYNC = ["SKILL.md", "mcp_server.py", "skill.json"]
 DIRS_TO_SYNC = ["tools", "hooks"]
 SKILL_DIRS = [
@@ -313,14 +324,19 @@ def setup_claude_settings_json(target_dir: str) -> bool:
 
     # enabledPlugins
     plugins = existing.setdefault("enabledPlugins", {})
-    plugins["minigraf@temporal-reasoning-local"] = True
+    plugins.pop("minigraf@temporal-reasoning-local", None)  # remove stale key
+    plugins["temporal-reasoning@temporal-reasoning-local"] = True
 
-    # extraKnownMarketplaces
+    # extraKnownMarketplaces — point at the stub, not REPO_DIR, so Claude Code's
+    # internal mc$() copier doesn't choke on .venv/ when syncing to the plugin cache.
+    stub_path = os.path.join(
+        os.path.expanduser("~"), ".claude", "plugins", "stubs", "temporal-reasoning-local",
+    )
     marketplaces = existing.setdefault("extraKnownMarketplaces", {})
     marketplaces["temporal-reasoning-local"] = {
         "source": {
             "source": "directory",
-            "path": REPO_DIR,
+            "path": stub_path,
         }
     }
 
@@ -343,8 +359,8 @@ def setup_claude_settings_json(target_dir: str) -> bool:
 
     verb = "Updated" if file_existed else "Created"
     print(f"✓ {verb} {settings_path}")
-    print(f"    enabledPlugins.minigraf@temporal-reasoning-local = true")
-    print(f"    extraKnownMarketplaces.temporal-reasoning-local → {REPO_DIR}")
+    print(f"    enabledPlugins.temporal-reasoning@temporal-reasoning-local = true")
+    print(f"    extraKnownMarketplaces.temporal-reasoning-local → {stub_path}")
     print(f"    enabledMcpjsonServers += temporal-reasoning")
     return True
 
@@ -434,6 +450,182 @@ def setup_claude_settings(target_dir: str) -> bool:
     return True
 
 
+def _build_plugin_stub() -> str:
+    """Create a minimal stub directory that Claude Code can safely copy to cache.
+
+    Claude Code's internal loader (mc$) resolves the plugin source path as:
+        path.join(extraKnownMarketplaces[marketplace].source.path, plugin.source)
+    and copies that entire tree into:
+        ~/.claude/plugins/cache/{marketplace}/{plugin}/{version}/
+
+    When that source path is REPO_DIR (which contains a multi-hundred-MB .venv/)
+    the copy fails silently.  We solve this by:
+      1. Building a stub directory (~/.claude/plugins/stubs/…) with only the
+         files Claude Code needs (.claude-plugin/, skills/).
+      2. Pointing extraKnownMarketplaces at the stub, not REPO_DIR.
+      3. The stub → cache copy is small and succeeds.
+
+    Returns the stub directory path.
+    """
+    import shutil
+
+    home_claude = os.path.join(os.path.expanduser("~"), ".claude")
+    stub_dir = os.path.join(
+        home_claude, "plugins", "stubs", "temporal-reasoning-local",
+    )
+
+    # Only the directories Claude Code needs:
+    #   .claude-plugin/  — plugin.json & marketplace.json (identity)
+    #   skills/          — SKILL.md discovery
+    essential = [".claude-plugin", "skills"]
+
+    os.makedirs(stub_dir, exist_ok=True)
+
+    for name in essential:
+        src = os.path.join(REPO_DIR, name)
+        dst = os.path.join(stub_dir, name)
+        if not os.path.exists(src):
+            continue
+        if os.path.isdir(src):
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+    print(f"✓ Plugin stub built at {stub_dir}")
+    return stub_dir
+
+
+def register_plugin_with_claude() -> bool:
+    """Register the plugin in Claude Code's user-level config files so it appears
+    in /skills globally (not just for the current project).
+
+    Files updated:
+    - ~/.claude/plugins/stubs/…/  — minimal stub Claude Code can copy from
+    - ~/.claude/settings.json     — enabledPlugins + extraKnownMarketplaces → stub
+    - ~/.claude/plugins/installed_plugins.json — installPath → expected cache dir
+    - ~/.claude/plugins/known_marketplaces.json — refresh timestamp
+    """
+    import json
+
+    home_claude = os.path.join(os.path.expanduser("~"), ".claude")
+    plugins_dir = os.path.join(home_claude, "plugins")
+    user_settings_path = os.path.join(home_claude, "settings.json")
+    installed_path = os.path.join(plugins_dir, "installed_plugins.json")
+    marketplaces_path = os.path.join(plugins_dir, "known_marketplaces.json")
+
+    plugin_key = "temporal-reasoning@temporal-reasoning-local"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
+          f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+
+    # --- Build minimal stub so Claude Code's loader doesn't choke on .venv ---
+    stub_path = _build_plugin_stub()
+
+    # Expected cache dir (where mc$ will copy the stub on next startup)
+    cache_path = os.path.join(
+        plugins_dir, "cache",
+        "temporal-reasoning-local", "temporal-reasoning", PLUGIN_VERSION,
+    )
+
+    # --- ~/.claude/settings.json: enable plugin + point marketplace at stub ---
+    user_settings: dict = {}
+    if os.path.exists(user_settings_path):
+        try:
+            with open(user_settings_path) as f:
+                user_settings = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    user_settings.setdefault("enabledPlugins", {})[plugin_key] = True
+    user_settings.setdefault("extraKnownMarketplaces", {})["temporal-reasoning-local"] = {
+        "source": {
+            "source": "directory",
+            "path": stub_path,
+        }
+    }
+
+    try:
+        with open(user_settings_path, "w") as f:
+            json.dump(user_settings, f, indent=2)
+            f.write("\n")
+        print(f"✓ Enabled plugin in {user_settings_path}")
+        print(f"    enabledPlugins.{plugin_key} = true")
+        print(f"    extraKnownMarketplaces.temporal-reasoning-local → {stub_path}")
+    except IOError as e:
+        print(f"✗ Could not write {user_settings_path}: {e}")
+        return False
+
+    # --- installed_plugins.json: pre-register with expected cache path ---
+    installed: dict = {"version": 2, "plugins": {}}
+    if os.path.exists(installed_path):
+        try:
+            with open(installed_path) as f:
+                installed = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    existing_entries = installed.setdefault("plugins", {}).get(plugin_key, [])
+    user_entry = next((e for e in existing_entries if e.get("scope") == "user"), None)
+    if user_entry:
+        user_entry["installPath"] = cache_path
+        user_entry["version"] = PLUGIN_VERSION
+        user_entry["lastUpdated"] = now
+        action = "updated"
+    else:
+        existing_entries.insert(0, {
+            "scope": "user",
+            "installPath": cache_path,
+            "version": PLUGIN_VERSION,
+            "installedAt": now,
+            "lastUpdated": now,
+        })
+        installed["plugins"][plugin_key] = existing_entries
+        action = "registered"
+
+    try:
+        with open(installed_path, "w") as f:
+            json.dump(installed, f, indent=2)
+            f.write("\n")
+    except IOError as e:
+        print(f"✗ Could not write {installed_path}: {e}")
+        return False
+
+    print(f"✓ Plugin {action} in {installed_path}")
+    print(f"    {plugin_key} → {cache_path}")
+
+    # --- known_marketplaces.json: update source.path and installLocation to stub ---
+    # This is the authoritative store Claude Code reads at startup; settings.json
+    # changes only propagate here on the next full marketplace sync.  We write it
+    # directly so the stub path takes effect immediately.
+    marketplaces: dict = {}
+    if os.path.exists(marketplaces_path):
+        try:
+            with open(marketplaces_path) as f:
+                marketplaces = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    marketplaces["temporal-reasoning-local"] = {
+        "source": {
+            "source": "directory",
+            "path": stub_path,
+        },
+        "installLocation": stub_path,
+        "lastUpdated": now,
+    }
+    try:
+        with open(marketplaces_path, "w") as f:
+            json.dump(marketplaces, f, indent=2)
+            f.write("\n")
+        print(f"✓ Updated marketplace in {marketplaces_path}")
+        print(f"    temporal-reasoning-local → {stub_path}")
+    except IOError as e:
+        print(f"  (could not update {marketplaces_path}: {e})")
+
+    return True
+
+
 def main(target_dir: str = "") -> None:
     print("=" * 50)
     print("Temporal Reasoning Skill Setup")
@@ -478,7 +670,11 @@ def main(target_dir: str = "") -> None:
     settings_ok = setup_claude_settings(target_dir)
     print()
 
-    if all(results) and mcp_ok and settings_json_ok and settings_ok:
+    print("Registering plugin with Claude Code...")
+    plugin_ok = register_plugin_with_claude()
+    print()
+
+    if all(results) and mcp_ok and settings_json_ok and settings_ok and plugin_ok:
         print("=" * 50)
         print("✓ Setup complete!")
         print("=" * 50)

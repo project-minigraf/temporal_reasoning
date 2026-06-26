@@ -1216,7 +1216,7 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
     },
     "ingestion": {
         "required": {":description": str},
-        "optional": {":hash": str, ":alias": str, ":last-run-at": str, ":last-commit": str},
+        "optional": {":hash": str, ":alias": str, ":last-run-at": str, ":last-commit": str, ":total-ingested": int},
     },
     "commit": {
         "required": {":description": str},

@@ -16,8 +16,7 @@ __pycache__/
 *.graph.lock
 .mcp.json
 
-# Claude Code plugin/session state
-.claude-plugin/
+# Claude Code session state
 .claude/
 
 # Synced skill copies (canonical versions are in repo root)

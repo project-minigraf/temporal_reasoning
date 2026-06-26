@@ -2,16 +2,7 @@
   "name": "temporal-reasoning",
   "version": "0.3.0",
   "description": "Temporal Reasoning gives AI coding agents bi-temporal graph memory: query any past state, traverse live dependency graphs, and correlate architectural decisions with structural change — all with deterministic Datalog, no fuzzy retrieval.",
-  "tools": [
-    "tools/query.json",
-    "tools/transact.json",
-    "tools/retract.json",
-    "tools/report_issue.json"
-  ],
-  "requires": {
-    "minigraf": ">=0.19.0"
-  },
-  "languages": ["python"],
-  "environments": ["claude-code", "opencode", "codex"],
-  "skills": ["skills/temporal-reasoning"]
+  "author": {
+    "name": "Minigraf"
+  }
 }
