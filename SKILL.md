@@ -48,6 +48,17 @@ Say "Let me check memory..." before querying. Then:
 
 **Query first, answer second.** The reason: a confident answer that contradicts a stored decision is far more damaging than taking a moment to check.
 
+**Two things to know before writing your first query:**
+
+1. **Filter predicates require square brackets.** `(contains? ?v "text")` silently returns nothing. Always write `[(contains? ?v "text")]`.
+
+2. **To discover what attribute names exist on an entity**, query it directly — you don't need to know them in advance:
+   ```python
+   query("[:find ?a ?v :where [:decision/postgres ?a ?v]]")
+   # Returns all attribute/value pairs for that entity
+   ```
+   To scan all stored attributes across the graph: `[:find ?e ?a :where [?e ?a ?v]]`
+
 ## When to Retract (minigraf_retract)
 
 Retract when:
@@ -266,7 +277,7 @@ minigraf_ingest_git(repo_path="/path/to/repo", branch="HEAD")
 
 Once started, inform the user that ingestion is running in the background and move on — do not poll or wait for completion.
 
-Auto-invoked at session start via the `UserPromptSubmit` hook. The hook fires `minigraf_ingest_git` with no arguments, defaulting to `cwd` and `HEAD`. Incremental: reads the `:ingestion/watermark` entity to determine the last ingested commit, then only processes new commits.
+Auto-started at MCP server startup — the server creates a background asyncio task that calls `_run_ingestion(cwd, "HEAD")` immediately. Set `MINIGRAF_NO_AUTO_INGEST=1` to suppress this (useful in eval sandboxes). Incremental: reads the `:ingestion/watermark` entity to determine the last ingested commit, then only processes new commits.
 
 Do not write to `:ingestion/watermark` or any `:ingestion/` entity directly.
 
@@ -310,7 +321,7 @@ Ident: `:module/<slugified-file-path>`
 | `:introduced-by` (keyword ref) | commit that first added this file |
 | `:modified-in` (keyword ref) | one edge per subsequent modifying commit |
 | `:contains` (keyword ref) | functions and classes defined in this file |
-| `:depends-on` (keyword ref) | modules this file imports — written from HEAD state after the full commit walk, not per-commit |
+| `:depends-on` (keyword ref) | modules this file imports — tracked per-commit with full valid-time bounds: `:valid-from` = commit that introduced the import, `:valid-to` = commit that removed it (open-ended if still present) |
 
 #### `:type/function` — one per top-level function or method
 Ident: `:function/<slugified-path-name>` (file path + `::` + function name, slugified together)
