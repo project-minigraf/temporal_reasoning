@@ -259,8 +259,9 @@ def setup_mcp_json(target_dir: str) -> bool:
 
     - Creates the file if absent.
     - Merges into existing content if present (other servers are preserved).
-    - Always updates args and MINIGRAF_GRAPH_PATH to reflect current paths.
-    - Uses the venv python as the command so the MCP server runs in the venv.
+    - Always updates MINIGRAF_GRAPH_PATH to reflect the target project path.
+    - Uses `uvx temporal-reasoning` so the published PyPI package is invoked
+      directly — no local venv path baked in.
     - Only MINIGRAF_GRAPH_PATH is set here; ANTHROPIC_API_KEY and
       MINIGRAF_EXTRACTION_STRATEGY belong in .claude/settings.local.json so
       they are available to hook subprocesses as well as the MCP server.
@@ -268,7 +269,6 @@ def setup_mcp_json(target_dir: str) -> bool:
     import json
 
     mcp_json_path = os.path.join(target_dir, ".mcp.json")
-    server_script = os.path.join(REPO_DIR, "mcp_server.py")
     graph_path = os.path.join(target_dir, "memory.graph")
 
     existing: dict = {}
@@ -280,14 +280,13 @@ def setup_mcp_json(target_dir: str) -> bool:
         except (json.JSONDecodeError, IOError):
             existing = {}
 
-    new_env = {
-        "MINIGRAF_GRAPH_PATH": graph_path,
-    }
     existing.setdefault("mcpServers", {})["temporal-reasoning"] = {
         "type": "stdio",
-        "command": VENV_PYTHON,
-        "args": [server_script],
-        "env": new_env,
+        "command": "uvx",
+        "args": ["temporal-reasoning"],
+        "env": {
+            "MINIGRAF_GRAPH_PATH": graph_path,
+        },
     }
 
     try:
@@ -300,7 +299,7 @@ def setup_mcp_json(target_dir: str) -> bool:
 
     verb = "Updated" if file_existed else "Created"
     print(f"✓ {verb} {mcp_json_path}")
-    print(f"    command = {VENV_PYTHON}")
+    print(f"    command = uvx temporal-reasoning")
     print(f"    MINIGRAF_GRAPH_PATH = {graph_path}")
     return True
 
@@ -482,6 +481,7 @@ def _build_plugin_stub() -> str:
     # Only the directories Claude Code needs:
     #   .claude-plugin/  — plugin.json & marketplace.json (identity)
     #   skills/          — SKILL.md discovery
+    #   .mcp.json        — MCP server config (uvx-based, no local paths)
     essential = [".claude-plugin", "skills"]
 
     os.makedirs(stub_dir, exist_ok=True)
@@ -497,6 +497,23 @@ def _build_plugin_stub() -> str:
             shutil.copytree(src, dst)
         else:
             shutil.copy2(src, dst)
+
+    # Write a clean .mcp.json using uvx — no local paths baked in.
+    # This is what marketplace installs use; the project-level .mcp.json
+    # (written by setup_mcp_json) adds MINIGRAF_GRAPH_PATH on top of this.
+    import json as _json
+    stub_mcp = os.path.join(stub_dir, ".mcp.json")
+    with open(stub_mcp, "w") as f:
+        _json.dump({
+            "mcpServers": {
+                "temporal-reasoning": {
+                    "type": "stdio",
+                    "command": "uvx",
+                    "args": ["temporal-reasoning"],
+                },
+            },
+        }, f, indent=2)
+        f.write("\n")
 
     # Remove stale versioned cache directories (other than the current version).
     cache_plugin_dir = os.path.join(

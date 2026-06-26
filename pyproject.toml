@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.scripts]
-temporal-reasoning = "mcp_server:main"
+temporal-reasoning = "mcp_server:run"
 
 [project.optional-dependencies]
 bm25 = ["rank-bm25"]

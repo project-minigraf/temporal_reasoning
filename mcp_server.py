@@ -2730,5 +2730,10 @@ async def main() -> None:
         )
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Sync entry point for the `temporal-reasoning` console script."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()
