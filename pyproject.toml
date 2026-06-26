@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "temporal-reasoning"
-version = "0.3.1"
+version = "0.0.0"  # stamped from .claude-plugin/plugin.json by CI
 description = "Perfect memory. Exact reasoning. Complete history. Bi-temporal graph memory for AI coding agents."
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,7 +28,12 @@ dependencies = [
     "mcp>=1.27.0",
 ]
 
+[project.scripts]
+temporal-reasoning = "mcp_server:main"
+
 [project.optional-dependencies]
+bm25 = ["rank-bm25"]
+git-ingestion = ["tree-sitter-languages"]
 llm = ["anthropic>=0.40.0"]
 dev = [
     "pytest>=8.4.2",
@@ -38,7 +43,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["mcp_server", "report_issue", "install"]
+py-modules = ["mcp_server", "report_issue"]
 
 [tool.ruff]
 line-length = 100
