@@ -1,6 +1,6 @@
 {
   "name": "temporal-reasoning",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Temporal Reasoning gives AI coding agents bi-temporal graph memory: query any past state, traverse live dependency graphs, and correlate architectural decisions with structural change — all with deterministic Datalog, no fuzzy retrieval.",
   "tools": [
     "tools/query.json",
