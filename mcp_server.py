@@ -86,6 +86,8 @@ _EXT_TO_LANG: Dict[str, str] = {
     ".cs": "c_sharp", ".rb": "ruby", ".php": "php",
     ".kt": "kotlin", ".swift": "swift", ".scala": "scala",
     ".hs": "haskell", ".lua": "lua", ".ex": "elixir", ".exs": "elixir",
+    ".h": "c", ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp",
+    ".cc": "cpp", ".cxx": "cpp",
 }
 
 _grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
@@ -544,6 +546,26 @@ def _extract_call_name(node, lang_name: str) -> Optional[str]:
     return None
 
 
+def _c_family_function_name(node) -> Optional[str]:
+    """Resolve a function/method name from a C/C++ declarator chain.
+
+    Unlike most tree-sitter grammars, C-family function_definition nodes have
+    no direct `name` field — the identifier is nested under one or more
+    `declarator` fields (pointer_declarator, function_declarator, ...). An
+    out-of-line qualified definition (`Foo::bar`) wraps the identifier in a
+    qualified_identifier, which exposes it via a `name` field instead.
+    """
+    current = node.child_by_field_name("declarator")
+    while current is not None:
+        if current.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
+            return current.text.decode("utf-8")
+        if current.type == "qualified_identifier":
+            current = current.child_by_field_name("name")
+            continue
+        current = current.child_by_field_name("declarator")
+    return None
+
+
 def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
     """Recursively extract code entities from a tree-sitter AST node."""
     node_types = _LANG_NODE_TYPES.get(lang_name)
@@ -551,9 +573,14 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
         return
 
     if node.type in node_types.get("functions", set()):
-        name_node = node.child_by_field_name("name")
-        if name_node:
-            results["functions"].append(name_node.text.decode("utf-8"))
+        if lang_name in ("c", "cpp"):
+            name = _c_family_function_name(node)
+            if name:
+                results["functions"].append(name)
+        else:
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                results["functions"].append(name_node.text.decode("utf-8"))
 
     elif node.type in node_types.get("classes", set()):
         name_node = node.child_by_field_name("name")

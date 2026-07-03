@@ -1325,6 +1325,27 @@ class TestGetParser:
         assert err.count("no tree-sitter grammar available for 'python'") == 1
 
 
+class TestExtToLangHeaders:
+    """Regression tests for issue #92 bug 2: header extensions (.h/.hpp/...)
+    were missing from _EXT_TO_LANG entirely, so _get_parser returned None for
+    them and header files were skipped by the ingest loop."""
+
+    def test_h_maps_to_c(self):
+        import mcp_server
+        assert mcp_server._EXT_TO_LANG[".h"] == "c"
+
+    def test_hpp_hh_hxx_map_to_cpp(self):
+        import mcp_server
+        assert mcp_server._EXT_TO_LANG[".hpp"] == "cpp"
+        assert mcp_server._EXT_TO_LANG[".hh"] == "cpp"
+        assert mcp_server._EXT_TO_LANG[".hxx"] == "cpp"
+
+    def test_cc_cxx_map_to_cpp(self):
+        import mcp_server
+        assert mcp_server._EXT_TO_LANG[".cc"] == "cpp"
+        assert mcp_server._EXT_TO_LANG[".cxx"] == "cpp"
+
+
 class TestExtractFromSource:
     def _python_parser(self):
         """Return a real tree_sitter.Parser for Python, built directly from the
@@ -1372,6 +1393,88 @@ class TestExtractFromSource:
         # Passing None as parser triggers AttributeError → except block returns empty dict
         result = mcp_server._extract_from_source(b"def foo(): pass", None, "x.py")
         assert result == {"functions": [], "classes": [], "imports": [], "calls": []}
+
+
+class TestExtractFromSourceCFamily:
+    """Regression tests for issue #92 bug 1: the generic `name` field lookup
+    in _walk_ast doesn't match the C/C++ grammar for functions — a C/C++
+    function_definition has no direct `name` field, so every function was
+    silently skipped. Also covers bug 2 (header extensions) end-to-end."""
+
+    def _c_parser(self):
+        import mcp_server
+        import tree_sitter
+        import tree_sitter_c
+        mcp_server._grammar_cache.clear()
+        real_lang = tree_sitter.Language(tree_sitter_c.language())
+        real_parser = tree_sitter.Parser(real_lang)
+        mcp_server._grammar_cache["c"] = real_parser
+        return real_parser
+
+    def _cpp_parser(self):
+        import mcp_server
+        import tree_sitter
+        import tree_sitter_cpp
+        mcp_server._grammar_cache.clear()
+        real_lang = tree_sitter.Language(tree_sitter_cpp.language())
+        real_parser = tree_sitter.Parser(real_lang)
+        mcp_server._grammar_cache["cpp"] = real_parser
+        return real_parser
+
+    def test_c_extracts_function_names(self):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b"int AddNewElement(int a, int b) {\n    return a + b;\n}\n"
+        result = mcp_server._extract_from_source(source, self._c_parser(), "associative.c")
+        assert result["functions"] == ["AddNewElement"]
+
+    def test_c_pointer_return_function(self):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b"char* makeStr(void) {\n    return 0;\n}\n"
+        result = mcp_server._extract_from_source(source, self._c_parser(), "foo.c")
+        assert result["functions"] == ["makeStr"]
+
+    def test_c_header_extension_extracts_function_names(self):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b"int helper(void) {\n    return 0;\n}\n"
+        result = mcp_server._extract_from_source(source, self._c_parser(), "associative.h")
+        assert result["functions"] == ["helper"]
+
+    def test_cpp_extracts_method_names(self):
+        pytest.importorskip("tree_sitter_cpp")
+        import mcp_server
+        source = b"class Foo {\npublic:\n    int bar(int x) { return x; }\n};\n"
+        result = mcp_server._extract_from_source(source, self._cpp_parser(), "foo.cpp")
+        assert result["functions"] == ["bar"]
+
+    def test_cpp_qualified_out_of_line_definition(self):
+        pytest.importorskip("tree_sitter_cpp")
+        import mcp_server
+        source = b"int Foo::baz() { return 0; }\n"
+        result = mcp_server._extract_from_source(source, self._cpp_parser(), "foo.cpp")
+        assert result["functions"] == ["baz"]
+
+    def test_cpp_destructor_and_operator_overload(self):
+        pytest.importorskip("tree_sitter_cpp")
+        import mcp_server
+        source = (
+            b"class Foo {\npublic:\n"
+            b"    ~Foo() {}\n"
+            b"    Foo operator+(const Foo& o) { return *this; }\n"
+            b"};\n"
+        )
+        result = mcp_server._extract_from_source(source, self._cpp_parser(), "foo.cpp")
+        assert "~Foo" in result["functions"]
+        assert "operator+" in result["functions"]
+
+    def test_cpp_hpp_extension_extracts_function_names(self):
+        pytest.importorskip("tree_sitter_cpp")
+        import mcp_server
+        source = b"inline int square(int x) { return x * x; }\n"
+        result = mcp_server._extract_from_source(source, self._cpp_parser(), "foo.hpp")
+        assert result["functions"] == ["square"]
 
 
 class TestMinigrafIngestStatus:
