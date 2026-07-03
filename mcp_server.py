@@ -13,6 +13,7 @@ import re
 import subprocess as _subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -61,10 +62,16 @@ _db_mtime: float = 0.0
 # Module-level server reference — set after server creation for MCP sampling
 _server_ref: Optional[Server] = None
 
+# Retry parameters for acquiring the DB file lock when another process
+# (hook subprocess or background ingestion) is briefly holding it.
+# Total max wait: 0.05 + 0.10 + 0.20 + 0.40 + 0.80 = 1.55s.
+_LOCK_RETRY_MAX = 5
+_LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
+
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
-    "status": "idle", "processed": 0, "total": 0,
+    "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None,
 }
 
@@ -641,14 +648,71 @@ def _refresh_if_stale() -> None:
         _open_db_at(_graph_path)
 
 
+def _is_lock_error(exc: Exception) -> bool:
+    return "locked" in str(exc).lower()
+
+
+def _stale_lock_holder_pid(exc: Exception) -> Optional[int]:
+    """Extract the holder PID from a minigraf lock-contention error message."""
+    match = re.search(r"holder PID:\s*(\d+)", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _clear_stale_lock(path: str, holder_pid: int) -> bool:
+    """Remove path's lock file if its recorded holder process is no longer alive.
+
+    Returns True if a stale lock was removed.
+    """
+    try:
+        os.kill(holder_pid, 0)
+        return False  # holder still alive (or we lack permission to tell — leave it)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return False
+    except OSError:
+        return False
+    try:
+        os.remove(path + ".lock")
+        return True
+    except OSError:
+        return False
+
+
+def _open_db_at_with_retry(path: str) -> MiniGrafDb:
+    """Open MiniGrafDb at path, retrying with backoff on lock contention.
+
+    Self-heals a stale lock (holder process no longer running) by removing it
+    before the next attempt, instead of surfacing a permanent error.
+    """
+    delay = _LOCK_RETRY_BASE
+    last_exc: Optional[Exception] = None
+    for attempt in range(_LOCK_RETRY_MAX):
+        try:
+            return _open_db_at(path)
+        except Exception as e:
+            if not _is_lock_error(e):
+                raise
+            last_exc = e
+            holder_pid = _stale_lock_holder_pid(e)
+            if holder_pid is not None:
+                _clear_stale_lock(path, holder_pid)
+            if attempt < _LOCK_RETRY_MAX - 1:
+                time.sleep(delay)
+                delay *= 2
+    assert last_exc is not None
+    raise last_exc
+
+
 def get_db() -> MiniGrafDb:
     """Return the open DB instance, opening it if not currently held.
 
     The DB is opened per-operation and released after each call_tool() invocation
     so that the prepare_hook subprocess can acquire the file lock between turns.
+    Opening retries with backoff on lock contention (see _open_db_at_with_retry).
     """
     if _db is None:
-        _open_db_at(_graph_path or _get_graph_path())
+        _open_db_at_with_retry(_graph_path or _get_graph_path())
     return _db
 
 
@@ -1137,8 +1201,25 @@ def _watermark_query(db: Any) -> Optional[str]:
 
 
 def _total_ingested_query(db: Any) -> int:
-    """Return the cumulative number of commits ingested across all runs, or 0."""
+    """Return the :total-ingested watermark recorded by the last *completed* run, or 0.
+
+    Only written on clean completion (see _last_run_write) — a run interrupted
+    mid-way (e.g. by lock contention) leaves this stale even though further
+    commits were durably persisted. Use _count_commit_entities for the true
+    current count.
+    """
     raw = db.execute("(query [:find ?n :any-valid-time :where [:ingestion/last-run-at :total-ingested ?n]])")
+    results = json.loads(raw).get("results", [])
+    return int(results[0][0]) if results else 0
+
+
+def _count_commit_entities(db: Any) -> int:
+    """Return the true number of durably persisted :type/commit entities.
+
+    Unlike _total_ingested_query, this reflects reality even after a run was
+    interrupted before it could write its completion watermark.
+    """
+    raw = db.execute("(query [:find (count ?e) :where [?e :entity-type :type/commit]])")
     results = json.loads(raw).get("results", [])
     return int(results[0][0]) if results else 0
 
@@ -2200,11 +2281,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # Read watermark and pre-load known entities before releasing DB
         db = get_db()
         watermark = _watermark_query(db)
-        prior_ingested = _total_ingested_query(db)
+        prior_ingested = _count_commit_entities(db)
         entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
         file_deps: Dict[str, set] = {}  # file_path -> set of dep module idents
         dep_valid_from: Dict[tuple, str] = {}  # (src_ident, dep_ident) -> intro commit ts
+        # minigraf exposes no explicit close(): the file lock is only released once
+        # every reference to the handle is gone, so the local `db` must be cleared
+        # too, not just the global — otherwise this frame keeps it alive (and the
+        # lock held) through the potentially slow commit enumeration below.
         _db = None  # release file lock while enumerating commits
+        db = None
 
         commits = _git_commits(repo_path, watermark, branch)
         repo_total_result = _subprocess.run(
@@ -2215,6 +2301,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _ingest_progress["total"] = repo_total
         _ingest_progress["status"] = "running"
         _ingest_progress["processed"] = prior_ingested
+        _ingest_progress["prior_ingested"] = prior_ingested
 
         last_hash = watermark or ""
 
@@ -2347,6 +2434,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
             finally:
                 _db = None  # release file lock between commits
+                db = None   # drop local reference too — see note above
 
             _ingest_progress["processed"] += 1
             await asyncio.sleep(0)  # yield to event loop
@@ -2392,7 +2480,7 @@ async def handle_minigraf_ingest_git(
             "error": f"Not a git repository (or git not found): {repo}",
         }
     _ingest_progress = {
-        "status": "idle", "processed": 0, "total": 0,
+        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch))
@@ -2402,6 +2490,12 @@ async def handle_minigraf_ingest_git(
 def handle_minigraf_ingest_status() -> Dict[str, Any]:
     """Return current ingestion progress, augmented with graph-backed last-run info."""
     result: Dict[str, Any] = {"ok": True, **_ingest_progress}
+    # processed_this_run is derived in-memory (no extra DB query) so it stays
+    # accurate even mid-run, distinguishing "this attempt's progress" from the
+    # cumulative total in `processed` — see issue #85.
+    result["processed_this_run"] = (
+        _ingest_progress["processed"] - _ingest_progress.get("prior_ingested", 0)
+    )
     if _ingest_progress["status"] != "running":
         try:
             db = get_db()
@@ -2417,7 +2511,11 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
             else:
                 result["last_run_at"] = None
                 result["last_commit"] = None
-            n = _total_ingested_query(db)
+            # True persisted count, not the :total-ingested watermark — the
+            # watermark is only written on clean completion, so it drifts
+            # arbitrarily far from reality after a run is interrupted
+            # mid-way (see issue #85).
+            n = _count_commit_entities(db)
             result["total_ingested"] = n if n > 0 else None
         except Exception:
             result["last_run_at"] = None
@@ -2717,7 +2815,7 @@ async def main() -> None:
     # asyncio task — never blocks the message loop.
     # Set MINIGRAF_NO_AUTO_INGEST=1 to skip auto-start (used by eval sandboxes).
     _ingest_progress = {
-        "status": "idle", "processed": 0, "total": 0,
+        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):

@@ -287,11 +287,18 @@ Poll the current git ingestion progress.
 
 ```python
 minigraf_ingest_status()
-# → {"ok": true, "status": "running", "processed": 12, "total": 47,
-#    "current_commit": "a3f2bc...", "error": null}
+# → {"ok": true, "status": "running", "processed": 21717, "processed_this_run": 2,
+#    "total": 47, "current_commit": "a3f2bc...", "error": null}
 ```
 
-`status` is one of: `idle`, `running`, `complete`, `error`.
+`status` is one of: `idle`, `running`, `complete`, `error`. `processed` is the
+cumulative count of durably persisted commits (seeded from the true
+`:type/commit` entity count at run start, so it stays accurate even after a
+prior run was interrupted mid-way — e.g. by lock contention). `processed_this_run`
+is how many commits *this* run-attempt has ingested, useful for distinguishing
+fresh progress from work already persisted by earlier runs. When idle,
+`total_ingested` similarly reflects the true persisted count, not a
+potentially stale watermark.
 
 ### Git-Ingested Data Schema
 

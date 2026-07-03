@@ -55,7 +55,9 @@ def main() -> None:
     if conversation_delta:
         try:
             import mcp_server
-            mcp_server.open_db()
+            # get_db() retries with backoff and self-heals a stale lock left by
+            # a crashed background-ingestion or hook subprocess.
+            mcp_server.get_db()
             asyncio.run(mcp_server.handle_memory_finalize_turn(conversation_delta))
         except Exception:
             pass  # Never block on memory errors

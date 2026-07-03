@@ -80,6 +80,92 @@ class TestOpenDb:
         mock_class.open.assert_called_once_with(custom_path)
 
 
+class TestGetDbLockRetry:
+    """Regression tests for #84: get_db() must retry lock contention with
+    backoff instead of letting a single "database is locked" error abort
+    the caller (e.g. the git-ingestion loop), and must self-heal a stale
+    lock left behind by a dead holder process."""
+
+    def test_retries_on_lock_error_then_succeeds(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        mock_class.open.side_effect = [
+            MiniGrafError("Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."),
+            db_instance,
+        ]
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = str(tmp_path / "t.graph")
+        result = mcp_server.get_db()
+        assert result is db_instance
+        assert mock_class.open.call_count == 2
+
+    def test_gives_up_after_max_attempts(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        lock_err = MiniGrafError("Database is locked by another process (lock file: x.graph.lock, holder PID: 1).")
+        mock_class.open.side_effect = lock_err
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = str(tmp_path / "t.graph")
+        with pytest.raises(MiniGrafError):
+            mcp_server.get_db()
+        assert mock_class.open.call_count == mcp_server._LOCK_RETRY_MAX
+
+    def test_non_lock_errors_are_not_retried(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        mock_class.open.side_effect = MiniGrafError("corrupt graph file")
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = str(tmp_path / "t.graph")
+        with pytest.raises(MiniGrafError):
+            mcp_server.get_db()
+        assert mock_class.open.call_count == 1  # no retry for non-lock errors
+
+    def test_self_heals_stale_lock_from_dead_pid(self, mock_minigraf_db, tmp_path, monkeypatch):
+        """If the lock's recorded holder PID is no longer running, the stale
+        .lock file should be removed so the retry can succeed without
+        requiring the operator to delete it manually."""
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        graph_path = str(tmp_path / "t.graph")
+        lock_path = graph_path + ".lock"
+        with open(lock_path, "w") as f:
+            f.write("stale")
+        # PID 999999 should not exist on any reasonable test machine.
+        dead_pid = 999999
+        mock_class.open.side_effect = [
+            MiniGrafError(f"Database is locked by another process (lock file: {lock_path}, holder PID: {dead_pid})."),
+            db_instance,
+        ]
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = graph_path
+        result = mcp_server.get_db()
+        assert result is db_instance
+        assert not os.path.exists(lock_path)
+
+    def test_leaves_lock_alone_when_holder_pid_alive(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        graph_path = str(tmp_path / "t.graph")
+        lock_path = graph_path + ".lock"
+        with open(lock_path, "w") as f:
+            f.write("held")
+        live_pid = os.getpid()  # definitely alive — this test process
+        mock_class.open.side_effect = [
+            MiniGrafError(f"Database is locked by another process (lock file: {lock_path}, holder PID: {live_pid})."),
+            db_instance,
+        ]
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = graph_path
+        result = mcp_server.get_db()
+        assert result is db_instance
+        assert os.path.exists(lock_path)  # untouched — holder is still alive
+
+
 class TestMinigrafQuery:
     def test_returns_results_on_success(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -1286,12 +1372,40 @@ class TestMinigrafIngestStatus:
         def execute_side_effect(query, *args, **kwargs):
             if ":last-run-at" in query and ":last-commit" in query:
                 return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
-            if ":total-ingested" in query:
+            if ":type/commit" in query:
                 return json.dumps({"results": [[1017]]})
             return json.dumps({"results": []})
         db_instance.execute.side_effect = execute_side_effect
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["total_ingested"] == 1017
+
+    def test_total_ingested_reflects_true_persisted_count_not_stale_watermark(
+        self, mock_minigraf_db, tmp_path
+    ):
+        """Regression test for #85: total_ingested must come from a direct
+        :type/commit entity count, not the :total-ingested watermark — the
+        watermark is only written on clean run completion, so after a run is
+        interrupted mid-way it drifts far below the true persisted count."""
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        def execute_side_effect(query, *args, **kwargs):
+            if ":last-run-at" in query and ":last-commit" in query:
+                return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
+            if ":total-ingested" in query:
+                # Stale watermark from the last *completed* run — far below reality.
+                return json.dumps({"results": [[104]]})
+            if ":type/commit" in query:
+                # True count of durably persisted commit entities.
+                return json.dumps({"results": [[21715]]})
+            return json.dumps({"results": []})
+        db_instance.execute.side_effect = execute_side_effect
+        result = mcp_server.handle_minigraf_ingest_status()
+        assert result["total_ingested"] == 21715
 
     def test_total_ingested_absent_returns_none(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -1715,6 +1829,72 @@ class TestRunIngestion:
         assert all(db_none_snapshots), f"_db was not None at yield: {db_none_snapshots}"
 
     @pytest.mark.asyncio
+    async def test_local_db_reference_dropped_before_commit_enumeration(
+        self, mock_minigraf_db, git_repo
+    ):
+        """Regression test for #84's deeper root cause: minigraf exposes no
+        explicit close(), so the OS-level file lock is only released once
+        *every* reference to the handle is gone via CPython refcounting.
+        Clearing the module-global `_db` alone is not enough if
+        `_run_ingestion`'s local `db` variable still points at the same
+        object — verified against the real (unmocked) minigraf FFI, where a
+        stale local reference left the `.lock` file in place.
+
+        This specifically targets the pre-loop release point (before
+        `_git_commits` walks the repo's history), because that call has no
+        `await` before it: unlike the per-commit loop — where CPython's
+        dead-local clearing at the `await asyncio.sleep(0)` yield point can
+        mask a missing explicit clear — a potentially slow, synchronous
+        `git log` walk here would hold the lock for its entire duration
+        unless `db` is explicitly dropped.
+        """
+        mock_class, _ = mock_minigraf_db
+
+        class _FakeDb:
+            """Plain object, not MagicMock — MagicMock carries internal
+            self-referential state that inflates sys.getrefcount() far past
+            what a real released reference would show."""
+            def execute(self, *a, **k):
+                return json.dumps({"results": []})
+            def checkpoint(self):
+                pass
+
+        opened_instances = []
+
+        def _open(path):
+            inst = _FakeDb()
+            opened_instances.append(inst)
+            return inst
+
+        mock_class.open.side_effect = _open
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        refcount_at_enumeration = {}
+        real_git_commits = mcp_server._git_commits
+
+        def spy_git_commits(repo, watermark, branch):
+            assert len(opened_instances) == 1
+            refcount_at_enumeration["count"] = sys.getrefcount(opened_instances[0])
+            return real_git_commits(repo, watermark, branch)
+
+        with patch.object(mcp_server, "_git_commits", side_effect=spy_git_commits):
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        # 1 ref for opened_instances' slot + 1 for the local `inst` in
+        # sys.getrefcount's own argument frame == 2 if nothing else (e.g. a
+        # stale `db` local in _run_ingestion's frame) is still holding it.
+        assert refcount_at_enumeration["count"] <= 2, (
+            "a stale local reference kept the DB instance (and its file "
+            f"lock) alive during commit enumeration: "
+            f"refcount={refcount_at_enumeration['count']}"
+        )
+
+    @pytest.mark.asyncio
     async def test_handle_minigraf_ingest_git_returns_immediately(self, mock_minigraf_db, git_repo):
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})
@@ -1753,11 +1933,14 @@ class TestRunIngestion:
 
     @pytest.mark.asyncio
     async def test_processed_seeded_from_prior_ingested(self, mock_minigraf_db, git_repo, monkeypatch):
-        """processed starts at prior_ingested and increments cumulatively."""
+        """processed starts at the true persisted commit count and increments
+        cumulatively — regression test for #85 (seeding must not rely on the
+        :total-ingested watermark, which goes stale after an interrupted run)."""
         mock_class, db_instance = mock_minigraf_db
-        # _total_ingested_query returns 462 (prior runs), all other queries return []
+        # _count_commit_entities returns 462 (true persisted count); all other
+        # queries — including the stale :total-ingested watermark — return [].
         def execute_side_effect(query, *args, **kwargs):
-            if ":total-ingested" in query:
+            if ":type/commit" in query:
                 return json.dumps({"results": [[462]]})
             return json.dumps({"results": []})
         db_instance.execute.side_effect = execute_side_effect
@@ -1771,6 +1954,32 @@ class TestRunIngestion:
         # git_repo fixture has 2 commits; prior was 462 → final should be 464
         assert mcp_server._ingest_progress["processed"] == 464
         assert mcp_server._ingest_progress["total"] == 2  # git_repo has 2 commits
+        assert mcp_server._ingest_progress["prior_ingested"] == 462
+
+    @pytest.mark.asyncio
+    async def test_processed_seed_ignores_stale_total_ingested_watermark(
+        self, mock_minigraf_db, git_repo
+    ):
+        """A stale :total-ingested watermark (left behind by a prior run that
+        was interrupted before writing its completion record) must not affect
+        seeding — only the true :type/commit count matters."""
+        mock_class, db_instance = mock_minigraf_db
+        def execute_side_effect(query, *args, **kwargs):
+            if ":type/commit" in query:
+                return json.dumps({"results": [[21715]]})
+            if ":total-ingested" in query:
+                return json.dumps({"results": [[104]]})  # stale, must be ignored
+            return json.dumps({"results": []})
+        db_instance.execute.side_effect = execute_side_effect
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["prior_ingested"] == 21715
+        assert mcp_server._ingest_progress["processed"] == 21717  # 21715 + 2 commits
 
 
 class TestIndexCache:
