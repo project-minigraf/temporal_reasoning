@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 
@@ -60,6 +61,15 @@ class TestCheckMcpServerImportable:
         mock_result.stderr = b"No module named 'mcp_server'"
         with patch("subprocess.run", return_value=mock_result):
             assert install.check_mcp_server_importable() is False
+
+
+class TestSetupMcpJson:
+    def test_uses_git_ingestion_extra(self, tmp_path):
+        install.setup_mcp_json(str(tmp_path))
+        with open(tmp_path / ".mcp.json") as f:
+            config = json.load(f)
+        args = config["mcpServers"]["temporal-reasoning"]["args"]
+        assert args == ["temporal-reasoning[git-ingestion]"]
 
 
 class TestSyncLists:

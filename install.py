@@ -255,8 +255,12 @@ def setup_mcp_json(target_dir: str) -> bool:
     - Creates the file if absent.
     - Merges into existing content if present (other servers are preserved).
     - Always updates MINIGRAF_GRAPH_PATH to reflect the target project path.
-    - Uses `uvx temporal-reasoning` so the published PyPI package is invoked
-      directly — no local venv path baked in.
+    - Uses `uvx temporal-reasoning[git-ingestion]` so the published PyPI package
+      is invoked directly — no local venv path baked in. The `[git-ingestion]`
+      extra is required so uvx's ephemeral venv actually has the tree-sitter
+      packages code-structure extraction depends on (see issue #93 — a bare
+      `uvx temporal-reasoning` resolves none of them, silently disabling
+      code-structure extraction).
     - Only MINIGRAF_GRAPH_PATH is set here; ANTHROPIC_API_KEY and
       MINIGRAF_EXTRACTION_STRATEGY belong in .claude/settings.local.json so
       they are available to hook subprocesses as well as the MCP server.
@@ -278,7 +282,7 @@ def setup_mcp_json(target_dir: str) -> bool:
     existing.setdefault("mcpServers", {})["temporal-reasoning"] = {
         "type": "stdio",
         "command": "uvx",
-        "args": ["temporal-reasoning"],
+        "args": ["temporal-reasoning[git-ingestion]"],
         "env": {
             "MINIGRAF_GRAPH_PATH": graph_path,
         },
@@ -294,7 +298,7 @@ def setup_mcp_json(target_dir: str) -> bool:
 
     verb = "Updated" if file_existed else "Created"
     print(f"✓ {verb} {mcp_json_path}")
-    print(f"    command = uvx temporal-reasoning")
+    print(f"    command = uvx temporal-reasoning[git-ingestion]")
     print(f"    MINIGRAF_GRAPH_PATH = {graph_path}")
     return True
 
@@ -504,7 +508,7 @@ def _build_plugin_stub() -> str:
                 "temporal-reasoning": {
                     "type": "stdio",
                     "command": "uvx",
-                    "args": ["temporal-reasoning"],
+                    "args": ["temporal-reasoning[git-ingestion]"],
                 },
             },
         }, f, indent=2)
