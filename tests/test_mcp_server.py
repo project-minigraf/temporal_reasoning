@@ -176,6 +176,34 @@ class TestGetDbLockRetry:
         assert result is db_instance
         assert os.path.exists(lock_path)  # untouched — holder is still alive
 
+    def test_retries_open_after_clearing_stale_lock_on_final_attempt(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Regression test for #91: previously, clearing a stale lock on the
+        final retry attempt still fell through to raising the just-resolved
+        lock error, because the follow-up open was gated on `attempt <
+        _LOCK_RETRY_MAX - 1`. The clear must always be followed by one more
+        open attempt, no matter which iteration triggered it."""
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        import mcp_server
+
+        lock_err = MiniGrafError(
+            "Database is locked by another process (lock file: x.graph.lock, holder PID: 999999)."
+        )
+        monkeypatch.setattr(mcp_server, "_clear_stale_lock", lambda path, pid: True)
+        # Every regular attempt's immediate post-clear retry also fails,
+        # except the very last one (triggered on the final loop iteration).
+        mock_class.open.side_effect = [lock_err] * (2 * mcp_server._LOCK_RETRY_MAX - 1) + [db_instance]
+
+        mcp_server._db = None
+        mcp_server._graph_path = str(tmp_path / "t.graph")
+
+        result = mcp_server.get_db()
+
+        assert result is db_instance
+        assert mock_class.open.call_count == 2 * mcp_server._LOCK_RETRY_MAX
+
 
 class TestMinigrafQuery:
     def test_returns_results_on_success(self, mock_minigraf_db, tmp_path):

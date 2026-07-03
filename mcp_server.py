@@ -696,8 +696,13 @@ def _open_db_at_with_retry(path: str) -> MiniGrafDb:
                 raise
             last_exc = e
             holder_pid = _stale_lock_holder_pid(e)
-            if holder_pid is not None:
-                _clear_stale_lock(path, holder_pid)
+            if holder_pid is not None and _clear_stale_lock(path, holder_pid):
+                try:
+                    return _open_db_at(path)
+                except Exception as e2:
+                    if not _is_lock_error(e2):
+                        raise
+                    last_exc = e2
             if attempt < _LOCK_RETRY_MAX - 1:
                 time.sleep(delay)
                 delay *= 2
