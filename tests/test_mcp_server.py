@@ -13,6 +13,17 @@ from minigraf import MiniGrafError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+try:
+    import rank_bm25  # noqa: F401
+    _HAS_RANK_BM25 = True
+except ImportError:
+    _HAS_RANK_BM25 = False
+
+requires_bm25 = pytest.mark.skipif(
+    not _HAS_RANK_BM25,
+    reason="rank_bm25 not installed (pip install -e .[bm25] or .[dev])",
+)
+
 
 @pytest.fixture(autouse=True)
 def reset_mcp_server_db():
@@ -2068,6 +2079,7 @@ class TestIndexCache:
         assert cache._rebuilding is False
 
 
+@requires_bm25
 class TestMemoryPrepareTurnBM25:
     def test_returns_empty_when_no_index(self, mock_minigraf_db, tmp_path):
         import mcp_server
@@ -2279,6 +2291,7 @@ class TestBM25Tokenize:
         assert not ":module/src-main".startswith(_MEMORY_PREFIXES)
 
 
+@requires_bm25
 class TestFactIndex:
     def test_empty_facts_returns_empty_query(self):
         from mcp_server import FactIndex

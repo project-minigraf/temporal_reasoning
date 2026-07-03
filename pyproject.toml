@@ -48,6 +48,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "black>=25.11.0",
     "ruff>=0.15.12",
+    "rank-bm25",
 ]
 
 [tool.setuptools]
