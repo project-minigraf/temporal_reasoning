@@ -1215,14 +1215,14 @@ class TestGetParser:
         import mcp_server
         from unittest.mock import MagicMock
         mcp_server._grammar_cache.clear()
-        # Mock tree_sitter modules
+        # Mock tree_sitter and the individual tree_sitter_python package
         mock_parser = MagicMock()
         mock_tree_sitter = MagicMock()
         mock_tree_sitter.Parser.return_value = mock_parser
-        mock_tree_sitter_languages = MagicMock()
-        mock_tree_sitter_languages.get_language.return_value = MagicMock()
+        mock_tree_sitter_python = MagicMock()
+        mock_tree_sitter_python.language.return_value = MagicMock()
 
-        with patch.dict("sys.modules", {"tree_sitter": mock_tree_sitter, "tree_sitter_languages": mock_tree_sitter_languages}):
+        with patch.dict("sys.modules", {"tree_sitter": mock_tree_sitter, "tree_sitter_python": mock_tree_sitter_python}):
             parser = mcp_server._get_parser("src/auth.py")
             assert parser is not None
 
@@ -1235,14 +1235,13 @@ class TestGetParser:
         import mcp_server
         from unittest.mock import MagicMock
         mcp_server._grammar_cache.clear()
-        # Mock tree_sitter modules
         mock_parser = MagicMock()
         mock_tree_sitter = MagicMock()
         mock_tree_sitter.Parser.return_value = mock_parser
-        mock_tree_sitter_languages = MagicMock()
-        mock_tree_sitter_languages.get_language.return_value = MagicMock()
+        mock_tree_sitter_python = MagicMock()
+        mock_tree_sitter_python.language.return_value = MagicMock()
 
-        with patch.dict("sys.modules", {"tree_sitter": mock_tree_sitter, "tree_sitter_languages": mock_tree_sitter_languages}):
+        with patch.dict("sys.modules", {"tree_sitter": mock_tree_sitter, "tree_sitter_python": mock_tree_sitter_python}):
             p1 = mcp_server._get_parser("foo.py")
             p2 = mcp_server._get_parser("bar.py")
             assert p1 is p2  # same cached parser instance
@@ -1255,21 +1254,34 @@ class TestGetParser:
         parser = mcp_server._get_parser("foo.py")
         assert parser is None
 
+    def test_warns_once_when_grammar_unavailable(self, capsys):
+        """Regression test for issue #86: a failed parser construction must
+        surface a warning, not fail completely silently, and must only warn
+        once per language (not once per file/commit)."""
+        import mcp_server
+        mcp_server._grammar_cache.clear()
+
+        with patch.dict("sys.modules", {"tree_sitter_python": None}):
+            p1 = mcp_server._get_parser("a.py")
+            p2 = mcp_server._get_parser("b.py")
+
+        assert p1 is None
+        assert p2 is None
+        err = capsys.readouterr().err
+        assert "no tree-sitter grammar available for 'python'" in err
+        assert err.count("no tree-sitter grammar available for 'python'") == 1
+
 
 class TestExtractFromSource:
     def _python_parser(self):
-        """Return a real tree_sitter.Parser for Python, mocking tree_sitter_languages
-        to return a real language object so _get_parser succeeds under the spec-compliant
-        code path (tree_sitter_languages only, no fallback)."""
+        """Return a real tree_sitter.Parser for Python, built directly from the
+        installed tree-sitter-python package and injected into the grammar cache
+        so _get_parser's import machinery isn't exercised here."""
         import mcp_server
         import tree_sitter
         import tree_sitter_python
         mcp_server._grammar_cache.clear()
         real_lang = tree_sitter.Language(tree_sitter_python.language())
-        mock_tsl = MagicMock()
-        mock_tsl.get_language.return_value = real_lang
-        # The spec uses parser.set_language(lang); accommodate the installed tree_sitter
-        # version by pre-building the parser and injecting it via the cache.
         real_parser = tree_sitter.Parser(real_lang)
         mcp_server._grammar_cache["python"] = real_parser
         return real_parser

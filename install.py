@@ -112,34 +112,29 @@ def check_mcp_package():
     return False
 
 
-def check_tree_sitter_languages_package():
+def check_tree_sitter_packages():
     """Verify tree-sitter grammar support, installing packages if absent.
 
     Required for git ingestion to extract code structure (functions, classes,
     imports) from source files. Without it, ingestion runs silently but stores
     no code entities.
 
-    Tries two options:
-    - tree-sitter-languages (bundled, Python <=3.12 only)
-    - Individual packages tree-sitter + tree-sitter-rust/python/javascript/...
-      (Python 3.13+ compatible, requires tree-sitter >=0.22)
+    Installs the individual tree-sitter-<lang> packages (tree-sitter-rust,
+    tree-sitter-python, ...) via the tree-sitter >=0.22 API, compatible across
+    Python 3.10-3.14+.
+
+    This previously tried the bundled `tree-sitter-languages` package first as
+    a fast path, but that package pins no upper bound on its `tree-sitter`
+    dependency and hasn't been updated since tree-sitter's 0.22 API redesign —
+    a fresh `pip install tree-sitter-languages` silently resolves an
+    incompatible `tree-sitter` and every parse fails at runtime with no error
+    surfaced (see issue #86). Individual packages are the only supported path now.
     """
-    if _venv_has("tree_sitter_languages"):
-        print("✓ tree_sitter_languages package found")
+    if _venv_has("tree_sitter_python"):
+        print("✓ tree-sitter language packages found")
         return True
 
-    # Try installing tree-sitter-languages (works for Python <=3.12)
-    result = subprocess.run(
-        [VENV_PYTHON, "-m", "pip", "install", "tree-sitter-languages"],
-        timeout=300,
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        print("✓ tree_sitter_languages installed")
-        return True
-
-    # Fallback: install individual language packages (Python 3.13+)
-    print("  tree-sitter-languages unavailable (Python 3.13+?) — installing individual packages...")
+    print("  Installing tree-sitter language packages...")
     individual = [
         "tree-sitter>=0.22.0",
         "tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript",
@@ -150,7 +145,7 @@ def check_tree_sitter_languages_package():
         "tree-sitter-haskell", "tree-sitter-lua", "tree-sitter-elixir",
     ]
     if _venv_pip_install(*individual):
-        print("✓ Individual tree-sitter language packages installed")
+        print("✓ tree-sitter language packages installed")
         return True
 
     print("✗ Could not install tree-sitter grammar support — code ingestion will be disabled")
@@ -682,7 +677,7 @@ def main(target_dir: str = "") -> None:
         ("Python version", check_python_version),
         ("minigraf package", check_minigraf_package),
         ("mcp package", check_mcp_package),
-        ("tree_sitter_languages package", check_tree_sitter_languages_package),
+        ("tree-sitter language packages", check_tree_sitter_packages),
         ("MCP server", check_mcp_server_importable),
     ]
 

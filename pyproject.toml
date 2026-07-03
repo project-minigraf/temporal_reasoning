@@ -33,7 +33,15 @@ temporal-reasoning = "mcp_server:run"
 
 [project.optional-dependencies]
 bm25 = ["rank-bm25"]
-git-ingestion = ["tree-sitter-languages"]
+git-ingestion = [
+    "tree-sitter>=0.22.0",
+    "tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript",
+    "tree-sitter-typescript", "tree-sitter-go", "tree-sitter-java",
+    "tree-sitter-c", "tree-sitter-cpp",
+    "tree-sitter-c-sharp", "tree-sitter-ruby", "tree-sitter-php",
+    "tree-sitter-kotlin", "tree-sitter-swift", "tree-sitter-scala",
+    "tree-sitter-haskell", "tree-sitter-lua", "tree-sitter-elixir",
+]
 llm = ["anthropic>=0.40.0"]
 dev = [
     "pytest>=8.4.2",

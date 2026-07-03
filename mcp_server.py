@@ -94,10 +94,16 @@ _grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
 def _get_parser(file_path: str) -> Optional[Any]:
     """Return a cached tree_sitter.Parser for the file's language, or None if unsupported.
 
-    Tries two backends in order:
-    1. tree_sitter_languages (bundled, requires Python <=3.12)
-    2. Individual tree-sitter-<lang> packages (e.g. tree-sitter-rust, tree-sitter-python)
-       — compatible with Python 3.13+ and tree-sitter >=0.22
+    Uses the individual tree-sitter-<lang> packages (e.g. tree-sitter-python,
+    tree-sitter-rust) via the tree-sitter >=0.22 API, compatible across Python
+    3.10-3.14+.
+
+    Previously this also tried the bundled `tree_sitter_languages` package as a
+    fast path. That package pins no upper bound on its `tree-sitter` dependency
+    and hasn't been updated since tree-sitter's 0.22 API redesign, so a fresh
+    install silently resolves an incompatible `tree-sitter` and every parse
+    fails at runtime (see issue #86). It has been dropped in favor of the
+    per-language packages, which are what `install.py` provisions anyway.
     """
     ext = Path(file_path).suffix.lower()
     lang_name = _EXT_TO_LANG.get(ext)
@@ -107,29 +113,24 @@ def _get_parser(file_path: str) -> Optional[Any]:
         return _grammar_cache[lang_name]
 
     parser = None
-
-    # Attempt 1: tree_sitter_languages (bundled grammars, old-style API)
+    error: Optional[Exception] = None
     try:
-        import tree_sitter_languages  # type: ignore
-        import tree_sitter            # type: ignore
-        lang = tree_sitter_languages.get_language(lang_name)
-        p = tree_sitter.Parser()
-        p.set_language(lang)
-        parser = p
-    except Exception:
-        pass
+        mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
+        from tree_sitter import Language, Parser  # type: ignore
+        # PHP exposes language_php() instead of language()
+        lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
+        lang_obj = Language(lang_fn())
+        parser = Parser(lang_obj)
+    except Exception as exc:
+        error = exc
 
-    # Attempt 2: individual tree-sitter-<lang> packages (new-style API, Python 3.13+)
     if parser is None:
-        try:
-            mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
-            from tree_sitter import Language, Parser  # type: ignore
-            # PHP exposes language_php() instead of language()
-            lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
-            lang_obj = Language(lang_fn())
-            parser = Parser(lang_obj)
-        except Exception:
-            pass
+        print(
+            f"[_get_parser] no tree-sitter grammar available for '{lang_name}' "
+            f"({error!r}); code-structure extraction disabled for this language "
+            f"until 'tree-sitter-{lang_name}' is installed.",
+            file=sys.stderr,
+        )
 
     _grammar_cache[lang_name] = parser
     return parser
