@@ -1047,7 +1047,7 @@ def _git_commits(
         ts_unix = int(parts[1])
         author = parts[2]
         subject = parts[3] if len(parts) > 3 else ""
-        ts_iso = datetime.datetime.fromtimestamp(ts_unix, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts_iso = datetime.datetime.fromtimestamp(ts_unix, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         commits.append((hash_, ts_iso, author, subject))
     return commits
 
