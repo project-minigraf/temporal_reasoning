@@ -10,7 +10,8 @@ import install
 
 class TestCheckMinigrafPackage:
     def test_returns_true_when_already_installed(self):
-        with patch.dict("sys.modules", {"minigraf": MagicMock()}):
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result):
             assert install.check_minigraf_package() is True
 
     def test_runs_pip_install_when_missing(self):
@@ -32,7 +33,8 @@ class TestCheckMinigrafPackage:
 
 class TestCheckMcpPackage:
     def test_returns_true_when_already_installed(self):
-        with patch.dict("sys.modules", {"mcp": MagicMock()}):
+        mock_result = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock_result):
             assert install.check_mcp_package() is True
 
     def test_runs_pip_install_when_missing(self):
