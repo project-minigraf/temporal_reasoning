@@ -280,12 +280,26 @@ class TestMinigrafReportIssue:
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
         mock_module = MagicMock()
+        mock_module.report_issue.return_value = {
+            "ok": True, "method": "gh", "repo": "org/repo", "result": "https://github.com/org/repo/issues/1"
+        }
         with patch.dict("sys.modules", {"report_issue": mock_module}):
             result = mcp_server.handle_minigraf_report_issue("bug", "something broke")
-        assert result["ok"] is True
+        assert result == {
+            "ok": True, "method": "gh", "repo": "org/repo", "result": "https://github.com/org/repo/issues/1"
+        }
         mock_module.report_issue.assert_called_once_with(
             "bug", "something broke", datalog=None, error=None
         )
+
+    def test_propagates_failure_from_report_issue(self, mock_minigraf_db, tmp_path):
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mock_module = MagicMock()
+        mock_module.report_issue.return_value = {"ok": False, "error": "gh command failed"}
+        with patch.dict("sys.modules", {"report_issue": mock_module}):
+            result = mcp_server.handle_minigraf_report_issue("bug", "something broke")
+        assert result == {"ok": False, "error": "gh command failed"}
 
     def test_returns_error_on_import_failure(self, mock_minigraf_db, tmp_path):
         import mcp_server

@@ -835,8 +835,7 @@ def handle_minigraf_report_issue(
     """Delegate to report_issue.py."""
     try:
         from report_issue import report_issue
-        report_issue(category, description, datalog=datalog, error=error)
-        return {"ok": True}
+        return report_issue(category, description, datalog=datalog, error=error)
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
