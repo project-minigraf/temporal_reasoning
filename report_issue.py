@@ -5,9 +5,9 @@ report_issue.py - Report Minigraf errors as GitHub issues.
 Provides a tool to file issues when Minigraf queries/transacts fail.
 Uses GitHub CLI (gh) if available, otherwise falls back to logging.
 
-Automatically routes issues to the correct repo:
+Automatically routes issues to the correct repo based on content analysis:
 - minigraf core bugs -> https://github.com/project-minigraf/minigraf
-- Minigraf skill bugs -> current repo
+- Minigraf skill bugs -> https://github.com/project-minigraf/temporal_reasoning
 """
 
 import subprocess
@@ -22,6 +22,10 @@ logger.addHandler(logging.NullHandler())
 VALID_ISSUE_TYPES = ["invalid_query", "transact_failure", "parse_error", "minigraf_bug"]
 
 MINIGRAF_REPO = "project-minigraf/minigraf"
+TEMPORAL_REASONING_REPO = "project-minigraf/temporal_reasoning"
+
+BUG_LABEL_NAME = "bug"
+BUG_ISSUE_TYPE_NAME = "Bug"
 
 
 def _is_minigraf_related(description: str, error: str = "", datalog: str = "") -> bool:
@@ -56,13 +60,16 @@ def _is_minigraf_related(description: str, error: str = "", datalog: str = "") -
     return minigraf_score > wrapper_score
 
 
-def _get_target_repo(is_minigraf_bug: bool) -> Optional[Dict[str, str]]:
-    """Get the target repo for the issue."""
-    if is_minigraf_bug:
-        parts = MINIGRAF_REPO.split("/")
-        return {"owner": parts[0], "name": parts[1]}
+def _get_target_repo(is_minigraf_bug: bool) -> Dict[str, str]:
+    """Get the target repo for the issue.
 
-    return _get_current_repo()
+    Always hardcoded (never derived from the caller's cwd via `gh repo view`)
+    so skill-level bugs reported from any downstream consumer project still
+    land in the skill's own repo, not the consumer's.
+    """
+    repo = MINIGRAF_REPO if is_minigraf_bug else TEMPORAL_REASONING_REPO
+    owner, name = repo.split("/")
+    return {"owner": owner, "name": name}
 
 
 def _check_gh_available() -> bool:
@@ -79,26 +86,84 @@ def _check_gh_available() -> bool:
         return False
 
 
-def _get_current_repo() -> Optional[Dict[str, str]]:
-    """Get current repo info using gh."""
+def _get_repo_metadata(owner: str, name: str) -> Dict[str, Optional[str]]:
+    """Best-effort lookup of the repo's node id, its 'bug' label id, and its
+    'Bug' issue type id, via a single GraphQL query.
+
+    Returns an empty dict if the lookup fails or the repo doesn't have these
+    (e.g. Issue Types isn't enabled) - callers must treat every key as optional.
+    """
+    query = """
+    query($owner: String!, $name: String!, $label: String!) {
+      repository(owner: $owner, name: $name) {
+        id
+        label(name: $label) { id }
+        issueTypes(first: 50) { nodes { id name } }
+      }
+    }
+    """
     try:
         result = subprocess.run(
-            ["gh", "repo", "view", "--json", "owner,name"],
+            [
+                "gh", "api", "graphql",
+                "-f", f"query={query}",
+                "-f", f"owner={owner}",
+                "-f", f"name={name}",
+                "-f", f"label={BUG_LABEL_NAME}",
+            ],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=15,
             check=True
         )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            return {
-                "owner": data.get("owner", {}).get("login", ""),
-                "name": data.get("name", "")
-            }
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return None
+        data = json.loads(result.stdout)
+        repo = (data.get("data") or {}).get("repository") or {}
+        label = repo.get("label") or {}
+        issue_types = ((repo.get("issueTypes") or {}).get("nodes")) or []
+        bug_type = next((t for t in issue_types if t.get("name") == BUG_ISSUE_TYPE_NAME), None)
+        return {
+            "repo_id": repo.get("id"),
+            "label_id": label.get("id"),
+            "issue_type_id": bug_type["id"] if bug_type else None,
+        }
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        return {}
 
+
+def _create_issue_via_graphql(
+    repo_id: str,
+    title: str,
+    body: str,
+    label_id: Optional[str],
+    issue_type_id: Optional[str]
+) -> str:
+    """Create the issue via GraphQL so the label and issue type can be set
+    atomically at creation time. Returns the created issue's URL."""
+    mutation = """
+    mutation($repositoryId: ID!, $title: String!, $body: String!, $labelIds: [ID!], $issueTypeId: ID) {
+      createIssue(input: {
+        repositoryId: $repositoryId, title: $title, body: $body,
+        labelIds: $labelIds, issueTypeId: $issueTypeId
+      }) {
+        issue { url }
+      }
+    }
+    """
+    args = [
+        "gh", "api", "graphql",
+        "-f", f"query={mutation}",
+        "-f", f"repositoryId={repo_id}",
+        "-f", f"title={title}",
+        "-f", f"body={body}",
+    ]
+    if label_id:
+        args += ["-f", f"labelIds[]={label_id}"]
+    if issue_type_id:
+        args += ["-f", f"issueTypeId={issue_type_id}"]
+
+    result = subprocess.run(args, capture_output=True, text=True, timeout=30, check=True)
+    data = json.loads(result.stdout)
+    return (((data.get("data") or {}).get("createIssue") or {}).get("issue") or {}).get("url", "")
 
 
 def report_issue(
@@ -125,15 +190,12 @@ def report_issue(
             "error": f"Invalid issue_type. Must be one of: {VALID_ISSUE_TYPES}"
         }
 
+    # issue_type is a caller-supplied hint, not the routing signal - content
+    # analysis alone decides core-vs-skill (see #87).
     is_minigraf_bug = _is_minigraf_related(description, error or "", datalog or "")
-    if issue_type == "minigraf_bug":
-        is_minigraf_bug = True
 
     target_repo = _get_target_repo(is_minigraf_bug)
-    if target_repo:
-        repo_name = f"{target_repo['owner']}/{target_repo['name']}"
-    else:
-        repo_name = "unknown"
+    repo_name = f"{target_repo['owner']}/{target_repo['name']}"
 
     body_parts = [f"**Description:** {description}"]
 
@@ -164,42 +226,37 @@ def report_issue(
             "result": "gh not available, logged"
         }
 
-    if not target_repo:
-        logger.warning("Not in a GitHub repository. Issue not filed.")
+    try:
+        metadata = _get_repo_metadata(target_repo["owner"], target_repo["name"])
+
+        if metadata.get("repo_id"):
+            issue_url = _create_issue_via_graphql(
+                metadata["repo_id"], title, body,
+                metadata.get("label_id"), metadata.get("issue_type_id"),
+            )
+        else:
+            # Metadata lookup failed (e.g. no network) - fall back to plain
+            # creation without label/issue type rather than losing the report.
+            result = subprocess.run(
+                [
+                    "gh", "issue", "create",
+                    "--repo", f"{target_repo['owner']}/{target_repo['name']}",
+                    "--title", title,
+                    "--body", body
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True
+            )
+            issue_url = result.stdout.strip()
+
         return {
             "ok": True,
-            "method": "log",
-            "repo": "unknown",
-            "result": "not in github repo, logged to stdout"
+            "method": "gh",
+            "repo": repo_name,
+            "result": issue_url
         }
-
-    try:
-        result = subprocess.run(
-            [
-                "gh", "issue", "create",
-                "--repo", f"{target_repo['owner']}/{target_repo['name']}",
-                "--title", title,
-                "--body", body
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True
-        )
-
-        if result.returncode == 0:
-            issue_url = result.stdout.strip()
-            return {
-                "ok": True,
-                "method": "gh",
-                "repo": repo_name,
-                "result": issue_url
-            }
-        else:
-            return {
-                "ok": False,
-                "error": result.stderr.strip() or "gh issue create failed"
-            }
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "gh command timed out"}
     except subprocess.CalledProcessError as e:
