@@ -1803,6 +1803,8 @@ class TestGitDiffTreeRaw:
         sub = tmp_path / "sub"
         sub.mkdir()
         _subprocess.run(["git", "init"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=sub, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "--allow-empty", "-m", "e"], cwd=sub, check=True, capture_output=True)
         sub_hash = _subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=sub, check=True, capture_output=True, text=True,
@@ -1973,6 +1975,8 @@ class TestExtractCommit:
         sub = tmp_path / "sub"
         sub.mkdir()
         _subprocess.run(["git", "init"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=sub, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "--allow-empty", "-m", "e"], cwd=sub, check=True, capture_output=True)
         sub_hash = _subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=sub, check=True, capture_output=True, text=True,
