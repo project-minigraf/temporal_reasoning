@@ -1856,6 +1856,47 @@ class TestGitlinkChanges:
         assert mcp_server._gitlink_changes(raw) == [("add", "e" * 40, "vendor/lib")]
 
 
+class TestParseGitmodules:
+    def test_parses_single_submodule(self):
+        import mcp_server
+        content = (
+            b'[submodule "abseil-cpp"]\n'
+            b'\tpath = 3rdParty/abseil-cpp\n'
+            b'\turl = https://github.com/abseil/abseil-cpp.git\n'
+        )
+        result = mcp_server._parse_gitmodules(content)
+        assert result == {
+            "3rdParty/abseil-cpp": {
+                "name": "abseil-cpp",
+                "url": "https://github.com/abseil/abseil-cpp.git",
+            }
+        }
+
+    def test_parses_multiple_submodules(self):
+        import mcp_server
+        content = (
+            b'[submodule "a"]\n\tpath = vendor/a\n\turl = https://x/a.git\n'
+            b'[submodule "b"]\n\tpath = vendor/b\n\turl = https://x/b.git\n'
+        )
+        result = mcp_server._parse_gitmodules(content)
+        assert set(result.keys()) == {"vendor/a", "vendor/b"}
+
+    def test_malformed_content_returns_empty_dict(self):
+        import mcp_server
+        result = mcp_server._parse_gitmodules(b"not a valid [ini file")
+        assert result == {}
+
+    def test_empty_content_returns_empty_dict(self):
+        import mcp_server
+        assert mcp_server._parse_gitmodules(b"") == {}
+
+    def test_git_gitmodules_at_missing_file_returns_empty(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        result = mcp_server._git_gitmodules_at(str(git_repo), commits[0][0])
+        assert result == {}
+
+
 class TestExtractCommit:
     def test_added_file_returns_extracted_dict(self, git_repo):
         import mcp_server

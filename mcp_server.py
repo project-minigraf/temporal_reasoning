@@ -7,6 +7,7 @@ Sole interface to the minigraf .graph file via the MiniGrafDb Python binding.
 """
 import asyncio
 import concurrent.futures
+import configparser
 import contextlib
 import datetime
 import json
@@ -1245,6 +1246,45 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
         cwd=repo_path, capture_output=True, check=True,
     )
     return result.stdout
+
+
+def _parse_gitmodules(content: bytes) -> Dict[str, Dict[str, str]]:
+    """Parse .gitmodules content into {path: {"name": ..., "url": ...}}.
+
+    Best-effort: git config's `[section "subsection"]` syntax is a strict
+    superset of what configparser expects for ordinary cases, so malformed
+    or unusual .gitmodules content fails closed to an empty dict rather
+    than raising — matches this file's existing best-effort git/parse
+    conventions (see _extract_from_source's bare except).
+    """
+    result: Dict[str, Dict[str, str]] = {}
+    parser = configparser.ConfigParser()
+    try:
+        parser.read_string(content.decode("utf-8", errors="replace"))
+    except configparser.Error:
+        return result
+    for section in parser.sections():
+        m = re.match(r'submodule\s+"(.+)"', section)
+        if not m:
+            continue
+        path = parser.get(section, "path", fallback=None)
+        url = parser.get(section, "url", fallback=None)
+        if path:
+            result[path] = {"name": m.group(1), "url": url or ""}
+    return result
+
+
+def _git_gitmodules_at(repo_path: str, commit_hash: str) -> Dict[str, Dict[str, str]]:
+    """Fetch and parse .gitmodules as it exists at commit_hash.
+
+    Empty dict if missing or unparseable — most repos never have a
+    .gitmodules file at all, which is the normal case, not an error.
+    """
+    try:
+        content = _git_file_content(repo_path, commit_hash, ".gitmodules")
+    except Exception:
+        return {}
+    return _parse_gitmodules(content)
 
 
 def _git_parent_hashes(repo_path: str, commit_hash: str) -> List[str]:
