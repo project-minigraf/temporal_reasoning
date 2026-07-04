@@ -362,6 +362,20 @@ Ident: `:tag/<slugified-tag-name>`
 | `:date` | tag creation date (if available) |
 | `:tagged-commit` (keyword ref) | the commit this tag points to |
 
+#### `:type/external-dependency` — real git submodules and genuinely-unresolved imports
+Ident: `:module/<slugified-path-or-import-name>` (shares the module ident namespace — only `:entity-type` distinguishes internal from external)
+
+| Attribute | Notes |
+|---|---|
+| `:description` | submodule's declared name from `.gitmodules` if resolvable, else raw path (submodules); raw import specifier (unresolved imports) |
+| `:path` | submodule's repo path (submodules only; absent for unresolved-import placeholders — they have no path) |
+| `:pinned-commit` | pinned commit SHA the submodule currently points to (submodules only); bi-temporally closed and reopened on every bump — point-in-time queries see the SHA pinned at that time |
+| `:submodule-name` / `:submodule-url` | from `.gitmodules`, when parseable (submodules only) |
+| `:introduced-by` (keyword ref) | commit that first introduced this dependency |
+| `:modified-in` (keyword ref) | one edge per commit that bumped a submodule's pinned commit |
+
+Vendored-in-tree code checked in as regular files (not a git submodule) is parsed as ordinary `:type/module`/`:function`/`:class` entities like any first-party code — only real gitlinks (mode `160000`) and genuinely-unresolved imports get the external marker.
+
 **Supported languages for AST extraction:** Python, JavaScript, TypeScript (+ TSX/JSX), Rust, Go, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Scala, Haskell, Lua, Elixir. Files in other languages are tracked as modules (with `:introduced-by`/`:modified-in`) but yield no function or class entities.
 
 **Pre-registered SESSION_RULES** — these are always available; no `minigraf_rule` call needed:

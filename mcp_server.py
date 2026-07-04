@@ -7,6 +7,7 @@ Sole interface to the minigraf .graph file via the MiniGrafDb Python binding.
 """
 import asyncio
 import concurrent.futures
+import configparser
 import contextlib
 import datetime
 import json
@@ -95,6 +96,15 @@ _EXT_TO_LANG: Dict[str, str] = {
     ".cc": "cpp", ".cxx": "cpp",
 }
 
+# Maps lang_name to the actual importable module, for the (currently only)
+# case where a single package ships multiple grammar variants. tsx and
+# typescript are both exposed by the tree_sitter_typescript package via
+# separate language_tsx()/language_typescript() functions — there is no
+# separate tree_sitter_tsx module, unlike every other language here.
+_LANG_MODULE_OVERRIDES: Dict[str, str] = {
+    "tsx": "tree_sitter_typescript",
+}
+
 _grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
 
 _grammar_cache_lock = threading.Lock()
@@ -113,9 +123,11 @@ def _build_parser(lang_name: str) -> Any:
     swallowed, consistent with how any other producer-task exception is
     handled.
     """
-    mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
+    module_name = _LANG_MODULE_OVERRIDES.get(lang_name, f"tree_sitter_{lang_name}")
+    mod = __import__(module_name, fromlist=["language"])
     from tree_sitter import Language, Parser  # type: ignore
-    # PHP exposes language_php() instead of language()
+    # PHP exposes language_php() instead of language(); tsx exposes
+    # language_tsx() from within the tree_sitter_typescript module.
     lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
     lang_obj = Language(lang_fn())
     return Parser(lang_obj)
@@ -357,50 +369,60 @@ def _rust_use_root(node) -> Optional[str]:
 
 
 def _c_include_name(node) -> Optional[str]:
-    """Return the header name (no path, no extension) from a C/C++ preproc_include node.
+    """Return the include target (path preserved, extension stripped) from a
+    C/C++ preproc_include node.
 
     Handles both:
-      #include <stdio.h>    → system_lib_string → "stdio"
-      #include "myheader.h" → string_literal    → "myheader"
+      #include <stdio.h>          → system_lib_string → "stdio"
+      #include <unicode/uloc.h>   → system_lib_string → "unicode/uloc"
+      #include "sub/myheader.h"   → string_literal    → "sub/myheader"
+
+    Path structure is preserved (not reduced to a bare basename) so
+    _resolve_module_import can match vendored in-tree headers precisely —
+    both angle-bracket and quoted forms commonly carry a real subdirectory
+    (<sys/socket.h>, <unicode/uloc.h>, "app/config.h"), not just stdlib-style
+    bare names like <vector>.
     """
-    import os
     for child in node.children:
         if child.type in ("system_lib_string", "string_literal"):
             raw = child.text.decode("utf-8").strip("<>\"'")
-            return os.path.splitext(os.path.basename(raw))[0]
+            return os.path.splitext(raw)[0]
     return None
 
 
 def _csharp_using_name(node) -> Optional[str]:
-    """Return the root namespace from a C# using_directive node.
+    """Return the full dotted namespace from a C# using_directive node.
 
     using System;                     → "System"
-    using System.Collections.Generic; → "System"
-    """
-    def _first_ident(n) -> Optional[str]:
-        if n.type == "identifier":
-            return n.text.decode("utf-8")
-        for c in n.named_children:
-            result = _first_ident(c)
-            if result:
-                return result
-        return None
+    using System.Collections.Generic; → "System.Collections.Generic"
 
-    return _first_ident(node)
+    The dotted path is one named child (qualified_name for multi-segment
+    paths, identifier for single-segment ones) whose own .text is already
+    the full joined name.
+    """
+    for child in node.named_children:
+        if child.type in ("qualified_name", "identifier"):
+            return child.text.decode("utf-8")
+    return None
 
 
 def _ruby_require_name(node) -> Optional[str]:
-    """Return the required module name from a Ruby call node.
+    """Return the required path from a Ruby call node (path preserved,
+    extension stripped). A require_relative target is prefixed with "./" so
+    it reuses the same relative-import detection _resolve_module_import
+    already needs for JS/TS-style "./foo" specifiers, rather than plumbing a
+    separate is-relative flag through the whole imports pipeline.
 
     Handles:
-      require 'rails'            → "rails"
-      require_relative 'my_mod' → "my_mod"
+      require 'rails'                            → "rails"
+      require 'active_support/core_ext/string'    → "active_support/core_ext/string"
+      require_relative 'my_mod'                   → "./my_mod"
     Returns None for non-require calls.
     """
-    import os
     method = node.child_by_field_name("method")
     if method is None or method.text.decode("utf-8") not in ("require", "require_relative"):
         return None
+    is_relative = method.text.decode("utf-8") == "require_relative"
     args = node.child_by_field_name("arguments")
     if args is None:
         return None
@@ -414,7 +436,8 @@ def _ruby_require_name(node) -> Optional[str]:
                 val = content_node.text.decode("utf-8")
             else:
                 val = child.text.decode("utf-8").strip("'\"")
-            return os.path.splitext(os.path.basename(val))[0]
+            path = os.path.splitext(val)[0]
+            return f"./{path}" if is_relative else path
     return None
 
 
@@ -448,11 +471,11 @@ def _lua_require_name(node) -> Optional[str]:
 
 
 def _elixir_module_name(node) -> Optional[str]:
-    """Return the root module name from an Elixir alias/import/use/require call.
+    """Return the full dotted module name from an Elixir alias/import/use/require call.
 
-    alias MyApp.Router     → "MyApp"
-    import Ecto.Query      → "Ecto"
-    use Phoenix.Controller → "Phoenix"
+    alias MyApp.Router     → "MyApp.Router"
+    import Ecto.Query      → "Ecto.Query"
+    use Phoenix.Controller → "Phoenix.Controller"
     require Logger         → "Logger"
     Returns None for non-module calls (e.g. IO.puts/1 where target is a dot node).
     """
@@ -470,8 +493,7 @@ def _elixir_module_name(node) -> Optional[str]:
         if child.type == "arguments":
             for arg in child.children:
                 if arg.type == "alias":
-                    txt = arg.text.decode("utf-8")
-                    return txt.split(".")[0]
+                    return arg.text.decode("utf-8")
     return None
 
 
@@ -482,17 +504,20 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         if node.type == "import_from_statement":
             m = node.child_by_field_name("module_name")
             if m:
-                names.append(m.text.decode("utf-8").split(".")[0])
+                # m.text is the raw specifier as written, including relative
+                # forms: "pathlib", ".sub", "..pkg" — see _resolve_module_import
+                # for how leading dots get resolved against the importing file.
+                names.append(m.text.decode("utf-8"))
         else:
-            # import_statement: collect all top-level module names
+            # import_statement: collect all full dotted module names
             for child in node.named_children:
                 if child.type == "aliased_import":
                     n = child.child_by_field_name("name")
                     if n:
-                        names.append(n.text.decode("utf-8").split(".")[0])
+                        names.append(n.text.decode("utf-8"))
                 elif child.type == "dotted_name":
-                    names.append(child.text.decode("utf-8").split(".")[0])
-    elif lang_name in ("javascript", "typescript"):
+                    names.append(child.text.decode("utf-8"))
+    elif lang_name in ("javascript", "typescript", "tsx"):
         src = node.child_by_field_name("source")
         if src:
             names.append(src.text.decode("utf-8").strip("'\""))
@@ -504,8 +529,7 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         def _go_spec(spec_node):
             path = spec_node.child_by_field_name("path")
             if path:
-                val = path.text.decode("utf-8").strip('"')
-                names.append(val.split("/")[-1])
+                names.append(path.text.decode("utf-8").strip('"'))
 
         for child in node.named_children:
             if child.type == "import_spec":
@@ -515,18 +539,13 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
                     if spec.type == "import_spec":
                         _go_spec(spec)
     elif lang_name == "java":
-        def _java_leftmost(n) -> Optional[str]:
-            if n.type == "identifier":
-                return n.text.decode("utf-8")
-            for c in n.named_children:
-                result = _java_leftmost(c)
-                if result:
-                    return result
-            return None
-
-        result = _java_leftmost(node)
-        if result:
-            names.append(result)
+        # import_declaration's dotted path is one named child, already the
+        # full text (e.g. "java.util.List") — scoped_identifier for
+        # multi-segment paths, plain identifier for single-segment ones.
+        for child in node.named_children:
+            if child.type in ("scoped_identifier", "identifier"):
+                names.append(child.text.decode("utf-8"))
+                break
     elif lang_name in ("c", "cpp"):
         name = _c_include_name(node)
         if name:
@@ -540,40 +559,42 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         if name:
             names.append(name)
     elif lang_name == "php":
-        import os
         for child in node.children:
             if child.type in ("string", "encapsed_string", "string_literal"):
                 val = child.text.decode("utf-8").strip("'\"")
-                names.append(os.path.splitext(os.path.basename(val))[0])
+                names.append(os.path.splitext(val)[0])
                 break
     elif lang_name == "kotlin":
-        def _kotlin_first_seg(n) -> Optional[str]:
-            if n.type in ("simple_identifier", "identifier"):
-                return n.text.decode("utf-8")
-            for c in n.named_children:
-                result = _kotlin_first_seg(c)
-                if result:
-                    return result
-            return None
-
-        result = _kotlin_first_seg(node)
-        if result:
-            names.append(result)
+        # import node's dotted path is one named child (qualified_identifier
+        # for multi-segment, identifier for single-segment) whose .text is
+        # already the full joined name.
+        for child in node.named_children:
+            if child.type in ("qualified_identifier", "identifier"):
+                names.append(child.text.decode("utf-8"))
+                break
     elif lang_name == "swift":
+        # import_declaration's single "identifier" named child already
+        # holds the full dotted text (e.g. "Foundation.NSString") directly —
+        # no recursion needed.
         for child in node.named_children:
             if child.type in ("identifier", "simple_identifier"):
                 names.append(child.text.decode("utf-8"))
                 break
     elif lang_name == "scala":
+        # import_declaration's path is flattened into individual "identifier"
+        # named children (no wrapping scoped node), so join the leading run
+        # of identifiers rather than taking the first one's text alone.
+        segments = []
         for child in node.named_children:
-            txt = child.text.decode("utf-8")
-            names.append(txt.split(".")[0])
-            break
+            if child.type != "identifier":
+                break
+            segments.append(child.text.decode("utf-8"))
+        if segments:
+            names.append(".".join(segments))
     elif lang_name == "haskell":
         for child in node.named_children:
             if child.type in ("module", "qualified_module", "constructor"):
-                txt = child.text.decode("utf-8")
-                names.append(txt.split(".")[0])
+                names.append(child.text.decode("utf-8"))
                 break
     elif lang_name == "lua":
         name = _lua_require_name(node)
@@ -615,8 +636,14 @@ def _c_family_function_name(node) -> Optional[str]:
 
 
 def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
-    """Recursively extract code entities from a tree-sitter AST node."""
-    node_types = _LANG_NODE_TYPES.get(lang_name)
+    """Recursively extract code entities from a tree-sitter AST node.
+
+    tsx is treated as an alias of typescript here (and in _extract_import_name)
+    rather than duplicating every _LANG_NODE_TYPES entry — the TSX grammar is
+    a strict superset of TypeScript's node types for the constructs this
+    module cares about (functions, classes, imports, calls).
+    """
+    node_types = _LANG_NODE_TYPES.get("typescript" if lang_name == "tsx" else lang_name)
     if node_types is None:
         return
 
@@ -1059,35 +1086,117 @@ def _canonical_ident(entity_type: str, value: str) -> str:
     return f":{entity_type}/{slug}"
 
 
-def _resolve_module_import(import_name: str, file_entities: Dict[str, List[str]]) -> str:
+def _path_segments(path_str: str) -> List[str]:
+    """Split a path into non-empty segments, normalizing os.sep to '/'."""
+    return [seg for seg in path_str.replace(os.sep, "/").split("/") if seg]
+
+
+def _segments_end_with(full_segments: List[str], candidate_segments: List[str]) -> bool:
+    """True if full_segments' trailing slice equals candidate_segments exactly.
+
+    A whole-segment suffix comparison, not a raw string suffix — comparing
+    strings directly would let e.g. "xyzcom/google" wrongly match a
+    candidate of "com/google" (the substring is present but not as its own
+    path segment).
+    """
+    if not candidate_segments or len(candidate_segments) > len(full_segments):
+        return False
+    return full_segments[-len(candidate_segments):] == candidate_segments
+
+
+def _resolve_module_import(
+    import_name: str,
+    file_entities: Dict[str, List[str]],
+    importing_file: Optional[str] = None,
+) -> Tuple[str, bool]:
     """Resolve an import name to a module ident that joins with stored module entities.
 
-    For a name like "storage", tries standard Rust source-root locations first
-    (src/storage.rs, src/storage/mod.rs) before falling back to a broader name
-    search. The ordered-priority approach prevents e.g. src/graph/storage.rs
-    from matching a top-level `use crate::storage` import.
+    Tries a relative-import resolution first (see below), then Rust's exact
+    source-root conventions (src/storage.rs, src/storage/mod.rs), then a
+    generic, language-agnostic segment-suffix matcher used by every other
+    language. This exists because every other language's import extraction
+    already reduces to a bare or dotted/slashed specifier (see
+    _extract_import_name) that would otherwise always fall through to the
+    external-dependency fallback — including for real in-tree vendored code,
+    which must stay internal per the design spec's Non-goals.
 
-    Falls back to _canonical_ident for external crate names (std, tokio, …)
-    so they still get an edge even though they have no :path attribute.
+    When import_name is relative (starts with ".") and importing_file is
+    given, resolves against the importing file's own directory before any
+    other tier runs. Covers three conventions: JS/TS/Ruby-style "./foo" and
+    "../foo/bar" (plain relative filesystem paths — Ruby's require_relative
+    results already carry this "./" prefix, added by _ruby_require_name),
+    and Python-style leading dots with no slash ("." = same package, each
+    extra dot = one directory further up) followed by an optional dotted
+    module path.
+
+    The generic matcher splits the specifier into segments on "/" if present
+    (Go, C/C++, Ruby, PHP already use "/" natively — note Go paths like
+    "github.com/user/pkg" contain literal dots inside a segment that must
+    NOT be treated as separators), otherwise on "." (Java, C#, Python, Scala,
+    Kotlin, Swift, Haskell, Elixir — genuinely dot-separated). Matching a
+    whole-segment suffix (not a raw substring) against either a file's own
+    path or its parent directory uniformly covers: an exact match, a
+    vendored path with extra prefix segments, a package-only/wildcard-style
+    import (via the parent-directory tier), and a bare single-segment name
+    (degenerates to a basename check).
+
+    Returns (ident, is_resolved). is_resolved is True when import_name
+    matched a real file in file_entities, False when it fell through to the
+    bare _canonical_ident guess.
     """
+    if importing_file and import_name.startswith("."):
+        base_dir = Path(importing_file).parent
+        if import_name.startswith("./") or import_name.startswith("../"):
+            target = os.path.normpath(str(base_dir / import_name))
+        else:
+            stripped = import_name.lstrip(".")
+            levels_up = len(import_name) - len(stripped) - 1
+            target_dir = base_dir
+            for _ in range(levels_up):
+                target_dir = target_dir.parent
+            target = str(target_dir / stripped.replace(".", "/")) if stripped else str(target_dir)
+            target = os.path.normpath(target)
+        target = target.replace(os.sep, "/")
+        for file_path in file_entities:
+            if str(Path(file_path).with_suffix("")).replace(os.sep, "/") == target:
+                return _code_ident("module", file_path), True
+        return _canonical_ident("module", import_name), False
+
     # Priority 1: canonical Rust module root paths under common source roots
     for src_root in ("src", "lib", ""):
         prefix = f"{src_root}/" if src_root else ""
         candidate_file = f"{prefix}{import_name}.rs"
         candidate_mod = f"{prefix}{import_name}/mod.rs"
         if candidate_file in file_entities:
-            return _code_ident("module", candidate_file)
+            return _code_ident("module", candidate_file), True
         if candidate_mod in file_entities:
-            return _code_ident("module", candidate_mod)
+            return _code_ident("module", candidate_mod), True
 
     # Priority 2: broader search — only match files directly under a src root
     # (parent.parent is the source root, not a nested subdir)
     for file_path in file_entities:
         p = Path(file_path)
         if p.stem == "mod" and p.parent.name == import_name:
-            return _code_ident("module", file_path)
+            return _code_ident("module", file_path), True
 
-    return _canonical_ident("module", import_name)
+    # Priority 3: generic segment-suffix matcher for every other language.
+    candidate_segments = import_name.split("/") if "/" in import_name else import_name.split(".")
+
+    # 3a. file match (exact, or a vendored path with extra prefix segments), extension stripped
+    for file_path in file_entities:
+        file_segments = _path_segments(str(Path(file_path).with_suffix("")))
+        if _segments_end_with(file_segments, candidate_segments):
+            return _code_ident("module", file_path), True
+
+    # 3b. parent-directory match (package-only/wildcard-style imports, e.g.
+    # a Java "import com.google.gson.*;" or a bare "com.google.gson" reference
+    # with no specific trailing class name)
+    for file_path in file_entities:
+        parent_segments = _path_segments(str(Path(file_path).parent))
+        if _segments_end_with(parent_segments, candidate_segments):
+            return _code_ident("module", file_path), True
+
+    return _canonical_ident("module", import_name), False
 
 
 def _code_ident(entity_type: str, file_path: str, name: Optional[str] = None) -> str:
@@ -1137,8 +1246,74 @@ def _git_commits(
     return commits
 
 
+def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
+    """Return (status_char, old_mode, new_mode, old_sha, new_sha, path) for
+    every changed path in a commit, via a single `git diff-tree --raw` call.
+
+    Supersedes running diff-tree a second time just to detect gitlinks:
+    --raw already carries file mode (needed to spot submodule paths, mode
+    160000) in the same subprocess invocation _extract_commit already makes.
+    """
+    result = _subprocess.run(
+        ["git", "diff-tree", "--no-commit-id", "-r", "--raw", "--root", commit_hash],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    entries = []
+    for line in result.stdout.strip().splitlines():
+        if not line.startswith(":"):
+            continue
+        meta, sep, path = line.partition("\t")
+        if not sep:
+            continue
+        fields = meta[1:].split(" ")
+        if len(fields) < 5:
+            continue
+        old_mode, new_mode, old_sha, new_sha, status = fields[0], fields[1], fields[2], fields[3], fields[4]
+        entries.append((status[0], old_mode, new_mode, old_sha, new_sha, path))
+    return entries
+
+
+_GITLINK_MODE = "160000"
+
+
+def _gitlink_changes(raw_entries: List[tuple]) -> List[tuple]:
+    """Filter _git_diff_tree_raw's output down to gitlink-involving rows,
+    collapsed into three cases by mode pair rather than by the raw status
+    letter (which varies: A/D/M/T can all represent a gitlink change
+    depending on what else happened to the same path):
+
+      "add"    — new_mode is a gitlink, old_mode is not. Covers a plain
+                 submodule addition (status A) and a same-path flip from a
+                 regular blob into a gitlink (status T).
+      "bump"   — both modes are gitlinks (status M): the pinned commit changed.
+      "remove" — old_mode is a gitlink, new_mode is not. Covers a plain
+                 submodule removal (status D) and a same-path flip from a
+                 gitlink back into a regular blob (status T).
+
+    sha is the new pinned commit for "add"/"bump", or the last-known pinned
+    commit for "remove" (needed by the caller to close the right fact).
+    """
+    changes = []
+    for status, old_mode, new_mode, old_sha, new_sha, path in raw_entries:
+        old_is_link = old_mode == _GITLINK_MODE
+        new_is_link = new_mode == _GITLINK_MODE
+        if not old_is_link and not new_is_link:
+            continue
+        if new_is_link and not old_is_link:
+            changes.append(("add", new_sha, path))
+        elif old_is_link and new_is_link:
+            changes.append(("bump", new_sha, path))
+        else:
+            changes.append(("remove", old_sha, path))
+    return changes
+
+
 def _git_changed_files(repo_path: str, commit_hash: str) -> List[tuple]:
-    """Return list of (status_char, path) for files changed in this commit."""
+    """Return list of (status_char, path) for files changed in this commit.
+
+    Not currently called by the ingestion pipeline (which uses _git_diff_tree_raw
+    instead, for mode-aware parsing) — retained as a general-purpose git helper.
+    """
     result = _subprocess.run(
         ["git", "diff-tree", "--no-commit-id", "-r", "--name-status", "--root", commit_hash],
         cwd=repo_path, capture_output=True, text=True, check=True,
@@ -1166,6 +1341,45 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
         cwd=repo_path, capture_output=True, check=True,
     )
     return result.stdout
+
+
+def _parse_gitmodules(content: bytes) -> Dict[str, Dict[str, str]]:
+    """Parse .gitmodules content into {path: {"name": ..., "url": ...}}.
+
+    Best-effort: git config's `[section "subsection"]` syntax is a strict
+    superset of what configparser expects for ordinary cases, so malformed
+    or unusual .gitmodules content fails closed to an empty dict rather
+    than raising — matches this file's existing best-effort git/parse
+    conventions (see _extract_from_source's bare except).
+    """
+    result: Dict[str, Dict[str, str]] = {}
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(content.decode("utf-8", errors="replace"))
+    except configparser.Error:
+        return result
+    for section in parser.sections():
+        m = re.match(r'submodule\s+"(.+)"', section)
+        if not m:
+            continue
+        path = parser.get(section, "path", fallback=None)
+        url = parser.get(section, "url", fallback=None)
+        if path:
+            result[path] = {"name": m.group(1), "url": url or ""}
+    return result
+
+
+def _git_gitmodules_at(repo_path: str, commit_hash: str) -> Dict[str, Dict[str, str]]:
+    """Fetch and parse .gitmodules as it exists at commit_hash.
+
+    Empty dict if missing or unparseable — most repos never have a
+    .gitmodules file at all, which is the normal case, not an error.
+    """
+    try:
+        content = _git_file_content(repo_path, commit_hash, ".gitmodules")
+    except Exception:
+        return {}
+    return _parse_gitmodules(content)
 
 
 def _git_parent_hashes(repo_path: str, commit_hash: str) -> List[str]:
@@ -2277,8 +2491,17 @@ def _build_code_triples(
 
 
 def _preload_known_entities(db: Any, repo_path: str) -> tuple:
-    """Load all existing module/function/class idents from the DB, and pre-seed
-    file_entities with all currently tracked files in the repo.
+    """Load all existing module/function/class/external-dependency idents from
+    the DB, and pre-seed file_entities with all currently tracked files in the
+    repo.
+
+    external-dependency entities share the module ident namespace and use the
+    same "path" attribute as modules, so folding them into this same query
+    means the existing close/reopen machinery (entity_valid_from,
+    entity_descriptions) just works for submodules without new parallel state.
+    Unresolved-import placeholders (no :path) are not reloaded by this query —
+    nothing in this codebase ever closes one, so the gap is harmless; see the
+    design spec's Section 2.
 
     Pre-seeding from `git ls-files` ensures that _resolve_module_import can
     find any module file even when processing early commits — before those files
@@ -2304,8 +2527,8 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     except Exception:
         pass
 
-    for entity_type in ("module", "function", "class"):
-        path_attr = "path" if entity_type == "module" else "file"
+    for entity_type in ("module", "function", "class", "external-dependency"):
+        path_attr = "path" if entity_type in ("module", "external-dependency") else "file"
         try:
             raw = db.execute(
                 f'(query [:find ?ident ?path ?desc ?date '
@@ -2391,6 +2614,41 @@ def _preload_known_deps(
     return file_deps, dep_valid_from
 
 
+def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
+    """Reload each external-dependency entity's current :pinned-commit value
+    and the timestamp it was set at, mirroring _preload_known_deps's per-fact
+    :any-valid-time pattern for :depends-on.
+
+    Needed because :pinned-commit is bi-temporally closed and reopened on
+    every bump (see _run_ingestion's gitlink handling) — without this, the
+    server would lose track of the prior SHA and valid-from across a restart,
+    corrupting the close on the next bump or removal exactly the way
+    _preload_known_deps' docstring describes for :depends-on.
+
+    Returns {ident: (sha, valid_from_iso)}.
+    """
+    pinned: Dict[str, tuple] = {}
+    try:
+        raw = db.execute(
+            "(query [:find ?e ?sha ?vf "
+            ":any-valid-time "
+            ":where [?e :pinned-commit ?sha] "
+            "[?e :db/valid-from ?vf] "
+            "[?e :db/valid-to ?vt] "
+            f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
+        )
+        rows = json.loads(raw).get("results", [])
+    except Exception:
+        return pinned
+    for ident, sha, vf_ms in rows:
+        vf_iso = (
+            datetime.datetime.fromtimestamp(vf_ms / 1000, datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        )
+        pinned[ident] = (sha, vf_iso)
+    return pinned
+
+
 def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
     """Ingest git tags as :tag/<slug> entities with :tagged-commit references.
 
@@ -2424,17 +2682,31 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
 
 def _extract_commit(
     repo_path: str, commit_hash: str
-) -> List[Tuple[str, str, Optional[Dict[str, List[str]]]]]:
+) -> Tuple[List[Tuple[str, str, Optional[Dict[str, List[str]]]]], List[tuple], Dict[str, Dict[str, str]]]:
     """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse.
 
     Runs in a worker thread via the ThreadPoolExecutor in _run_ingestion.
-    Touches no shared mutable state and no DB. Returns one entry per changed
-    file that has a supported parser; A/M files whose content fetch fails
-    are omitted entirely, mirroring the previous inline `continue` — the
-    file is simply skipped for this commit, same as today.
+    Touches no shared mutable state and no DB. Returns (file_results,
+    gitlink_changes, gitmodules_map):
+
+      file_results: one entry per changed file that has a supported parser;
+        A/M files whose content fetch fails are omitted entirely, mirroring
+        the previous inline `continue` — same as before this pipeline existed.
+      gitlink_changes: _gitlink_changes' output — gitlink-involving rows,
+        never fed through the tree-sitter parser (gitlink paths never have
+        a resolvable extension).
+      gitmodules_map: path -> {"name", "url"}, populated only when this
+        commit has at least one gitlink "add" — avoids a wasted git-show
+        call on the (overwhelmingly common) case of a commit that touches
+        no submodules at all.
+
+    Sources both file_results and gitlink_changes from a single
+    `git diff-tree --raw` call (via _git_diff_tree_raw) rather than the
+    former --name-status call, which discarded file mode entirely.
     """
+    raw_entries = _git_diff_tree_raw(repo_path, commit_hash)
     results: List[Tuple[str, str, Optional[Dict[str, List[str]]]]] = []
-    for status, file_path in _git_changed_files(repo_path, commit_hash):
+    for status, old_mode, new_mode, old_sha, new_sha, file_path in raw_entries:
         parser = _thread_parser(file_path)
         if parser is None:
             continue
@@ -2447,7 +2719,13 @@ def _extract_commit(
             continue
         extracted = _extract_from_source(content, parser, file_path)
         results.append((status, file_path, extracted))
-    return results
+
+    gitlink_changes = _gitlink_changes(raw_entries)
+    gitmodules_map: Dict[str, Dict[str, str]] = {}
+    if any(kind == "add" for kind, _, _ in gitlink_changes):
+        gitmodules_map = _git_gitmodules_at(repo_path, commit_hash)
+
+    return results, gitlink_changes, gitmodules_map
 
 
 async def _run_ingestion(repo_path: str, branch: str) -> None:
@@ -2471,6 +2749,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         prior_ingested = _count_commit_entities(db)
         entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
         file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
+        pinned_commit_state = _preload_pinned_commits(db)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone, so the local `db` must be cleared
         # too, not just the global — otherwise this frame keeps it alive (and the
@@ -2521,7 +2800,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     break
 
                 (commit_hash, commit_ts_iso, author, subject), fut = pending.popleft()
-                extracted_files = await fut
+                extracted_files, gitlink_changes, gitmodules_map = await fut
                 submit_next()
 
                 last_hash = commit_hash
@@ -2593,9 +2872,20 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             module_ident = _code_ident("module", file_path)
                             current_deps: set = set()
                             for import_name in set(extracted.get("imports", [])):
-                                dep_ident = _resolve_module_import(import_name, file_entities)
+                                dep_ident, is_resolved = _resolve_module_import(
+                                    import_name, file_entities, importing_file=file_path,
+                                )
                                 if dep_ident != module_ident:
                                     current_deps.add(dep_ident)
+                                    is_relative = import_name.startswith(".")
+                                    if not is_resolved and not is_relative and dep_ident not in entity_valid_from:
+                                        add_triples.extend([
+                                            f"[{dep_ident} :entity-type :type/external-dependency]",
+                                            f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
+                                            f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
+                                        ])
+                                        entity_valid_from[dep_ident] = commit_ts_iso
+                                        entity_descriptions[dep_ident] = import_name
                             previous_deps = file_deps.get(file_path, set())
                             for dep_ident in current_deps - previous_deps:
                                 dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
@@ -2607,6 +2897,56 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
                                     )
                             file_deps[file_path] = current_deps
+
+                    # Process gitlink changes (submodule add/bump/remove).
+                    # The "remove" case's interaction with the ordinary per-file module-open
+                    # logic (elsewhere in this loop) is only sound because real submodule paths
+                    # are extensionless (no tree-sitter parser matches them, so no module is
+                    # ever opened for a bare gitlink path) — a gitlink path that happened to
+                    # carry a recognized source extension is an untested, unreachable-in-practice edge case.
+                    for kind, sha, path in gitlink_changes:
+                        ext_ident = _code_ident("module", path)
+                        if kind == "add":
+                            info = gitmodules_map.get(path, {})
+                            name = info.get("name", "")
+                            url = info.get("url", "")
+                            description = name or path
+                            ext_triples = [
+                                f"[{ext_ident} :entity-type :type/external-dependency]",
+                                f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
+                                f'[{ext_ident} :description "{_edn_escape(description)}"]',
+                                f'[{ext_ident} :path "{_edn_escape(path)}"]',
+                                f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
+                                f"[{ext_ident} :introduced-by {commit_ident}]",
+                            ]
+                            if name:
+                                ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
+                            if url:
+                                ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
+                            add_triples.extend(ext_triples)
+                            entity_valid_from[ext_ident] = commit_ts_iso
+                            entity_descriptions[ext_ident] = description
+                            pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+                        elif kind == "bump":
+                            old_sha, orig_ts = pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
+                            if old_sha is not None:
+                                close_items.append(
+                                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
+                                )
+                            add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
+                            add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
+                            pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+                        else:  # "remove"
+                            orig_ts = entity_valid_from.get(ext_ident, commit_ts_iso)
+                            desc = entity_descriptions.get(ext_ident, "")
+                            close_items.append(
+                                (_build_close_triples(ext_ident, desc, ext_ident), orig_ts)
+                            )
+                            old_sha, pin_orig_ts = pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
+                            if old_sha is not None:
+                                close_items.append(
+                                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
+                                )
 
                     # Split :contains triples out before batching.  Minigraf's EAVT
                     # pending index lacks value bytes in the key, so batching multiple

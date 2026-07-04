@@ -1559,6 +1559,36 @@ class TestExtractFromSourceCFamily:
         assert result["functions"] == ["square"]
 
 
+class TestTsxParserLoading:
+    """Regression test for the .tsx module-name bug: _build_parser assumed
+    the importable module is always tree_sitter_{lang_name}, but tsx's grammar
+    ships inside the tree_sitter_typescript package under language_tsx()."""
+
+    def test_tsx_parser_builds_successfully(self):
+        pytest.importorskip("tree_sitter_typescript")
+        import mcp_server
+        mcp_server._grammar_cache.clear()
+        parser = mcp_server._get_parser("component.tsx")
+        assert parser is not None
+
+    def test_tsx_extracts_functions_classes_imports(self):
+        pytest.importorskip("tree_sitter_typescript")
+        import mcp_server
+        mcp_server._grammar_cache.clear()
+        source = (
+            b"import React from 'react';\n"
+            b"class Widget extends React.Component {\n"
+            b"  render() { return null; }\n"
+            b"}\n"
+            b"function useThing() { return 1; }\n"
+        )
+        parser = mcp_server._get_parser("component.tsx")
+        result = mcp_server._extract_from_source(source, parser, "component.tsx")
+        assert "Widget" in result["classes"]
+        assert "useThing" in result["functions"] or "render" in result["functions"]
+        assert "react" in result["imports"]
+
+
 class TestMinigrafIngestStatus:
     def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -1750,26 +1780,162 @@ class TestGitHelpers:
         assert b"def login" in content
 
 
+class TestGitDiffTreeRaw:
+    def test_regular_file_add(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(git_repo), commits[0][0])
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path = entries[0]
+        assert status == "A"
+        assert old_mode == "000000"
+        assert new_mode == "100644"
+        assert path == "auth.py"
+
+    def test_gitlink_add_reports_mode_160000(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        _subprocess.run(["git", "init"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--allow-empty", "-m", "e"], cwd=sub, check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=sub, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},vendor/lib"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(repo), commits[0][0])
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path = entries[0]
+        assert status == "A"
+        assert new_mode == "160000"
+        assert new_sha == sub_hash
+        assert path == "vendor/lib"
+
+
+class TestGitlinkChanges:
+    def test_non_gitlink_rows_are_ignored(self):
+        import mcp_server
+        raw = [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py")]
+        assert mcp_server._gitlink_changes(raw) == []
+
+    def test_add_when_new_mode_is_gitlink(self):
+        import mcp_server
+        raw = [("A", "000000", "160000", "0" * 40, "b" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("add", "b" * 40, "vendor/lib")]
+
+    def test_bump_when_both_modes_are_gitlink(self):
+        import mcp_server
+        raw = [("M", "160000", "160000", "b" * 40, "c" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("bump", "c" * 40, "vendor/lib")]
+
+    def test_remove_when_old_mode_is_gitlink(self):
+        import mcp_server
+        raw = [("D", "160000", "000000", "c" * 40, "0" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("remove", "c" * 40, "vendor/lib")]
+
+    def test_type_change_into_internal_reported_as_remove(self):
+        import mcp_server
+        raw = [("T", "160000", "100644", "c" * 40, "d" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("remove", "c" * 40, "vendor/lib")]
+
+    def test_type_change_into_external_reported_as_add(self):
+        import mcp_server
+        raw = [("T", "100644", "160000", "d" * 40, "e" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("add", "e" * 40, "vendor/lib")]
+
+
+class TestParseGitmodules:
+    def test_parses_single_submodule(self):
+        import mcp_server
+        content = (
+            b'[submodule "abseil-cpp"]\n'
+            b'\tpath = 3rdParty/abseil-cpp\n'
+            b'\turl = https://github.com/abseil/abseil-cpp.git\n'
+        )
+        result = mcp_server._parse_gitmodules(content)
+        assert result == {
+            "3rdParty/abseil-cpp": {
+                "name": "abseil-cpp",
+                "url": "https://github.com/abseil/abseil-cpp.git",
+            }
+        }
+
+    def test_parses_multiple_submodules(self):
+        import mcp_server
+        content = (
+            b'[submodule "a"]\n\tpath = vendor/a\n\turl = https://x/a.git\n'
+            b'[submodule "b"]\n\tpath = vendor/b\n\turl = https://x/b.git\n'
+        )
+        result = mcp_server._parse_gitmodules(content)
+        assert set(result.keys()) == {"vendor/a", "vendor/b"}
+
+    def test_malformed_content_returns_empty_dict(self):
+        import mcp_server
+        result = mcp_server._parse_gitmodules(b"not a valid [ini file")
+        assert result == {}
+
+    def test_empty_content_returns_empty_dict(self):
+        import mcp_server
+        assert mcp_server._parse_gitmodules(b"") == {}
+
+    def test_parses_url_containing_percent_sign(self):
+        import mcp_server
+        content = (
+            b'[submodule "weird"]\n'
+            b'\tpath = vendor/weird\n'
+            b'\turl = https://example.com/repo%2Fname.git\n'
+        )
+        result = mcp_server._parse_gitmodules(content)
+        assert result == {
+            "vendor/weird": {
+                "name": "weird",
+                "url": "https://example.com/repo%2Fname.git",
+            }
+        }
+
+    def test_git_gitmodules_at_missing_file_returns_empty(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        result = mcp_server._git_gitmodules_at(str(git_repo), commits[0][0])
+        assert result == {}
+
+
 class TestExtractCommit:
     def test_added_file_returns_extracted_dict(self, git_repo):
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         first_hash = commits[0][0]
 
-        results = mcp_server._extract_commit(str(git_repo), first_hash)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
 
         assert len(results) == 1
         status, file_path, extracted = results[0]
         assert status == "A"
         assert file_path == "auth.py"
         assert "login" in extracted["functions"]
+        assert gitlink_changes == []
+        assert gitmodules_map == {}
 
     def test_deleted_file_has_none_extracted(self, git_repo_with_deletion):
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo_with_deletion), watermark_hash=None)
         delete_hash = commits[-1][0]
 
-        results = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
 
         d_entries = [r for r in results if r[0] == "D"]
         assert len(d_entries) == 1
@@ -1778,25 +1944,64 @@ class TestExtractCommit:
     def test_unsupported_extension_is_omitted(self, git_repo, monkeypatch):
         import mcp_server
         monkeypatch.setattr(
-            mcp_server, "_git_changed_files",
-            lambda repo, commit: [("A", "notes.txt")],
+            mcp_server, "_git_diff_tree_raw",
+            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "notes.txt")],
         )
-        results = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), "deadbeef")
         assert results == []
 
     def test_content_fetch_failure_is_omitted_not_raised(self, git_repo, monkeypatch):
         import mcp_server
         monkeypatch.setattr(
-            mcp_server, "_git_changed_files",
-            lambda repo, commit: [("A", "auth.py")],
+            mcp_server, "_git_diff_tree_raw",
+            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py")],
         )
 
         def boom(repo, commit, path):
             raise mcp_server.MiniGrafError("simulated git-show failure")
 
         monkeypatch.setattr(mcp_server, "_git_file_content", boom)
-        results = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), "deadbeef")
         assert results == []
+
+    def test_gitlink_add_is_reported_separately_from_file_results(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        _subprocess.run(["git", "init"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--allow-empty", "-m", "e"], cwd=sub, check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=sub, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        (repo / ".gitmodules").write_text(
+            '[submodule "lib"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n'
+        )
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},vendor/lib"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "add", ".gitmodules"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(repo), commits[0][0])
+
+        # Neither the gitlink path (vendor/lib) nor .gitmodules itself has a
+        # resolvable extension (_EXT_TO_LANG has no entry for either), so
+        # file_results is empty for this commit — the submodule info is
+        # carried entirely by gitlink_changes/gitmodules_map instead.
+        assert results == []
+        assert gitlink_changes == [("add", sub_hash, "vendor/lib")]
+        assert gitmodules_map == {"vendor/lib": {"name": "lib", "url": "https://example.com/lib.git"}}
 
 
 class TestIngestionWrites:
@@ -2016,7 +2221,7 @@ class TestIngestionWrites:
             mcp_server, "_git_commits",
             lambda repo, watermark, branch: [("abc123", "2025-01-01T00:00:00Z", "author", "msg")]
         )
-        monkeypatch.setattr(mcp_server, "_git_changed_files", lambda repo, commit: [])
+        monkeypatch.setattr(mcp_server, "_git_diff_tree_raw", lambda repo, commit: [])
         monkeypatch.setattr(mcp_server, "_watermark_update", lambda db, h, ts, r: None)
 
         last_run_calls = []
@@ -2118,6 +2323,49 @@ class TestPreloadKnownDeps:
 
         assert file_deps == {}
         assert dep_valid_from == {}
+
+
+class TestPreloadExternalDependencies:
+    def test_preload_known_entities_includes_external_dependency(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        # _preload_known_entities' query shape is [?ident ?path ?desc ?date] per entity_type
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":module/vendor-lib", "vendor/lib", "lib", "2026-01-01T00:00:00Z"]]
+        })
+        mcp_server.open_db(str(tmp_path / "memory.graph"))
+        db = mcp_server.get_db()
+
+        entity_valid_from, entity_descriptions, file_entities = mcp_server._preload_known_entities(db, str(tmp_path))
+
+        assert ":module/vendor-lib" in entity_valid_from
+        assert entity_descriptions[":module/vendor-lib"] == "lib"
+        assert "vendor/lib" in file_entities
+
+    def test_preload_pinned_commits_reloads_current_sha(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        # _preload_pinned_commits' query shape is [?e ?sha ?vf] with :any-valid-time
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":module/vendor-lib", "abc123", 1735689600000]]
+        })
+        mcp_server.open_db(str(tmp_path / "memory.graph"))
+        db = mcp_server.get_db()
+
+        pinned = mcp_server._preload_pinned_commits(db)
+
+        assert pinned[":module/vendor-lib"][0] == "abc123"
+        assert pinned[":module/vendor-lib"][1].endswith("Z")
+
+    def test_preload_pinned_commits_returns_empty_on_query_failure(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        from minigraf import MiniGrafError
+        mcp_server.open_db(str(tmp_path / "memory.graph"))
+        db = mcp_server.get_db()
+        db_instance.execute.side_effect = MiniGrafError("boom")
+
+        assert mcp_server._preload_pinned_commits(db) == {}
 
 
 class TestTotalIngestedQuery:
@@ -3201,9 +3449,10 @@ class TestRunIngestionBitemporalDeps:
         await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
 
         mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
-        # _resolve_module_import is Rust-focused; for Python `import mod_b` it falls back
-        # to _canonical_ident("module", "mod_b") since mod_b.py != mod_b.rs
-        mod_b_resolved = mcp_server._canonical_ident("module", "mod_b")
+        # mod_b.py genuinely exists in file_entities, so the generalized
+        # tiered matcher (Task 12) now resolves "mod_b" to the real internal
+        # module via the basename tier, instead of the old Rust-only fallback.
+        mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
         dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
         assert any(dep_triple in t for t in transact_calls), (
             f"Expected _ingest_transact to be called with '{dep_triple}' during commit loop, "
@@ -3231,12 +3480,320 @@ class TestRunIngestionBitemporalDeps:
         await mcp_server._run_ingestion(str(git_repo_with_dep_removal), "HEAD")
 
         mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
-        mod_b_resolved = mcp_server._canonical_ident("module", "mod_b")
+        mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
         dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
         assert any(dep_triple in t for t in close_triples_seen), (
             f"Expected _ingest_close to be called with '{dep_triple}' when import removed, "
             f"got: {close_triples_seen}"
         )
+
+
+class TestUnresolvedImportTagging:
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+    def test_resolve_module_import_returns_bool_flag(self):
+        import mcp_server
+        file_entities = {"src/storage.rs": []}
+        ident, is_resolved = mcp_server._resolve_module_import("storage", file_entities)
+        assert is_resolved is True
+        ident, is_resolved = mcp_server._resolve_module_import("totally_unknown_crate", file_entities)
+        assert is_resolved is False
+
+    @pytest.mark.asyncio
+    async def test_unresolved_import_gets_tagged_external_dependency(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "main.rs").write_text('use tokio;\nfn main() {}\n')
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        tokio_ident = mcp_server._canonical_ident("module", "tokio")
+        assert any(f"[{tokio_ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
+        assert any(f'[{tokio_ident} :description "tokio"]' in t for t in transact_calls)
+
+    @pytest.mark.asyncio
+    async def test_unresolved_relative_import_not_tagged_external_end_to_end(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "main.ts").write_text("import { thing } from './missing';\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        missing_ident = mcp_server._canonical_ident("module", "./missing")
+        assert not any(
+            f"[{missing_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
+        )
+
+
+class TestResolveModuleImportTieredMatcher:
+    def test_exact_file_match_java_package(self):
+        import mcp_server
+        file_entities = {"com/google/gson/Gson.java": []}
+        ident, is_resolved = mcp_server._resolve_module_import("com.google.gson.Gson", file_entities)
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "com/google/gson/Gson.java")
+
+    def test_parent_directory_match_java_wildcard_style(self):
+        import mcp_server
+        # "com.google.gson" (no trailing class name) is a package-level
+        # reference — it matches via the file's *parent directory*, not the
+        # file's own path, since there's no specific file named exactly that.
+        file_entities = {"com/google/gson/JsonElement.java": []}
+        ident, is_resolved = mcp_server._resolve_module_import("com.google.gson", file_entities)
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "com/google/gson/JsonElement.java")
+
+    def test_genuinely_external_java_package_not_resolved(self):
+        import mcp_server
+        file_entities = {"com/mycompany/App.java": []}
+        # com.fasterxml.jackson.Foo shares no path with the project's own "com" tree
+        ident, is_resolved = mcp_server._resolve_module_import("com.fasterxml.jackson.Foo", file_entities)
+        assert is_resolved is False
+
+    def test_exact_file_match_go_full_path(self):
+        import mcp_server
+        # Vendored Go deps live under a vendor/ prefix that never appears in
+        # the import string itself — this must match as a segment suffix,
+        # not exact path equality, and "github.com" must survive as one path
+        # segment rather than being split on its literal dot.
+        file_entities = {"vendor/github.com/user/pkg/pkg.go": []}
+        ident, is_resolved = mcp_server._resolve_module_import("github.com/user/pkg/pkg", file_entities)
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "vendor/github.com/user/pkg/pkg.go")
+
+    def test_basename_match_vendored_c_header(self):
+        import mcp_server
+        file_entities = {"3rdParty/icu/include/unicode/uloc.h": []}
+        ident, is_resolved = mcp_server._resolve_module_import("unicode/uloc", file_entities)
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "3rdParty/icu/include/unicode/uloc.h")
+
+    def test_genuinely_external_c_stdlib_header_not_resolved(self):
+        import mcp_server
+        file_entities = {"src/main.cpp": []}
+        ident, is_resolved = mcp_server._resolve_module_import("vector", file_entities)
+        assert is_resolved is False
+
+
+class TestResolveModuleImportRelative:
+    def test_js_relative_import_resolves_against_importing_file(self):
+        import mcp_server
+        file_entities = {"src/utils/foo.ts": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "./utils/foo", file_entities, importing_file="src/main.ts",
+        )
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "src/utils/foo.ts")
+
+    def test_js_parent_relative_import_resolves(self):
+        import mcp_server
+        file_entities = {"lib.ts": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "../lib", file_entities, importing_file="src/main.ts",
+        )
+        assert is_resolved is True
+
+    def test_python_single_dot_relative_import_resolves(self):
+        import mcp_server
+        file_entities = {"pkg/sibling.py": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            ".sibling", file_entities, importing_file="pkg/main.py",
+        )
+        assert is_resolved is True
+
+    def test_python_double_dot_relative_import_resolves(self):
+        import mcp_server
+        # For a file at a/b/c/main.py, the containing package is a.b.c: one
+        # leading dot means "this package" (a/b/c), two dots means "the
+        # parent package" (a/b) — so "..sibling" resolves to a/b/sibling.py,
+        # not a top-level sibling.py.
+        file_entities = {"a/b/sibling.py": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "..sibling", file_entities, importing_file="a/b/c/main.py",
+        )
+        assert is_resolved is True
+
+    def test_ruby_require_relative_marker_resolves(self):
+        import mcp_server
+        file_entities = {"lib/helper.rb": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "./helper", file_entities, importing_file="lib/main.rb",
+        )
+        assert is_resolved is True
+
+    def test_unresolved_relative_import_is_not_tagged_external(self):
+        import mcp_server
+        file_entities: dict = {}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "./missing", file_entities, importing_file="src/main.ts",
+        )
+        assert is_resolved is False
+        # Caller-side contract (see _run_ingestion): a relative import is only
+        # ever tagged external if the generic (non-relative) tiers would also
+        # tag it — this test documents that resolution itself still reports
+        # is_resolved=False for a genuinely missing relative target, same as
+        # any other unresolved import; the "don't mislabel" guarantee lives in
+        # the caller, verified by Task 13's Step 5 integration test below.
+
+
+class TestRunIngestionGitlinks:
+    """End-to-end tests for submodule add/bump/remove/flip via _run_ingestion."""
+
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+    def _add_submodule_commit(self, repo, path="vendor/lib", name="lib", url="https://example.com/lib.git"):
+        sub = repo.parent / f"{repo.name}-sub"
+        _subprocess.run(["git", "init", "-q", str(sub)], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.email", "t@t.com"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.name", "T"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "commit", "--allow-empty", "-m", "e"], check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "-C", str(sub), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        (repo / ".gitmodules").write_text(f'[submodule "{name}"]\n\tpath = {path}\n\turl = {url}\n')
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},{path}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "add", ".gitmodules"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
+        return sub_hash
+
+    @pytest.mark.asyncio
+    async def test_submodule_add_creates_external_dependency_entity(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        sub_hash = self._add_submodule_commit(repo)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        ident = mcp_server._code_ident("module", "vendor/lib")
+        assert any(f"[{ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
+        assert any(f'[{ident} :pinned-commit "{sub_hash}"]' in t for t in transact_calls)
+        assert any(f'[{ident} :submodule-name "lib"]' in t for t in transact_calls)
+        assert any(f'[{ident} :submodule-url "https://example.com/lib.git"]' in t for t in transact_calls)
+
+    @pytest.mark.asyncio
+    async def test_submodule_bump_closes_old_pinned_commit(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        first_sha = self._add_submodule_commit(repo)
+
+        sub_dir = tmp_path / f"{repo.name}-sub"
+        _subprocess.run(["git", "-C", str(sub_dir), "commit", "--allow-empty", "-m", "bump"], check=True, capture_output=True)
+        second_sha = _subprocess.run(
+            ["git", "-C", str(sub_dir), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _subprocess.run(
+            ["git", "update-index", "--cacheinfo", f"160000,{second_sha},vendor/lib"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "commit", "-m", "bump submodule"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen: list = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        ident = mcp_server._code_ident("module", "vendor/lib")
+        assert any(f'[{ident} :pinned-commit "{first_sha}"]' in t for t in close_triples_seen)
+
+    @pytest.mark.asyncio
+    async def test_submodule_removal_closes_entity(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        self._add_submodule_commit(repo)
+
+        _subprocess.run(["git", "rm", "-f", "vendor/lib"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "remove submodule"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen: list = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        ident = mcp_server._code_ident("module", "vendor/lib")
+        assert any(f'[{ident} :ident "{ident}"]' in t for t in close_triples_seen)
+
 
 # ---------------------------------------------------------------------------
 # Helpers for TestExtractImportName
@@ -3295,7 +3852,23 @@ class TestExtractImportName:
         node = _parse_import_node("go", source, "import_declaration", tmp_path)
         result = mcp_server._extract_import_name(node, "go")
         assert "os" in result
-        assert "pkg" in result
+        assert "github.com/user/pkg" in result
+
+    def test_python_import_from_preserves_full_dotted_name(self):
+        import mcp_server
+        source = b"from os.path import join\n"
+        result = mcp_server._extract_from_source(
+            source, TestExtractFromSource()._python_parser(), "foo.py"
+        )
+        assert "os.path" in result["imports"]
+
+    def test_python_dotted_import_preserves_full_name(self):
+        import mcp_server
+        source = b"import os.path\n"
+        result = mcp_server._extract_from_source(
+            source, TestExtractFromSource()._python_parser(), "foo.py"
+        )
+        assert "os.path" in result["imports"]
 
     def test_java_import(self, tmp_path):
         pytest.importorskip("tree_sitter_java")
@@ -3303,7 +3876,7 @@ class TestExtractImportName:
         source = b'import java.util.List;'
         node = _parse_import_node("java", source, "import_declaration", tmp_path)
         result = mcp_server._extract_import_name(node, "java")
-        assert result == ["java"]
+        assert result == ["java.util.List"]
 
     def test_c_system_include(self, tmp_path):
         pytest.importorskip("tree_sitter_c")
@@ -3343,7 +3916,7 @@ class TestExtractImportName:
         source = b'using System.Collections.Generic;'
         node = _parse_import_node("c_sharp", source, "using_directive", tmp_path)
         result = mcp_server._extract_import_name(node, "c_sharp")
-        assert result == ["System"]
+        assert result == ["System.Collections.Generic"]
 
     def test_ruby_require(self, tmp_path):
         pytest.importorskip("tree_sitter_ruby")
@@ -3359,7 +3932,7 @@ class TestExtractImportName:
         source = b"require_relative 'my_module'"
         node = _parse_import_node("ruby", source, "call", tmp_path)
         result = mcp_server._extract_import_name(node, "ruby")
-        assert result == ["my_module"]
+        assert result == ["./my_module"]
 
     def test_ruby_non_require_call_ignored(self, tmp_path):
         pytest.importorskip("tree_sitter_ruby")
@@ -3391,7 +3964,7 @@ class TestExtractImportName:
         source = b'import kotlin.collections.List'
         node = _parse_import_node("kotlin", source, "import", tmp_path)
         result = mcp_server._extract_import_name(node, "kotlin")
-        assert result == ["kotlin"]
+        assert result == ["kotlin.collections.List"]
 
     def test_swift_import(self, tmp_path):
         pytest.importorskip("tree_sitter_swift")
@@ -3401,13 +3974,21 @@ class TestExtractImportName:
         result = mcp_server._extract_import_name(node, "swift")
         assert result == ["Foundation"]
 
+    def test_swift_submodule_import_preserves_full_name(self, tmp_path):
+        pytest.importorskip("tree_sitter_swift")
+        import mcp_server
+        source = b'import Foundation.NSString'
+        node = _parse_import_node("swift", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "swift")
+        assert result == ["Foundation.NSString"]
+
     def test_scala_import(self, tmp_path):
         pytest.importorskip("tree_sitter_scala")
         import mcp_server
         source = b'import scala.collection.mutable'
         node = _parse_import_node("scala", source, "import_declaration", tmp_path)
         result = mcp_server._extract_import_name(node, "scala")
-        assert result == ["scala"]
+        assert result == ["scala.collection.mutable"]
 
     def test_haskell_import(self, tmp_path):
         pytest.importorskip("tree_sitter_haskell")
@@ -3415,7 +3996,7 @@ class TestExtractImportName:
         source = b'import Data.List'
         node = _parse_import_node("haskell", source, "import", tmp_path)
         result = mcp_server._extract_import_name(node, "haskell")
-        assert result == ["Data"]
+        assert result == ["Data.List"]
 
     def test_lua_require(self, tmp_path):
         pytest.importorskip("tree_sitter_lua")
@@ -3439,7 +4020,7 @@ class TestExtractImportName:
         source = b'alias MyApp.Router'
         node = _parse_import_node("elixir", source, "call", tmp_path)
         result = mcp_server._extract_import_name(node, "elixir")
-        assert result == ["MyApp"]
+        assert result == ["MyApp.Router"]
 
     def test_elixir_import(self, tmp_path):
         pytest.importorskip("tree_sitter_elixir")
@@ -3447,7 +4028,7 @@ class TestExtractImportName:
         source = b'import Ecto.Query'
         node = _parse_import_node("elixir", source, "call", tmp_path)
         result = mcp_server._extract_import_name(node, "elixir")
-        assert result == ["Ecto"]
+        assert result == ["Ecto.Query"]
 
     def test_elixir_non_module_call_ignored(self, tmp_path):
         pytest.importorskip("tree_sitter_elixir")
@@ -3461,3 +4042,53 @@ class TestExtractImportName:
             return  # no call node found — that's fine
         result = mcp_server._extract_import_name(node, "elixir")
         assert result == []
+
+    def test_c_local_include_preserves_subdirectory(self, tmp_path):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b'#include "unicode/uloc.h"'
+        node = _parse_import_node("c", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "c")
+        assert result == ["unicode/uloc"]
+
+    def test_c_angle_include_preserves_subdirectory(self, tmp_path):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b'#include <sys/socket.h>'
+        node = _parse_import_node("c", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "c")
+        assert result == ["sys/socket"]
+
+    def test_ruby_require_preserves_subdirectory(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"require 'active_support/core_ext/string'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == ["active_support/core_ext/string"]
+
+    def test_ruby_require_relative_gets_dot_slash_marker(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"require_relative 'my_module'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == ["./my_module"]
+
+    def test_php_require_preserves_subdirectory(self, tmp_path):
+        pytest.importorskip("tree_sitter_php")
+        import mcp_server
+        source = b"<?php\nrequire 'app/config/database.php';"
+        node = _parse_import_node("php", source, "require_expression", tmp_path)
+        result = mcp_server._extract_import_name(node, "php")
+        assert result == ["app/config/database"]
+
+    def test_go_grouped_import_preserves_full_path(self, tmp_path):
+        pytest.importorskip("tree_sitter_go")
+        import mcp_server
+        source = b'package main\nimport (\n\t"os"\n\t"github.com/user/pkg"\n)'
+        node = _parse_import_node("go", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "go")
+        assert "os" in result
+        assert "github.com/user/pkg" in result
+
