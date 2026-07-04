@@ -3,6 +3,7 @@
 All tests mock MiniGrafDb so no live minigraf install is required.
 """
 import asyncio
+import contextlib
 import json
 import sys
 import os
@@ -2494,6 +2495,76 @@ class TestRunIngestionShutdown:
         # _count_commit_entities (mocked to [] here) seeds prior_ingested=0,
         # so processed reflects just that run's own work.
         assert mcp_server._ingest_progress["processed"] == 1
+
+
+class TestMainShutdown:
+    @pytest.mark.asyncio
+    async def test_shutdown_event_cancels_server_run_and_returns(self, monkeypatch):
+        """A SIGTERM/SIGINT handler that only sets _shutdown_requested does
+        nothing unless something is racing that event against server.run().
+        This proves main() actually returns promptly once the event fires,
+        instead of hanging forever waiting on a live (never-completing)
+        connection."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_NO_AUTO_INGEST", "1")
+        # A fresh Event (not just .clear()) — asyncio.Event binds itself to
+        # whichever event loop first calls .wait() on it, and pytest-asyncio
+        # gives each test function its own loop, so reusing the module-level
+        # singleton's Event object across tests raises "bound to a different
+        # event loop" on the second test that calls .wait() on it.
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()  # simulates a live connection that never completes on its own
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+        mcp_server._shutdown_requested.set()
+
+        await asyncio.wait_for(main_task, timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_server_run_completing_normally_returns_without_shutdown_event(self, monkeypatch):
+        """Regression guard for the non-signal path: if server.run() finishes
+        on its own (e.g. the client closes the connection cleanly), main()
+        must still return promptly without needing _shutdown_requested set."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_NO_AUTO_INGEST", "1")
+        # A fresh Event (not just .clear()) — asyncio.Event binds itself to
+        # whichever event loop first calls .wait() on it, and pytest-asyncio
+        # gives each test function its own loop, so reusing the module-level
+        # singleton's Event object across tests raises "bound to a different
+        # event loop" on the second test that calls .wait() on it.
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            return  # completes immediately, as if the client disconnected cleanly
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await asyncio.wait_for(main_task, timeout=2)
 
 
 class TestIndexCache:

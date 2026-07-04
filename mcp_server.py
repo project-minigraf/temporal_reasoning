@@ -7,6 +7,7 @@ Sole interface to the minigraf .graph file via the MiniGrafDb Python binding.
 """
 import asyncio
 import concurrent.futures
+import contextlib
 import datetime
 import json
 import os
@@ -3030,11 +3031,26 @@ async def main() -> None:
 
     try:
         async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                server.create_initialization_options(),
+            server_task = asyncio.ensure_future(
+                server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
             )
+            shutdown_task = asyncio.ensure_future(_shutdown_requested.wait())
+            done, _ = await asyncio.wait(
+                {server_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if server_task in done:
+                shutdown_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await shutdown_task
+                server_task.result()  # propagate any exception from a normal exit
+            else:
+                server_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await server_task
     finally:
         # The MCP server's most common "session ended" signal is stdin EOF
         # (the parent closing the pipe) rather than a delivered signal, so
