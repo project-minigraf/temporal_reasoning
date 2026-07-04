@@ -1077,7 +1077,7 @@ def _canonical_ident(entity_type: str, value: str) -> str:
     return f":{entity_type}/{slug}"
 
 
-def _resolve_module_import(import_name: str, file_entities: Dict[str, List[str]]) -> str:
+def _resolve_module_import(import_name: str, file_entities: Dict[str, List[str]]) -> Tuple[str, bool]:
     """Resolve an import name to a module ident that joins with stored module entities.
 
     For a name like "storage", tries standard Rust source-root locations first
@@ -1085,8 +1085,11 @@ def _resolve_module_import(import_name: str, file_entities: Dict[str, List[str]]
     search. The ordered-priority approach prevents e.g. src/graph/storage.rs
     from matching a top-level `use crate::storage` import.
 
-    Falls back to _canonical_ident for external crate names (std, tokio, …)
-    so they still get an edge even though they have no :path attribute.
+    Returns (ident, is_resolved). is_resolved is True when import_name matched
+    a real file in file_entities, False when it fell through to the bare
+    _canonical_ident guess — the caller uses this to tag genuinely unresolved
+    imports as :type/external-dependency without also tagging real (if not
+    yet visited) internal modules.
     """
     # Priority 1: canonical Rust module root paths under common source roots
     for src_root in ("src", "lib", ""):
@@ -1094,18 +1097,18 @@ def _resolve_module_import(import_name: str, file_entities: Dict[str, List[str]]
         candidate_file = f"{prefix}{import_name}.rs"
         candidate_mod = f"{prefix}{import_name}/mod.rs"
         if candidate_file in file_entities:
-            return _code_ident("module", candidate_file)
+            return _code_ident("module", candidate_file), True
         if candidate_mod in file_entities:
-            return _code_ident("module", candidate_mod)
+            return _code_ident("module", candidate_mod), True
 
     # Priority 2: broader search — only match files directly under a src root
     # (parent.parent is the source root, not a nested subdir)
     for file_path in file_entities:
         p = Path(file_path)
         if p.stem == "mod" and p.parent.name == import_name:
-            return _code_ident("module", file_path)
+            return _code_ident("module", file_path), True
 
-    return _canonical_ident("module", import_name)
+    return _canonical_ident("module", import_name), False
 
 
 def _code_ident(entity_type: str, file_path: str, name: Optional[str] = None) -> str:
@@ -2777,9 +2780,17 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             module_ident = _code_ident("module", file_path)
                             current_deps: set = set()
                             for import_name in set(extracted.get("imports", [])):
-                                dep_ident = _resolve_module_import(import_name, file_entities)
+                                dep_ident, is_resolved = _resolve_module_import(import_name, file_entities)
                                 if dep_ident != module_ident:
                                     current_deps.add(dep_ident)
+                                    if not is_resolved and dep_ident not in entity_valid_from:
+                                        add_triples.extend([
+                                            f"[{dep_ident} :entity-type :type/external-dependency]",
+                                            f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
+                                            f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
+                                        ])
+                                        entity_valid_from[dep_ident] = commit_ts_iso
+                                        entity_descriptions[dep_ident] = import_name
                             previous_deps = file_deps.get(file_path, set())
                             for dep_ident in current_deps - previous_deps:
                                 dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")

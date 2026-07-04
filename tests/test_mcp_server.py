@@ -3483,6 +3483,50 @@ class TestRunIngestionBitemporalDeps:
         )
 
 
+class TestUnresolvedImportTagging:
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+    def test_resolve_module_import_returns_bool_flag(self):
+        import mcp_server
+        file_entities = {"src/storage.rs": []}
+        ident, is_resolved = mcp_server._resolve_module_import("storage", file_entities)
+        assert is_resolved is True
+        ident, is_resolved = mcp_server._resolve_module_import("totally_unknown_crate", file_entities)
+        assert is_resolved is False
+
+    @pytest.mark.asyncio
+    async def test_unresolved_import_gets_tagged_external_dependency(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "main.rs").write_text('use tokio;\nfn main() {}\n')
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        tokio_ident = mcp_server._canonical_ident("module", "tokio")
+        assert any(f"[{tokio_ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
+        assert any(f'[{tokio_ident} :description "tokio"]' in t for t in transact_calls)
+
+
 class TestRunIngestionGitlinks:
     """End-to-end tests for submodule add/bump/remove/flip via _run_ingestion."""
 
