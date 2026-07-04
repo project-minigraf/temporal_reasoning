@@ -2654,6 +2654,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         prior_ingested = _count_commit_entities(db)
         entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
         file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
+        pinned_commit_state = _preload_pinned_commits(db)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone, so the local `db` must be cleared
         # too, not just the global — otherwise this frame keeps it alive (and the
@@ -2790,6 +2791,50 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
                                     )
                             file_deps[file_path] = current_deps
+
+                    for kind, sha, path in gitlink_changes:
+                        ext_ident = _code_ident("module", path)
+                        if kind == "add":
+                            info = gitmodules_map.get(path, {})
+                            name = info.get("name", "")
+                            url = info.get("url", "")
+                            description = name or path
+                            ext_triples = [
+                                f"[{ext_ident} :entity-type :type/external-dependency]",
+                                f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
+                                f'[{ext_ident} :description "{_edn_escape(description)}"]',
+                                f'[{ext_ident} :path "{_edn_escape(path)}"]',
+                                f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
+                                f"[{ext_ident} :introduced-by {commit_ident}]",
+                            ]
+                            if name:
+                                ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
+                            if url:
+                                ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
+                            add_triples.extend(ext_triples)
+                            entity_valid_from[ext_ident] = commit_ts_iso
+                            entity_descriptions[ext_ident] = description
+                            pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+                        elif kind == "bump":
+                            old_sha, orig_ts = pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
+                            if old_sha is not None:
+                                close_items.append(
+                                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
+                                )
+                            add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
+                            add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
+                            pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+                        else:  # "remove"
+                            orig_ts = entity_valid_from.get(ext_ident, commit_ts_iso)
+                            desc = entity_descriptions.get(ext_ident, "")
+                            close_items.append(
+                                (_build_close_triples(ext_ident, desc, ext_ident), orig_ts)
+                            )
+                            old_sha, pin_orig_ts = pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
+                            if old_sha is not None:
+                                close_items.append(
+                                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
+                                )
 
                     # Split :contains triples out before batching.  Minigraf's EAVT
                     # pending index lacks value bytes in the key, so batching multiple

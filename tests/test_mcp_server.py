@@ -3482,6 +3482,127 @@ class TestRunIngestionBitemporalDeps:
             f"got: {close_triples_seen}"
         )
 
+
+class TestRunIngestionGitlinks:
+    """End-to-end tests for submodule add/bump/remove/flip via _run_ingestion."""
+
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+    def _add_submodule_commit(self, repo, path="vendor/lib", name="lib", url="https://example.com/lib.git"):
+        sub = repo.parent / f"{repo.name}-sub"
+        _subprocess.run(["git", "init", "-q", str(sub)], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.email", "t@t.com"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.name", "T"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "commit", "--allow-empty", "-m", "e"], check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "-C", str(sub), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        (repo / ".gitmodules").write_text(f'[submodule "{name}"]\n\tpath = {path}\n\turl = {url}\n')
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},{path}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "add", ".gitmodules"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
+        return sub_hash
+
+    @pytest.mark.asyncio
+    async def test_submodule_add_creates_external_dependency_entity(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        sub_hash = self._add_submodule_commit(repo)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        ident = mcp_server._code_ident("module", "vendor/lib")
+        assert any(f"[{ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
+        assert any(f'[{ident} :pinned-commit "{sub_hash}"]' in t for t in transact_calls)
+        assert any(f'[{ident} :submodule-name "lib"]' in t for t in transact_calls)
+        assert any(f'[{ident} :submodule-url "https://example.com/lib.git"]' in t for t in transact_calls)
+
+    @pytest.mark.asyncio
+    async def test_submodule_bump_closes_old_pinned_commit(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        first_sha = self._add_submodule_commit(repo)
+
+        sub_dir = tmp_path / f"{repo.name}-sub"
+        _subprocess.run(["git", "-C", str(sub_dir), "commit", "--allow-empty", "-m", "bump"], check=True, capture_output=True)
+        second_sha = _subprocess.run(
+            ["git", "-C", str(sub_dir), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _subprocess.run(
+            ["git", "update-index", "--cacheinfo", f"160000,{second_sha},vendor/lib"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "commit", "-m", "bump submodule"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen: list = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        ident = mcp_server._code_ident("module", "vendor/lib")
+        assert any(f'[{ident} :pinned-commit "{first_sha}"]' in t for t in close_triples_seen)
+
+    @pytest.mark.asyncio
+    async def test_submodule_removal_closes_entity(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        self._add_submodule_commit(repo)
+
+        _subprocess.run(["git", "rm", "-f", "vendor/lib"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "remove submodule"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen: list = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        ident = mcp_server._code_ident("module", "vendor/lib")
+        assert any(f'[{ident} :ident "{ident}"]' in t for t in close_triples_seen)
+
+
 # ---------------------------------------------------------------------------
 # Helpers for TestExtractImportName
 # ---------------------------------------------------------------------------
