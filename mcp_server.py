@@ -2485,6 +2485,75 @@ async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]
     return {"ok": False, "error": f"Unknown strategy: {strategy}"}
 
 
+def _precompute_file_triples(
+    file_path: str,
+    extracted: Dict[str, List[str]],
+    commit_ident: str,
+    known_files: Dict[str, List[str]],
+) -> Dict[str, Any]:
+    """Pure, per-commit-independent precomputation for _build_code_triples.
+
+    Runs inside _extract_commit on the worker pool. Computes everything that does
+    NOT depend on the serially-maintained entity_valid_from/file_deps state:
+      - the candidate triple strings for the module/function/class idents this file
+        would introduce, ready to use verbatim IF the main thread's diff against
+        entity_valid_from decides the ident is genuinely new (see _build_code_triples);
+      - the resolved dependency ident for every import in the file, via
+        _resolve_module_import against known_files (this commit's own git-ls-tree
+        state, not the incrementally-mutated file_entities).
+
+    known_files must come from _known_files_at_commit for the SAME commit_hash this
+    file was extracted from — it determines what "is_resolved" means here.
+    """
+    module_ident = _code_ident("module", file_path)
+    module_candidate_triples = [
+        f"[{module_ident} :entity-type :type/module]",
+        f'[{module_ident} :ident "{module_ident}"]',
+        f'[{module_ident} :description "{_edn_escape(file_path)}"]',
+        f'[{module_ident} :path "{_edn_escape(file_path)}"]',
+        f"[{module_ident} :introduced-by {commit_ident}]",
+    ]
+
+    function_entries: List[Tuple[str, str, List[str]]] = []
+    for fn_name in extracted.get("functions", []):
+        fn_ident = _code_ident("function", file_path, fn_name)
+        function_entries.append((fn_ident, fn_name, [
+            f"[{fn_ident} :entity-type :type/function]",
+            f'[{fn_ident} :ident "{fn_ident}"]',
+            f'[{fn_ident} :description "{_edn_escape(fn_name)}"]',
+            f'[{fn_ident} :file "{_edn_escape(file_path)}"]',
+            f"[{module_ident} :contains {fn_ident}]",
+            f"[{fn_ident} :introduced-by {commit_ident}]",
+        ]))
+
+    class_entries: List[Tuple[str, str, List[str]]] = []
+    for cls_name in extracted.get("classes", []):
+        cls_ident = _code_ident("class", file_path, cls_name)
+        class_entries.append((cls_ident, cls_name, [
+            f"[{cls_ident} :entity-type :type/class]",
+            f'[{cls_ident} :ident "{cls_ident}"]',
+            f'[{cls_ident} :description "{_edn_escape(cls_name)}"]',
+            f'[{cls_ident} :file "{_edn_escape(file_path)}"]',
+            f"[{module_ident} :contains {cls_ident}]",
+            f"[{cls_ident} :introduced-by {commit_ident}]",
+        ]))
+
+    resolved_imports: List[Tuple[str, str, bool]] = []
+    for import_name in set(extracted.get("imports", [])):
+        dep_ident, is_resolved = _resolve_module_import(
+            import_name, known_files, importing_file=file_path,
+        )
+        resolved_imports.append((import_name, dep_ident, is_resolved))
+
+    return {
+        "module_ident": module_ident,
+        "module_candidate_triples": module_candidate_triples,
+        "function_entries": function_entries,
+        "class_entries": class_entries,
+        "resolved_imports": resolved_imports,
+    }
+
+
 def _build_code_triples(
     file_path: str,
     extracted: Dict[str, List[str]],

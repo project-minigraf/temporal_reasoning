@@ -2329,6 +2329,81 @@ class TestIngestionWrites:
         assert last_run_calls[0][2] == 0  # no commits processed this run, prior was 0
 
 
+class TestPrecomputeFileTriples:
+    def test_module_candidate_triples_include_introduced_by(self):
+        import mcp_server
+        result = mcp_server._precompute_file_triples(
+            "auth.py",
+            {"functions": [], "classes": [], "imports": []},
+            ":commit/abc123456789",
+            {},
+        )
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        assert result["module_ident"] == module_ident
+        assert any(
+            f"[{module_ident} :introduced-by :commit/abc123456789]" in t
+            for t in result["module_candidate_triples"]
+        )
+
+    def test_function_entries_carry_ident_name_and_candidate_triples(self):
+        import mcp_server
+        result = mcp_server._precompute_file_triples(
+            "auth.py",
+            {"functions": ["login"], "classes": [], "imports": []},
+            ":commit/abc123456789",
+            {},
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert len(result["function_entries"]) == 1
+        ident, name, triples = result["function_entries"][0]
+        assert ident == fn_ident
+        assert name == "login"
+        assert any(f'[{fn_ident} :description "login"]' in t for t in triples)
+        assert any(f"[{fn_ident} :introduced-by :commit/abc123456789]" in t for t in triples)
+
+    def test_class_entries_carry_ident_name_and_candidate_triples(self):
+        import mcp_server
+        result = mcp_server._precompute_file_triples(
+            "auth.py",
+            {"functions": [], "classes": ["User"], "imports": []},
+            ":commit/abc123456789",
+            {},
+        )
+        cls_ident = mcp_server._code_ident("class", "auth.py", "User")
+        assert len(result["class_entries"]) == 1
+        ident, name, triples = result["class_entries"][0]
+        assert ident == cls_ident
+        assert name == "User"
+        assert any(f'[{cls_ident} :description "User"]' in t for t in triples)
+
+    def test_resolved_imports_use_known_files_not_file_entities(self):
+        import mcp_server
+        known_files = {"mod_b.py": []}
+        result = mcp_server._precompute_file_triples(
+            "mod_a.py",
+            {"functions": [], "classes": [], "imports": ["mod_b"]},
+            ":commit/abc123456789",
+            known_files,
+        )
+        assert len(result["resolved_imports"]) == 1
+        import_name, dep_ident, is_resolved = result["resolved_imports"][0]
+        assert import_name == "mod_b"
+        assert is_resolved is True
+        assert dep_ident == mcp_server._code_ident("module", "mod_b.py")
+
+    def test_unresolved_import_flagged_false(self):
+        import mcp_server
+        result = mcp_server._precompute_file_triples(
+            "main.rs",
+            {"functions": [], "classes": [], "imports": ["totally_unknown_crate"]},
+            ":commit/abc123456789",
+            {},
+        )
+        import_name, dep_ident, is_resolved = result["resolved_imports"][0]
+        assert is_resolved is False
+        assert dep_ident == mcp_server._canonical_ident("module", "totally_unknown_crate")
+
+
 class TestPreloadKnownDeps:
     def test_reloads_open_depends_on_edge(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
