@@ -778,6 +778,34 @@ class TestMcpToolWiring:
         with pytest.raises(Exception, match="Unknown tool"):
             asyncio.run(mcp_server.call_tool("nonexistent_tool", {}))
 
+    def test_call_tool_lock_retry_does_not_block_event_loop(self, mock_minigraf_db, tmp_path, monkeypatch):
+        """Regression test for #99: lock-retry backoff hit while opening the DB
+        for a tool call must not use a blocking time.sleep(), since call_tool
+        runs on the single-threaded asyncio event loop — a blocking sleep there
+        would freeze the very coroutine (e.g. ingestion) that's about to
+        release the lock we're waiting on."""
+        import asyncio
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = str(tmp_path / "t.graph")
+        lock_err = MiniGrafError(
+            "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
+        )
+        mock_class.open.side_effect = [lock_err, db_instance]
+
+        def fail_if_called(_delay):
+            raise AssertionError("time.sleep() must not be called on the event-loop retry path (see #99)")
+        monkeypatch.setattr(mcp_server.time, "sleep", fail_if_called)
+
+        result = asyncio.run(mcp_server.call_tool(
+            "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
+        ))
+
+        data = json.loads(result[0].text)
+        assert data["ok"] is True
+        assert mock_class.open.call_count == 2
+
 
 class TestParseValidAtHint:
     def test_returns_utc_ms_timestamp_when_no_hint(self):
@@ -2417,6 +2445,38 @@ class TestRunIngestion:
             if ":ingestion/watermark" in str(c) and "transact" in str(c)
         ]
         assert len(watermark_calls) >= 2  # one per commit
+
+    @pytest.mark.asyncio
+    async def test_per_commit_get_db_lock_retry_does_not_block_event_loop(
+        self, mock_minigraf_db, git_repo, monkeypatch
+    ):
+        """Regression test for #99: a lock-retry hit while reacquiring the DB
+        between commits must not block via time.sleep() — _run_ingestion runs
+        on the single-threaded event loop, and a blocking sleep there would
+        freeze the very coroutine responsible for eventually releasing that
+        lock."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+
+        lock_err = MiniGrafError(
+            "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
+        )
+        mock_class.open.side_effect = [db_instance, lock_err, db_instance, db_instance, db_instance]
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        def fail_if_called(_delay):
+            raise AssertionError("time.sleep() must not be called on the event-loop retry path (see #99)")
+        monkeypatch.setattr(mcp_server.time, "sleep", fail_if_called)
+
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
 
     @pytest.mark.asyncio
     async def test_db_released_between_commits(self, mock_minigraf_db, git_repo):

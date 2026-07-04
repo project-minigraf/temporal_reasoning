@@ -782,31 +782,82 @@ def _clear_stale_lock(path: str, holder_pid: int) -> bool:
         return False
 
 
-def _open_db_at_with_retry(path: str) -> MiniGrafDb:
-    """Open MiniGrafDb at path, retrying with backoff on lock contention.
+def _try_open_with_self_heal(path: str) -> MiniGrafDb:
+    """Attempt one open, self-healing a stale lock (holder process no longer
+    running) by removing it and retrying once, instead of surfacing a
+    permanent error.
 
-    Self-heals a stale lock (holder process no longer running) by removing it
-    before the next attempt, instead of surfacing a permanent error.
+    Raises the lock-contention exception if the lock is still held by a live
+    process (caller decides whether to back off and retry); raises any
+    non-lock exception immediately.
+    """
+    try:
+        return _open_db_at(path)
+    except Exception as e:
+        if not _is_lock_error(e):
+            raise
+        holder_pid = _stale_lock_holder_pid(e)
+        if holder_pid is not None and _clear_stale_lock(path, holder_pid):
+            try:
+                return _open_db_at(path)
+            except Exception as e2:
+                if not _is_lock_error(e2):
+                    raise
+                raise e2 from None
+        raise
+
+
+def _open_db_at_with_retry(path: str) -> MiniGrafDb:
+    """Open MiniGrafDb at path, retrying with blocking backoff on lock contention.
+
+    Only safe off the asyncio event-loop thread (e.g. IndexCache's background
+    rebuild thread): the backoff uses time.sleep(), which would otherwise
+    freeze the single-threaded event loop for the whole retry budget — see
+    _ensure_db_async for the event-loop-safe equivalent (issue #99).
     """
     delay = _LOCK_RETRY_BASE
     last_exc: Optional[Exception] = None
     for attempt in range(_LOCK_RETRY_MAX):
         try:
-            return _open_db_at(path)
+            return _try_open_with_self_heal(path)
         except Exception as e:
             if not _is_lock_error(e):
                 raise
             last_exc = e
-            holder_pid = _stale_lock_holder_pid(e)
-            if holder_pid is not None and _clear_stale_lock(path, holder_pid):
-                try:
-                    return _open_db_at(path)
-                except Exception as e2:
-                    if not _is_lock_error(e2):
-                        raise
-                    last_exc = e2
             if attempt < _LOCK_RETRY_MAX - 1:
                 time.sleep(delay)
+                delay *= 2
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _ensure_db_async() -> MiniGrafDb:
+    """Ensure the DB is open, retrying lock contention without blocking the
+    event loop.
+
+    Await this from any event-loop coroutine (call_tool, _run_ingestion)
+    before code that will call the synchronous get_db() — once _db is
+    populated, get_db() just returns it, so its own blocking retry path never
+    runs on the event-loop thread. Backs off with asyncio.sleep instead of
+    time.sleep so a lock held by another coroutine on this same event loop
+    (e.g. ingestion mid-commit) gets a chance to be released during the wait,
+    instead of the retry deterministically exhausting itself against a lock
+    state its own blocking sleep prevented from changing (issue #99).
+    """
+    if _db is not None:
+        return _db
+    path = _graph_path or _get_graph_path()
+    delay = _LOCK_RETRY_BASE
+    last_exc: Optional[Exception] = None
+    for attempt in range(_LOCK_RETRY_MAX):
+        try:
+            return _try_open_with_self_heal(path)
+        except Exception as e:
+            if not _is_lock_error(e):
+                raise
+            last_exc = e
+            if attempt < _LOCK_RETRY_MAX - 1:
+                await asyncio.sleep(delay)
                 delay *= 2
     assert last_exc is not None
     raise last_exc
@@ -817,7 +868,10 @@ def get_db() -> MiniGrafDb:
 
     The DB is opened per-operation and released after each call_tool() invocation
     so that the prepare_hook subprocess can acquire the file lock between turns.
-    Opening retries with backoff on lock contention (see _open_db_at_with_retry).
+    Opening retries with a blocking backoff on lock contention (see
+    _open_db_at_with_retry) — safe here only because event-loop call sites
+    (call_tool, _run_ingestion) always await _ensure_db_async() first, so _db
+    is already populated by the time they reach this function.
     """
     if _db is None:
         _open_db_at_with_retry(_graph_path or _get_graph_path())
@@ -2000,6 +2054,10 @@ def handle_memory_prepare_turn(user_message: str) -> str:
 
     Returns a formatted context block string for injection as additionalContext,
     or an empty string if no relevant facts are found.
+
+    Callers on the event-loop thread (call_tool) must await _ensure_db_async()
+    first — the heuristic fallback's get_db() assumes _db is already open so
+    it never falls back to its own blocking retry (issue #99).
     """
     if not _BM25_AVAILABLE:
         return _handle_memory_prepare_turn_heuristic(user_message)
@@ -2369,6 +2427,8 @@ async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]
     Strategy selected via MINIGRAF_EXTRACTION_STRATEGY env var (default: heuristic).
     """
     strategy = os.environ.get("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
+    if strategy in ("heuristic", "llm", "agent"):
+        await _ensure_db_async()
 
     if strategy == "heuristic":
         facts = heuristic_extract(conversation_delta)
@@ -2744,7 +2804,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     _shutdown_requested.clear()
     try:
         # Read watermark and pre-load known entities/deps before releasing DB
-        db = get_db()
+        db = await _ensure_db_async()
         watermark = _watermark_query(db)
         prior_ingested = _count_commit_entities(db)
         entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
@@ -2811,7 +2871,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 commit_ident = f":commit/{commit_hash[:12]}"
 
                 # Acquire DB fresh each commit — never hold across yield
-                db = get_db()
+                db = await _ensure_db_async()
                 try:
                     add_triples: List[str] = [
                         f"[{commit_ident} :entity-type :type/commit]",
@@ -2989,7 +3049,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
         if completed_all:
             now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-            db = get_db()
+            db = await _ensure_db_async()
             try:
                 _ingest_tags(db, repo_path, now)
                 _last_run_write(db, last_hash, now, _ingest_progress["processed"])
@@ -3302,18 +3362,22 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
     global _db
     try:
         if name == "minigraf_query":
+            await _ensure_db_async()
             result = handle_minigraf_query(arguments["datalog"])
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_transact":
+            await _ensure_db_async()
             result = handle_minigraf_transact(arguments["facts"], arguments["reason"])
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_retract":
+            await _ensure_db_async()
             result = handle_minigraf_retract(arguments["facts"], arguments["reason"])
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_rule":
+            await _ensure_db_async()
             result = handle_minigraf_rule(arguments["rule"])
             return [TextContent(type="text", text=json.dumps(result))]
 
@@ -3327,6 +3391,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "memory_prepare_turn":
+            await _ensure_db_async()
             block = handle_memory_prepare_turn(arguments["user_message"])
             return [TextContent(type="text", text=block)]
 
@@ -3335,6 +3400,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_audit":
+            await _ensure_db_async()
             as_of = arguments.get("as_of")
             result = handle_minigraf_audit(as_of=as_of)
             return [TextContent(type="text", text=json.dumps(result))]
@@ -3348,6 +3414,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
 
 
         if name == "minigraf_ingest_status":
+            if _ingest_progress["status"] != "running":
+                await _ensure_db_async()
             result = handle_minigraf_ingest_status()
             return [TextContent(type="text", text=json.dumps(result))]
 
