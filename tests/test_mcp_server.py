@@ -3,6 +3,7 @@
 All tests mock MiniGrafDb so no live minigraf install is required.
 """
 import asyncio
+import contextlib
 import json
 import sys
 import os
@@ -1325,6 +1326,66 @@ class TestGetParser:
         assert err.count("no tree-sitter grammar available for 'python'") == 1
 
 
+class TestThreadParser:
+    def test_returns_none_for_unsupported_extension(self):
+        import mcp_server
+        assert mcp_server._thread_parser("data.csv") is None
+
+    def test_returns_a_parser_for_supported_extension(self):
+        import mcp_server
+        parser = mcp_server._thread_parser("foo.py")
+        assert parser is not None
+
+    def test_different_threads_get_different_parser_instances(self):
+        import mcp_server
+        import threading
+
+        results = {}
+
+        def grab(name):
+            results[name] = mcp_server._thread_parser("foo.py")
+
+        t1 = threading.Thread(target=grab, args=("t1",))
+        t2 = threading.Thread(target=grab, args=("t2",))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        assert results["t1"] is not None
+        assert results["t2"] is not None
+        assert results["t1"] is not results["t2"]
+
+    def test_same_thread_reuses_its_own_parser_instance(self):
+        import mcp_server
+        p1 = mcp_server._thread_parser("foo.py")
+        p2 = mcp_server._thread_parser("bar.py")  # same language, same thread
+        assert p1 is p2
+
+    def test_concurrent_first_use_of_new_language_warns_once(self, capsys):
+        """Two threads racing to build the same never-seen-before language's
+        grammar for the first time must not double-import or double-warn —
+        regression guard for the lock added around _get_parser's
+        first-time-construction branch."""
+        import mcp_server
+        import threading
+
+        barrier = threading.Barrier(2)
+
+        def touch():
+            barrier.wait()
+            mcp_server._thread_parser("foo.c")
+
+        threads = [threading.Thread(target=touch) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        err = capsys.readouterr().err
+        # Either the grammar loads fine (no warning at all) or, if it's
+        # missing in this environment, the warning fires at most once.
+        assert err.count("no tree-sitter grammar available for 'c'") <= 1
+
+
 class TestExtToLangHeaders:
     """Regression tests for issue #92 bug 2: header extensions (.h/.hpp/...)
     were missing from _EXT_TO_LANG entirely, so _get_parser returned None for
@@ -1668,6 +1729,55 @@ class TestGitHelpers:
         assert b"def login" in content
 
 
+class TestExtractCommit:
+    def test_added_file_returns_extracted_dict(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        first_hash = commits[0][0]
+
+        results = mcp_server._extract_commit(str(git_repo), first_hash)
+
+        assert len(results) == 1
+        status, file_path, extracted = results[0]
+        assert status == "A"
+        assert file_path == "auth.py"
+        assert "login" in extracted["functions"]
+
+    def test_deleted_file_has_none_extracted(self, git_repo_with_deletion):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo_with_deletion), watermark_hash=None)
+        delete_hash = commits[-1][0]
+
+        results = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
+
+        d_entries = [r for r in results if r[0] == "D"]
+        assert len(d_entries) == 1
+        assert d_entries[0][2] is None
+
+    def test_unsupported_extension_is_omitted(self, git_repo, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_changed_files",
+            lambda repo, commit: [("A", "notes.txt")],
+        )
+        results = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        assert results == []
+
+    def test_content_fetch_failure_is_omitted_not_raised(self, git_repo, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_changed_files",
+            lambda repo, commit: [("A", "auth.py")],
+        )
+
+        def boom(repo, commit, path):
+            raise mcp_server.MiniGrafError("simulated git-show failure")
+
+        monkeypatch.setattr(mcp_server, "_git_file_content", boom)
+        results = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        assert results == []
+
+
 class TestIngestionWrites:
     def test_ingest_transact_uses_valid_from(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -1923,6 +2033,72 @@ class TestIngestionWrites:
         assert last_run_calls[0][2] == 0  # no commits processed this run, prior was 0
 
 
+class TestPreloadKnownDeps:
+    def test_reloads_open_depends_on_edge(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+
+        src_ident = mcp_server._code_ident("module", "mod_a.py")
+        dep_ident = mcp_server._canonical_ident("module", "mod_b")
+        # 1704067200000 ms == 2024-01-01T00:00:00.000Z
+        db_instance.execute.return_value = json.dumps(
+            {"results": [[src_ident, dep_ident, 1704067200000]]}
+        )
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+
+        file_entities = {"mod_a.py": [src_ident]}
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, file_entities)
+
+        assert file_deps["mod_a.py"] == {dep_ident}
+        assert dep_valid_from[(src_ident, dep_ident)] == "2024-01-01T00:00:00.000Z"
+
+    def test_query_includes_any_valid_time_and_forever_filter(self, mock_minigraf_db, tmp_path):
+        """The query must ask for :any-valid-time (required for any per-fact
+        pseudo-attribute to bind) and filter :db/valid-to down to the
+        VALID_TIME_FOREVER sentinel so closed edges aren't reloaded as open."""
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        db_instance.execute.return_value = json.dumps({"results": []})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        db_instance.execute.reset_mock()
+
+        mcp_server._preload_known_deps(db, {})
+
+        query = db_instance.execute.call_args[0][0]
+        assert ":any-valid-time" in query
+        assert ":depends-on" in query
+        assert ":db/valid-from" in query
+        assert ":db/valid-to" in query
+        assert "9223372036854775807" in query
+
+    def test_no_deps_returns_empty_structures(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        db_instance.execute.return_value = json.dumps({"results": []})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, {"mod_a.py": []})
+
+        assert file_deps == {}
+        assert dep_valid_from == {}
+
+    def test_query_failure_is_non_fatal(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        from minigraf import MiniGrafError
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        db_instance.execute.side_effect = MiniGrafError("boom")
+
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, {"mod_a.py": []})
+
+        assert file_deps == {}
+        assert dep_valid_from == {}
+
+
 class TestTotalIngestedQuery:
     def test_returns_zero_when_absent(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -2148,6 +2324,271 @@ class TestRunIngestion:
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         assert mcp_server._ingest_progress["prior_ingested"] == 21715
         assert mcp_server._ingest_progress["processed"] == 21717  # 21715 + 2 commits
+
+
+class TestRunIngestionConcurrency:
+    @pytest.mark.asyncio
+    async def test_concurrent_run_matches_sequential_facts(self, mock_minigraf_db, git_repo_with_deps, monkeypatch):
+        """A run using the thread-pool pipeline must produce the exact same
+        set of transacted triples, in the same commit order, as today's
+        sequential loop — this is the core correctness guarantee for the
+        producer/consumer split."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+
+        # Capture the true, unpatched transact function once — each run below
+        # re-patches mcp_server._ingest_transact, so grabbing this later would
+        # pick up the previous run's capture wrapper instead of the original.
+        real_ingest_transact = mcp_server._ingest_transact
+
+        async def run_and_capture(worker_count):
+            if worker_count is None:
+                monkeypatch.delenv("MINIGRAF_INGEST_WORKERS", raising=False)
+            else:
+                monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", str(worker_count))
+
+            # Reset module-level state so the second run starts exactly as
+            # clean as the first (same watermark, same progress, no leftover
+            # shutdown signal).
+            mcp_server.open_db(str(git_repo_with_deps / "memory.graph"))
+            mcp_server._ingest_progress = {
+                "status": "idle", "processed": 0, "total": 0,
+                "current_commit": "", "error": None,
+            }
+            mcp_server._shutdown_requested.clear()
+
+            transacted: list = []
+
+            def capture(db, triples, ts_iso, reason=""):
+                transacted.append(list(triples))
+                return real_ingest_transact(db, triples, ts_iso, reason)
+
+            monkeypatch.setattr(mcp_server, "_ingest_transact", capture)
+            await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
+            assert mcp_server._ingest_progress["status"] == "complete"
+            assert mcp_server._ingest_progress["processed"] == 1
+            return transacted
+
+        sequential_triples = await run_and_capture(1)
+        concurrent_triples = await run_and_capture(4)
+
+        mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
+        mod_b_ident = mcp_server._code_ident("module", "mod_b.py")
+        all_triples = [t for batch in sequential_triples for t in batch]
+        assert any(mod_a_ident in t for t in all_triples)
+        assert any(mod_b_ident in t for t in all_triples)
+
+        # The core equivalence guarantee: identical triples, identical
+        # per-commit batching, identical order — regardless of how many
+        # worker threads did the extraction.
+        assert concurrent_triples == sequential_triples
+
+    @pytest.mark.asyncio
+    async def test_worker_count_env_var_is_respected(self, mock_minigraf_db, git_repo, monkeypatch):
+        monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", "1")
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_one_commits_file_failure_does_not_affect_other_commits(
+        self, mock_minigraf_db, git_repo, monkeypatch
+    ):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        failing_hash = commits[0][0]
+        real_content = mcp_server._git_file_content
+
+        def flaky(repo, commit, path):
+            if commit == failing_hash:
+                raise mcp_server.MiniGrafError("simulated failure for one commit's file")
+            return real_content(repo, commit, path)
+
+        monkeypatch.setattr(mcp_server, "_git_file_content", flaky)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        # Both commits still get counted as processed even though the first
+        # commit's only changed file failed to fetch.
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+
+
+class TestRunIngestionShutdown:
+    @pytest.mark.asyncio
+    async def test_shutdown_mid_run_stops_at_commit_boundary(self, mock_minigraf_db, git_repo, monkeypatch):
+        """git_repo has 2 commits. Request shutdown right after the first
+        commit's extraction is consumed but before the second is processed;
+        the loop must stop cleanly with status 'stopped' and only 1 commit
+        durably processed."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        original_sleep = asyncio.sleep
+
+        async def patched_sleep(t):
+            # Fires after the first commit's processed += 1, i.e. exactly at
+            # the next loop-top boundary check.
+            mcp_server._shutdown_requested.set()
+            await original_sleep(t)
+
+        with patch("mcp_server.asyncio.sleep", patched_sleep):
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        assert mcp_server._ingest_progress["processed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_resumes_from_watermark_after_shutdown(self, mock_minigraf_db, git_repo, monkeypatch):
+        """After a simulated shutdown mid-run, a second _run_ingestion call
+        against the same (mocked) DB state must pick up the watermark that
+        was written for the last fully-completed commit and finish the
+        remaining commit(s), without re-processing or skipping any."""
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+
+        # In-memory fake DB standing in for minigraf so the watermark
+        # written by run 1 is genuinely visible to run 2 (the default mock
+        # always returns the same canned response and can't model this).
+        state = {"watermark": None}
+
+        def execute(cmd, *a, **k):
+            if "(query" in cmd and ":ingestion/watermark" in cmd and ":hash" in cmd:
+                if state["watermark"]:
+                    return json.dumps({"results": [[state["watermark"]]]})
+                return json.dumps({"results": []})
+            if "(transact" in cmd and ":ingestion/watermark" in cmd:
+                import re
+                m = re.search(r':hash "([0-9a-f]+)"', cmd)
+                if m:
+                    state["watermark"] = m.group(1)
+            return json.dumps({"results": []})
+
+        db_instance.execute.side_effect = execute
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        original_sleep = asyncio.sleep
+        stop_once = {"done": False}
+
+        async def stop_after_first(t):
+            if not stop_once["done"]:
+                stop_once["done"] = True
+                mcp_server._shutdown_requested.set()
+            await original_sleep(t)
+
+        with patch("mcp_server.asyncio.sleep", stop_after_first):
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        first_run_processed = mcp_server._ingest_progress["processed"]
+        assert first_run_processed == 1
+
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        # Second run only had the 1 remaining commit to do, and
+        # _count_commit_entities (mocked to [] here) seeds prior_ingested=0,
+        # so processed reflects just that run's own work.
+        assert mcp_server._ingest_progress["processed"] == 1
+
+
+class TestMainShutdown:
+    @pytest.mark.asyncio
+    async def test_shutdown_event_cancels_server_run_and_returns(self, monkeypatch):
+        """A SIGTERM/SIGINT handler that only sets _shutdown_requested does
+        nothing unless something is racing that event against server.run().
+        This proves main() actually returns promptly once the event fires,
+        instead of hanging forever waiting on a live (never-completing)
+        connection."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_NO_AUTO_INGEST", "1")
+        # A fresh Event (not just .clear()) — asyncio.Event binds itself to
+        # whichever event loop first calls .wait() on it, and pytest-asyncio
+        # gives each test function its own loop, so reusing the module-level
+        # singleton's Event object across tests raises "bound to a different
+        # event loop" on the second test that calls .wait() on it.
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()  # simulates a live connection that never completes on its own
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+        mcp_server._shutdown_requested.set()
+
+        await asyncio.wait_for(main_task, timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_server_run_completing_normally_returns_without_shutdown_event(self, monkeypatch):
+        """Regression guard for the non-signal path: if server.run() finishes
+        on its own (e.g. the client closes the connection cleanly), main()
+        must still return promptly without needing _shutdown_requested set."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_NO_AUTO_INGEST", "1")
+        # A fresh Event (not just .clear()) — asyncio.Event binds itself to
+        # whichever event loop first calls .wait() on it, and pytest-asyncio
+        # gives each test function its own loop, so reusing the module-level
+        # singleton's Event object across tests raises "bound to a different
+        # event loop" on the second test that calls .wait() on it.
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            return  # completes immediately, as if the client disconnected cleanly
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await asyncio.wait_for(main_task, timeout=2)
 
 
 class TestIndexCache:

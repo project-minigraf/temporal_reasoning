@@ -6,16 +6,20 @@ Persistent stdio MCP server providing bi-temporal graph memory for AI coding age
 Sole interface to the minigraf .graph file via the MiniGrafDb Python binding.
 """
 import asyncio
+import concurrent.futures
+import contextlib
 import datetime
 import json
 import os
 import re
+import signal
 import subprocess as _subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -74,6 +78,7 @@ _ingest_progress: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None,
 }
+_shutdown_requested = asyncio.Event()
 
 # ---------------------------------------------------------------------------
 # Language detection and grammar caching
@@ -91,6 +96,29 @@ _EXT_TO_LANG: Dict[str, str] = {
 }
 
 _grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
+
+_grammar_cache_lock = threading.Lock()
+
+
+def _build_parser(lang_name: str) -> Any:
+    """Construct a fresh tree_sitter.Parser for lang_name. Raises on failure
+    (missing grammar package, incompatible tree-sitter version, etc).
+
+    No caching, no warning side effects — those stay in _get_parser, the
+    only caller that needs to turn a failure into a one-time stderr warning.
+    Also used by _thread_parser to build a private-to-this-thread instance
+    once _get_parser has already proven the grammar loads; an unexpected
+    failure there is left to propagate to the caller (Task 3's
+    _extract_commit, running in a worker thread) rather than being
+    swallowed, consistent with how any other producer-task exception is
+    handled.
+    """
+    mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
+    from tree_sitter import Language, Parser  # type: ignore
+    # PHP exposes language_php() instead of language()
+    lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
+    lang_obj = Language(lang_fn())
+    return Parser(lang_obj)
 
 
 def _get_parser(file_path: str) -> Optional[Any]:
@@ -114,28 +142,48 @@ def _get_parser(file_path: str) -> Optional[Any]:
     if lang_name in _grammar_cache:
         return _grammar_cache[lang_name]
 
-    parser = None
-    error: Optional[Exception] = None
-    try:
-        mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
-        from tree_sitter import Language, Parser  # type: ignore
-        # PHP exposes language_php() instead of language()
-        lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
-        lang_obj = Language(lang_fn())
-        parser = Parser(lang_obj)
-    except Exception as exc:
-        error = exc
+    with _grammar_cache_lock:
+        if lang_name in _grammar_cache:  # another thread populated it while we waited
+            return _grammar_cache[lang_name]
+        try:
+            parser = _build_parser(lang_name)
+        except Exception as exc:
+            parser = None
+            print(
+                f"[_get_parser] no tree-sitter grammar available for '{lang_name}' "
+                f"({exc!r}); code-structure extraction disabled for this language "
+                f"until 'tree-sitter-{lang_name}' is installed.",
+                file=sys.stderr,
+            )
+        _grammar_cache[lang_name] = parser
+        return parser
 
-    if parser is None:
-        print(
-            f"[_get_parser] no tree-sitter grammar available for '{lang_name}' "
-            f"({error!r}); code-structure extraction disabled for this language "
-            f"until 'tree-sitter-{lang_name}' is installed.",
-            file=sys.stderr,
-        )
 
-    _grammar_cache[lang_name] = parser
-    return parser
+_thread_local = threading.local()
+
+
+def _thread_parser(file_path: str) -> Optional[Any]:
+    """Return a Parser instance private to the calling thread for file_path's language.
+
+    tree_sitter.Parser objects are not safe for concurrent .parse() calls
+    from multiple threads. Rather than lock around every parse (which would
+    serialize the CPU-bound part of concurrent ingestion), each thread gets
+    its own Parser per language, built once and cached in thread-local
+    storage. Reuses _get_parser purely as the "is this language supported"
+    check — including its shared cache and once-only warning — since that
+    part is safe to share across threads (a plain dict read after the first
+    population, or a briefly-held lock on a miss).
+    """
+    if _get_parser(file_path) is None:
+        return None
+    lang_name = _EXT_TO_LANG[Path(file_path).suffix.lower()]
+    cache = getattr(_thread_local, "parsers", None)
+    if cache is None:
+        cache = {}
+        _thread_local.parsers = cache
+    if lang_name not in cache:
+        cache[lang_name] = _build_parser(lang_name)
+    return cache[lang_name]
 
 # ---------------------------------------------------------------------------
 # AST extraction
@@ -2275,6 +2323,68 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     return entity_valid_from, entity_descriptions, file_entities
 
 
+_VALID_TIME_FOREVER_MS = (1 << 63) - 1  # minigraf's i64::MAX "still open" :valid-to sentinel
+
+
+def _preload_known_deps(
+    db: Any, file_entities: Dict[str, List[str]]
+) -> tuple:
+    """Reload file_deps/dep_valid_from from durable :depends-on facts.
+
+    Mirrors _preload_known_entities, but :depends-on facts have no
+    :introduced-by-style companion edge to a commit's :date, so the
+    introduction timestamp has to come from the fact's own :db/valid-from
+    via minigraf's per-fact temporal metadata pseudo-attributes (minigraf
+    >=1.0.0, verified present at the pinned/installed 1.2.1). :any-valid-time
+    is required for any per-fact pseudo-attribute to bind at all; the
+    explicit :db/valid-to equality against the "forever" sentinel is what
+    restricts results to edges that haven't been closed (:any-valid-time
+    alone would also return already-closed historical facts).
+
+    Without this, file_deps/dep_valid_from start empty on every restart,
+    which not only breaks removed-dependency detection but actively
+    corrupts history: current_deps - previous_deps would treat every
+    already-standing dependency as newly introduced the next time its file
+    is touched, overwriting its true :valid-from.
+
+    Returns (file_deps, dep_valid_from):
+    file_deps maps file_path -> set of dep module idents.
+    dep_valid_from maps (src_module_ident, dep_ident) -> ISO 8601 intro timestamp.
+    """
+    file_deps: Dict[str, set] = {}
+    dep_valid_from: Dict[tuple, str] = {}
+
+    ident_to_file = {
+        _code_ident("module", file_path): file_path for file_path in file_entities
+    }
+
+    try:
+        raw = db.execute(
+            "(query [:find ?src ?dep ?vf "
+            ":any-valid-time "
+            ":where [?src :depends-on ?dep] "
+            "[?src :db/valid-from ?vf] "
+            "[?src :db/valid-to ?vt] "
+            f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
+        )
+        rows = json.loads(raw).get("results", [])
+    except Exception:
+        return file_deps, dep_valid_from
+
+    for src_ident, dep_ident, vf_ms in rows:
+        file_path = ident_to_file.get(src_ident)
+        if file_path is None:
+            continue
+        vf_iso = (
+            datetime.datetime.fromtimestamp(vf_ms / 1000, datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        )
+        file_deps.setdefault(file_path, set()).add(dep_ident)
+        dep_valid_from[(src_ident, dep_ident)] = vf_iso
+
+    return file_deps, dep_valid_from
+
+
 def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
     """Ingest git tags as :tag/<slug> entities with :tagged-commit references.
 
@@ -2306,17 +2416,55 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
             pass  # non-fatal per tag
 
 
+def _extract_commit(
+    repo_path: str, commit_hash: str
+) -> List[Tuple[str, str, Optional[Dict[str, List[str]]]]]:
+    """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse.
+
+    Runs in a worker thread via the ThreadPoolExecutor in _run_ingestion.
+    Touches no shared mutable state and no DB. Returns one entry per changed
+    file that has a supported parser; A/M files whose content fetch fails
+    are omitted entirely, mirroring the previous inline `continue` — the
+    file is simply skipped for this commit, same as today.
+    """
+    results: List[Tuple[str, str, Optional[Dict[str, List[str]]]]] = []
+    for status, file_path in _git_changed_files(repo_path, commit_hash):
+        parser = _thread_parser(file_path)
+        if parser is None:
+            continue
+        if status == "D":
+            results.append((status, file_path, None))
+            continue
+        try:
+            content = _git_file_content(repo_path, commit_hash, file_path)
+        except Exception:
+            continue
+        extracted = _extract_from_source(content, parser, file_path)
+        results.append((status, file_path, extracted))
+    return results
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
-    """Background coroutine: walk git history and ingest code structure."""
+    """Background coroutine: walk git history and ingest code structure.
+
+    Extraction (git show + tree-sitter parse) for upcoming commits runs
+    ahead of time on a thread pool via a bounded sliding-window pipeline;
+    all DB-writing bookkeeping below stays strictly sequential, one commit
+    at a time, exactly as before this pipeline was introduced.
+    """
     global _db, _ingest_progress
+    # Safe to clear unconditionally: handle_minigraf_ingest_git refuses to start a
+    # new run while one is already active, so no in-flight shutdown signal is ever
+    # stomped on here; main()'s finally block re-sets the flag on exit regardless,
+    # so a shutdown request arriving between runs is never silently lost.
+    _shutdown_requested.clear()
     try:
-        # Read watermark and pre-load known entities before releasing DB
+        # Read watermark and pre-load known entities/deps before releasing DB
         db = get_db()
         watermark = _watermark_query(db)
         prior_ingested = _count_commit_entities(db)
         entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
-        file_deps: Dict[str, set] = {}  # file_path -> set of dep module idents
-        dep_valid_from: Dict[tuple, str] = {}  # (src_ident, dep_ident) -> intro commit ts
+        file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone, so the local `db` must be cleared
         # too, not just the global — otherwise this frame keeps it alive (and the
@@ -2337,151 +2485,176 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
         last_hash = watermark or ""
 
-        for commit_hash, commit_ts_iso, author, subject in commits:
-            last_hash = commit_hash
-            _ingest_progress["current_commit"] = commit_hash
-            reason = f"git:{commit_hash} {author}: {subject}"
+        env_workers = os.environ.get("MINIGRAF_INGEST_WORKERS")
+        max_workers = int(env_workers) if env_workers else min(32, (os.cpu_count() or 1) + 4)
+        pipeline_depth = max_workers * 2
 
-            # Build commit entity ident from first 12 chars of hash
-            commit_ident = f":commit/{commit_hash[:12]}"
+        loop = asyncio.get_running_loop()
+        completed_all = True
 
-            # Acquire DB fresh each commit — never hold across yield
-            db = get_db()
-            try:
-                changed = _git_changed_files(repo_path, commit_hash)
-                add_triples: List[str] = [
-                    f"[{commit_ident} :entity-type :type/commit]",
-                    f'[{commit_ident} :ident "{commit_ident}"]',
-                    f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
-                    f'[{commit_ident} :hash "{commit_hash}"]',
-                    f'[{commit_ident} :author "{_edn_escape(author)}"]',
-                    f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
-                    f'[{commit_ident} :date "{commit_ts_iso}"]',
-                ]
-                close_items: List[tuple] = []  # (triples, original_ts_iso)
-                dep_add_triples: List[str] = []  # :depends-on triples to transact individually
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            commits_iter = iter(commits)
+            pending: Any = deque()
 
-                for status, file_path in changed:
-                    parser = _get_parser(file_path)
-                    if parser is None:
-                        continue
+            def submit_next() -> bool:
+                try:
+                    commit = next(commits_iter)
+                except StopIteration:
+                    return False
+                fut = loop.run_in_executor(executor, _extract_commit, repo_path, commit[0])
+                pending.append((commit, fut))
+                return True
 
-                    if status == "D":
-                        # Close module and all known child entities for this file
-                        idents = file_entities.get(file_path, [_code_ident("module", file_path)])
-                        module_ident = _code_ident("module", file_path)
-                        for ident in idents:
-                            orig_ts = entity_valid_from.get(ident, commit_ts_iso)
-                            desc = entity_descriptions.get(ident, "")
-                            close_items.append(
-                                (_build_close_triples(ident, desc, module_ident), orig_ts)
-                            )
-                        # Close all :depends-on edges for the deleted module
-                        for dep_ident in file_deps.get(file_path, set()):
-                            orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                            close_items.append(
-                                ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
-                            )
-                        file_deps.pop(file_path, None)
-                    else:  # A or M
-                        previous_idents = set(file_entities.get(file_path, []))
-                        try:
-                            content = _git_file_content(repo_path, commit_hash, file_path)
-                        except Exception:
-                            continue
-                        extracted = _extract_from_source(content, parser, file_path)
-                        triples = _build_code_triples(
-                            file_path, extracted, commit_ts_iso, entity_valid_from,
-                            entity_descriptions, file_entities, commit_ident,
-                        )
-                        add_triples.extend(triples)
-                        # Detect entities removed from a modified file.
-                        # _build_code_triples only appends to file_entities, never removes.
-                        # Compare previous idents against the idents derivable from the
-                        # current extraction to find what was deleted.
-                        if status == "M":
+            for _ in range(pipeline_depth):
+                if not submit_next():
+                    break
+
+            while pending:
+                if _shutdown_requested.is_set():
+                    completed_all = False
+                    break
+
+                (commit_hash, commit_ts_iso, author, subject), fut = pending.popleft()
+                extracted_files = await fut
+                submit_next()
+
+                last_hash = commit_hash
+                _ingest_progress["current_commit"] = commit_hash
+                reason = f"git:{commit_hash} {author}: {subject}"
+
+                # Build commit entity ident from first 12 chars of hash
+                commit_ident = f":commit/{commit_hash[:12]}"
+
+                # Acquire DB fresh each commit — never hold across yield
+                db = get_db()
+                try:
+                    add_triples: List[str] = [
+                        f"[{commit_ident} :entity-type :type/commit]",
+                        f'[{commit_ident} :ident "{commit_ident}"]',
+                        f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
+                        f'[{commit_ident} :hash "{commit_hash}"]',
+                        f'[{commit_ident} :author "{_edn_escape(author)}"]',
+                        f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
+                        f'[{commit_ident} :date "{commit_ts_iso}"]',
+                    ]
+                    close_items: List[tuple] = []  # (triples, original_ts_iso)
+                    dep_add_triples: List[str] = []  # :depends-on triples to transact individually
+
+                    for status, file_path, extracted in extracted_files:
+                        if status == "D":
+                            # Close module and all known child entities for this file
+                            idents = file_entities.get(file_path, [_code_ident("module", file_path)])
                             module_ident = _code_ident("module", file_path)
-                            current_extracted_idents: set = {module_ident}
-                            for fn_name in extracted.get("functions", []):
-                                current_extracted_idents.add(_code_ident("function", file_path, fn_name))
-                            for cls_name in extracted.get("classes", []):
-                                current_extracted_idents.add(_code_ident("class", file_path, cls_name))
-                            removed_idents = previous_idents - current_extracted_idents
-                            for ident in removed_idents:
+                            for ident in idents:
                                 orig_ts = entity_valid_from.get(ident, commit_ts_iso)
                                 desc = entity_descriptions.get(ident, "")
                                 close_items.append(
                                     (_build_close_triples(ident, desc, module_ident), orig_ts)
                                 )
-                        # Compute dep edges for this file and diff against previous
-                        module_ident = _code_ident("module", file_path)
-                        current_deps: set = set()
-                        for import_name in set(extracted.get("imports", [])):
-                            dep_ident = _resolve_module_import(import_name, file_entities)
-                            if dep_ident != module_ident:
-                                current_deps.add(dep_ident)
-                        previous_deps = file_deps.get(file_path, set())
-                        for dep_ident in current_deps - previous_deps:
-                            dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
-                            dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
-                        if status == "M":
-                            for dep_ident in previous_deps - current_deps:
+                            # Close all :depends-on edges for the deleted module
+                            for dep_ident in file_deps.get(file_path, set()):
                                 orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
                                 close_items.append(
                                     ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
                                 )
-                        file_deps[file_path] = current_deps
+                            file_deps.pop(file_path, None)
+                        else:  # A or M
+                            previous_idents = set(file_entities.get(file_path, []))
+                            triples = _build_code_triples(
+                                file_path, extracted, commit_ts_iso, entity_valid_from,
+                                entity_descriptions, file_entities, commit_ident,
+                            )
+                            add_triples.extend(triples)
+                            # Detect entities removed from a modified file.
+                            # _build_code_triples only appends to file_entities, never removes.
+                            # Compare previous idents against the idents derivable from the
+                            # current extraction to find what was deleted.
+                            if status == "M":
+                                module_ident = _code_ident("module", file_path)
+                                current_extracted_idents: set = {module_ident}
+                                for fn_name in extracted.get("functions", []):
+                                    current_extracted_idents.add(_code_ident("function", file_path, fn_name))
+                                for cls_name in extracted.get("classes", []):
+                                    current_extracted_idents.add(_code_ident("class", file_path, cls_name))
+                                removed_idents = previous_idents - current_extracted_idents
+                                for ident in removed_idents:
+                                    orig_ts = entity_valid_from.get(ident, commit_ts_iso)
+                                    desc = entity_descriptions.get(ident, "")
+                                    close_items.append(
+                                        (_build_close_triples(ident, desc, module_ident), orig_ts)
+                                    )
+                            # Compute dep edges for this file and diff against previous
+                            module_ident = _code_ident("module", file_path)
+                            current_deps: set = set()
+                            for import_name in set(extracted.get("imports", [])):
+                                dep_ident = _resolve_module_import(import_name, file_entities)
+                                if dep_ident != module_ident:
+                                    current_deps.add(dep_ident)
+                            previous_deps = file_deps.get(file_path, set())
+                            for dep_ident in current_deps - previous_deps:
+                                dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
+                                dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
+                            if status == "M":
+                                for dep_ident in previous_deps - current_deps:
+                                    orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
+                                    close_items.append(
+                                        ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+                                    )
+                            file_deps[file_path] = current_deps
 
-                # Split :contains triples out before batching.  Minigraf's EAVT
-                # pending index lacks value bytes in the key, so batching multiple
-                # [module :contains fn] facts in one transact silently drops all
-                # but the last.  Each :contains triple gets its own transact so
-                # they receive distinct tx_counts and avoid the index collision.
-                contains_triples = [t for t in add_triples if ":contains" in t]
-                other_triples = [t for t in add_triples if ":contains" not in t]
-                _ingest_transact(db, other_triples, commit_ts_iso, reason)
-                for ct in contains_triples:
-                    _ingest_transact(db, [ct], commit_ts_iso, reason)
-                # :depends-on triples transacted individually — same EAVT collision risk
-                # as :contains when multiple deps share the same source module
-                for dt in dep_add_triples:
-                    _ingest_transact(db, [dt], commit_ts_iso, reason)
-                for close_triples, orig_ts in close_items:
-                    _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason)
+                    # Split :contains triples out before batching.  Minigraf's EAVT
+                    # pending index lacks value bytes in the key, so batching multiple
+                    # [module :contains fn] facts in one transact silently drops all
+                    # but the last.  Each :contains triple gets its own transact so
+                    # they receive distinct tx_counts and avoid the index collision.
+                    contains_triples = [t for t in add_triples if ":contains" in t]
+                    other_triples = [t for t in add_triples if ":contains" not in t]
+                    _ingest_transact(db, other_triples, commit_ts_iso, reason)
+                    for ct in contains_triples:
+                        _ingest_transact(db, [ct], commit_ts_iso, reason)
+                    # :depends-on triples transacted individually — same EAVT collision risk
+                    # as :contains when multiple deps share the same source module
+                    for dt in dep_add_triples:
+                        _ingest_transact(db, [dt], commit_ts_iso, reason)
+                    for close_triples, orig_ts in close_items:
+                        _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason)
 
-                # Ingest :parent edges — one transact per parent to avoid EAVT
-                # collision for merge commits (which have two parent hashes).
-                try:
-                    for parent_hash in _git_parent_hashes(repo_path, commit_hash):
-                        parent_ident = f":commit/{parent_hash[:12]}"
-                        db.execute(
-                            f'(transact [[{commit_ident} :parent {parent_ident}]] '
-                            f'{{:valid-from "{commit_ts_iso}"}})'
-                        )
-                except Exception:
-                    pass  # non-fatal; parent edges are best-effort
+                    # Ingest :parent edges — one transact per parent to avoid EAVT
+                    # collision for merge commits (which have two parent hashes).
+                    try:
+                        for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+                            parent_ident = f":commit/{parent_hash[:12]}"
+                            db.execute(
+                                f'(transact [[{commit_ident} :parent {parent_ident}]] '
+                                f'{{:valid-from "{commit_ts_iso}"}})'
+                            )
+                    except Exception:
+                        pass  # non-fatal; parent edges are best-effort
 
-                _watermark_update(db, commit_hash, commit_ts_iso, reason)
+                    _watermark_update(db, commit_hash, commit_ts_iso, reason)
+                    db.checkpoint()
+
+                finally:
+                    _db = None  # release file lock between commits
+                    db = None   # drop local reference too — see note above
+
+                _ingest_progress["processed"] += 1
+                await asyncio.sleep(0)  # yield to event loop
+
+        if completed_all:
+            now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            db = get_db()
+            try:
+                _ingest_tags(db, repo_path, now)
+                _last_run_write(db, last_hash, now, _ingest_progress["processed"])
                 db.checkpoint()
-
             finally:
-                _db = None  # release file lock between commits
-                db = None   # drop local reference too — see note above
+                _db = None
 
-            _ingest_progress["processed"] += 1
-            await asyncio.sleep(0)  # yield to event loop
-
-        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        db = get_db()
-        try:
-            _ingest_tags(db, repo_path, now)
-            _last_run_write(db, last_hash, now, _ingest_progress["processed"])
-            db.checkpoint()
-        finally:
-            _db = None
-
-        _ingest_progress["status"] = "complete"
-        _index_cache.invalidate()
+            _ingest_progress["status"] = "complete"
+            _index_cache.invalidate()
+        else:
+            _ingest_progress["status"] = "stopped"
 
     except Exception as e:
         _ingest_progress["status"] = "error"
@@ -2852,12 +3025,50 @@ async def main() -> None:
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _shutdown_requested.set)
+        except (NotImplementedError, AttributeError):
+            pass  # Windows: add_signal_handler unsupported; no graceful-shutdown-by-signal there
+
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            server_task = asyncio.ensure_future(
+                server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
+            )
+            shutdown_task = asyncio.ensure_future(_shutdown_requested.wait())
+            done, _ = await asyncio.wait(
+                {server_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if server_task in done:
+                shutdown_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await shutdown_task
+                server_task.result()  # propagate any exception from a normal exit
+            else:
+                server_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await server_task
+    finally:
+        # The MCP server's most common "session ended" signal is stdin EOF
+        # (the parent closing the pipe) rather than a delivered signal, so
+        # this runs on every exit path. Give a long-running ingest a chance
+        # to reach its next commit boundary and exit cleanly — leaving the
+        # watermark correctly reflecting the last fully-completed commit —
+        # instead of asyncio.run() abruptly cancelling it mid-write once
+        # this coroutine returns.
+        _shutdown_requested.set()
+        if _ingest_task is not None and not _ingest_task.done():
+            try:
+                await asyncio.wait_for(_ingest_task, timeout=30)
+            except asyncio.TimeoutError:
+                _ingest_task.cancel()
 
 
 def run() -> None:

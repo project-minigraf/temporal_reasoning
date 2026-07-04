@@ -291,7 +291,10 @@ minigraf_ingest_status()
 #    "total": 47, "current_commit": "a3f2bc...", "error": null}
 ```
 
-`status` is one of: `idle`, `running`, `complete`, `error`. `processed` is the
+`status` is one of: `idle`, `running`, `complete`, `error`, `stopped`. `stopped`
+means a graceful shutdown (session end) paused ingestion between commits —
+not a failure; the next `minigraf_ingest_git` call (or server auto-start)
+resumes from the watermark automatically. `processed` is the
 cumulative count of durably persisted commits (seeded from the true
 `:type/commit` entity count at run start, so it stays accurate even after a
 prior run was interrupted mid-way — e.g. by lock contention). `processed_this_run`
