@@ -11,6 +11,7 @@ import datetime
 import json
 import os
 import re
+import signal
 import subprocess as _subprocess
 import sys
 import threading
@@ -3019,12 +3020,35 @@ async def main() -> None:
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _shutdown_requested.set)
+        except (NotImplementedError, AttributeError):
+            pass  # Windows: add_signal_handler unsupported; no graceful-shutdown-by-signal there
+
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                server.create_initialization_options(),
+            )
+    finally:
+        # The MCP server's most common "session ended" signal is stdin EOF
+        # (the parent closing the pipe) rather than a delivered signal, so
+        # this runs on every exit path. Give a long-running ingest a chance
+        # to reach its next commit boundary and exit cleanly — leaving the
+        # watermark correctly reflecting the last fully-completed commit —
+        # instead of asyncio.run() abruptly cancelling it mid-write once
+        # this coroutine returns.
+        _shutdown_requested.set()
+        if _ingest_task is not None and not _ingest_task.done():
+            try:
+                await asyncio.wait_for(_ingest_task, timeout=30)
+            except asyncio.TimeoutError:
+                _ingest_task.cancel()
 
 
 def run() -> None:

@@ -2405,6 +2405,97 @@ class TestRunIngestionConcurrency:
         assert mcp_server._ingest_progress["processed"] == 2
 
 
+class TestRunIngestionShutdown:
+    @pytest.mark.asyncio
+    async def test_shutdown_mid_run_stops_at_commit_boundary(self, mock_minigraf_db, git_repo, monkeypatch):
+        """git_repo has 2 commits. Request shutdown right after the first
+        commit's extraction is consumed but before the second is processed;
+        the loop must stop cleanly with status 'stopped' and only 1 commit
+        durably processed."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        original_sleep = asyncio.sleep
+
+        async def patched_sleep(t):
+            # Fires after the first commit's processed += 1, i.e. exactly at
+            # the next loop-top boundary check.
+            mcp_server._shutdown_requested.set()
+            await original_sleep(t)
+
+        with patch("mcp_server.asyncio.sleep", patched_sleep):
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        assert mcp_server._ingest_progress["processed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_resumes_from_watermark_after_shutdown(self, mock_minigraf_db, git_repo, monkeypatch):
+        """After a simulated shutdown mid-run, a second _run_ingestion call
+        against the same (mocked) DB state must pick up the watermark that
+        was written for the last fully-completed commit and finish the
+        remaining commit(s), without re-processing or skipping any."""
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+
+        # In-memory fake DB standing in for minigraf so the watermark
+        # written by run 1 is genuinely visible to run 2 (the default mock
+        # always returns the same canned response and can't model this).
+        state = {"watermark": None}
+
+        def execute(cmd, *a, **k):
+            if "(query" in cmd and ":ingestion/watermark" in cmd and ":hash" in cmd:
+                if state["watermark"]:
+                    return json.dumps({"results": [[state["watermark"]]]})
+                return json.dumps({"results": []})
+            if "(transact" in cmd and ":ingestion/watermark" in cmd:
+                import re
+                m = re.search(r':hash "([0-9a-f]+)"', cmd)
+                if m:
+                    state["watermark"] = m.group(1)
+            return json.dumps({"results": []})
+
+        db_instance.execute.side_effect = execute
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        original_sleep = asyncio.sleep
+        stop_once = {"done": False}
+
+        async def stop_after_first(t):
+            if not stop_once["done"]:
+                stop_once["done"] = True
+                mcp_server._shutdown_requested.set()
+            await original_sleep(t)
+
+        with patch("mcp_server.asyncio.sleep", stop_after_first):
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        first_run_processed = mcp_server._ingest_progress["processed"]
+        assert first_run_processed == 1
+
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        # Second run only had the 1 remaining commit to do, and
+        # _count_commit_entities (mocked to [] here) seeds prior_ingested=0,
+        # so processed reflects just that run's own work.
+        assert mcp_server._ingest_progress["processed"] == 1
+
+
 class TestIndexCache:
     def test_get_returns_none_before_any_rebuild(self):
         from mcp_server import IndexCache
