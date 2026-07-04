@@ -2817,43 +2817,57 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
 
 def _extract_commit(
     repo_path: str, commit_hash: str
-) -> Tuple[List[Tuple[str, str, Optional[Dict[str, List[str]]]]], List[tuple], Dict[str, Dict[str, str]]]:
-    """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse.
+) -> Tuple[List[tuple], List[tuple], Dict[str, Dict[str, str]]]:
+    """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse,
+    plus import resolution and "if this turns out to be new" triple precomputation —
+    both pure functions of this commit alone (see _known_files_at_commit and
+    _precompute_file_triples), unlike the incrementally-mutated file_entities/
+    entity_valid_from state only the serial main thread maintains.
 
-    Runs in a worker thread via the ThreadPoolExecutor in _run_ingestion.
-    Touches no shared mutable state and no DB. Returns (file_results,
-    gitlink_changes, gitmodules_map):
+    Runs in a worker thread via the ThreadPoolExecutor in _run_ingestion. Touches no
+    shared mutable state and no DB. Returns (file_results, gitlink_changes, gitmodules_map):
 
-      file_results: one entry per changed file that has a supported parser;
-        A/M files whose content fetch fails are omitted entirely, mirroring
-        the previous inline `continue` — same as before this pipeline existed.
-      gitlink_changes: _gitlink_changes' output — gitlink-involving rows,
-        never fed through the tree-sitter parser (gitlink paths never have
-        a resolvable extension).
-      gitmodules_map: path -> {"name", "url"}, populated only when this
-        commit has at least one gitlink "add" — avoids a wasted git-show
-        call on the (overwhelmingly common) case of a commit that touches
-        no submodules at all.
+      file_results: one entry per changed file that has a supported parser, as
+        (status, file_path, extracted, precomputed). A/M files whose content fetch
+        fails are omitted entirely, mirroring the previous inline `continue` — same
+        as before this pipeline existed. For a "D" (deleted) file, extracted and
+        precomputed are both None — the main thread only needs file_path to know
+        what to close.
+      gitlink_changes: _gitlink_changes' output — gitlink-involving rows, never fed
+        through the tree-sitter parser (gitlink paths never have a resolvable extension).
+      gitmodules_map: path -> {"name", "url"}, populated only when this commit has at
+        least one gitlink "add" — avoids a wasted git-show call on the (overwhelmingly
+        common) case of a commit that touches no submodules at all.
 
     Sources both file_results and gitlink_changes from a single
-    `git diff-tree --raw` call (via _git_diff_tree_raw) rather than the
-    former --name-status call, which discarded file mode entirely.
+    `git diff-tree --raw` call (via _git_diff_tree_raw) rather than a --name-status
+    call, which discarded file mode entirely.
+
+    known_files (via _known_files_at_commit) is computed lazily, once per commit,
+    and shared across every A/M file in this commit — a commit with only deletions
+    never pays for it.
     """
     raw_entries = _git_diff_tree_raw(repo_path, commit_hash)
-    results: List[Tuple[str, str, Optional[Dict[str, List[str]]]]] = []
+    commit_ident = f":commit/{commit_hash[:12]}"
+    results: List[tuple] = []
+    known_files: Optional[Dict[str, List[str]]] = None
+
     for status, old_mode, new_mode, old_sha, new_sha, file_path in raw_entries:
         parser = _thread_parser(file_path)
         if parser is None:
             continue
         if status == "D":
-            results.append((status, file_path, None))
+            results.append((status, file_path, None, None))
             continue
         try:
             content = _git_file_content(repo_path, commit_hash, file_path)
         except Exception:
             continue
         extracted = _extract_from_source(content, parser, file_path)
-        results.append((status, file_path, extracted))
+        if known_files is None:
+            known_files = _known_files_at_commit(repo_path, commit_hash)
+        precomputed = _precompute_file_triples(file_path, extracted, commit_ident, known_files)
+        results.append((status, file_path, extracted, precomputed))
 
     gitlink_changes = _gitlink_changes(raw_entries)
     gitmodules_map: Dict[str, Dict[str, str]] = {}
