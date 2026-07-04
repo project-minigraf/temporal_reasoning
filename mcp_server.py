@@ -92,6 +92,29 @@ _EXT_TO_LANG: Dict[str, str] = {
 
 _grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
 
+_grammar_cache_lock = threading.Lock()
+
+
+def _build_parser(lang_name: str) -> Any:
+    """Construct a fresh tree_sitter.Parser for lang_name. Raises on failure
+    (missing grammar package, incompatible tree-sitter version, etc).
+
+    No caching, no warning side effects — those stay in _get_parser, the
+    only caller that needs to turn a failure into a one-time stderr warning.
+    Also used by _thread_parser to build a private-to-this-thread instance
+    once _get_parser has already proven the grammar loads; an unexpected
+    failure there is left to propagate to the caller (Task 3's
+    _extract_commit, running in a worker thread) rather than being
+    swallowed, consistent with how any other producer-task exception is
+    handled.
+    """
+    mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
+    from tree_sitter import Language, Parser  # type: ignore
+    # PHP exposes language_php() instead of language()
+    lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
+    lang_obj = Language(lang_fn())
+    return Parser(lang_obj)
+
 
 def _get_parser(file_path: str) -> Optional[Any]:
     """Return a cached tree_sitter.Parser for the file's language, or None if unsupported.
@@ -114,28 +137,48 @@ def _get_parser(file_path: str) -> Optional[Any]:
     if lang_name in _grammar_cache:
         return _grammar_cache[lang_name]
 
-    parser = None
-    error: Optional[Exception] = None
-    try:
-        mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
-        from tree_sitter import Language, Parser  # type: ignore
-        # PHP exposes language_php() instead of language()
-        lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
-        lang_obj = Language(lang_fn())
-        parser = Parser(lang_obj)
-    except Exception as exc:
-        error = exc
+    with _grammar_cache_lock:
+        if lang_name in _grammar_cache:  # another thread populated it while we waited
+            return _grammar_cache[lang_name]
+        try:
+            parser = _build_parser(lang_name)
+        except Exception as exc:
+            parser = None
+            print(
+                f"[_get_parser] no tree-sitter grammar available for '{lang_name}' "
+                f"({exc!r}); code-structure extraction disabled for this language "
+                f"until 'tree-sitter-{lang_name}' is installed.",
+                file=sys.stderr,
+            )
+        _grammar_cache[lang_name] = parser
+        return parser
 
-    if parser is None:
-        print(
-            f"[_get_parser] no tree-sitter grammar available for '{lang_name}' "
-            f"({error!r}); code-structure extraction disabled for this language "
-            f"until 'tree-sitter-{lang_name}' is installed.",
-            file=sys.stderr,
-        )
 
-    _grammar_cache[lang_name] = parser
-    return parser
+_thread_local = threading.local()
+
+
+def _thread_parser(file_path: str) -> Optional[Any]:
+    """Return a Parser instance private to the calling thread for file_path's language.
+
+    tree_sitter.Parser objects are not safe for concurrent .parse() calls
+    from multiple threads. Rather than lock around every parse (which would
+    serialize the CPU-bound part of concurrent ingestion), each thread gets
+    its own Parser per language, built once and cached in thread-local
+    storage. Reuses _get_parser purely as the "is this language supported"
+    check — including its shared cache and once-only warning — since that
+    part is safe to share across threads (a plain dict read after the first
+    population, or a briefly-held lock on a miss).
+    """
+    if _get_parser(file_path) is None:
+        return None
+    lang_name = _EXT_TO_LANG[Path(file_path).suffix.lower()]
+    cache = getattr(_thread_local, "parsers", None)
+    if cache is None:
+        cache = {}
+        _thread_local.parsers = cache
+    if lang_name not in cache:
+        cache[lang_name] = _build_parser(lang_name)
+    return cache[lang_name]
 
 # ---------------------------------------------------------------------------
 # AST extraction

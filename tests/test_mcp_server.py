@@ -1325,6 +1325,66 @@ class TestGetParser:
         assert err.count("no tree-sitter grammar available for 'python'") == 1
 
 
+class TestThreadParser:
+    def test_returns_none_for_unsupported_extension(self):
+        import mcp_server
+        assert mcp_server._thread_parser("data.csv") is None
+
+    def test_returns_a_parser_for_supported_extension(self):
+        import mcp_server
+        parser = mcp_server._thread_parser("foo.py")
+        assert parser is not None
+
+    def test_different_threads_get_different_parser_instances(self):
+        import mcp_server
+        import threading
+
+        results = {}
+
+        def grab(name):
+            results[name] = mcp_server._thread_parser("foo.py")
+
+        t1 = threading.Thread(target=grab, args=("t1",))
+        t2 = threading.Thread(target=grab, args=("t2",))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        assert results["t1"] is not None
+        assert results["t2"] is not None
+        assert results["t1"] is not results["t2"]
+
+    def test_same_thread_reuses_its_own_parser_instance(self):
+        import mcp_server
+        p1 = mcp_server._thread_parser("foo.py")
+        p2 = mcp_server._thread_parser("bar.py")  # same language, same thread
+        assert p1 is p2
+
+    def test_concurrent_first_use_of_new_language_warns_once(self, capsys):
+        """Two threads racing to build the same never-seen-before language's
+        grammar for the first time must not double-import or double-warn —
+        regression guard for the lock added around _get_parser's
+        first-time-construction branch."""
+        import mcp_server
+        import threading
+
+        barrier = threading.Barrier(2)
+
+        def touch():
+            barrier.wait()
+            mcp_server._thread_parser("foo.c")
+
+        threads = [threading.Thread(target=touch) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        err = capsys.readouterr().err
+        # Either the grammar loads fine (no warning at all) or, if it's
+        # missing in this environment, the warning fires at most once.
+        assert err.count("no tree-sitter grammar available for 'c'") <= 1
+
+
 class TestExtToLangHeaders:
     """Regression tests for issue #92 bug 2: header extensions (.h/.hpp/...)
     were missing from _EXT_TO_LANG entirely, so _get_parser returned None for
