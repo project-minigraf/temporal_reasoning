@@ -626,9 +626,11 @@ class TestExtractCommit:
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
         results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(repo), commits[0][0])
 
-        # The gitlink path itself never has a resolvable extension, so it
-        # contributes nothing to the regular per-file results — only .gitmodules does.
-        assert [r[1] for r in results] == [".gitmodules"]
+        # Neither the gitlink path nor .gitmodules itself has a resolvable
+        # extension (Path(".gitmodules").suffix == "" per pathlib — a
+        # leading-dot-only filename has no extension), so both are omitted
+        # from the regular per-file results just like any unsupported file.
+        assert results == []
         assert gitlink_changes == [("add", sub_hash, "vendor/lib")]
         assert gitmodules_map == {"vendor/lib": {"name": "lib", "url": "https://example.com/lib.git"}}
 ```
