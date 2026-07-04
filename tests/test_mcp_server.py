@@ -1728,6 +1728,55 @@ class TestGitHelpers:
         assert b"def login" in content
 
 
+class TestExtractCommit:
+    def test_added_file_returns_extracted_dict(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        first_hash = commits[0][0]
+
+        results = mcp_server._extract_commit(str(git_repo), first_hash)
+
+        assert len(results) == 1
+        status, file_path, extracted = results[0]
+        assert status == "A"
+        assert file_path == "auth.py"
+        assert "login" in extracted["functions"]
+
+    def test_deleted_file_has_none_extracted(self, git_repo_with_deletion):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo_with_deletion), watermark_hash=None)
+        delete_hash = commits[-1][0]
+
+        results = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
+
+        d_entries = [r for r in results if r[0] == "D"]
+        assert len(d_entries) == 1
+        assert d_entries[0][2] is None
+
+    def test_unsupported_extension_is_omitted(self, git_repo, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_changed_files",
+            lambda repo, commit: [("A", "notes.txt")],
+        )
+        results = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        assert results == []
+
+    def test_content_fetch_failure_is_omitted_not_raised(self, git_repo, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_changed_files",
+            lambda repo, commit: [("A", "auth.py")],
+        )
+
+        def boom(repo, commit, path):
+            raise mcp_server.MiniGrafError("simulated git-show failure")
+
+        monkeypatch.setattr(mcp_server, "_git_file_content", boom)
+        results = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        assert results == []
+
+
 class TestIngestionWrites:
     def test_ingest_transact_uses_valid_from(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
