@@ -3708,11 +3708,11 @@ class TestExtractImportName:
 
     def test_python_import_from_preserves_full_dotted_name(self):
         import mcp_server
-        source = b"from pathlib import Path\n"
+        source = b"from os.path import join\n"
         result = mcp_server._extract_from_source(
             source, TestExtractFromSource()._python_parser(), "foo.py"
         )
-        assert "pathlib" in result["imports"]
+        assert "os.path" in result["imports"]
 
     def test_python_dotted_import_preserves_full_name(self):
         import mcp_server

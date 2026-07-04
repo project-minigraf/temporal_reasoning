@@ -471,7 +471,7 @@ def _lua_require_name(node) -> Optional[str]:
 
 
 def _elixir_module_name(node) -> Optional[str]:
-    """Return the root module name from an Elixir alias/import/use/require call.
+    """Return the full dotted module name from an Elixir alias/import/use/require call.
 
     alias MyApp.Router     → "MyApp.Router"
     import Ecto.Query      → "Ecto.Query"
