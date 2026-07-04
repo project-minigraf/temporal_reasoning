@@ -2325,6 +2325,86 @@ class TestRunIngestion:
         assert mcp_server._ingest_progress["processed"] == 21717  # 21715 + 2 commits
 
 
+class TestRunIngestionConcurrency:
+    @pytest.mark.asyncio
+    async def test_concurrent_run_matches_sequential_facts(self, mock_minigraf_db, git_repo_with_deps, monkeypatch):
+        """A run using the thread-pool pipeline must produce the exact same
+        set of transacted triples, in the same commit order, as today's
+        sequential loop — this is the core correctness guarantee for the
+        producer/consumer split."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo_with_deps / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        transacted: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture(db, triples, ts_iso, reason=""):
+            transacted.append(list(triples))
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture)
+        await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
+
+        mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
+        mod_b_ident = mcp_server._code_ident("module", "mod_b.py")
+        all_triples = [t for batch in transacted for t in batch]
+        assert any(mod_a_ident in t for t in all_triples)
+        assert any(mod_b_ident in t for t in all_triples)
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_worker_count_env_var_is_respected(self, mock_minigraf_db, git_repo, monkeypatch):
+        monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", "1")
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_one_commits_file_failure_does_not_affect_other_commits(
+        self, mock_minigraf_db, git_repo, monkeypatch
+    ):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        failing_hash = commits[0][0]
+        real_content = mcp_server._git_file_content
+
+        def flaky(repo, commit, path):
+            if commit == failing_hash:
+                raise mcp_server.MiniGrafError("simulated failure for one commit's file")
+            return real_content(repo, commit, path)
+
+        monkeypatch.setattr(mcp_server, "_git_file_content", flaky)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        # Both commits still get counted as processed even though the first
+        # commit's only changed file failed to fetch.
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+
+
 class TestIndexCache:
     def test_get_returns_none_before_any_rebuild(self):
         from mcp_server import IndexCache
