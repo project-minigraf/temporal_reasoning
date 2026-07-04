@@ -2321,6 +2321,49 @@ class TestPreloadKnownDeps:
         assert dep_valid_from == {}
 
 
+class TestPreloadExternalDependencies:
+    def test_preload_known_entities_includes_external_dependency(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        # _preload_known_entities' query shape is [?ident ?path ?desc ?date] per entity_type
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":module/vendor-lib", "vendor/lib", "lib", "2026-01-01T00:00:00Z"]]
+        })
+        mcp_server.open_db(str(tmp_path / "memory.graph"))
+        db = mcp_server.get_db()
+
+        entity_valid_from, entity_descriptions, file_entities = mcp_server._preload_known_entities(db, str(tmp_path))
+
+        assert ":module/vendor-lib" in entity_valid_from
+        assert entity_descriptions[":module/vendor-lib"] == "lib"
+        assert "vendor/lib" in file_entities
+
+    def test_preload_pinned_commits_reloads_current_sha(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        # _preload_pinned_commits' query shape is [?e ?sha ?vf] with :any-valid-time
+        db_instance.execute.return_value = json.dumps({
+            "results": [[":module/vendor-lib", "abc123", 1735689600000]]
+        })
+        mcp_server.open_db(str(tmp_path / "memory.graph"))
+        db = mcp_server.get_db()
+
+        pinned = mcp_server._preload_pinned_commits(db)
+
+        assert pinned[":module/vendor-lib"][0] == "abc123"
+        assert pinned[":module/vendor-lib"][1].endswith("Z")
+
+    def test_preload_pinned_commits_returns_empty_on_query_failure(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        from minigraf import MiniGrafError
+        mcp_server.open_db(str(tmp_path / "memory.graph"))
+        db = mcp_server.get_db()
+        db_instance.execute.side_effect = MiniGrafError("boom")
+
+        assert mcp_server._preload_pinned_commits(db) == {}
+
+
 class TestTotalIngestedQuery:
     def test_returns_zero_when_absent(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db

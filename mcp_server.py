@@ -2396,8 +2396,17 @@ def _build_code_triples(
 
 
 def _preload_known_entities(db: Any, repo_path: str) -> tuple:
-    """Load all existing module/function/class idents from the DB, and pre-seed
-    file_entities with all currently tracked files in the repo.
+    """Load all existing module/function/class/external-dependency idents from
+    the DB, and pre-seed file_entities with all currently tracked files in the
+    repo.
+
+    external-dependency entities share the module ident namespace and use the
+    same "path" attribute as modules, so folding them into this same query
+    means the existing close/reopen machinery (entity_valid_from,
+    entity_descriptions) just works for submodules without new parallel state.
+    Unresolved-import placeholders (no :path) are not reloaded by this query —
+    nothing in this codebase ever closes one, so the gap is harmless; see the
+    design spec's Section 2.
 
     Pre-seeding from `git ls-files` ensures that _resolve_module_import can
     find any module file even when processing early commits — before those files
@@ -2423,8 +2432,8 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     except Exception:
         pass
 
-    for entity_type in ("module", "function", "class"):
-        path_attr = "path" if entity_type == "module" else "file"
+    for entity_type in ("module", "function", "class", "external-dependency"):
+        path_attr = "path" if entity_type in ("module", "external-dependency") else "file"
         try:
             raw = db.execute(
                 f'(query [:find ?ident ?path ?desc ?date '
@@ -2508,6 +2517,41 @@ def _preload_known_deps(
         dep_valid_from[(src_ident, dep_ident)] = vf_iso
 
     return file_deps, dep_valid_from
+
+
+def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
+    """Reload each external-dependency entity's current :pinned-commit value
+    and the timestamp it was set at, mirroring _preload_known_deps's per-fact
+    :any-valid-time pattern for :depends-on.
+
+    Needed because :pinned-commit is bi-temporally closed and reopened on
+    every bump (see _run_ingestion's gitlink handling) — without this, the
+    server would lose track of the prior SHA and valid-from across a restart,
+    corrupting the close on the next bump or removal exactly the way
+    _preload_known_deps' docstring describes for :depends-on.
+
+    Returns {ident: (sha, valid_from_iso)}.
+    """
+    pinned: Dict[str, tuple] = {}
+    try:
+        raw = db.execute(
+            "(query [:find ?e ?sha ?vf "
+            ":any-valid-time "
+            ":where [?e :pinned-commit ?sha] "
+            "[?e :db/valid-from ?vf] "
+            "[?e :db/valid-to ?vt] "
+            f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
+        )
+        rows = json.loads(raw).get("results", [])
+    except Exception:
+        return pinned
+    for ident, sha, vf_ms in rows:
+        vf_iso = (
+            datetime.datetime.fromtimestamp(vf_ms / 1000, datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        )
+        pinned[ident] = (sha, vf_iso)
+    return pinned
 
 
 def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
