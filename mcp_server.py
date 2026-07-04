@@ -1040,6 +1040,12 @@ _STOP_WORDS = frozenset(
 
 _MIN_ENTITY_LEN = 4
 
+# Each entity triggers one unindexed, O(graph-size) `contains?` scan in
+# _handle_memory_prepare_turn_heuristic (see issue #96). Cap the count so a
+# long user message can't turn one hook invocation into an unbounded number
+# of full-graph scans.
+_MAX_HEURISTIC_ENTITIES = int(os.environ.get("MINIGRAF_PREPARE_MAX_ENTITIES", "8"))
+
 
 def _canonical_ident(entity_type: str, value: str) -> str:
     """Slug-canonicalize a value into a Minigraf keyword ident.
@@ -1734,7 +1740,7 @@ def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
     scan_limit = int(os.environ.get("MINIGRAF_PREPARE_SCAN_LIMIT", "50"))
     temporal_clauses = _build_query_clauses(user_message)
 
-    entities = _extract_entities(user_message)
+    entities = _extract_entities(user_message)[:_MAX_HEURISTIC_ENTITIES]
     collected: List[List[str]] = []
     seen: set = set()
 

@@ -407,6 +407,27 @@ class TestMemoryPrepareTurn:
         calls = [str(c) for c in db_instance.execute.call_args_list]
         assert any(':valid-at "2026-01-15"' in c for c in calls)
 
+    def test_caps_number_of_entities_scanned(self, mock_minigraf_db, tmp_path):
+        """A long message must not issue one full-graph contains? scan per token.
+
+        Each contains? query is an unindexed O(graph-size) linear scan (see
+        issue #96); an unbounded entity count turns a single hook invocation
+        into an unbounded number of full scans as the user's message grows.
+        """
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        long_message = " ".join(f"distinctentityword{i}" for i in range(200))
+        mcp_server._handle_memory_prepare_turn_heuristic(long_message)
+
+        contains_calls = [
+            c for c in db_instance.execute.call_args_list if "contains?" in str(c)
+        ]
+        assert len(contains_calls) <= mcp_server._MAX_HEURISTIC_ENTITIES
+
     def test_uses_current_utc_timestamp_for_current_state_queries(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})
