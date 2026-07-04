@@ -2453,6 +2453,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     at a time, exactly as before this pipeline was introduced.
     """
     global _db, _ingest_progress
+    # Safe to clear unconditionally: handle_minigraf_ingest_git refuses to start a
+    # new run while one is already active, so no in-flight shutdown signal is ever
+    # stomped on here; main()'s finally block re-sets the flag on exit regardless,
+    # so a shutdown request arriving between runs is never silently lost.
     _shutdown_requested.clear()
     try:
         # Read watermark and pre-load known entities/deps before releasing DB

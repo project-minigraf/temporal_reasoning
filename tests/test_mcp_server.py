@@ -2336,29 +2336,53 @@ class TestRunIngestionConcurrency:
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_deps / "memory.graph"))
-        mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
-            "current_commit": "", "error": None,
-        }
 
-        transacted: list = []
+        # Capture the true, unpatched transact function once — each run below
+        # re-patches mcp_server._ingest_transact, so grabbing this later would
+        # pick up the previous run's capture wrapper instead of the original.
         real_ingest_transact = mcp_server._ingest_transact
 
-        def capture(db, triples, ts_iso, reason=""):
-            transacted.append(list(triples))
-            return real_ingest_transact(db, triples, ts_iso, reason)
+        async def run_and_capture(worker_count):
+            if worker_count is None:
+                monkeypatch.delenv("MINIGRAF_INGEST_WORKERS", raising=False)
+            else:
+                monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", str(worker_count))
 
-        monkeypatch.setattr(mcp_server, "_ingest_transact", capture)
-        await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
+            # Reset module-level state so the second run starts exactly as
+            # clean as the first (same watermark, same progress, no leftover
+            # shutdown signal).
+            mcp_server.open_db(str(git_repo_with_deps / "memory.graph"))
+            mcp_server._ingest_progress = {
+                "status": "idle", "processed": 0, "total": 0,
+                "current_commit": "", "error": None,
+            }
+            mcp_server._shutdown_requested.clear()
+
+            transacted: list = []
+
+            def capture(db, triples, ts_iso, reason=""):
+                transacted.append(list(triples))
+                return real_ingest_transact(db, triples, ts_iso, reason)
+
+            monkeypatch.setattr(mcp_server, "_ingest_transact", capture)
+            await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
+            assert mcp_server._ingest_progress["status"] == "complete"
+            assert mcp_server._ingest_progress["processed"] == 1
+            return transacted
+
+        sequential_triples = await run_and_capture(1)
+        concurrent_triples = await run_and_capture(4)
 
         mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
         mod_b_ident = mcp_server._code_ident("module", "mod_b.py")
-        all_triples = [t for batch in transacted for t in batch]
+        all_triples = [t for batch in sequential_triples for t in batch]
         assert any(mod_a_ident in t for t in all_triples)
         assert any(mod_b_ident in t for t in all_triples)
-        assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 1
+
+        # The core equivalence guarantee: identical triples, identical
+        # per-commit batching, identical order — regardless of how many
+        # worker threads did the extraction.
+        assert concurrent_triples == sequential_triples
 
     @pytest.mark.asyncio
     async def test_worker_count_env_var_is_respected(self, mock_minigraf_db, git_repo, monkeypatch):
