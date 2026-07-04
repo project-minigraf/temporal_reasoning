@@ -3706,13 +3706,29 @@ class TestExtractImportName:
         assert "os" in result
         assert "github.com/user/pkg" in result
 
+    def test_python_import_from_preserves_full_dotted_name(self):
+        import mcp_server
+        source = b"from pathlib import Path\n"
+        result = mcp_server._extract_from_source(
+            source, TestExtractFromSource()._python_parser(), "foo.py"
+        )
+        assert "pathlib" in result["imports"]
+
+    def test_python_dotted_import_preserves_full_name(self):
+        import mcp_server
+        source = b"import os.path\n"
+        result = mcp_server._extract_from_source(
+            source, TestExtractFromSource()._python_parser(), "foo.py"
+        )
+        assert "os.path" in result["imports"]
+
     def test_java_import(self, tmp_path):
         pytest.importorskip("tree_sitter_java")
         import mcp_server
         source = b'import java.util.List;'
         node = _parse_import_node("java", source, "import_declaration", tmp_path)
         result = mcp_server._extract_import_name(node, "java")
-        assert result == ["java"]
+        assert result == ["java.util.List"]
 
     def test_c_system_include(self, tmp_path):
         pytest.importorskip("tree_sitter_c")
@@ -3752,7 +3768,7 @@ class TestExtractImportName:
         source = b'using System.Collections.Generic;'
         node = _parse_import_node("c_sharp", source, "using_directive", tmp_path)
         result = mcp_server._extract_import_name(node, "c_sharp")
-        assert result == ["System"]
+        assert result == ["System.Collections.Generic"]
 
     def test_ruby_require(self, tmp_path):
         pytest.importorskip("tree_sitter_ruby")
@@ -3800,7 +3816,7 @@ class TestExtractImportName:
         source = b'import kotlin.collections.List'
         node = _parse_import_node("kotlin", source, "import", tmp_path)
         result = mcp_server._extract_import_name(node, "kotlin")
-        assert result == ["kotlin"]
+        assert result == ["kotlin.collections.List"]
 
     def test_swift_import(self, tmp_path):
         pytest.importorskip("tree_sitter_swift")
@@ -3810,13 +3826,21 @@ class TestExtractImportName:
         result = mcp_server._extract_import_name(node, "swift")
         assert result == ["Foundation"]
 
+    def test_swift_submodule_import_preserves_full_name(self, tmp_path):
+        pytest.importorskip("tree_sitter_swift")
+        import mcp_server
+        source = b'import Foundation.NSString'
+        node = _parse_import_node("swift", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "swift")
+        assert result == ["Foundation.NSString"]
+
     def test_scala_import(self, tmp_path):
         pytest.importorskip("tree_sitter_scala")
         import mcp_server
         source = b'import scala.collection.mutable'
         node = _parse_import_node("scala", source, "import_declaration", tmp_path)
         result = mcp_server._extract_import_name(node, "scala")
-        assert result == ["scala"]
+        assert result == ["scala.collection.mutable"]
 
     def test_haskell_import(self, tmp_path):
         pytest.importorskip("tree_sitter_haskell")
@@ -3824,7 +3848,7 @@ class TestExtractImportName:
         source = b'import Data.List'
         node = _parse_import_node("haskell", source, "import", tmp_path)
         result = mcp_server._extract_import_name(node, "haskell")
-        assert result == ["Data"]
+        assert result == ["Data.List"]
 
     def test_lua_require(self, tmp_path):
         pytest.importorskip("tree_sitter_lua")
@@ -3848,7 +3872,7 @@ class TestExtractImportName:
         source = b'alias MyApp.Router'
         node = _parse_import_node("elixir", source, "call", tmp_path)
         result = mcp_server._extract_import_name(node, "elixir")
-        assert result == ["MyApp"]
+        assert result == ["MyApp.Router"]
 
     def test_elixir_import(self, tmp_path):
         pytest.importorskip("tree_sitter_elixir")
@@ -3856,7 +3880,7 @@ class TestExtractImportName:
         source = b'import Ecto.Query'
         node = _parse_import_node("elixir", source, "call", tmp_path)
         result = mcp_server._extract_import_name(node, "elixir")
-        assert result == ["Ecto"]
+        assert result == ["Ecto.Query"]
 
     def test_elixir_non_module_call_ignored(self, tmp_path):
         pytest.importorskip("tree_sitter_elixir")

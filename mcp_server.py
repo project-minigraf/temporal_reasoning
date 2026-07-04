@@ -391,21 +391,19 @@ def _c_include_name(node) -> Optional[str]:
 
 
 def _csharp_using_name(node) -> Optional[str]:
-    """Return the root namespace from a C# using_directive node.
+    """Return the full dotted namespace from a C# using_directive node.
 
     using System;                     → "System"
-    using System.Collections.Generic; → "System"
-    """
-    def _first_ident(n) -> Optional[str]:
-        if n.type == "identifier":
-            return n.text.decode("utf-8")
-        for c in n.named_children:
-            result = _first_ident(c)
-            if result:
-                return result
-        return None
+    using System.Collections.Generic; → "System.Collections.Generic"
 
-    return _first_ident(node)
+    The dotted path is one named child (qualified_name for multi-segment
+    paths, identifier for single-segment ones) whose own .text is already
+    the full joined name.
+    """
+    for child in node.named_children:
+        if child.type in ("qualified_name", "identifier"):
+            return child.text.decode("utf-8")
+    return None
 
 
 def _ruby_require_name(node) -> Optional[str]:
@@ -475,9 +473,9 @@ def _lua_require_name(node) -> Optional[str]:
 def _elixir_module_name(node) -> Optional[str]:
     """Return the root module name from an Elixir alias/import/use/require call.
 
-    alias MyApp.Router     → "MyApp"
-    import Ecto.Query      → "Ecto"
-    use Phoenix.Controller → "Phoenix"
+    alias MyApp.Router     → "MyApp.Router"
+    import Ecto.Query      → "Ecto.Query"
+    use Phoenix.Controller → "Phoenix.Controller"
     require Logger         → "Logger"
     Returns None for non-module calls (e.g. IO.puts/1 where target is a dot node).
     """
@@ -495,8 +493,7 @@ def _elixir_module_name(node) -> Optional[str]:
         if child.type == "arguments":
             for arg in child.children:
                 if arg.type == "alias":
-                    txt = arg.text.decode("utf-8")
-                    return txt.split(".")[0]
+                    return arg.text.decode("utf-8")
     return None
 
 
@@ -507,16 +504,19 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         if node.type == "import_from_statement":
             m = node.child_by_field_name("module_name")
             if m:
-                names.append(m.text.decode("utf-8").split(".")[0])
+                # m.text is the raw specifier as written, including relative
+                # forms: "pathlib", ".sub", "..pkg" — see _resolve_module_import
+                # for how leading dots get resolved against the importing file.
+                names.append(m.text.decode("utf-8"))
         else:
-            # import_statement: collect all top-level module names
+            # import_statement: collect all full dotted module names
             for child in node.named_children:
                 if child.type == "aliased_import":
                     n = child.child_by_field_name("name")
                     if n:
-                        names.append(n.text.decode("utf-8").split(".")[0])
+                        names.append(n.text.decode("utf-8"))
                 elif child.type == "dotted_name":
-                    names.append(child.text.decode("utf-8").split(".")[0])
+                    names.append(child.text.decode("utf-8"))
     elif lang_name in ("javascript", "typescript", "tsx"):
         src = node.child_by_field_name("source")
         if src:
@@ -539,18 +539,13 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
                     if spec.type == "import_spec":
                         _go_spec(spec)
     elif lang_name == "java":
-        def _java_leftmost(n) -> Optional[str]:
-            if n.type == "identifier":
-                return n.text.decode("utf-8")
-            for c in n.named_children:
-                result = _java_leftmost(c)
-                if result:
-                    return result
-            return None
-
-        result = _java_leftmost(node)
-        if result:
-            names.append(result)
+        # import_declaration's dotted path is one named child, already the
+        # full text (e.g. "java.util.List") — scoped_identifier for
+        # multi-segment paths, plain identifier for single-segment ones.
+        for child in node.named_children:
+            if child.type in ("scoped_identifier", "identifier"):
+                names.append(child.text.decode("utf-8"))
+                break
     elif lang_name in ("c", "cpp"):
         name = _c_include_name(node)
         if name:
@@ -570,33 +565,36 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
                 names.append(os.path.splitext(val)[0])
                 break
     elif lang_name == "kotlin":
-        def _kotlin_first_seg(n) -> Optional[str]:
-            if n.type in ("simple_identifier", "identifier"):
-                return n.text.decode("utf-8")
-            for c in n.named_children:
-                result = _kotlin_first_seg(c)
-                if result:
-                    return result
-            return None
-
-        result = _kotlin_first_seg(node)
-        if result:
-            names.append(result)
+        # import node's dotted path is one named child (qualified_identifier
+        # for multi-segment, identifier for single-segment) whose .text is
+        # already the full joined name.
+        for child in node.named_children:
+            if child.type in ("qualified_identifier", "identifier"):
+                names.append(child.text.decode("utf-8"))
+                break
     elif lang_name == "swift":
+        # import_declaration's single "identifier" named child already
+        # holds the full dotted text (e.g. "Foundation.NSString") directly —
+        # no recursion needed.
         for child in node.named_children:
             if child.type in ("identifier", "simple_identifier"):
                 names.append(child.text.decode("utf-8"))
                 break
     elif lang_name == "scala":
+        # import_declaration's path is flattened into individual "identifier"
+        # named children (no wrapping scoped node), so join the leading run
+        # of identifiers rather than taking the first one's text alone.
+        segments = []
         for child in node.named_children:
-            txt = child.text.decode("utf-8")
-            names.append(txt.split(".")[0])
-            break
+            if child.type != "identifier":
+                break
+            segments.append(child.text.decode("utf-8"))
+        if segments:
+            names.append(".".join(segments))
     elif lang_name == "haskell":
         for child in node.named_children:
             if child.type in ("module", "qualified_module", "constructor"):
-                txt = child.text.decode("utf-8")
-                names.append(txt.split(".")[0])
+                names.append(child.text.decode("utf-8"))
                 break
     elif lang_name == "lua":
         name = _lua_require_name(node)
