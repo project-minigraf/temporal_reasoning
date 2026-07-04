@@ -1559,6 +1559,19 @@ class TestExtractFromSourceCFamily:
         assert result["functions"] == ["square"]
 
 
+class TestTsxParserLoading:
+    """Regression test for the .tsx module-name bug: _build_parser assumed
+    the importable module is always tree_sitter_{lang_name}, but tsx's grammar
+    ships inside the tree_sitter_typescript package under language_tsx()."""
+
+    def test_tsx_parser_builds_successfully(self):
+        pytest.importorskip("tree_sitter_typescript")
+        import mcp_server
+        mcp_server._grammar_cache.clear()
+        parser = mcp_server._get_parser("component.tsx")
+        assert parser is not None
+
+
 class TestMinigrafIngestStatus:
     def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db

@@ -95,6 +95,15 @@ _EXT_TO_LANG: Dict[str, str] = {
     ".cc": "cpp", ".cxx": "cpp",
 }
 
+# Maps lang_name to the actual importable module, for the (currently only)
+# case where a single package ships multiple grammar variants. tsx and
+# typescript are both exposed by the tree_sitter_typescript package via
+# separate language_tsx()/language_typescript() functions — there is no
+# separate tree_sitter_tsx module, unlike every other language here.
+_LANG_MODULE_OVERRIDES: Dict[str, str] = {
+    "tsx": "tree_sitter_typescript",
+}
+
 _grammar_cache: Dict[str, Any] = {}  # lang_name → Parser or None
 
 _grammar_cache_lock = threading.Lock()
@@ -113,9 +122,11 @@ def _build_parser(lang_name: str) -> Any:
     swallowed, consistent with how any other producer-task exception is
     handled.
     """
-    mod = __import__(f"tree_sitter_{lang_name}", fromlist=["language"])
+    module_name = _LANG_MODULE_OVERRIDES.get(lang_name, f"tree_sitter_{lang_name}")
+    mod = __import__(module_name, fromlist=["language"])
     from tree_sitter import Language, Parser  # type: ignore
-    # PHP exposes language_php() instead of language()
+    # PHP exposes language_php() instead of language(); tsx exposes
+    # language_tsx() from within the tree_sitter_typescript module.
     lang_fn = getattr(mod, f"language_{lang_name}", None) or mod.language
     lang_obj = Language(lang_fn())
     return Parser(lang_obj)
