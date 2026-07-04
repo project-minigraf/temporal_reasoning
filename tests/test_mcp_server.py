@@ -3704,7 +3704,7 @@ class TestExtractImportName:
         node = _parse_import_node("go", source, "import_declaration", tmp_path)
         result = mcp_server._extract_import_name(node, "go")
         assert "os" in result
-        assert "pkg" in result
+        assert "github.com/user/pkg" in result
 
     def test_java_import(self, tmp_path):
         pytest.importorskip("tree_sitter_java")
@@ -3768,7 +3768,7 @@ class TestExtractImportName:
         source = b"require_relative 'my_module'"
         node = _parse_import_node("ruby", source, "call", tmp_path)
         result = mcp_server._extract_import_name(node, "ruby")
-        assert result == ["my_module"]
+        assert result == ["./my_module"]
 
     def test_ruby_non_require_call_ignored(self, tmp_path):
         pytest.importorskip("tree_sitter_ruby")
@@ -3870,3 +3870,52 @@ class TestExtractImportName:
             return  # no call node found — that's fine
         result = mcp_server._extract_import_name(node, "elixir")
         assert result == []
+
+    def test_c_local_include_preserves_subdirectory(self, tmp_path):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b'#include "unicode/uloc.h"'
+        node = _parse_import_node("c", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "c")
+        assert result == ["unicode/uloc"]
+
+    def test_c_angle_include_preserves_subdirectory(self, tmp_path):
+        pytest.importorskip("tree_sitter_c")
+        import mcp_server
+        source = b'#include <sys/socket.h>'
+        node = _parse_import_node("c", source, "preproc_include", tmp_path)
+        result = mcp_server._extract_import_name(node, "c")
+        assert result == ["sys/socket"]
+
+    def test_ruby_require_preserves_subdirectory(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"require 'active_support/core_ext/string'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == ["active_support/core_ext/string"]
+
+    def test_ruby_require_relative_gets_dot_slash_marker(self, tmp_path):
+        pytest.importorskip("tree_sitter_ruby")
+        import mcp_server
+        source = b"require_relative 'my_module'"
+        node = _parse_import_node("ruby", source, "call", tmp_path)
+        result = mcp_server._extract_import_name(node, "ruby")
+        assert result == ["./my_module"]
+
+    def test_php_require_preserves_subdirectory(self, tmp_path):
+        pytest.importorskip("tree_sitter_php")
+        import mcp_server
+        source = b"<?php\nrequire 'app/config/database.php';"
+        node = _parse_import_node("php", source, "require_expression", tmp_path)
+        result = mcp_server._extract_import_name(node, "php")
+        assert result == ["app/config/database"]
+
+    def test_go_grouped_import_preserves_full_path(self, tmp_path):
+        pytest.importorskip("tree_sitter_go")
+        import mcp_server
+        source = b'package main\nimport (\n\t"os"\n\t"github.com/user/pkg"\n)'
+        node = _parse_import_node("go", source, "import_declaration", tmp_path)
+        result = mcp_server._extract_import_name(node, "go")
+        assert "os" in result
+        assert "github.com/user/pkg" in result

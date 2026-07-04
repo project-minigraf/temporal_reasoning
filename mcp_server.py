@@ -369,17 +369,24 @@ def _rust_use_root(node) -> Optional[str]:
 
 
 def _c_include_name(node) -> Optional[str]:
-    """Return the header name (no path, no extension) from a C/C++ preproc_include node.
+    """Return the include target (path preserved, extension stripped) from a
+    C/C++ preproc_include node.
 
     Handles both:
-      #include <stdio.h>    → system_lib_string → "stdio"
-      #include "myheader.h" → string_literal    → "myheader"
+      #include <stdio.h>          → system_lib_string → "stdio"
+      #include <unicode/uloc.h>   → system_lib_string → "unicode/uloc"
+      #include "sub/myheader.h"   → string_literal    → "sub/myheader"
+
+    Path structure is preserved (not reduced to a bare basename) so
+    _resolve_module_import can match vendored in-tree headers precisely —
+    both angle-bracket and quoted forms commonly carry a real subdirectory
+    (<sys/socket.h>, <unicode/uloc.h>, "app/config.h"), not just stdlib-style
+    bare names like <vector>.
     """
-    import os
     for child in node.children:
         if child.type in ("system_lib_string", "string_literal"):
             raw = child.text.decode("utf-8").strip("<>\"'")
-            return os.path.splitext(os.path.basename(raw))[0]
+            return os.path.splitext(raw)[0]
     return None
 
 
@@ -402,17 +409,22 @@ def _csharp_using_name(node) -> Optional[str]:
 
 
 def _ruby_require_name(node) -> Optional[str]:
-    """Return the required module name from a Ruby call node.
+    """Return the required path from a Ruby call node (path preserved,
+    extension stripped). A require_relative target is prefixed with "./" so
+    it reuses the same relative-import detection _resolve_module_import
+    already needs for JS/TS-style "./foo" specifiers, rather than plumbing a
+    separate is-relative flag through the whole imports pipeline.
 
     Handles:
-      require 'rails'            → "rails"
-      require_relative 'my_mod' → "my_mod"
+      require 'rails'                            → "rails"
+      require 'active_support/core_ext/string'    → "active_support/core_ext/string"
+      require_relative 'my_mod'                   → "./my_mod"
     Returns None for non-require calls.
     """
-    import os
     method = node.child_by_field_name("method")
     if method is None or method.text.decode("utf-8") not in ("require", "require_relative"):
         return None
+    is_relative = method.text.decode("utf-8") == "require_relative"
     args = node.child_by_field_name("arguments")
     if args is None:
         return None
@@ -426,7 +438,8 @@ def _ruby_require_name(node) -> Optional[str]:
                 val = content_node.text.decode("utf-8")
             else:
                 val = child.text.decode("utf-8").strip("'\"")
-            return os.path.splitext(os.path.basename(val))[0]
+            path = os.path.splitext(val)[0]
+            return f"./{path}" if is_relative else path
     return None
 
 
@@ -516,8 +529,7 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         def _go_spec(spec_node):
             path = spec_node.child_by_field_name("path")
             if path:
-                val = path.text.decode("utf-8").strip('"')
-                names.append(val.split("/")[-1])
+                names.append(path.text.decode("utf-8").strip('"'))
 
         for child in node.named_children:
             if child.type == "import_spec":
@@ -552,11 +564,10 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
         if name:
             names.append(name)
     elif lang_name == "php":
-        import os
         for child in node.children:
             if child.type in ("string", "encapsed_string", "string_literal"):
                 val = child.text.decode("utf-8").strip("'\"")
-                names.append(os.path.splitext(os.path.basename(val))[0])
+                names.append(os.path.splitext(val)[0])
                 break
     elif lang_name == "kotlin":
         def _kotlin_first_seg(n) -> Optional[str]:
