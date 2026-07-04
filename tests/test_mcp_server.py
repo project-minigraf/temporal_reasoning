@@ -1571,6 +1571,23 @@ class TestTsxParserLoading:
         parser = mcp_server._get_parser("component.tsx")
         assert parser is not None
 
+    def test_tsx_extracts_functions_classes_imports(self):
+        pytest.importorskip("tree_sitter_typescript")
+        import mcp_server
+        mcp_server._grammar_cache.clear()
+        source = (
+            b"import React from 'react';\n"
+            b"class Widget extends React.Component {\n"
+            b"  render() { return null; }\n"
+            b"}\n"
+            b"function useThing() { return 1; }\n"
+        )
+        parser = mcp_server._get_parser("component.tsx")
+        result = mcp_server._extract_from_source(source, parser, "component.tsx")
+        assert "Widget" in result["classes"]
+        assert "useThing" in result["functions"] or "render" in result["functions"]
+        assert "react" in result["imports"]
+
 
 class TestMinigrafIngestStatus:
     def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):

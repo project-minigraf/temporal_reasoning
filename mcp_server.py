@@ -503,7 +503,7 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
                         names.append(n.text.decode("utf-8").split(".")[0])
                 elif child.type == "dotted_name":
                     names.append(child.text.decode("utf-8").split(".")[0])
-    elif lang_name in ("javascript", "typescript"):
+    elif lang_name in ("javascript", "typescript", "tsx"):
         src = node.child_by_field_name("source")
         if src:
             names.append(src.text.decode("utf-8").strip("'\""))
@@ -626,8 +626,14 @@ def _c_family_function_name(node) -> Optional[str]:
 
 
 def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
-    """Recursively extract code entities from a tree-sitter AST node."""
-    node_types = _LANG_NODE_TYPES.get(lang_name)
+    """Recursively extract code entities from a tree-sitter AST node.
+
+    tsx is treated as an alias of typescript here (and in _extract_import_name)
+    rather than duplicating every _LANG_NODE_TYPES entry — the TSX grammar is
+    a strict superset of TypeScript's node types for the constructs this
+    module cares about (functions, classes, imports, calls).
+    """
+    node_types = _LANG_NODE_TYPES.get("typescript" if lang_name == "tsx" else lang_name)
     if node_types is None:
         return
 
