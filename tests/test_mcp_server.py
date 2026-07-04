@@ -2194,14 +2194,17 @@ class TestIngestionWrites:
             cls_ident: "2025-01-01T00:00:00Z",
         }
         commit_ident = ":commit/deadbeef12345678"
+        extracted = {"functions": ["login"], "classes": ["User"], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
         triples = mcp_server._build_code_triples(
             "auth.py",
-            {"functions": ["login"], "classes": ["User"], "imports": []},
+            extracted,
             "2025-02-01T00:00:00Z",
             entity_valid_from,
             {},
             {},
             commit_ident,
+            precomputed,
         )
         assert any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
         assert any(f"[{cls_ident} :modified-in {commit_ident}]" in t for t in triples)
@@ -2211,14 +2214,17 @@ class TestIngestionWrites:
         module_ident = mcp_server._code_ident("module", "auth.py")
         entity_valid_from = {module_ident: "2025-01-01T00:00:00Z"}
         commit_ident = ":commit/deadbeef12345678"
+        extracted = {"functions": ["new_func"], "classes": [], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
         triples = mcp_server._build_code_triples(
             "auth.py",
-            {"functions": ["new_func"], "classes": [], "imports": []},
+            extracted,
             "2025-02-01T00:00:00Z",
             entity_valid_from,
             {},
             {},
             commit_ident,
+            precomputed,
         )
         fn_ident = mcp_server._code_ident("function", "auth.py", "new_func")
         assert not any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
@@ -2229,14 +2235,18 @@ class TestIngestionWrites:
         entity_valid_from: dict = {}
         entity_descriptions: dict = {}
         file_entities: dict = {}
+        commit_ident = ":commit/abc123456789"
+        extracted = {"functions": ["login"], "classes": ["User"], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
         mcp_server._build_code_triples(
             "auth.py",
-            {"functions": ["login"], "classes": ["User"], "imports": []},
+            extracted,
             "2025-01-01T00:00:00Z",
             entity_valid_from,
             entity_descriptions,
             file_entities,
-            ":commit/abc123456789",
+            commit_ident,
+            precomputed,
         )
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
         cls_ident = mcp_server._code_ident("class", "auth.py", "User")

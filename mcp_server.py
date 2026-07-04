@@ -2562,6 +2562,7 @@ def _build_code_triples(
     entity_descriptions: Dict[str, str],
     file_entities: Dict[str, List[str]],
     commit_ident: str,
+    precomputed: Dict[str, Any],
 ) -> List[str]:
     """Return Datalog triple strings for a file's extracted code entities.
 
@@ -2571,46 +2572,37 @@ def _build_code_triples(
     bi-temporal fact explosion from N re-assertions of the same attribute
     joining into N² result rows.
 
+    precomputed comes from _precompute_file_triples (see mcp_server.py),
+    computed ahead of time in the extraction worker pool — the candidate
+    triple strings for a would-be-new entity are a pure function of the
+    file's own extracted structure and ident, independent of whether
+    entity_valid_from turns out to already know about it. This function's
+    only remaining job is the diff against entity_valid_from itself, which
+    genuinely needs the serially-maintained state.
+
     :depends-on edges are written in the commit loop by _run_ingestion as the
     file's imports change, giving them proper bi-temporal bounds.
     """
     triples: List[str] = []
-    module_ident = _code_ident("module", file_path)
+    module_ident = precomputed["module_ident"]
 
     is_new_module = module_ident not in entity_valid_from
     # Track all idents for this file (for deletion cleanup)
     idents_for_file = file_entities.setdefault(file_path, [])
 
     if is_new_module:
-        # Write all stable attributes once, at introduction time
-        triples += [
-            f"[{module_ident} :entity-type :type/module]",
-            f'[{module_ident} :ident "{module_ident}"]',
-            f'[{module_ident} :description "{_edn_escape(file_path)}"]',
-            f'[{module_ident} :path "{_edn_escape(file_path)}"]',
-            f"[{module_ident} :introduced-by {commit_ident}]",
-        ]
+        triples += precomputed["module_candidate_triples"]
         if module_ident not in idents_for_file:
             idents_for_file.append(module_ident)
         entity_valid_from[module_ident] = commit_ts_iso
         entity_descriptions[module_ident] = file_path
-
     else:
         # Existing module: only record that this commit modified it
         triples.append(f"[{module_ident} :modified-in {commit_ident}]")
 
-    for fn_name in extracted["functions"]:
-        fn_ident = _code_ident("function", file_path, fn_name)
+    for fn_ident, fn_name, candidate_triples in precomputed["function_entries"]:
         if fn_ident not in entity_valid_from:
-            # New function: write all stable attributes once
-            triples += [
-                f"[{fn_ident} :entity-type :type/function]",
-                f'[{fn_ident} :ident "{fn_ident}"]',
-                f'[{fn_ident} :description "{_edn_escape(fn_name)}"]',
-                f'[{fn_ident} :file "{_edn_escape(file_path)}"]',
-                f"[{module_ident} :contains {fn_ident}]",
-                f"[{fn_ident} :introduced-by {commit_ident}]",
-            ]
+            triples += candidate_triples
             if fn_ident not in idents_for_file:
                 idents_for_file.append(fn_ident)
             entity_valid_from[fn_ident] = commit_ts_iso
@@ -2619,18 +2611,9 @@ def _build_code_triples(
             # Pre-existing function: record that this commit modified it
             triples.append(f"[{fn_ident} :modified-in {commit_ident}]")
 
-    for cls_name in extracted["classes"]:
-        cls_ident = _code_ident("class", file_path, cls_name)
+    for cls_ident, cls_name, candidate_triples in precomputed["class_entries"]:
         if cls_ident not in entity_valid_from:
-            # New class: write all stable attributes once
-            triples += [
-                f"[{cls_ident} :entity-type :type/class]",
-                f'[{cls_ident} :ident "{cls_ident}"]',
-                f'[{cls_ident} :description "{_edn_escape(cls_name)}"]',
-                f'[{cls_ident} :file "{_edn_escape(file_path)}"]',
-                f"[{module_ident} :contains {cls_ident}]",
-                f"[{cls_ident} :introduced-by {commit_ident}]",
-            ]
+            triples += candidate_triples
             if cls_ident not in idents_for_file:
                 idents_for_file.append(cls_ident)
             entity_valid_from[cls_ident] = commit_ts_iso
