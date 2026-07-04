@@ -1397,6 +1397,29 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
     return result.stdout
 
 
+def _known_files_at_commit(repo_path: str, commit_hash: str) -> Dict[str, List[str]]:
+    """Return {file_path: []} for every file tracked at commit_hash whose extension
+    has a supported tree-sitter grammar (_EXT_TO_LANG).
+
+    A pure function of commit_hash via `git ls-tree -r --name-only`, independent of
+    ingestion progress — unlike the incrementally-mutated file_entities dict, this
+    reflects the repo's actual state at that specific historical commit, so it can
+    run inside _extract_commit on the worker pool instead of waiting for the serial
+    main thread to catch up. Shaped like file_entities (dict keyed on path, values
+    unused) so it can be passed straight into _resolve_module_import, which only
+    ever reads the dict's keys.
+    """
+    result = _subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", commit_hash],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    known: Dict[str, List[str]] = {}
+    for path in result.stdout.strip().splitlines():
+        if Path(path).suffix.lower() in _EXT_TO_LANG:
+            known[path] = []
+    return known
+
+
 def _parse_gitmodules(content: bytes) -> Dict[str, Dict[str, str]]:
     """Parse .gitmodules content into {path: {"name": ..., "url": ...}}.
 

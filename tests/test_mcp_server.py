@@ -1854,6 +1854,48 @@ class TestGitDiffTreeRaw:
         assert path == "vendor/lib"
 
 
+class TestKnownFilesAtCommit:
+    def test_returns_files_present_at_that_commit(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        first_commit_hash = commits[0][0]
+        known = mcp_server._known_files_at_commit(str(git_repo), first_commit_hash)
+        assert "auth.py" in known
+        # models.py isn't added until the second commit
+        assert "models.py" not in known
+
+    def test_second_commit_sees_both_files(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        second_commit_hash = commits[1][0]
+        known = mcp_server._known_files_at_commit(str(git_repo), second_commit_hash)
+        assert "auth.py" in known
+        assert "models.py" in known
+
+    def test_filters_out_unsupported_extensions(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "main.py").write_text("def f(): pass\n")
+        (repo / "README.md").write_text("hello\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        known = mcp_server._known_files_at_commit(str(repo), commits[0][0])
+        assert "main.py" in known
+        assert "README.md" not in known
+
+    def test_returned_dict_shape_matches_file_entities(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        known = mcp_server._known_files_at_commit(str(git_repo), commits[0][0])
+        assert known["auth.py"] == []
+
+
 class TestGitlinkChanges:
     def test_non_gitlink_rows_are_ignored(self):
         import mcp_server
