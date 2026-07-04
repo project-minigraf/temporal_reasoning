@@ -3445,9 +3445,10 @@ class TestRunIngestionBitemporalDeps:
         await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
 
         mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
-        # _resolve_module_import is Rust-focused; for Python `import mod_b` it falls back
-        # to _canonical_ident("module", "mod_b") since mod_b.py != mod_b.rs
-        mod_b_resolved = mcp_server._canonical_ident("module", "mod_b")
+        # mod_b.py genuinely exists in file_entities, so the generalized
+        # tiered matcher (Task 12) now resolves "mod_b" to the real internal
+        # module via the basename tier, instead of the old Rust-only fallback.
+        mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
         dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
         assert any(dep_triple in t for t in transact_calls), (
             f"Expected _ingest_transact to be called with '{dep_triple}' during commit loop, "
@@ -3475,7 +3476,7 @@ class TestRunIngestionBitemporalDeps:
         await mcp_server._run_ingestion(str(git_repo_with_dep_removal), "HEAD")
 
         mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
-        mod_b_resolved = mcp_server._canonical_ident("module", "mod_b")
+        mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
         dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
         assert any(dep_triple in t for t in close_triples_seen), (
             f"Expected _ingest_close to be called with '{dep_triple}' when import removed, "
