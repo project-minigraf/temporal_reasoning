@@ -1154,6 +1154,33 @@ def _git_commits(
     return commits
 
 
+def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
+    """Return (status_char, old_mode, new_mode, old_sha, new_sha, path) for
+    every changed path in a commit, via a single `git diff-tree --raw` call.
+
+    Supersedes running diff-tree a second time just to detect gitlinks:
+    --raw already carries file mode (needed to spot submodule paths, mode
+    160000) in the same subprocess invocation _extract_commit already makes.
+    """
+    result = _subprocess.run(
+        ["git", "diff-tree", "--no-commit-id", "-r", "--raw", "--root", commit_hash],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    entries = []
+    for line in result.stdout.strip().splitlines():
+        if not line.startswith(":"):
+            continue
+        meta, sep, path = line.partition("\t")
+        if not sep:
+            continue
+        fields = meta[1:].split(" ")
+        if len(fields) < 5:
+            continue
+        old_mode, new_mode, old_sha, new_sha, status = fields[0], fields[1], fields[2], fields[3], fields[4]
+        entries.append((status[0], old_mode, new_mode, old_sha, new_sha, path))
+    return entries
+
+
 def _git_changed_files(repo_path: str, commit_hash: str) -> List[tuple]:
     """Return list of (status_char, path) for files changed in this commit."""
     result = _subprocess.run(

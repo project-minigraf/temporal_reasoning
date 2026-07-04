@@ -1780,6 +1780,50 @@ class TestGitHelpers:
         assert b"def login" in content
 
 
+class TestGitDiffTreeRaw:
+    def test_regular_file_add(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(git_repo), commits[0][0])
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path = entries[0]
+        assert status == "A"
+        assert old_mode == "000000"
+        assert new_mode == "100644"
+        assert path == "auth.py"
+
+    def test_gitlink_add_reports_mode_160000(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        _subprocess.run(["git", "init"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--allow-empty", "-m", "e"], cwd=sub, check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=sub, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},vendor/lib"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(repo), commits[0][0])
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path = entries[0]
+        assert status == "A"
+        assert new_mode == "160000"
+        assert new_sha == sub_hash
+        assert path == "vendor/lib"
+
+
 class TestExtractCommit:
     def test_added_file_returns_extracted_dict(self, git_repo):
         import mcp_server
