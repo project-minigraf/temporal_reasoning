@@ -1918,20 +1918,22 @@ class TestExtractCommit:
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         first_hash = commits[0][0]
 
-        results = mcp_server._extract_commit(str(git_repo), first_hash)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
 
         assert len(results) == 1
         status, file_path, extracted = results[0]
         assert status == "A"
         assert file_path == "auth.py"
         assert "login" in extracted["functions"]
+        assert gitlink_changes == []
+        assert gitmodules_map == {}
 
     def test_deleted_file_has_none_extracted(self, git_repo_with_deletion):
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo_with_deletion), watermark_hash=None)
         delete_hash = commits[-1][0]
 
-        results = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
 
         d_entries = [r for r in results if r[0] == "D"]
         assert len(d_entries) == 1
@@ -1940,25 +1942,62 @@ class TestExtractCommit:
     def test_unsupported_extension_is_omitted(self, git_repo, monkeypatch):
         import mcp_server
         monkeypatch.setattr(
-            mcp_server, "_git_changed_files",
-            lambda repo, commit: [("A", "notes.txt")],
+            mcp_server, "_git_diff_tree_raw",
+            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "notes.txt")],
         )
-        results = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), "deadbeef")
         assert results == []
 
     def test_content_fetch_failure_is_omitted_not_raised(self, git_repo, monkeypatch):
         import mcp_server
         monkeypatch.setattr(
-            mcp_server, "_git_changed_files",
-            lambda repo, commit: [("A", "auth.py")],
+            mcp_server, "_git_diff_tree_raw",
+            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py")],
         )
 
         def boom(repo, commit, path):
             raise mcp_server.MiniGrafError("simulated git-show failure")
 
         monkeypatch.setattr(mcp_server, "_git_file_content", boom)
-        results = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), "deadbeef")
         assert results == []
+
+    def test_gitlink_add_is_reported_separately_from_file_results(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        _subprocess.run(["git", "init"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--allow-empty", "-m", "e"], cwd=sub, check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=sub, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        (repo / ".gitmodules").write_text(
+            '[submodule "lib"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n'
+        )
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},vendor/lib"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "add", ".gitmodules"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(repo), commits[0][0])
+
+        # Neither the gitlink path (vendor/lib) nor .gitmodules itself has a
+        # resolvable extension (_EXT_TO_LANG has no entry for either), so
+        # file_results is empty for this commit — the submodule info is
+        # carried entirely by gitlink_changes/gitmodules_map instead.
+        assert results == []
+        assert gitlink_changes == [("add", sub_hash, "vendor/lib")]
+        assert gitmodules_map == {"vendor/lib": {"name": "lib", "url": "https://example.com/lib.git"}}
 
 
 class TestIngestionWrites:
@@ -2178,7 +2217,7 @@ class TestIngestionWrites:
             mcp_server, "_git_commits",
             lambda repo, watermark, branch: [("abc123", "2025-01-01T00:00:00Z", "author", "msg")]
         )
-        monkeypatch.setattr(mcp_server, "_git_changed_files", lambda repo, commit: [])
+        monkeypatch.setattr(mcp_server, "_git_diff_tree_raw", lambda repo, commit: [])
         monkeypatch.setattr(mcp_server, "_watermark_update", lambda db, h, ts, r: None)
 
         last_run_calls = []

@@ -2543,17 +2543,31 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
 
 def _extract_commit(
     repo_path: str, commit_hash: str
-) -> List[Tuple[str, str, Optional[Dict[str, List[str]]]]]:
+) -> Tuple[List[Tuple[str, str, Optional[Dict[str, List[str]]]]], List[tuple], Dict[str, Dict[str, str]]]:
     """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse.
 
     Runs in a worker thread via the ThreadPoolExecutor in _run_ingestion.
-    Touches no shared mutable state and no DB. Returns one entry per changed
-    file that has a supported parser; A/M files whose content fetch fails
-    are omitted entirely, mirroring the previous inline `continue` — the
-    file is simply skipped for this commit, same as today.
+    Touches no shared mutable state and no DB. Returns (file_results,
+    gitlink_changes, gitmodules_map):
+
+      file_results: one entry per changed file that has a supported parser;
+        A/M files whose content fetch fails are omitted entirely, mirroring
+        the previous inline `continue` — same as before this pipeline existed.
+      gitlink_changes: _gitlink_changes' output — gitlink-involving rows,
+        never fed through the tree-sitter parser (gitlink paths never have
+        a resolvable extension).
+      gitmodules_map: path -> {"name", "url"}, populated only when this
+        commit has at least one gitlink "add" — avoids a wasted git-show
+        call on the (overwhelmingly common) case of a commit that touches
+        no submodules at all.
+
+    Sources both file_results and gitlink_changes from a single
+    `git diff-tree --raw` call (via _git_diff_tree_raw) rather than the
+    former --name-status call, which discarded file mode entirely.
     """
+    raw_entries = _git_diff_tree_raw(repo_path, commit_hash)
     results: List[Tuple[str, str, Optional[Dict[str, List[str]]]]] = []
-    for status, file_path in _git_changed_files(repo_path, commit_hash):
+    for status, old_mode, new_mode, old_sha, new_sha, file_path in raw_entries:
         parser = _thread_parser(file_path)
         if parser is None:
             continue
@@ -2566,7 +2580,13 @@ def _extract_commit(
             continue
         extracted = _extract_from_source(content, parser, file_path)
         results.append((status, file_path, extracted))
-    return results
+
+    gitlink_changes = _gitlink_changes(raw_entries)
+    gitmodules_map: Dict[str, Dict[str, str]] = {}
+    if any(kind == "add" for kind, _, _ in gitlink_changes):
+        gitmodules_map = _git_gitmodules_at(repo_path, commit_hash)
+
+    return results, gitlink_changes, gitmodules_map
 
 
 async def _run_ingestion(repo_path: str, branch: str) -> None:
@@ -2640,7 +2660,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     break
 
                 (commit_hash, commit_ts_iso, author, subject), fut = pending.popleft()
-                extracted_files = await fut
+                extracted_files, gitlink_changes, gitmodules_map = await fut
                 submit_next()
 
                 last_hash = commit_hash
