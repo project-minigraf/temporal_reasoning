@@ -138,6 +138,15 @@ The consumer's DB-write phase for a single commit is unchanged and stays atomic-
 
 **Explicit non-goal:** `SIGKILL` and power loss cannot be intercepted by any process. That failure mode is unchanged from today's behavior and is already partially mitigated by the existing stale-lock detection/recovery path (`_clear_stale_lock`/`_stale_lock_holder_pid`) for a DB file lock left behind by a hard kill.
 
+## Section 7: Dependency Bump
+
+Since this work touches `mcp_server.py` and will require a release regardless, bump the `minigraf` floor pin to the latest version, `1.2.1` (already the version verified against in Section 5, and already what's installed in this project's `.venv`):
+
+- `pyproject.toml`: `minigraf>=1.2.0` → `minigraf>=1.2.1`.
+- `install.py`'s `check_minigraf_package()` fallback pip-install (`minigraf>=0.22.0`) — stale and out of sync with `pyproject.toml` already before this change — bumped to match: `minigraf>=1.2.1`.
+
+`1.2.1` includes a magic-sets fix (`bf3aa98`, upstream issues #297/#298) for adornment seed encoding and guard injection in recursive rules, which is relevant here since this project's `SESSION_RULES` already registers recursive-shaped rules (`reachable`, `linked` over `:depends-on`). No code changes required beyond the two version strings — this is a pure floor bump, not a new minimum feature dependency (Section 5's temporal-metadata query already works as far back as `v1.0.0`).
+
 ## Testing
 
 - No changes needed to `TestGetParser`/`TestExtractFromSource`/etc. — they call `_get_parser`/`_extract_from_source` directly and never exercise the concurrent path.

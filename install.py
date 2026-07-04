@@ -92,7 +92,7 @@ def check_minigraf_package():
         print("✓ minigraf Python package found")
         return True
     print("✗ minigraf not found — installing via pip...")
-    if _venv_pip_install("minigraf>=0.22.0", timeout=120):
+    if _venv_pip_install("minigraf>=1.2.1", timeout=120):
         print("✓ minigraf installed")
         return True
     print("✗ pip install minigraf failed")

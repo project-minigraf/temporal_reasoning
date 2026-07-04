@@ -24,7 +24,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "minigraf>=1.2.0",
+    "minigraf>=1.2.1",
     "mcp>=1.27.0",
 ]
 
