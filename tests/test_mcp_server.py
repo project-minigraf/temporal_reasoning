@@ -3527,6 +3527,56 @@ class TestUnresolvedImportTagging:
         assert any(f'[{tokio_ident} :description "tokio"]' in t for t in transact_calls)
 
 
+class TestResolveModuleImportTieredMatcher:
+    def test_exact_file_match_java_package(self):
+        import mcp_server
+        file_entities = {"com/google/gson/Gson.java": []}
+        ident, is_resolved = mcp_server._resolve_module_import("com.google.gson.Gson", file_entities)
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "com/google/gson/Gson.java")
+
+    def test_parent_directory_match_java_wildcard_style(self):
+        import mcp_server
+        # "com.google.gson" (no trailing class name) is a package-level
+        # reference — it matches via the file's *parent directory*, not the
+        # file's own path, since there's no specific file named exactly that.
+        file_entities = {"com/google/gson/JsonElement.java": []}
+        ident, is_resolved = mcp_server._resolve_module_import("com.google.gson", file_entities)
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "com/google/gson/JsonElement.java")
+
+    def test_genuinely_external_java_package_not_resolved(self):
+        import mcp_server
+        file_entities = {"com/mycompany/App.java": []}
+        # com.fasterxml.jackson.Foo shares no path with the project's own "com" tree
+        ident, is_resolved = mcp_server._resolve_module_import("com.fasterxml.jackson.Foo", file_entities)
+        assert is_resolved is False
+
+    def test_exact_file_match_go_full_path(self):
+        import mcp_server
+        # Vendored Go deps live under a vendor/ prefix that never appears in
+        # the import string itself — this must match as a segment suffix,
+        # not exact path equality, and "github.com" must survive as one path
+        # segment rather than being split on its literal dot.
+        file_entities = {"vendor/github.com/user/pkg/pkg.go": []}
+        ident, is_resolved = mcp_server._resolve_module_import("github.com/user/pkg/pkg", file_entities)
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "vendor/github.com/user/pkg/pkg.go")
+
+    def test_basename_match_vendored_c_header(self):
+        import mcp_server
+        file_entities = {"3rdParty/icu/include/unicode/uloc.h": []}
+        ident, is_resolved = mcp_server._resolve_module_import("unicode/uloc", file_entities)
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "3rdParty/icu/include/unicode/uloc.h")
+
+    def test_genuinely_external_c_stdlib_header_not_resolved(self):
+        import mcp_server
+        file_entities = {"src/main.cpp": []}
+        ident, is_resolved = mcp_server._resolve_module_import("vector", file_entities)
+        assert is_resolved is False
+
+
 class TestRunIngestionGitlinks:
     """End-to-end tests for submodule add/bump/remove/flip via _run_ingestion."""
 
@@ -3943,3 +3993,4 @@ class TestExtractImportName:
         result = mcp_server._extract_import_name(node, "go")
         assert "os" in result
         assert "github.com/user/pkg" in result
+

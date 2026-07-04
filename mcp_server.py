@@ -1086,19 +1086,49 @@ def _canonical_ident(entity_type: str, value: str) -> str:
     return f":{entity_type}/{slug}"
 
 
+def _path_segments(path_str: str) -> List[str]:
+    """Split a path into non-empty segments, normalizing os.sep to '/'."""
+    return [seg for seg in path_str.replace(os.sep, "/").split("/") if seg]
+
+
+def _segments_end_with(full_segments: List[str], candidate_segments: List[str]) -> bool:
+    """True if full_segments' trailing slice equals candidate_segments exactly.
+
+    A whole-segment suffix comparison, not a raw string suffix — comparing
+    strings directly would let e.g. "xyzcom/google" wrongly match a
+    candidate of "com/google" (the substring is present but not as its own
+    path segment).
+    """
+    if not candidate_segments or len(candidate_segments) > len(full_segments):
+        return False
+    return full_segments[-len(candidate_segments):] == candidate_segments
+
+
 def _resolve_module_import(import_name: str, file_entities: Dict[str, List[str]]) -> Tuple[str, bool]:
     """Resolve an import name to a module ident that joins with stored module entities.
 
-    For a name like "storage", tries standard Rust source-root locations first
-    (src/storage.rs, src/storage/mod.rs) before falling back to a broader name
-    search. The ordered-priority approach prevents e.g. src/graph/storage.rs
-    from matching a top-level `use crate::storage` import.
+    Tries Rust's exact source-root conventions first (src/storage.rs,
+    src/storage/mod.rs), then a generic, language-agnostic segment-suffix
+    matcher used by every other language. This exists because every other
+    language's import extraction already reduces to a bare or dotted/slashed
+    specifier (see _extract_import_name) that would otherwise always fall
+    through to the external-dependency fallback — including for real in-tree
+    vendored code, which must stay internal per the design spec's Non-goals.
 
-    Returns (ident, is_resolved). is_resolved is True when import_name matched
-    a real file in file_entities, False when it fell through to the bare
-    _canonical_ident guess — the caller uses this to tag genuinely unresolved
-    imports as :type/external-dependency without also tagging real (if not
-    yet visited) internal modules.
+    The specifier is split into segments on "/" if present (Go, C/C++, Ruby,
+    PHP already use "/" natively — note Go paths like "github.com/user/pkg"
+    contain literal dots inside a segment that must NOT be treated as
+    separators), otherwise on "." (Java, C#, Python, Scala, Kotlin, Swift,
+    Haskell, Elixir — genuinely dot-separated). Matching a whole-segment
+    suffix (not a raw substring) against either a file's own path or its
+    parent directory uniformly covers: an exact match, a vendored path with
+    extra prefix segments, a package-only/wildcard-style import (matches via
+    the parent-directory tier), and a bare single-segment name (degenerates
+    to a basename check) — one algorithm instead of separate ad hoc tiers.
+
+    Returns (ident, is_resolved). is_resolved is True when import_name
+    matched a real file in file_entities, False when it fell through to the
+    bare _canonical_ident guess.
     """
     # Priority 1: canonical Rust module root paths under common source roots
     for src_root in ("src", "lib", ""):
@@ -1115,6 +1145,23 @@ def _resolve_module_import(import_name: str, file_entities: Dict[str, List[str]]
     for file_path in file_entities:
         p = Path(file_path)
         if p.stem == "mod" and p.parent.name == import_name:
+            return _code_ident("module", file_path), True
+
+    # Priority 3: generic segment-suffix matcher for every other language.
+    candidate_segments = import_name.split("/") if "/" in import_name else import_name.split(".")
+
+    # 3a. file match (exact, or a vendored path with extra prefix segments), extension stripped
+    for file_path in file_entities:
+        file_segments = _path_segments(str(Path(file_path).with_suffix("")))
+        if _segments_end_with(file_segments, candidate_segments):
+            return _code_ident("module", file_path), True
+
+    # 3b. parent-directory match (package-only/wildcard-style imports, e.g.
+    # a Java "import com.google.gson.*;" or a bare "com.google.gson" reference
+    # with no specific trailing class name)
+    for file_path in file_entities:
+        parent_segments = _path_segments(str(Path(file_path).parent))
+        if _segments_end_with(parent_segments, candidate_segments):
             return _code_ident("module", file_path), True
 
     return _canonical_ident("module", import_name), False
