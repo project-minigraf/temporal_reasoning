@@ -1890,6 +1890,21 @@ class TestParseGitmodules:
         import mcp_server
         assert mcp_server._parse_gitmodules(b"") == {}
 
+    def test_parses_url_containing_percent_sign(self):
+        import mcp_server
+        content = (
+            b'[submodule "weird"]\n'
+            b'\tpath = vendor/weird\n'
+            b'\turl = https://example.com/repo%2Fname.git\n'
+        )
+        result = mcp_server._parse_gitmodules(content)
+        assert result == {
+            "vendor/weird": {
+                "name": "weird",
+                "url": "https://example.com/repo%2Fname.git",
+            }
+        }
+
     def test_git_gitmodules_at_missing_file_returns_empty(self, git_repo):
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)

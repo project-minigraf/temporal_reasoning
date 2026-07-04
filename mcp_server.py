@@ -1258,7 +1258,7 @@ def _parse_gitmodules(content: bytes) -> Dict[str, Dict[str, str]]:
     conventions (see _extract_from_source's bare except).
     """
     result: Dict[str, Dict[str, str]] = {}
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(interpolation=None)
     try:
         parser.read_string(content.decode("utf-8", errors="replace"))
     except configparser.Error:
