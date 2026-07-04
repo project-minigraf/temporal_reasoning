@@ -2974,7 +2974,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     close_items: List[tuple] = []  # (triples, original_ts_iso)
                     dep_add_triples: List[str] = []  # :depends-on triples to transact individually
 
-                    for status, file_path, extracted in extracted_files:
+                    for status, file_path, extracted, precomputed in extracted_files:
                         if status == "D":
                             # Close module and all known child entities for this file
                             idents = file_entities.get(file_path, [_code_ident("module", file_path)])
@@ -2996,7 +2996,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             previous_idents = set(file_entities.get(file_path, []))
                             triples = _build_code_triples(
                                 file_path, extracted, commit_ts_iso, entity_valid_from,
-                                entity_descriptions, file_entities, commit_ident,
+                                entity_descriptions, file_entities, commit_ident, precomputed,
                             )
                             add_triples.extend(triples)
                             # Detect entities removed from a modified file.
@@ -3006,10 +3006,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             if status == "M":
                                 module_ident = _code_ident("module", file_path)
                                 current_extracted_idents: set = {module_ident}
-                                for fn_name in extracted.get("functions", []):
-                                    current_extracted_idents.add(_code_ident("function", file_path, fn_name))
-                                for cls_name in extracted.get("classes", []):
-                                    current_extracted_idents.add(_code_ident("class", file_path, cls_name))
+                                for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
+                                    current_extracted_idents.add(fn_ident)
+                                for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
+                                    current_extracted_idents.add(cls_ident)
                                 removed_idents = previous_idents - current_extracted_idents
                                 for ident in removed_idents:
                                     orig_ts = entity_valid_from.get(ident, commit_ts_iso)
@@ -3017,13 +3017,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     close_items.append(
                                         (_build_close_triples(ident, desc, module_ident), orig_ts)
                                     )
-                            # Compute dep edges for this file and diff against previous
+                            # Compute dep edges for this file and diff against previous.
+                            # Resolution itself already happened in _extract_commit
+                            # (precomputed["resolved_imports"]) against that commit's
+                            # own git-ls-tree state — nothing left to resolve here.
                             module_ident = _code_ident("module", file_path)
                             current_deps: set = set()
-                            for import_name in set(extracted.get("imports", [])):
-                                dep_ident, is_resolved = _resolve_module_import(
-                                    import_name, file_entities, importing_file=file_path,
-                                )
+                            for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
                                 if dep_ident != module_ident:
                                     current_deps.add(dep_ident)
                                     is_relative = import_name.startswith(".")

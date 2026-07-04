@@ -1993,10 +1993,13 @@ class TestExtractCommit:
         results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
 
         assert len(results) == 1
-        status, file_path, extracted = results[0]
+        status, file_path, extracted, precomputed = results[0]
         assert status == "A"
         assert file_path == "auth.py"
         assert "login" in extracted["functions"]
+        assert "resolved_imports" in precomputed
+        assert "function_entries" in precomputed
+        assert "class_entries" in precomputed
         assert gitlink_changes == []
         assert gitmodules_map == {}
 
@@ -3799,6 +3802,63 @@ class TestResolveModuleImportTieredMatcher:
         file_entities = {"src/main.cpp": []}
         ident, is_resolved = mcp_server._resolve_module_import("vector", file_entities)
         assert is_resolved is False
+
+
+@pytest.fixture
+def git_repo_with_future_dep(tmp_path):
+    """commit 1: mod_a.py imports mod_b, which does not exist yet.
+    commit 2: mod_b.py is added.
+    Resolving mod_a's import while processing commit 1 must reflect commit 1's
+    OWN tree (mod_b.py doesn't exist there yet) — not HEAD's tree, where it does."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "mod_a.py").write_text("import mod_b\n\ndef main(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add mod_a importing not-yet-existing mod_b"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "mod_b.py").write_text("def helper(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add mod_b"], cwd=repo, check=True, capture_output=True)
+
+    return repo
+
+
+class TestPerCommitAccurateImportResolution:
+    @pytest.mark.asyncio
+    async def test_import_of_not_yet_existing_file_tagged_external_at_introduction(
+        self, mock_minigraf_db, git_repo_with_future_dep, monkeypatch
+    ):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo_with_future_dep / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None,
+        }
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(git_repo_with_future_dep), "HEAD")
+
+        mod_b_external_ident = mcp_server._canonical_ident("module", "mod_b")
+        assert any(
+            f"[{mod_b_external_ident} :entity-type :type/external-dependency]" in t
+            for t in transact_calls
+        ), (
+            "mod_b.py did not exist yet at commit 1, so resolving mod_a's import "
+            "must use commit 1's own tree and tag it external — not silently "
+            "resolve against HEAD's tree, where mod_b.py exists by the end."
+        )
 
 
 class TestResolveModuleImportRelative:
