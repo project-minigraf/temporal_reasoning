@@ -1983,6 +1983,72 @@ class TestIngestionWrites:
         assert last_run_calls[0][2] == 0  # no commits processed this run, prior was 0
 
 
+class TestPreloadKnownDeps:
+    def test_reloads_open_depends_on_edge(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+
+        src_ident = mcp_server._code_ident("module", "mod_a.py")
+        dep_ident = mcp_server._canonical_ident("module", "mod_b")
+        # 1704067200000 ms == 2024-01-01T00:00:00.000Z
+        db_instance.execute.return_value = json.dumps(
+            {"results": [[src_ident, dep_ident, 1704067200000]]}
+        )
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+
+        file_entities = {"mod_a.py": [src_ident]}
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, file_entities)
+
+        assert file_deps["mod_a.py"] == {dep_ident}
+        assert dep_valid_from[(src_ident, dep_ident)] == "2024-01-01T00:00:00.000Z"
+
+    def test_query_includes_any_valid_time_and_forever_filter(self, mock_minigraf_db, tmp_path):
+        """The query must ask for :any-valid-time (required for any per-fact
+        pseudo-attribute to bind) and filter :db/valid-to down to the
+        VALID_TIME_FOREVER sentinel so closed edges aren't reloaded as open."""
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        db_instance.execute.return_value = json.dumps({"results": []})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        db_instance.execute.reset_mock()
+
+        mcp_server._preload_known_deps(db, {})
+
+        query = db_instance.execute.call_args[0][0]
+        assert ":any-valid-time" in query
+        assert ":depends-on" in query
+        assert ":db/valid-from" in query
+        assert ":db/valid-to" in query
+        assert "9223372036854775807" in query
+
+    def test_no_deps_returns_empty_structures(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        db_instance.execute.return_value = json.dumps({"results": []})
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, {"mod_a.py": []})
+
+        assert file_deps == {}
+        assert dep_valid_from == {}
+
+    def test_query_failure_is_non_fatal(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        from minigraf import MiniGrafError
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        db_instance.execute.side_effect = MiniGrafError("boom")
+
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, {"mod_a.py": []})
+
+        assert file_deps == {}
+        assert dep_valid_from == {}
+
+
 class TestTotalIngestedQuery:
     def test_returns_zero_when_absent(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db

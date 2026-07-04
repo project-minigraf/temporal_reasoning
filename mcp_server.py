@@ -2318,6 +2318,68 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     return entity_valid_from, entity_descriptions, file_entities
 
 
+_VALID_TIME_FOREVER_MS = (1 << 63) - 1  # minigraf's i64::MAX "still open" :valid-to sentinel
+
+
+def _preload_known_deps(
+    db: Any, file_entities: Dict[str, List[str]]
+) -> tuple:
+    """Reload file_deps/dep_valid_from from durable :depends-on facts.
+
+    Mirrors _preload_known_entities, but :depends-on facts have no
+    :introduced-by-style companion edge to a commit's :date, so the
+    introduction timestamp has to come from the fact's own :db/valid-from
+    via minigraf's per-fact temporal metadata pseudo-attributes (minigraf
+    >=1.0.0, verified present at the pinned/installed 1.2.1). :any-valid-time
+    is required for any per-fact pseudo-attribute to bind at all; the
+    explicit :db/valid-to equality against the "forever" sentinel is what
+    restricts results to edges that haven't been closed (:any-valid-time
+    alone would also return already-closed historical facts).
+
+    Without this, file_deps/dep_valid_from start empty on every restart,
+    which not only breaks removed-dependency detection but actively
+    corrupts history: current_deps - previous_deps would treat every
+    already-standing dependency as newly introduced the next time its file
+    is touched, overwriting its true :valid-from.
+
+    Returns (file_deps, dep_valid_from):
+    file_deps maps file_path -> set of dep module idents.
+    dep_valid_from maps (src_module_ident, dep_ident) -> ISO 8601 intro timestamp.
+    """
+    file_deps: Dict[str, set] = {}
+    dep_valid_from: Dict[tuple, str] = {}
+
+    ident_to_file = {
+        _code_ident("module", file_path): file_path for file_path in file_entities
+    }
+
+    try:
+        raw = db.execute(
+            "(query [:find ?src ?dep ?vf "
+            ":any-valid-time "
+            ":where [?src :depends-on ?dep] "
+            "[?src :db/valid-from ?vf] "
+            "[?src :db/valid-to ?vt] "
+            f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
+        )
+        rows = json.loads(raw).get("results", [])
+    except Exception:
+        return file_deps, dep_valid_from
+
+    for src_ident, dep_ident, vf_ms in rows:
+        file_path = ident_to_file.get(src_ident)
+        if file_path is None:
+            continue
+        vf_iso = (
+            datetime.datetime.fromtimestamp(vf_ms / 1000, datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        )
+        file_deps.setdefault(file_path, set()).add(dep_ident)
+        dep_valid_from[(src_ident, dep_ident)] = vf_iso
+
+    return file_deps, dep_valid_from
+
+
 def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
     """Ingest git tags as :tag/<slug> entities with :tagged-commit references.
 
