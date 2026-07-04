@@ -1104,32 +1104,64 @@ def _segments_end_with(full_segments: List[str], candidate_segments: List[str]) 
     return full_segments[-len(candidate_segments):] == candidate_segments
 
 
-def _resolve_module_import(import_name: str, file_entities: Dict[str, List[str]]) -> Tuple[str, bool]:
+def _resolve_module_import(
+    import_name: str,
+    file_entities: Dict[str, List[str]],
+    importing_file: Optional[str] = None,
+) -> Tuple[str, bool]:
     """Resolve an import name to a module ident that joins with stored module entities.
 
-    Tries Rust's exact source-root conventions first (src/storage.rs,
-    src/storage/mod.rs), then a generic, language-agnostic segment-suffix
-    matcher used by every other language. This exists because every other
-    language's import extraction already reduces to a bare or dotted/slashed
-    specifier (see _extract_import_name) that would otherwise always fall
-    through to the external-dependency fallback — including for real in-tree
-    vendored code, which must stay internal per the design spec's Non-goals.
+    Tries a relative-import resolution first (see below), then Rust's exact
+    source-root conventions (src/storage.rs, src/storage/mod.rs), then a
+    generic, language-agnostic segment-suffix matcher used by every other
+    language. This exists because every other language's import extraction
+    already reduces to a bare or dotted/slashed specifier (see
+    _extract_import_name) that would otherwise always fall through to the
+    external-dependency fallback — including for real in-tree vendored code,
+    which must stay internal per the design spec's Non-goals.
 
-    The specifier is split into segments on "/" if present (Go, C/C++, Ruby,
-    PHP already use "/" natively — note Go paths like "github.com/user/pkg"
-    contain literal dots inside a segment that must NOT be treated as
-    separators), otherwise on "." (Java, C#, Python, Scala, Kotlin, Swift,
-    Haskell, Elixir — genuinely dot-separated). Matching a whole-segment
-    suffix (not a raw substring) against either a file's own path or its
-    parent directory uniformly covers: an exact match, a vendored path with
-    extra prefix segments, a package-only/wildcard-style import (matches via
-    the parent-directory tier), and a bare single-segment name (degenerates
-    to a basename check) — one algorithm instead of separate ad hoc tiers.
+    When import_name is relative (starts with ".") and importing_file is
+    given, resolves against the importing file's own directory before any
+    other tier runs. Covers three conventions: JS/TS/Ruby-style "./foo" and
+    "../foo/bar" (plain relative filesystem paths — Ruby's require_relative
+    results already carry this "./" prefix, added by _ruby_require_name),
+    and Python-style leading dots with no slash ("." = same package, each
+    extra dot = one directory further up) followed by an optional dotted
+    module path.
+
+    The generic matcher splits the specifier into segments on "/" if present
+    (Go, C/C++, Ruby, PHP already use "/" natively — note Go paths like
+    "github.com/user/pkg" contain literal dots inside a segment that must
+    NOT be treated as separators), otherwise on "." (Java, C#, Python, Scala,
+    Kotlin, Swift, Haskell, Elixir — genuinely dot-separated). Matching a
+    whole-segment suffix (not a raw substring) against either a file's own
+    path or its parent directory uniformly covers: an exact match, a
+    vendored path with extra prefix segments, a package-only/wildcard-style
+    import (via the parent-directory tier), and a bare single-segment name
+    (degenerates to a basename check).
 
     Returns (ident, is_resolved). is_resolved is True when import_name
     matched a real file in file_entities, False when it fell through to the
     bare _canonical_ident guess.
     """
+    if importing_file and import_name.startswith("."):
+        base_dir = Path(importing_file).parent
+        if import_name.startswith("./") or import_name.startswith("../"):
+            target = os.path.normpath(str(base_dir / import_name))
+        else:
+            stripped = import_name.lstrip(".")
+            levels_up = len(import_name) - len(stripped) - 1
+            target_dir = base_dir
+            for _ in range(levels_up):
+                target_dir = target_dir.parent
+            target = str(target_dir / stripped.replace(".", "/")) if stripped else str(target_dir)
+            target = os.path.normpath(target)
+        target = target.replace(os.sep, "/")
+        for file_path in file_entities:
+            if str(Path(file_path).with_suffix("")).replace(os.sep, "/") == target:
+                return _code_ident("module", file_path), True
+        return _canonical_ident("module", import_name), False
+
     # Priority 1: canonical Rust module root paths under common source roots
     for src_root in ("src", "lib", ""):
         prefix = f"{src_root}/" if src_root else ""
@@ -2836,10 +2868,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             module_ident = _code_ident("module", file_path)
                             current_deps: set = set()
                             for import_name in set(extracted.get("imports", [])):
-                                dep_ident, is_resolved = _resolve_module_import(import_name, file_entities)
+                                dep_ident, is_resolved = _resolve_module_import(
+                                    import_name, file_entities, importing_file=file_path,
+                                )
                                 if dep_ident != module_ident:
                                     current_deps.add(dep_ident)
-                                    if not is_resolved and dep_ident not in entity_valid_from:
+                                    is_relative = import_name.startswith(".")
+                                    if not is_resolved and not is_relative and dep_ident not in entity_valid_from:
                                         add_triples.extend([
                                             f"[{dep_ident} :entity-type :type/external-dependency]",
                                             f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',

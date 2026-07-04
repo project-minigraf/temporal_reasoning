@@ -3526,6 +3526,38 @@ class TestUnresolvedImportTagging:
         assert any(f"[{tokio_ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
         assert any(f'[{tokio_ident} :description "tokio"]' in t for t in transact_calls)
 
+    @pytest.mark.asyncio
+    async def test_unresolved_relative_import_not_tagged_external_end_to_end(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "main.ts").write_text("import { thing } from './missing';\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        missing_ident = mcp_server._canonical_ident("module", "./missing")
+        assert not any(
+            f"[{missing_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
+        )
+
 
 class TestResolveModuleImportTieredMatcher:
     def test_exact_file_match_java_package(self):
@@ -3575,6 +3607,67 @@ class TestResolveModuleImportTieredMatcher:
         file_entities = {"src/main.cpp": []}
         ident, is_resolved = mcp_server._resolve_module_import("vector", file_entities)
         assert is_resolved is False
+
+
+class TestResolveModuleImportRelative:
+    def test_js_relative_import_resolves_against_importing_file(self):
+        import mcp_server
+        file_entities = {"src/utils/foo.ts": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "./utils/foo", file_entities, importing_file="src/main.ts",
+        )
+        assert is_resolved is True
+        assert ident == mcp_server._code_ident("module", "src/utils/foo.ts")
+
+    def test_js_parent_relative_import_resolves(self):
+        import mcp_server
+        file_entities = {"lib.ts": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "../lib", file_entities, importing_file="src/main.ts",
+        )
+        assert is_resolved is True
+
+    def test_python_single_dot_relative_import_resolves(self):
+        import mcp_server
+        file_entities = {"pkg/sibling.py": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            ".sibling", file_entities, importing_file="pkg/main.py",
+        )
+        assert is_resolved is True
+
+    def test_python_double_dot_relative_import_resolves(self):
+        import mcp_server
+        # For a file at a/b/c/main.py, the containing package is a.b.c: one
+        # leading dot means "this package" (a/b/c), two dots means "the
+        # parent package" (a/b) — so "..sibling" resolves to a/b/sibling.py,
+        # not a top-level sibling.py.
+        file_entities = {"a/b/sibling.py": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "..sibling", file_entities, importing_file="a/b/c/main.py",
+        )
+        assert is_resolved is True
+
+    def test_ruby_require_relative_marker_resolves(self):
+        import mcp_server
+        file_entities = {"lib/helper.rb": []}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "./helper", file_entities, importing_file="lib/main.rb",
+        )
+        assert is_resolved is True
+
+    def test_unresolved_relative_import_is_not_tagged_external(self):
+        import mcp_server
+        file_entities: dict = {}
+        ident, is_resolved = mcp_server._resolve_module_import(
+            "./missing", file_entities, importing_file="src/main.ts",
+        )
+        assert is_resolved is False
+        # Caller-side contract (see _run_ingestion): a relative import is only
+        # ever tagged external if the generic (non-relative) tiers would also
+        # tag it — this test documents that resolution itself still reports
+        # is_resolved=False for a genuinely missing relative target, same as
+        # any other unresolved import; the "don't mislabel" guarantee lives in
+        # the caller, verified by Task 13's Step 5 integration test below.
 
 
 class TestRunIngestionGitlinks:
