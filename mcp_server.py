@@ -1181,6 +1181,41 @@ def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
     return entries
 
 
+_GITLINK_MODE = "160000"
+
+
+def _gitlink_changes(raw_entries: List[tuple]) -> List[tuple]:
+    """Filter _git_diff_tree_raw's output down to gitlink-involving rows,
+    collapsed into three cases by mode pair rather than by the raw status
+    letter (which varies: A/D/M/T can all represent a gitlink change
+    depending on what else happened to the same path):
+
+      "add"    — new_mode is a gitlink, old_mode is not. Covers a plain
+                 submodule addition (status A) and a same-path flip from a
+                 regular blob into a gitlink (status T).
+      "bump"   — both modes are gitlinks (status M): the pinned commit changed.
+      "remove" — old_mode is a gitlink, new_mode is not. Covers a plain
+                 submodule removal (status D) and a same-path flip from a
+                 gitlink back into a regular blob (status T).
+
+    sha is the new pinned commit for "add"/"bump", or the last-known pinned
+    commit for "remove" (needed by the caller to close the right fact).
+    """
+    changes = []
+    for status, old_mode, new_mode, old_sha, new_sha, path in raw_entries:
+        old_is_link = old_mode == _GITLINK_MODE
+        new_is_link = new_mode == _GITLINK_MODE
+        if not old_is_link and not new_is_link:
+            continue
+        if new_is_link and not old_is_link:
+            changes.append(("add", new_sha, path))
+        elif old_is_link and new_is_link:
+            changes.append(("bump", new_sha, path))
+        else:
+            changes.append(("remove", old_sha, path))
+    return changes
+
+
 def _git_changed_files(repo_path: str, commit_hash: str) -> List[tuple]:
     """Return list of (status_char, path) for files changed in this commit."""
     result = _subprocess.run(

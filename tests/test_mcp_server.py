@@ -1824,6 +1824,38 @@ class TestGitDiffTreeRaw:
         assert path == "vendor/lib"
 
 
+class TestGitlinkChanges:
+    def test_non_gitlink_rows_are_ignored(self):
+        import mcp_server
+        raw = [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py")]
+        assert mcp_server._gitlink_changes(raw) == []
+
+    def test_add_when_new_mode_is_gitlink(self):
+        import mcp_server
+        raw = [("A", "000000", "160000", "0" * 40, "b" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("add", "b" * 40, "vendor/lib")]
+
+    def test_bump_when_both_modes_are_gitlink(self):
+        import mcp_server
+        raw = [("M", "160000", "160000", "b" * 40, "c" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("bump", "c" * 40, "vendor/lib")]
+
+    def test_remove_when_old_mode_is_gitlink(self):
+        import mcp_server
+        raw = [("D", "160000", "000000", "c" * 40, "0" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("remove", "c" * 40, "vendor/lib")]
+
+    def test_type_change_into_internal_reported_as_remove(self):
+        import mcp_server
+        raw = [("T", "160000", "100644", "c" * 40, "d" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("remove", "c" * 40, "vendor/lib")]
+
+    def test_type_change_into_external_reported_as_add(self):
+        import mcp_server
+        raw = [("T", "100644", "160000", "d" * 40, "e" * 40, "vendor/lib")]
+        assert mcp_server._gitlink_changes(raw) == [("add", "e" * 40, "vendor/lib")]
+
+
 class TestExtractCommit:
     def test_added_file_returns_extracted_dict(self, git_repo):
         import mcp_server
