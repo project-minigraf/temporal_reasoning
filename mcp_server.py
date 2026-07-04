@@ -1309,7 +1309,11 @@ def _gitlink_changes(raw_entries: List[tuple]) -> List[tuple]:
 
 
 def _git_changed_files(repo_path: str, commit_hash: str) -> List[tuple]:
-    """Return list of (status_char, path) for files changed in this commit."""
+    """Return list of (status_char, path) for files changed in this commit.
+
+    Not currently called by the ingestion pipeline (which uses _git_diff_tree_raw
+    instead, for mode-aware parsing) — retained as a general-purpose git helper.
+    """
     result = _subprocess.run(
         ["git", "diff-tree", "--no-commit-id", "-r", "--name-status", "--root", commit_hash],
         cwd=repo_path, capture_output=True, text=True, check=True,
@@ -2894,6 +2898,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     )
                             file_deps[file_path] = current_deps
 
+                    # Process gitlink changes (submodule add/bump/remove).
+                    # The "remove" case's interaction with the ordinary per-file module-open
+                    # logic (elsewhere in this loop) is only sound because real submodule paths
+                    # are extensionless (no tree-sitter parser matches them, so no module is
+                    # ever opened for a bare gitlink path) — a gitlink path that happened to
+                    # carry a recognized source extension is an untested, unreachable-in-practice edge case.
                     for kind, sha, path in gitlink_changes:
                         ext_ident = _code_ident("module", path)
                         if kind == "add":
