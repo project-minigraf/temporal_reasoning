@@ -1158,10 +1158,50 @@ def _segments_end_with(full_segments: List[str], candidate_segments: List[str]) 
     return full_segments[-len(candidate_segments):] == candidate_segments
 
 
+class _SegmentSuffixIndex:
+    """Reverse index over file_entities' path segments, bucketed by last segment.
+
+    _resolve_module_import's tiers 3a/3b used to linear-scan every entry in
+    file_entities and recompute its Path/segment work on every single call,
+    even though only files sharing the candidate's last segment (the most
+    discriminating part of a path or module specifier) can ever match. This
+    buckets each file once by that last segment so a lookup only suffix-checks
+    the handful of files that could plausibly match, independent of how many
+    files exist overall. Built once per known_files snapshot (see
+    _extract_commit) and reused across every import resolved against it.
+    """
+
+    __slots__ = ("_file_buckets", "_parent_buckets")
+
+    def __init__(self, file_entities: Dict[str, List[str]]):
+        self._file_buckets: Dict[str, List[Tuple[str, List[str]]]] = {}
+        self._parent_buckets: Dict[str, List[Tuple[str, List[str]]]] = {}
+        for file_path in file_entities:
+            file_segments = _path_segments(str(Path(file_path).with_suffix("")))
+            if file_segments:
+                self._file_buckets.setdefault(file_segments[-1], []).append((file_path, file_segments))
+            parent_segments = _path_segments(str(Path(file_path).parent))
+            if parent_segments:
+                self._parent_buckets.setdefault(parent_segments[-1], []).append((file_path, parent_segments))
+
+    def match_file(self, candidate_segments: List[str]) -> Optional[str]:
+        for file_path, file_segments in self._file_buckets.get(candidate_segments[-1], []):
+            if _segments_end_with(file_segments, candidate_segments):
+                return file_path
+        return None
+
+    def match_parent(self, candidate_segments: List[str]) -> Optional[str]:
+        for file_path, parent_segments in self._parent_buckets.get(candidate_segments[-1], []):
+            if _segments_end_with(parent_segments, candidate_segments):
+                return file_path
+        return None
+
+
 def _resolve_module_import(
     import_name: str,
     file_entities: Dict[str, List[str]],
     importing_file: Optional[str] = None,
+    segment_index: Optional[_SegmentSuffixIndex] = None,
 ) -> Tuple[str, bool]:
     """Resolve an import name to a module ident that joins with stored module entities.
 
@@ -1197,6 +1237,12 @@ def _resolve_module_import(
     Returns (ident, is_resolved). is_resolved is True when import_name
     matched a real file in file_entities, False when it fell through to the
     bare _canonical_ident guess.
+
+    segment_index, if given, must be a _SegmentSuffixIndex built from this
+    same file_entities — used to speed up tiers 3a/3b. When omitted, one is
+    built on the fly from file_entities (same cost as the old linear scan);
+    callers resolving many imports against the same file_entities should
+    build it once and pass it in.
     """
     if importing_file and import_name.startswith("."):
         base_dir = Path(importing_file).parent
@@ -1235,20 +1281,19 @@ def _resolve_module_import(
 
     # Priority 3: generic segment-suffix matcher for every other language.
     candidate_segments = import_name.split("/") if "/" in import_name else import_name.split(".")
+    index = segment_index if segment_index is not None else _SegmentSuffixIndex(file_entities)
 
     # 3a. file match (exact, or a vendored path with extra prefix segments), extension stripped
-    for file_path in file_entities:
-        file_segments = _path_segments(str(Path(file_path).with_suffix("")))
-        if _segments_end_with(file_segments, candidate_segments):
-            return _code_ident("module", file_path), True
+    file_match = index.match_file(candidate_segments)
+    if file_match is not None:
+        return _code_ident("module", file_match), True
 
     # 3b. parent-directory match (package-only/wildcard-style imports, e.g.
     # a Java "import com.google.gson.*;" or a bare "com.google.gson" reference
     # with no specific trailing class name)
-    for file_path in file_entities:
-        parent_segments = _path_segments(str(Path(file_path).parent))
-        if _segments_end_with(parent_segments, candidate_segments):
-            return _code_ident("module", file_path), True
+    parent_match = index.match_parent(candidate_segments)
+    if parent_match is not None:
+        return _code_ident("module", parent_match), True
 
     return _canonical_ident("module", import_name), False
 
@@ -2490,6 +2535,7 @@ def _precompute_file_triples(
     extracted: Dict[str, List[str]],
     commit_ident: str,
     known_files: Dict[str, List[str]],
+    segment_index: Optional[_SegmentSuffixIndex] = None,
 ) -> Dict[str, Any]:
     """Pure, per-commit-independent precomputation for _build_code_triples.
 
@@ -2504,6 +2550,11 @@ def _precompute_file_triples(
 
     known_files must come from _known_files_at_commit for the SAME commit_hash this
     file was extracted from — it determines what "is_resolved" means here.
+
+    segment_index, if given, must be a _SegmentSuffixIndex built from that same
+    known_files — _extract_commit builds it once per commit and passes it here for
+    every A/M file so _resolve_module_import's tiers 3a/3b aren't rebuilding it (or
+    linear-scanning known_files) once per import.
     """
     module_ident = _code_ident("module", file_path)
     module_candidate_triples = [
@@ -2541,7 +2592,7 @@ def _precompute_file_triples(
     resolved_imports: List[Tuple[str, str, bool]] = []
     for import_name in set(extracted.get("imports", [])):
         dep_ident, is_resolved = _resolve_module_import(
-            import_name, known_files, importing_file=file_path,
+            import_name, known_files, importing_file=file_path, segment_index=segment_index,
         )
         resolved_imports.append((import_name, dep_ident, is_resolved))
 
@@ -2845,12 +2896,16 @@ def _extract_commit(
 
     known_files (via _known_files_at_commit) is computed lazily, once per commit,
     and shared across every A/M file in this commit — a commit with only deletions
-    never pays for it.
+    never pays for it. Its _SegmentSuffixIndex (for _resolve_module_import's tiers
+    3a/3b) is built alongside it, once, and reused the same way — otherwise every
+    import in every A/M file would re-scan and re-derive segments for the whole
+    known_files set from scratch.
     """
     raw_entries = _git_diff_tree_raw(repo_path, commit_hash)
     commit_ident = f":commit/{commit_hash[:12]}"
     results: List[tuple] = []
     known_files: Optional[Dict[str, List[str]]] = None
+    segment_index: Optional[_SegmentSuffixIndex] = None
 
     for status, old_mode, new_mode, old_sha, new_sha, file_path in raw_entries:
         parser = _thread_parser(file_path)
@@ -2866,7 +2921,10 @@ def _extract_commit(
         extracted = _extract_from_source(content, parser, file_path)
         if known_files is None:
             known_files = _known_files_at_commit(repo_path, commit_hash)
-        precomputed = _precompute_file_triples(file_path, extracted, commit_ident, known_files)
+            segment_index = _SegmentSuffixIndex(known_files)
+        precomputed = _precompute_file_triples(
+            file_path, extracted, commit_ident, known_files, segment_index=segment_index,
+        )
         results.append((status, file_path, extracted, precomputed))
 
     gitlink_changes = _gitlink_changes(raw_entries)

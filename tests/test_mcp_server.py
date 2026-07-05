@@ -2076,6 +2076,26 @@ class TestExtractCommit:
         assert gitlink_changes == [("add", sub_hash, "vendor/lib")]
         assert gitmodules_map == {"vendor/lib": {"name": "lib", "url": "https://example.com/lib.git"}}
 
+    def test_segment_index_built_once_per_commit_not_per_file(self, git_repo_with_deps, monkeypatch):
+        """#102: the tier 3a/3b index must be built once per commit and reused
+        across every file's import resolution in that commit, not rebuilt per file."""
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo_with_deps), watermark_hash=None)
+
+        build_count = 0
+        original_init = mcp_server._SegmentSuffixIndex.__init__
+
+        def counting_init(self, *args, **kwargs):
+            nonlocal build_count
+            build_count += 1
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server._SegmentSuffixIndex, "__init__", counting_init)
+        results, _, _ = mcp_server._extract_commit(str(git_repo_with_deps), commits[0][0])
+
+        assert len(results) == 2  # mod_a.py (imports mod_b) and mod_b.py both added here
+        assert build_count == 1
+
 
 class TestIngestionWrites:
     def test_ingest_transact_uses_valid_from(self, mock_minigraf_db, tmp_path):
@@ -3802,6 +3822,74 @@ class TestResolveModuleImportTieredMatcher:
         file_entities = {"src/main.cpp": []}
         ident, is_resolved = mcp_server._resolve_module_import("vector", file_entities)
         assert is_resolved is False
+
+
+class TestSegmentSuffixIndex:
+    """Reverse index used to speed up tiers 3a/3b of _resolve_module_import (#102)."""
+
+    def test_match_file_finds_exact_match(self):
+        import mcp_server
+        index = mcp_server._SegmentSuffixIndex({"com/google/gson/Gson.java": []})
+        assert index.match_file(["com", "google", "gson", "Gson"]) == "com/google/gson/Gson.java"
+
+    def test_match_file_returns_none_when_no_file_shares_last_segment(self):
+        import mcp_server
+        index = mcp_server._SegmentSuffixIndex({"com/google/gson/Gson.java": []})
+        assert index.match_file(["org", "other", "Widget"]) is None
+
+    def test_match_file_ignores_decoy_sharing_last_segment_but_wrong_suffix(self):
+        import mcp_server
+        # Both files end in "Gson", so both land in the same bucket — only the
+        # one whose full segment suffix matches the candidate should be returned.
+        index = mcp_server._SegmentSuffixIndex({
+            "com/google/gson/Gson.java": [],
+            "org/other/nested/Gson.java": [],
+        })
+        assert index.match_file(["google", "gson", "Gson"]) == "com/google/gson/Gson.java"
+
+    def test_match_parent_finds_wildcard_style_match(self):
+        import mcp_server
+        index = mcp_server._SegmentSuffixIndex({"com/google/gson/JsonElement.java": []})
+        assert index.match_parent(["com", "google", "gson"]) == "com/google/gson/JsonElement.java"
+
+    def test_match_parent_returns_none_when_no_match(self):
+        import mcp_server
+        index = mcp_server._SegmentSuffixIndex({"com/google/gson/JsonElement.java": []})
+        assert index.match_parent(["org", "other"]) is None
+
+
+class TestResolveModuleImportWithPrecomputedIndex:
+    """A precomputed segment_index must resolve identically to the no-index default."""
+
+    def test_precomputed_index_matches_default_for_tier_3a(self):
+        import mcp_server
+        file_entities = {"com/google/gson/Gson.java": []}
+        index = mcp_server._SegmentSuffixIndex(file_entities)
+        with_index = mcp_server._resolve_module_import(
+            "com.google.gson.Gson", file_entities, segment_index=index,
+        )
+        without_index = mcp_server._resolve_module_import("com.google.gson.Gson", file_entities)
+        assert with_index == without_index == (mcp_server._code_ident("module", "com/google/gson/Gson.java"), True)
+
+    def test_precomputed_index_matches_default_for_tier_3b(self):
+        import mcp_server
+        file_entities = {"com/google/gson/JsonElement.java": []}
+        index = mcp_server._SegmentSuffixIndex(file_entities)
+        with_index = mcp_server._resolve_module_import(
+            "com.google.gson", file_entities, segment_index=index,
+        )
+        without_index = mcp_server._resolve_module_import("com.google.gson", file_entities)
+        assert with_index == without_index == (mcp_server._code_ident("module", "com/google/gson/JsonElement.java"), True)
+
+    def test_precomputed_index_matches_default_for_unresolved_case(self):
+        import mcp_server
+        file_entities = {"com/mycompany/App.java": []}
+        index = mcp_server._SegmentSuffixIndex(file_entities)
+        with_index = mcp_server._resolve_module_import(
+            "com.fasterxml.jackson.Foo", file_entities, segment_index=index,
+        )
+        without_index = mcp_server._resolve_module_import("com.fasterxml.jackson.Foo", file_entities)
+        assert with_index == without_index == (mcp_server._canonical_ident("module", "com.fasterxml.jackson.Foo"), False)
 
 
 @pytest.fixture
