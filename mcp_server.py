@@ -1397,6 +1397,29 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
     return result.stdout
 
 
+def _known_files_at_commit(repo_path: str, commit_hash: str) -> Dict[str, List[str]]:
+    """Return {file_path: []} for every file tracked at commit_hash whose extension
+    has a supported tree-sitter grammar (_EXT_TO_LANG).
+
+    A pure function of commit_hash via `git ls-tree -r --name-only`, independent of
+    ingestion progress — unlike the incrementally-mutated file_entities dict, this
+    reflects the repo's actual state at that specific historical commit, so it can
+    run inside _extract_commit on the worker pool instead of waiting for the serial
+    main thread to catch up. Shaped like file_entities (dict keyed on path, values
+    unused) so it can be passed straight into _resolve_module_import, which only
+    ever reads the dict's keys.
+    """
+    result = _subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", commit_hash],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    known: Dict[str, List[str]] = {}
+    for path in result.stdout.strip().splitlines():
+        if Path(path).suffix.lower() in _EXT_TO_LANG:
+            known[path] = []
+    return known
+
+
 def _parse_gitmodules(content: bytes) -> Dict[str, Dict[str, str]]:
     """Parse .gitmodules content into {path: {"name": ..., "url": ...}}.
 
@@ -2462,6 +2485,75 @@ async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]
     return {"ok": False, "error": f"Unknown strategy: {strategy}"}
 
 
+def _precompute_file_triples(
+    file_path: str,
+    extracted: Dict[str, List[str]],
+    commit_ident: str,
+    known_files: Dict[str, List[str]],
+) -> Dict[str, Any]:
+    """Pure, per-commit-independent precomputation for _build_code_triples.
+
+    Runs inside _extract_commit on the worker pool. Computes everything that does
+    NOT depend on the serially-maintained entity_valid_from/file_deps state:
+      - the candidate triple strings for the module/function/class idents this file
+        would introduce, ready to use verbatim IF the main thread's diff against
+        entity_valid_from decides the ident is genuinely new (see _build_code_triples);
+      - the resolved dependency ident for every import in the file, via
+        _resolve_module_import against known_files (this commit's own git-ls-tree
+        state, not the incrementally-mutated file_entities).
+
+    known_files must come from _known_files_at_commit for the SAME commit_hash this
+    file was extracted from — it determines what "is_resolved" means here.
+    """
+    module_ident = _code_ident("module", file_path)
+    module_candidate_triples = [
+        f"[{module_ident} :entity-type :type/module]",
+        f'[{module_ident} :ident "{module_ident}"]',
+        f'[{module_ident} :description "{_edn_escape(file_path)}"]',
+        f'[{module_ident} :path "{_edn_escape(file_path)}"]',
+        f"[{module_ident} :introduced-by {commit_ident}]",
+    ]
+
+    function_entries: List[Tuple[str, str, List[str]]] = []
+    for fn_name in extracted.get("functions", []):
+        fn_ident = _code_ident("function", file_path, fn_name)
+        function_entries.append((fn_ident, fn_name, [
+            f"[{fn_ident} :entity-type :type/function]",
+            f'[{fn_ident} :ident "{fn_ident}"]',
+            f'[{fn_ident} :description "{_edn_escape(fn_name)}"]',
+            f'[{fn_ident} :file "{_edn_escape(file_path)}"]',
+            f"[{module_ident} :contains {fn_ident}]",
+            f"[{fn_ident} :introduced-by {commit_ident}]",
+        ]))
+
+    class_entries: List[Tuple[str, str, List[str]]] = []
+    for cls_name in extracted.get("classes", []):
+        cls_ident = _code_ident("class", file_path, cls_name)
+        class_entries.append((cls_ident, cls_name, [
+            f"[{cls_ident} :entity-type :type/class]",
+            f'[{cls_ident} :ident "{cls_ident}"]',
+            f'[{cls_ident} :description "{_edn_escape(cls_name)}"]',
+            f'[{cls_ident} :file "{_edn_escape(file_path)}"]',
+            f"[{module_ident} :contains {cls_ident}]",
+            f"[{cls_ident} :introduced-by {commit_ident}]",
+        ]))
+
+    resolved_imports: List[Tuple[str, str, bool]] = []
+    for import_name in set(extracted.get("imports", [])):
+        dep_ident, is_resolved = _resolve_module_import(
+            import_name, known_files, importing_file=file_path,
+        )
+        resolved_imports.append((import_name, dep_ident, is_resolved))
+
+    return {
+        "module_ident": module_ident,
+        "module_candidate_triples": module_candidate_triples,
+        "function_entries": function_entries,
+        "class_entries": class_entries,
+        "resolved_imports": resolved_imports,
+    }
+
+
 def _build_code_triples(
     file_path: str,
     extracted: Dict[str, List[str]],
@@ -2470,6 +2562,7 @@ def _build_code_triples(
     entity_descriptions: Dict[str, str],
     file_entities: Dict[str, List[str]],
     commit_ident: str,
+    precomputed: Dict[str, Any],
 ) -> List[str]:
     """Return Datalog triple strings for a file's extracted code entities.
 
@@ -2479,46 +2572,37 @@ def _build_code_triples(
     bi-temporal fact explosion from N re-assertions of the same attribute
     joining into N² result rows.
 
+    precomputed comes from _precompute_file_triples (see mcp_server.py),
+    computed ahead of time in the extraction worker pool — the candidate
+    triple strings for a would-be-new entity are a pure function of the
+    file's own extracted structure and ident, independent of whether
+    entity_valid_from turns out to already know about it. This function's
+    only remaining job is the diff against entity_valid_from itself, which
+    genuinely needs the serially-maintained state.
+
     :depends-on edges are written in the commit loop by _run_ingestion as the
     file's imports change, giving them proper bi-temporal bounds.
     """
     triples: List[str] = []
-    module_ident = _code_ident("module", file_path)
+    module_ident = precomputed["module_ident"]
 
     is_new_module = module_ident not in entity_valid_from
     # Track all idents for this file (for deletion cleanup)
     idents_for_file = file_entities.setdefault(file_path, [])
 
     if is_new_module:
-        # Write all stable attributes once, at introduction time
-        triples += [
-            f"[{module_ident} :entity-type :type/module]",
-            f'[{module_ident} :ident "{module_ident}"]',
-            f'[{module_ident} :description "{_edn_escape(file_path)}"]',
-            f'[{module_ident} :path "{_edn_escape(file_path)}"]',
-            f"[{module_ident} :introduced-by {commit_ident}]",
-        ]
+        triples += precomputed["module_candidate_triples"]
         if module_ident not in idents_for_file:
             idents_for_file.append(module_ident)
         entity_valid_from[module_ident] = commit_ts_iso
         entity_descriptions[module_ident] = file_path
-
     else:
         # Existing module: only record that this commit modified it
         triples.append(f"[{module_ident} :modified-in {commit_ident}]")
 
-    for fn_name in extracted["functions"]:
-        fn_ident = _code_ident("function", file_path, fn_name)
+    for fn_ident, fn_name, candidate_triples in precomputed["function_entries"]:
         if fn_ident not in entity_valid_from:
-            # New function: write all stable attributes once
-            triples += [
-                f"[{fn_ident} :entity-type :type/function]",
-                f'[{fn_ident} :ident "{fn_ident}"]',
-                f'[{fn_ident} :description "{_edn_escape(fn_name)}"]',
-                f'[{fn_ident} :file "{_edn_escape(file_path)}"]',
-                f"[{module_ident} :contains {fn_ident}]",
-                f"[{fn_ident} :introduced-by {commit_ident}]",
-            ]
+            triples += candidate_triples
             if fn_ident not in idents_for_file:
                 idents_for_file.append(fn_ident)
             entity_valid_from[fn_ident] = commit_ts_iso
@@ -2527,18 +2611,9 @@ def _build_code_triples(
             # Pre-existing function: record that this commit modified it
             triples.append(f"[{fn_ident} :modified-in {commit_ident}]")
 
-    for cls_name in extracted["classes"]:
-        cls_ident = _code_ident("class", file_path, cls_name)
+    for cls_ident, cls_name, candidate_triples in precomputed["class_entries"]:
         if cls_ident not in entity_valid_from:
-            # New class: write all stable attributes once
-            triples += [
-                f"[{cls_ident} :entity-type :type/class]",
-                f'[{cls_ident} :ident "{cls_ident}"]',
-                f'[{cls_ident} :description "{_edn_escape(cls_name)}"]',
-                f'[{cls_ident} :file "{_edn_escape(file_path)}"]',
-                f"[{module_ident} :contains {cls_ident}]",
-                f"[{cls_ident} :introduced-by {commit_ident}]",
-            ]
+            triples += candidate_triples
             if cls_ident not in idents_for_file:
                 idents_for_file.append(cls_ident)
             entity_valid_from[cls_ident] = commit_ts_iso
@@ -2742,43 +2817,57 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
 
 def _extract_commit(
     repo_path: str, commit_hash: str
-) -> Tuple[List[Tuple[str, str, Optional[Dict[str, List[str]]]]], List[tuple], Dict[str, Dict[str, str]]]:
-    """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse.
+) -> Tuple[List[tuple], List[tuple], Dict[str, Dict[str, str]]]:
+    """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse,
+    plus import resolution and "if this turns out to be new" triple precomputation —
+    both pure functions of this commit alone (see _known_files_at_commit and
+    _precompute_file_triples), unlike the incrementally-mutated file_entities/
+    entity_valid_from state only the serial main thread maintains.
 
-    Runs in a worker thread via the ThreadPoolExecutor in _run_ingestion.
-    Touches no shared mutable state and no DB. Returns (file_results,
-    gitlink_changes, gitmodules_map):
+    Runs in a worker thread via the ThreadPoolExecutor in _run_ingestion. Touches no
+    shared mutable state and no DB. Returns (file_results, gitlink_changes, gitmodules_map):
 
-      file_results: one entry per changed file that has a supported parser;
-        A/M files whose content fetch fails are omitted entirely, mirroring
-        the previous inline `continue` — same as before this pipeline existed.
-      gitlink_changes: _gitlink_changes' output — gitlink-involving rows,
-        never fed through the tree-sitter parser (gitlink paths never have
-        a resolvable extension).
-      gitmodules_map: path -> {"name", "url"}, populated only when this
-        commit has at least one gitlink "add" — avoids a wasted git-show
-        call on the (overwhelmingly common) case of a commit that touches
-        no submodules at all.
+      file_results: one entry per changed file that has a supported parser, as
+        (status, file_path, extracted, precomputed). A/M files whose content fetch
+        fails are omitted entirely, mirroring the previous inline `continue` — same
+        as before this pipeline existed. For a "D" (deleted) file, extracted and
+        precomputed are both None — the main thread only needs file_path to know
+        what to close.
+      gitlink_changes: _gitlink_changes' output — gitlink-involving rows, never fed
+        through the tree-sitter parser (gitlink paths never have a resolvable extension).
+      gitmodules_map: path -> {"name", "url"}, populated only when this commit has at
+        least one gitlink "add" — avoids a wasted git-show call on the (overwhelmingly
+        common) case of a commit that touches no submodules at all.
 
     Sources both file_results and gitlink_changes from a single
-    `git diff-tree --raw` call (via _git_diff_tree_raw) rather than the
-    former --name-status call, which discarded file mode entirely.
+    `git diff-tree --raw` call (via _git_diff_tree_raw) rather than a --name-status
+    call, which discarded file mode entirely.
+
+    known_files (via _known_files_at_commit) is computed lazily, once per commit,
+    and shared across every A/M file in this commit — a commit with only deletions
+    never pays for it.
     """
     raw_entries = _git_diff_tree_raw(repo_path, commit_hash)
-    results: List[Tuple[str, str, Optional[Dict[str, List[str]]]]] = []
+    commit_ident = f":commit/{commit_hash[:12]}"
+    results: List[tuple] = []
+    known_files: Optional[Dict[str, List[str]]] = None
+
     for status, old_mode, new_mode, old_sha, new_sha, file_path in raw_entries:
         parser = _thread_parser(file_path)
         if parser is None:
             continue
         if status == "D":
-            results.append((status, file_path, None))
+            results.append((status, file_path, None, None))
             continue
         try:
             content = _git_file_content(repo_path, commit_hash, file_path)
         except Exception:
             continue
         extracted = _extract_from_source(content, parser, file_path)
-        results.append((status, file_path, extracted))
+        if known_files is None:
+            known_files = _known_files_at_commit(repo_path, commit_hash)
+        precomputed = _precompute_file_triples(file_path, extracted, commit_ident, known_files)
+        results.append((status, file_path, extracted, precomputed))
 
     gitlink_changes = _gitlink_changes(raw_entries)
     gitmodules_map: Dict[str, Dict[str, str]] = {}
@@ -2885,7 +2974,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     close_items: List[tuple] = []  # (triples, original_ts_iso)
                     dep_add_triples: List[str] = []  # :depends-on triples to transact individually
 
-                    for status, file_path, extracted in extracted_files:
+                    for status, file_path, extracted, precomputed in extracted_files:
                         if status == "D":
                             # Close module and all known child entities for this file
                             idents = file_entities.get(file_path, [_code_ident("module", file_path)])
@@ -2907,7 +2996,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             previous_idents = set(file_entities.get(file_path, []))
                             triples = _build_code_triples(
                                 file_path, extracted, commit_ts_iso, entity_valid_from,
-                                entity_descriptions, file_entities, commit_ident,
+                                entity_descriptions, file_entities, commit_ident, precomputed,
                             )
                             add_triples.extend(triples)
                             # Detect entities removed from a modified file.
@@ -2917,10 +3006,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             if status == "M":
                                 module_ident = _code_ident("module", file_path)
                                 current_extracted_idents: set = {module_ident}
-                                for fn_name in extracted.get("functions", []):
-                                    current_extracted_idents.add(_code_ident("function", file_path, fn_name))
-                                for cls_name in extracted.get("classes", []):
-                                    current_extracted_idents.add(_code_ident("class", file_path, cls_name))
+                                for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
+                                    current_extracted_idents.add(fn_ident)
+                                for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
+                                    current_extracted_idents.add(cls_ident)
                                 removed_idents = previous_idents - current_extracted_idents
                                 for ident in removed_idents:
                                     orig_ts = entity_valid_from.get(ident, commit_ts_iso)
@@ -2928,13 +3017,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     close_items.append(
                                         (_build_close_triples(ident, desc, module_ident), orig_ts)
                                     )
-                            # Compute dep edges for this file and diff against previous
+                            # Compute dep edges for this file and diff against previous.
+                            # Resolution itself already happened in _extract_commit
+                            # (precomputed["resolved_imports"]) against that commit's
+                            # own git-ls-tree state — nothing left to resolve here.
                             module_ident = _code_ident("module", file_path)
                             current_deps: set = set()
-                            for import_name in set(extracted.get("imports", [])):
-                                dep_ident, is_resolved = _resolve_module_import(
-                                    import_name, file_entities, importing_file=file_path,
-                                )
+                            for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
                                 if dep_ident != module_ident:
                                     current_deps.add(dep_ident)
                                     is_relative = import_name.startswith(".")

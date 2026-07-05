@@ -1854,6 +1854,48 @@ class TestGitDiffTreeRaw:
         assert path == "vendor/lib"
 
 
+class TestKnownFilesAtCommit:
+    def test_returns_files_present_at_that_commit(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        first_commit_hash = commits[0][0]
+        known = mcp_server._known_files_at_commit(str(git_repo), first_commit_hash)
+        assert "auth.py" in known
+        # models.py isn't added until the second commit
+        assert "models.py" not in known
+
+    def test_second_commit_sees_both_files(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        second_commit_hash = commits[1][0]
+        known = mcp_server._known_files_at_commit(str(git_repo), second_commit_hash)
+        assert "auth.py" in known
+        assert "models.py" in known
+
+    def test_filters_out_unsupported_extensions(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "main.py").write_text("def f(): pass\n")
+        (repo / "README.md").write_text("hello\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        known = mcp_server._known_files_at_commit(str(repo), commits[0][0])
+        assert "main.py" in known
+        assert "README.md" not in known
+
+    def test_returned_dict_shape_matches_file_entities(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        known = mcp_server._known_files_at_commit(str(git_repo), commits[0][0])
+        assert known["auth.py"] == []
+
+
 class TestGitlinkChanges:
     def test_non_gitlink_rows_are_ignored(self):
         import mcp_server
@@ -1951,10 +1993,13 @@ class TestExtractCommit:
         results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
 
         assert len(results) == 1
-        status, file_path, extracted = results[0]
+        status, file_path, extracted, precomputed = results[0]
         assert status == "A"
         assert file_path == "auth.py"
         assert "login" in extracted["functions"]
+        assert "resolved_imports" in precomputed
+        assert "function_entries" in precomputed
+        assert "class_entries" in precomputed
         assert gitlink_changes == []
         assert gitmodules_map == {}
 
@@ -2152,14 +2197,17 @@ class TestIngestionWrites:
             cls_ident: "2025-01-01T00:00:00Z",
         }
         commit_ident = ":commit/deadbeef12345678"
+        extracted = {"functions": ["login"], "classes": ["User"], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
         triples = mcp_server._build_code_triples(
             "auth.py",
-            {"functions": ["login"], "classes": ["User"], "imports": []},
+            extracted,
             "2025-02-01T00:00:00Z",
             entity_valid_from,
             {},
             {},
             commit_ident,
+            precomputed,
         )
         assert any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
         assert any(f"[{cls_ident} :modified-in {commit_ident}]" in t for t in triples)
@@ -2169,14 +2217,17 @@ class TestIngestionWrites:
         module_ident = mcp_server._code_ident("module", "auth.py")
         entity_valid_from = {module_ident: "2025-01-01T00:00:00Z"}
         commit_ident = ":commit/deadbeef12345678"
+        extracted = {"functions": ["new_func"], "classes": [], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
         triples = mcp_server._build_code_triples(
             "auth.py",
-            {"functions": ["new_func"], "classes": [], "imports": []},
+            extracted,
             "2025-02-01T00:00:00Z",
             entity_valid_from,
             {},
             {},
             commit_ident,
+            precomputed,
         )
         fn_ident = mcp_server._code_ident("function", "auth.py", "new_func")
         assert not any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
@@ -2187,14 +2238,18 @@ class TestIngestionWrites:
         entity_valid_from: dict = {}
         entity_descriptions: dict = {}
         file_entities: dict = {}
+        commit_ident = ":commit/abc123456789"
+        extracted = {"functions": ["login"], "classes": ["User"], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
         mcp_server._build_code_triples(
             "auth.py",
-            {"functions": ["login"], "classes": ["User"], "imports": []},
+            extracted,
             "2025-01-01T00:00:00Z",
             entity_valid_from,
             entity_descriptions,
             file_entities,
-            ":commit/abc123456789",
+            commit_ident,
+            precomputed,
         )
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
         cls_ident = mcp_server._code_ident("class", "auth.py", "User")
@@ -2285,6 +2340,81 @@ class TestIngestionWrites:
         assert last_run_calls[0][0] == "abc123"
         assert last_run_calls[0][1].endswith("Z")
         assert last_run_calls[0][2] == 0  # no commits processed this run, prior was 0
+
+
+class TestPrecomputeFileTriples:
+    def test_module_candidate_triples_include_introduced_by(self):
+        import mcp_server
+        result = mcp_server._precompute_file_triples(
+            "auth.py",
+            {"functions": [], "classes": [], "imports": []},
+            ":commit/abc123456789",
+            {},
+        )
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        assert result["module_ident"] == module_ident
+        assert any(
+            f"[{module_ident} :introduced-by :commit/abc123456789]" in t
+            for t in result["module_candidate_triples"]
+        )
+
+    def test_function_entries_carry_ident_name_and_candidate_triples(self):
+        import mcp_server
+        result = mcp_server._precompute_file_triples(
+            "auth.py",
+            {"functions": ["login"], "classes": [], "imports": []},
+            ":commit/abc123456789",
+            {},
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert len(result["function_entries"]) == 1
+        ident, name, triples = result["function_entries"][0]
+        assert ident == fn_ident
+        assert name == "login"
+        assert any(f'[{fn_ident} :description "login"]' in t for t in triples)
+        assert any(f"[{fn_ident} :introduced-by :commit/abc123456789]" in t for t in triples)
+
+    def test_class_entries_carry_ident_name_and_candidate_triples(self):
+        import mcp_server
+        result = mcp_server._precompute_file_triples(
+            "auth.py",
+            {"functions": [], "classes": ["User"], "imports": []},
+            ":commit/abc123456789",
+            {},
+        )
+        cls_ident = mcp_server._code_ident("class", "auth.py", "User")
+        assert len(result["class_entries"]) == 1
+        ident, name, triples = result["class_entries"][0]
+        assert ident == cls_ident
+        assert name == "User"
+        assert any(f'[{cls_ident} :description "User"]' in t for t in triples)
+
+    def test_resolved_imports_use_known_files_not_file_entities(self):
+        import mcp_server
+        known_files = {"mod_b.py": []}
+        result = mcp_server._precompute_file_triples(
+            "mod_a.py",
+            {"functions": [], "classes": [], "imports": ["mod_b"]},
+            ":commit/abc123456789",
+            known_files,
+        )
+        assert len(result["resolved_imports"]) == 1
+        import_name, dep_ident, is_resolved = result["resolved_imports"][0]
+        assert import_name == "mod_b"
+        assert is_resolved is True
+        assert dep_ident == mcp_server._code_ident("module", "mod_b.py")
+
+    def test_unresolved_import_flagged_false(self):
+        import mcp_server
+        result = mcp_server._precompute_file_triples(
+            "main.rs",
+            {"functions": [], "classes": [], "imports": ["totally_unknown_crate"]},
+            ":commit/abc123456789",
+            {},
+        )
+        import_name, dep_ident, is_resolved = result["resolved_imports"][0]
+        assert is_resolved is False
+        assert dep_ident == mcp_server._canonical_ident("module", "totally_unknown_crate")
 
 
 class TestPreloadKnownDeps:
@@ -3672,6 +3802,63 @@ class TestResolveModuleImportTieredMatcher:
         file_entities = {"src/main.cpp": []}
         ident, is_resolved = mcp_server._resolve_module_import("vector", file_entities)
         assert is_resolved is False
+
+
+@pytest.fixture
+def git_repo_with_future_dep(tmp_path):
+    """commit 1: mod_a.py imports mod_b, which does not exist yet.
+    commit 2: mod_b.py is added.
+    Resolving mod_a's import while processing commit 1 must reflect commit 1's
+    OWN tree (mod_b.py doesn't exist there yet) — not HEAD's tree, where it does."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "mod_a.py").write_text("import mod_b\n\ndef main(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add mod_a importing not-yet-existing mod_b"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "mod_b.py").write_text("def helper(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add mod_b"], cwd=repo, check=True, capture_output=True)
+
+    return repo
+
+
+class TestPerCommitAccurateImportResolution:
+    @pytest.mark.asyncio
+    async def test_import_of_not_yet_existing_file_tagged_external_at_introduction(
+        self, mock_minigraf_db, git_repo_with_future_dep, monkeypatch
+    ):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo_with_future_dep / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None,
+        }
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(git_repo_with_future_dep), "HEAD")
+
+        mod_b_external_ident = mcp_server._canonical_ident("module", "mod_b")
+        assert any(
+            f"[{mod_b_external_ident} :entity-type :type/external-dependency]" in t
+            for t in transact_calls
+        ), (
+            "mod_b.py did not exist yet at commit 1, so resolving mod_a's import "
+            "must use commit 1's own tree and tag it external — not silently "
+            "resolve against HEAD's tree, where mod_b.py exists by the end."
+        )
 
 
 class TestResolveModuleImportRelative:
