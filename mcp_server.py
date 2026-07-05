@@ -2941,7 +2941,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     Extraction (git show + tree-sitter parse) for upcoming commits runs
     ahead of time on a thread pool via a bounded sliding-window pipeline;
     all DB-writing bookkeeping below stays strictly sequential, one commit
-    at a time, exactly as before this pipeline was introduced.
+    at a time, exactly as before this pipeline was introduced — the actual
+    db.execute()/checkpoint() calls just run on a dedicated single-worker
+    executor (write_executor) instead of inline on the event-loop thread, so
+    each fsync no longer blocks concurrent call_tool() requests.
     """
     global _db, _ingest_progress
     # Safe to clear unconditionally: handle_minigraf_ingest_git refuses to start a
@@ -2983,233 +2986,261 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
         loop = asyncio.get_running_loop()
         completed_all = True
+        # Dedicated single-worker pool for every DB write below. Each write is a
+        # synchronous, fsync'd call into the Rust-backed MiniGrafDb (see minigraf
+        # issue #287 for why facts can't batch across :contains/:depends-on edges
+        # into fewer fsyncs). The FFI call releases the GIL for its duration, so
+        # running it via run_in_executor lets the event loop keep servicing
+        # concurrent call_tool() requests while a write's fsync is in flight,
+        # instead of blocking the whole loop for that call. A single worker keeps
+        # writes strictly one-at-a-time, matching the existing invariant that only
+        # one commit's write section ever holds _db/db at once.
+        write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            commits_iter = iter(commits)
-            pending: Any = deque()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                commits_iter = iter(commits)
+                pending: Any = deque()
 
-            def submit_next() -> bool:
-                try:
-                    commit = next(commits_iter)
-                except StopIteration:
-                    return False
-                fut = loop.run_in_executor(executor, _extract_commit, repo_path, commit[0])
-                pending.append((commit, fut))
-                return True
+                def submit_next() -> bool:
+                    try:
+                        commit = next(commits_iter)
+                    except StopIteration:
+                        return False
+                    fut = loop.run_in_executor(executor, _extract_commit, repo_path, commit[0])
+                    pending.append((commit, fut))
+                    return True
 
-            for _ in range(pipeline_depth):
-                if not submit_next():
-                    break
+                for _ in range(pipeline_depth):
+                    if not submit_next():
+                        break
 
-            while pending:
-                if _shutdown_requested.is_set():
-                    completed_all = False
-                    break
+                while pending:
+                    if _shutdown_requested.is_set():
+                        completed_all = False
+                        break
 
-                (commit_hash, commit_ts_iso, author, subject), fut = pending.popleft()
-                extracted_files, gitlink_changes, gitmodules_map = await fut
-                submit_next()
+                    (commit_hash, commit_ts_iso, author, subject), fut = pending.popleft()
+                    extracted_files, gitlink_changes, gitmodules_map = await fut
+                    submit_next()
 
-                last_hash = commit_hash
-                _ingest_progress["current_commit"] = commit_hash
-                reason = f"git:{commit_hash} {author}: {subject}"
+                    last_hash = commit_hash
+                    _ingest_progress["current_commit"] = commit_hash
+                    reason = f"git:{commit_hash} {author}: {subject}"
 
-                # Build commit entity ident from first 12 chars of hash
-                commit_ident = f":commit/{commit_hash[:12]}"
+                    # Build commit entity ident from first 12 chars of hash
+                    commit_ident = f":commit/{commit_hash[:12]}"
 
-                # Acquire DB fresh each commit — never hold across yield
-                db = await _ensure_db_async()
-                try:
-                    add_triples: List[str] = [
-                        f"[{commit_ident} :entity-type :type/commit]",
-                        f'[{commit_ident} :ident "{commit_ident}"]',
-                        f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
-                        f'[{commit_ident} :hash "{commit_hash}"]',
-                        f'[{commit_ident} :author "{_edn_escape(author)}"]',
-                        f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
-                        f'[{commit_ident} :date "{commit_ts_iso}"]',
-                    ]
-                    close_items: List[tuple] = []  # (triples, original_ts_iso)
-                    dep_add_triples: List[str] = []  # :depends-on triples to transact individually
+                    # Acquire DB fresh each commit — never hold across yield
+                    db = await _ensure_db_async()
+                    try:
+                        add_triples: List[str] = [
+                            f"[{commit_ident} :entity-type :type/commit]",
+                            f'[{commit_ident} :ident "{commit_ident}"]',
+                            f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
+                            f'[{commit_ident} :hash "{commit_hash}"]',
+                            f'[{commit_ident} :author "{_edn_escape(author)}"]',
+                            f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
+                            f'[{commit_ident} :date "{commit_ts_iso}"]',
+                        ]
+                        close_items: List[tuple] = []  # (triples, original_ts_iso)
+                        dep_add_triples: List[str] = []  # :depends-on triples to transact individually
 
-                    for status, file_path, extracted, precomputed in extracted_files:
-                        if status == "D":
-                            # Close module and all known child entities for this file
-                            idents = file_entities.get(file_path, [_code_ident("module", file_path)])
-                            module_ident = _code_ident("module", file_path)
-                            for ident in idents:
-                                orig_ts = entity_valid_from.get(ident, commit_ts_iso)
-                                desc = entity_descriptions.get(ident, "")
-                                close_items.append(
-                                    (_build_close_triples(ident, desc, module_ident), orig_ts)
-                                )
-                            # Close all :depends-on edges for the deleted module
-                            for dep_ident in file_deps.get(file_path, set()):
-                                orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                                close_items.append(
-                                    ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
-                                )
-                            file_deps.pop(file_path, None)
-                        else:  # A or M
-                            previous_idents = set(file_entities.get(file_path, []))
-                            triples = _build_code_triples(
-                                file_path, extracted, commit_ts_iso, entity_valid_from,
-                                entity_descriptions, file_entities, commit_ident, precomputed,
-                            )
-                            add_triples.extend(triples)
-                            # Detect entities removed from a modified file.
-                            # _build_code_triples only appends to file_entities, never removes.
-                            # Compare previous idents against the idents derivable from the
-                            # current extraction to find what was deleted.
-                            if status == "M":
+                        for status, file_path, extracted, precomputed in extracted_files:
+                            if status == "D":
+                                # Close module and all known child entities for this file
+                                idents = file_entities.get(file_path, [_code_ident("module", file_path)])
                                 module_ident = _code_ident("module", file_path)
-                                current_extracted_idents: set = {module_ident}
-                                for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
-                                    current_extracted_idents.add(fn_ident)
-                                for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
-                                    current_extracted_idents.add(cls_ident)
-                                removed_idents = previous_idents - current_extracted_idents
-                                for ident in removed_idents:
+                                for ident in idents:
                                     orig_ts = entity_valid_from.get(ident, commit_ts_iso)
                                     desc = entity_descriptions.get(ident, "")
                                     close_items.append(
                                         (_build_close_triples(ident, desc, module_ident), orig_ts)
                                     )
-                            # Compute dep edges for this file and diff against previous.
-                            # Resolution itself already happened in _extract_commit
-                            # (precomputed["resolved_imports"]) against that commit's
-                            # own git-ls-tree state — nothing left to resolve here.
-                            module_ident = _code_ident("module", file_path)
-                            current_deps: set = set()
-                            for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
-                                if dep_ident != module_ident:
-                                    current_deps.add(dep_ident)
-                                    is_relative = import_name.startswith(".")
-                                    if not is_resolved and not is_relative and dep_ident not in entity_valid_from:
-                                        add_triples.extend([
-                                            f"[{dep_ident} :entity-type :type/external-dependency]",
-                                            f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
-                                            f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
-                                        ])
-                                        entity_valid_from[dep_ident] = commit_ts_iso
-                                        entity_descriptions[dep_ident] = import_name
-                            previous_deps = file_deps.get(file_path, set())
-                            for dep_ident in current_deps - previous_deps:
-                                dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
-                                dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
-                            if status == "M":
-                                for dep_ident in previous_deps - current_deps:
+                                # Close all :depends-on edges for the deleted module
+                                for dep_ident in file_deps.get(file_path, set()):
                                     orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
                                     close_items.append(
                                         ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
                                     )
-                            file_deps[file_path] = current_deps
-
-                    # Process gitlink changes (submodule add/bump/remove).
-                    # The "remove" case's interaction with the ordinary per-file module-open
-                    # logic (elsewhere in this loop) is only sound because real submodule paths
-                    # are extensionless (no tree-sitter parser matches them, so no module is
-                    # ever opened for a bare gitlink path) — a gitlink path that happened to
-                    # carry a recognized source extension is an untested, unreachable-in-practice edge case.
-                    for kind, sha, path in gitlink_changes:
-                        ext_ident = _code_ident("module", path)
-                        if kind == "add":
-                            info = gitmodules_map.get(path, {})
-                            name = info.get("name", "")
-                            url = info.get("url", "")
-                            description = name or path
-                            ext_triples = [
-                                f"[{ext_ident} :entity-type :type/external-dependency]",
-                                f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
-                                f'[{ext_ident} :description "{_edn_escape(description)}"]',
-                                f'[{ext_ident} :path "{_edn_escape(path)}"]',
-                                f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
-                                f"[{ext_ident} :introduced-by {commit_ident}]",
-                            ]
-                            if name:
-                                ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
-                            if url:
-                                ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
-                            add_triples.extend(ext_triples)
-                            entity_valid_from[ext_ident] = commit_ts_iso
-                            entity_descriptions[ext_ident] = description
-                            pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
-                        elif kind == "bump":
-                            old_sha, orig_ts = pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
-                            if old_sha is not None:
-                                close_items.append(
-                                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
+                                file_deps.pop(file_path, None)
+                            else:  # A or M
+                                previous_idents = set(file_entities.get(file_path, []))
+                                triples = _build_code_triples(
+                                    file_path, extracted, commit_ts_iso, entity_valid_from,
+                                    entity_descriptions, file_entities, commit_ident, precomputed,
                                 )
-                            add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
-                            add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
-                            pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
-                        else:  # "remove"
-                            orig_ts = entity_valid_from.get(ext_ident, commit_ts_iso)
-                            desc = entity_descriptions.get(ext_ident, "")
-                            close_items.append(
-                                (_build_close_triples(ext_ident, desc, ext_ident), orig_ts)
-                            )
-                            old_sha, pin_orig_ts = pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
-                            if old_sha is not None:
+                                add_triples.extend(triples)
+                                # Detect entities removed from a modified file.
+                                # _build_code_triples only appends to file_entities, never removes.
+                                # Compare previous idents against the idents derivable from the
+                                # current extraction to find what was deleted.
+                                if status == "M":
+                                    module_ident = _code_ident("module", file_path)
+                                    current_extracted_idents: set = {module_ident}
+                                    for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
+                                        current_extracted_idents.add(fn_ident)
+                                    for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
+                                        current_extracted_idents.add(cls_ident)
+                                    removed_idents = previous_idents - current_extracted_idents
+                                    for ident in removed_idents:
+                                        orig_ts = entity_valid_from.get(ident, commit_ts_iso)
+                                        desc = entity_descriptions.get(ident, "")
+                                        close_items.append(
+                                            (_build_close_triples(ident, desc, module_ident), orig_ts)
+                                        )
+                                # Compute dep edges for this file and diff against previous.
+                                # Resolution itself already happened in _extract_commit
+                                # (precomputed["resolved_imports"]) against that commit's
+                                # own git-ls-tree state — nothing left to resolve here.
+                                module_ident = _code_ident("module", file_path)
+                                current_deps: set = set()
+                                for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
+                                    if dep_ident != module_ident:
+                                        current_deps.add(dep_ident)
+                                        is_relative = import_name.startswith(".")
+                                        if not is_resolved and not is_relative and dep_ident not in entity_valid_from:
+                                            add_triples.extend([
+                                                f"[{dep_ident} :entity-type :type/external-dependency]",
+                                                f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
+                                                f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
+                                            ])
+                                            entity_valid_from[dep_ident] = commit_ts_iso
+                                            entity_descriptions[dep_ident] = import_name
+                                previous_deps = file_deps.get(file_path, set())
+                                for dep_ident in current_deps - previous_deps:
+                                    dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
+                                    dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
+                                if status == "M":
+                                    for dep_ident in previous_deps - current_deps:
+                                        orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
+                                        close_items.append(
+                                            ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+                                        )
+                                file_deps[file_path] = current_deps
+
+                        # Process gitlink changes (submodule add/bump/remove).
+                        # The "remove" case's interaction with the ordinary per-file module-open
+                        # logic (elsewhere in this loop) is only sound because real submodule paths
+                        # are extensionless (no tree-sitter parser matches them, so no module is
+                        # ever opened for a bare gitlink path) — a gitlink path that happened to
+                        # carry a recognized source extension is an untested, unreachable-in-practice edge case.
+                        for kind, sha, path in gitlink_changes:
+                            ext_ident = _code_ident("module", path)
+                            if kind == "add":
+                                info = gitmodules_map.get(path, {})
+                                name = info.get("name", "")
+                                url = info.get("url", "")
+                                description = name or path
+                                ext_triples = [
+                                    f"[{ext_ident} :entity-type :type/external-dependency]",
+                                    f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
+                                    f'[{ext_ident} :description "{_edn_escape(description)}"]',
+                                    f'[{ext_ident} :path "{_edn_escape(path)}"]',
+                                    f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
+                                    f"[{ext_ident} :introduced-by {commit_ident}]",
+                                ]
+                                if name:
+                                    ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
+                                if url:
+                                    ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
+                                add_triples.extend(ext_triples)
+                                entity_valid_from[ext_ident] = commit_ts_iso
+                                entity_descriptions[ext_ident] = description
+                                pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+                            elif kind == "bump":
+                                old_sha, orig_ts = pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
+                                if old_sha is not None:
+                                    close_items.append(
+                                        ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
+                                    )
+                                add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
+                                add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
+                                pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+                            else:  # "remove"
+                                orig_ts = entity_valid_from.get(ext_ident, commit_ts_iso)
+                                desc = entity_descriptions.get(ext_ident, "")
                                 close_items.append(
-                                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
+                                    (_build_close_triples(ext_ident, desc, ext_ident), orig_ts)
                                 )
+                                old_sha, pin_orig_ts = pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
+                                if old_sha is not None:
+                                    close_items.append(
+                                        ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
+                                    )
 
-                    # Split :contains triples out before batching.  Minigraf's EAVT
-                    # pending index lacks value bytes in the key, so batching multiple
-                    # [module :contains fn] facts in one transact silently drops all
-                    # but the last.  Each :contains triple gets its own transact so
-                    # they receive distinct tx_counts and avoid the index collision.
-                    contains_triples = [t for t in add_triples if ":contains" in t]
-                    other_triples = [t for t in add_triples if ":contains" not in t]
-                    _ingest_transact(db, other_triples, commit_ts_iso, reason)
-                    for ct in contains_triples:
-                        _ingest_transact(db, [ct], commit_ts_iso, reason)
-                    # :depends-on triples transacted individually — same EAVT collision risk
-                    # as :contains when multiple deps share the same source module
-                    for dt in dep_add_triples:
-                        _ingest_transact(db, [dt], commit_ts_iso, reason)
-                    for close_triples, orig_ts in close_items:
-                        _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason)
-
-                    # Ingest :parent edges — one transact per parent to avoid EAVT
-                    # collision for merge commits (which have two parent hashes).
-                    try:
-                        for parent_hash in _git_parent_hashes(repo_path, commit_hash):
-                            parent_ident = f":commit/{parent_hash[:12]}"
-                            db.execute(
-                                f'(transact [[{commit_ident} :parent {parent_ident}]] '
-                                f'{{:valid-from "{commit_ts_iso}"}})'
+                        # Split :contains triples out before batching.  Minigraf's EAVT
+                        # pending index lacks value bytes in the key, so batching multiple
+                        # [module :contains fn] facts in one transact silently drops all
+                        # but the last.  Each :contains triple gets its own transact so
+                        # they receive distinct tx_counts and avoid the index collision.
+                        contains_triples = [t for t in add_triples if ":contains" in t]
+                        other_triples = [t for t in add_triples if ":contains" not in t]
+                        await loop.run_in_executor(
+                            write_executor, _ingest_transact, db, other_triples, commit_ts_iso, reason
+                        )
+                        for ct in contains_triples:
+                            await loop.run_in_executor(
+                                write_executor, _ingest_transact, db, [ct], commit_ts_iso, reason
                             )
-                    except Exception:
-                        pass  # non-fatal; parent edges are best-effort
+                        # :depends-on triples transacted individually — same EAVT collision risk
+                        # as :contains when multiple deps share the same source module
+                        for dt in dep_add_triples:
+                            await loop.run_in_executor(
+                                write_executor, _ingest_transact, db, [dt], commit_ts_iso, reason
+                            )
+                        for close_triples, orig_ts in close_items:
+                            await loop.run_in_executor(
+                                write_executor, _ingest_close, db, close_triples, orig_ts, commit_ts_iso, reason
+                            )
 
-                    _watermark_update(db, commit_hash, commit_ts_iso, reason)
-                    db.checkpoint()
+                        # Ingest :parent edges — one transact per parent to avoid EAVT
+                        # collision for merge commits (which have two parent hashes).
+                        try:
+                            for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+                                parent_ident = f":commit/{parent_hash[:12]}"
+                                await loop.run_in_executor(
+                                    write_executor,
+                                    db.execute,
+                                    f'(transact [[{commit_ident} :parent {parent_ident}]] '
+                                    f'{{:valid-from "{commit_ts_iso}"}})',
+                                )
+                        except Exception:
+                            pass  # non-fatal; parent edges are best-effort
 
+                        await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason)
+                        await loop.run_in_executor(write_executor, db.checkpoint)
+
+                    finally:
+                        _db = None  # release file lock between commits
+                        db = None   # drop local reference too — see note above
+
+                    _ingest_progress["processed"] += 1
+                    await asyncio.sleep(0)  # yield to event loop
+
+            if completed_all:
+                now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                db = await _ensure_db_async()
+                try:
+                    await loop.run_in_executor(write_executor, _ingest_tags, db, repo_path, now)
+                    await loop.run_in_executor(
+                        write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"]
+                    )
+                    await loop.run_in_executor(write_executor, db.checkpoint)
                 finally:
-                    _db = None  # release file lock between commits
-                    db = None   # drop local reference too — see note above
+                    _db = None
 
-                _ingest_progress["processed"] += 1
-                await asyncio.sleep(0)  # yield to event loop
-
-        if completed_all:
-            now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-            db = await _ensure_db_async()
-            try:
-                _ingest_tags(db, repo_path, now)
-                _last_run_write(db, last_hash, now, _ingest_progress["processed"])
-                db.checkpoint()
-            finally:
-                _db = None
-
-            _ingest_progress["status"] = "complete"
-            _index_cache.invalidate()
-        else:
-            _ingest_progress["status"] = "stopped"
+                _ingest_progress["status"] = "complete"
+                _index_cache.invalidate()
+            else:
+                _ingest_progress["status"] = "stopped"
+        finally:
+            write_executor.shutdown(wait=True)
 
     except Exception as e:
+        # write_executor is already shut down by the inner finally above by the
+        # time we get here (it runs on any exit from that try, including this
+        # exception propagating through it) — nothing left to clean up.
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _db = None
