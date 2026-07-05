@@ -2835,6 +2835,29 @@ def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
     return pinned
 
 
+def _load_ingestion_preload_state(repo_path: str) -> tuple:
+    """Open the DB and run every startup preload query for _run_ingestion.
+
+    Executed via run_in_executor on a worker thread (see _run_ingestion), not
+    inline on the event loop: opening/mmapping a graph file plus these preload
+    queries contain no internal awaits, so running them directly on the event
+    loop thread starves the stdio handshake for as long as they take — on a
+    large enough graph, longer than a client's connection timeout (issue #103).
+    Uses get_db()'s blocking lock-retry rather than _ensure_db_async()'s
+    event-loop-safe variant precisely because this now runs off that thread.
+    """
+    db = get_db()
+    watermark = _watermark_query(db)
+    prior_ingested = _count_commit_entities(db)
+    entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
+    file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
+    pinned_commit_state = _preload_pinned_commits(db)
+    return (
+        watermark, prior_ingested, entity_valid_from, entity_descriptions,
+        file_entities, file_deps, dep_valid_from, pinned_commit_state,
+    )
+
+
 def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
     """Ingest git tags as :tag/<slug> entities with :tagged-commit references.
 
@@ -2953,19 +2976,21 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # so a shutdown request arriving between runs is never silently lost.
     _shutdown_requested.clear()
     try:
-        # Read watermark and pre-load known entities/deps before releasing DB
-        db = await _ensure_db_async()
-        watermark = _watermark_query(db)
-        prior_ingested = _count_commit_entities(db)
-        entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
-        file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
-        pinned_commit_state = _preload_pinned_commits(db)
+        # Read watermark and pre-load known entities/deps before releasing DB.
+        # Off-loaded to a worker thread (see _load_ingestion_preload_state)
+        # so this potentially slow phase never blocks the event loop from
+        # servicing the stdio handshake concurrently (issue #103).
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as preload_executor:
+            (
+                watermark, prior_ingested, entity_valid_from, entity_descriptions,
+                file_entities, file_deps, dep_valid_from, pinned_commit_state,
+            ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
         # minigraf exposes no explicit close(): the file lock is only released once
-        # every reference to the handle is gone, so the local `db` must be cleared
-        # too, not just the global — otherwise this frame keeps it alive (and the
-        # lock held) through the potentially slow commit enumeration below.
+        # every reference to the handle is gone — the worker thread's own `db`
+        # local already went out of scope when it returned above, so clearing
+        # the global here is enough to release the lock.
         _db = None  # release file lock while enumerating commits
-        db = None
 
         commits = _git_commits(repo_path, watermark, branch)
         repo_total_result = _subprocess.run(
@@ -2984,7 +3009,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         max_workers = int(env_workers) if env_workers else min(32, (os.cpu_count() or 1) + 4)
         pipeline_depth = max_workers * 2
 
-        loop = asyncio.get_running_loop()
         completed_all = True
         # Dedicated single-worker pool for every DB write below. Each write is a
         # synchronous, fsync'd call into the Rust-backed MiniGrafDb (see minigraf

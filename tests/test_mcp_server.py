@@ -8,6 +8,7 @@ import json
 import sys
 import os
 import subprocess as _subprocess
+import time
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from minigraf import MiniGrafError
@@ -2627,6 +2628,50 @@ class TestRunIngestion:
 
         assert mcp_server._ingest_progress["status"] == "complete"
         assert mcp_server._ingest_progress["processed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_preload_phase_does_not_block_event_loop(
+        self, mock_minigraf_db, git_repo, monkeypatch
+    ):
+        """Regression test for #103: opening the DB and running the startup
+        preload queries (_watermark_query, _count_commit_entities,
+        _preload_known_entities/_deps/_pinned_commits) must run off the event
+        loop. Before the fix these ran synchronously inline with no `await`
+        between them, so on a large graph the phase could run long enough to
+        starve the stdio handshake past a client's connection timeout,
+        leaving the server permanently unable to connect."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+
+        def slow_preload(db, repo_path):
+            time.sleep(0.3)
+            return {}, {}, {}
+
+        monkeypatch.setattr(mcp_server, "_preload_known_entities", slow_preload)
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        heartbeat_ticks = 0
+
+        async def heartbeat():
+            nonlocal heartbeat_ticks
+            while True:
+                heartbeat_ticks += 1
+                await asyncio.sleep(0.02)
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+        assert heartbeat_ticks >= 5, (
+            "event loop was starved during the preload phase: only "
+            f"{heartbeat_ticks} heartbeat ticks during a 0.3s slow preload"
+        )
 
     @pytest.mark.asyncio
     async def test_db_released_between_commits(self, mock_minigraf_db, git_repo):
