@@ -3319,6 +3319,18 @@ async def handle_minigraf_ingest_git(
     global _ingest_task, _ingest_progress
     if _ingest_task and not _ingest_task.done():
         return {"ok": False, "error": "ingestion already in progress"}
+    # Proactive check-before-attempt: if another live process already owns
+    # the graph lock, don't start ingestion here rather than racing for it
+    # and losing (#108).
+    holder_pid = _live_lock_holder_pid(_graph_path or _get_graph_path())
+    if holder_pid is not None:
+        _ingest_progress["status"] = "skipped"
+        _ingest_progress["owner_pid"] = holder_pid
+        return {
+            "ok": False,
+            "error": f"ingestion already owned by live process (pid {holder_pid})",
+            "owner_pid": holder_pid,
+        }
     repo = repo_path or str(Path.cwd())
     try:
         check = _subprocess.run(
@@ -3332,16 +3344,6 @@ async def handle_minigraf_ingest_git(
         return {
             "ok": False,
             "error": f"Not a git repository (or git not found): {repo}",
-        }
-    # Proactive check-before-attempt: if another live process already owns
-    # the graph lock, don't start ingestion here rather than racing for it
-    # and losing (#108).
-    holder_pid = _live_lock_holder_pid(_get_graph_path())
-    if holder_pid is not None:
-        return {
-            "ok": False,
-            "error": f"Graph lock already held by live process (pid {holder_pid})",
-            "owner_pid": holder_pid,
         }
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
