@@ -3083,6 +3083,30 @@ class TestRunIngestion:
         assert mcp_server._ingest_task is not None
 
     @pytest.mark.asyncio
+    async def test_status_not_idle_immediately_after_ingest_git_starts(
+        self, mock_minigraf_db, git_repo, monkeypatch
+    ):
+        """Regression test for #109: handle_minigraf_ingest_git creates
+        _ingest_task and returns before _run_ingestion's preload phase has
+        had a chance to run, so _ingest_progress must already reflect
+        "in progress" the instant it returns. Leaving it at "idle" reproduces
+        the reported contradiction, where a caller sees status "idle" but
+        a subsequent minigraf_ingest_git call is rejected with "already in
+        progress" because the task-existence check is accurate immediately."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+        }
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
+        assert result["ok"] is True
+        assert mcp_server._ingest_progress["status"] == "starting"
+
+    @pytest.mark.asyncio
     async def test_processed_seeded_from_prior_ingested(self, mock_minigraf_db, git_repo, monkeypatch):
         """processed starts at the true persisted commit count and increments
         cumulatively — regression test for #85 (seeding must not rely on the
@@ -3472,6 +3496,61 @@ class TestMainAutoIngestLockCheck:
 
         assert mcp_server._ingest_task is not None
         assert mcp_server._ingest_progress["status"] != "skipped"
+
+        mcp_server._shutdown_requested.set()
+        await asyncio.wait_for(main_task, timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_status_not_idle_immediately_after_auto_start(self, monkeypatch, tmp_path):
+        """Regression test for #109: main() creates _ingest_task for the
+        auto-started ingestion, then _run_ingestion's preload phase (a full
+        re-scan that can take minutes on a large repo) runs before status
+        ever leaves "idle" — so a caller polling minigraf_ingest_status
+        right after startup sees "idle" while minigraf_ingest_git already
+        rejects a start attempt with "already in progress", an actionable
+        -but-confusing contradiction. _ingest_progress must reflect
+        "in progress" the instant the task exists, not just once preload
+        completes."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+
+        async def fake_run_ingestion(repo_path, branch):
+            # Never touches _ingest_progress — isolates what main() itself
+            # sets before/at task creation from what _run_ingestion would
+            # later set once its preload phase completes.
+            await asyncio.wait(
+                {
+                    asyncio.create_task(mcp_server._shutdown_requested.wait()),
+                    asyncio.create_task(asyncio.Event().wait()),
+                },
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+
+        assert mcp_server._ingest_task is not None
+        assert mcp_server._ingest_progress["status"] == "starting"
 
         mcp_server._shutdown_requested.set()
         await asyncio.wait_for(main_task, timeout=2)
