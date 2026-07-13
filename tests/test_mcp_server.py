@@ -207,6 +207,78 @@ class TestGetDbLockRetry:
         assert mock_class.open.call_count == 2 * mcp_server._LOCK_RETRY_MAX
 
 
+class TestOpenDbAtWithExtendedRetry:
+    """Unit tests for _open_db_at_with_extended_retry — the longer,
+    time-budgeted backoff used only for ingestion startup lock acquisition,
+    separate from get_db()'s ~1.55s budget (#106)."""
+
+    def test_succeeds_after_retries_within_budget(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        fake_time = {"t": 0.0}
+        monkeypatch.setattr("mcp_server.time.monotonic", lambda: fake_time["t"])
+        monkeypatch.setattr(
+            "mcp_server.time.sleep",
+            lambda s: fake_time.__setitem__("t", fake_time["t"] + s),
+        )
+        live_pid = os.getpid()  # alive -> self-heal never fires, pure backoff-then-succeed
+        lock_err = MiniGrafError(
+            f"Database is locked by another process (lock file: x.graph.lock, holder PID: {live_pid})."
+        )
+        mock_class.open.side_effect = [lock_err, lock_err, db_instance]
+        import mcp_server
+        result = mcp_server._open_db_at_with_extended_retry(str(tmp_path / "t.graph"))
+        assert result is db_instance
+        assert mock_class.open.call_count == 3
+
+    def test_gives_up_after_budget_exhausted(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        fake_time = {"t": 0.0}
+        monkeypatch.setattr("mcp_server.time.monotonic", lambda: fake_time["t"])
+        monkeypatch.setattr(
+            "mcp_server.time.sleep",
+            lambda s: fake_time.__setitem__("t", fake_time["t"] + s),
+        )
+        live_pid = os.getpid()  # alive -> self-heal never fires; pure budget exhaustion
+        lock_err = MiniGrafError(
+            f"Database is locked by another process (lock file: x.graph.lock, holder PID: {live_pid})."
+        )
+        mock_class.open.side_effect = lock_err  # always raises the same error
+        import mcp_server
+        with pytest.raises(MiniGrafError):
+            mcp_server._open_db_at_with_extended_retry(str(tmp_path / "t.graph"))
+        # Far more retries than the old ~1.55s/5-attempt budget would allow —
+        # proves the extended budget, not the general-purpose one, was used.
+        assert mock_class.open.call_count >= 10
+
+    def test_non_lock_error_propagates_immediately(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        mock_class.open.side_effect = MiniGrafError("corrupt graph file")
+        import mcp_server
+        with pytest.raises(MiniGrafError):
+            mcp_server._open_db_at_with_extended_retry(str(tmp_path / "t.graph"))
+        assert mock_class.open.call_count == 1  # no retry for non-lock errors
+
+    def test_self_heals_dead_holder_mid_loop(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        graph_path = str(tmp_path / "t.graph")
+        lock_path = graph_path + ".lock"
+        with open(lock_path, "w") as f:
+            f.write("stale")
+        dead_pid = 999999  # not running on any reasonable test machine
+        mock_class.open.side_effect = [
+            MiniGrafError(
+                f"Database is locked by another process (lock file: {lock_path}, holder PID: {dead_pid})."
+            ),
+            db_instance,
+        ]
+        import mcp_server
+        result = mcp_server._open_db_at_with_extended_retry(graph_path)
+        assert result is db_instance
+        assert not os.path.exists(lock_path)
+
+
 class TestLiveLockHolderPid:
     """Unit tests for _live_lock_holder_pid — the proactive pre-check used
     to avoid racing another live process for the ingestion lock (#108)."""
@@ -263,6 +335,28 @@ class TestLiveLockHolderPid:
 
         monkeypatch.setattr(mcp_server.os, "kill", raise_permission_error)
         assert mcp_server._live_lock_holder_pid(graph_path) == other_pid
+
+
+class TestPidIsAlive:
+    """Unit tests for _pid_is_alive — shared conservative liveness check
+    extracted from _clear_stale_lock and _live_lock_holder_pid (#106)."""
+
+    def test_dead_pid_returns_false(self):
+        import mcp_server
+        assert mcp_server._pid_is_alive(999999) is False  # not running on any reasonable test machine
+
+    def test_live_pid_returns_true(self):
+        import mcp_server
+        assert mcp_server._pid_is_alive(os.getpid()) is True
+
+    def test_permission_error_treated_as_alive(self, monkeypatch):
+        import mcp_server
+
+        def raise_permission_error(pid, sig):
+            raise PermissionError()
+
+        monkeypatch.setattr(mcp_server.os, "kill", raise_permission_error)
+        assert mcp_server._pid_is_alive(424242) is True
 
 
 class TestMinigrafQuery:
@@ -1728,7 +1822,7 @@ class TestMinigrafIngestStatus:
         # Must not query the graph while running
         db_instance.execute.assert_not_called()
 
-    def test_reports_owner_pid_when_skipped(self, mock_minigraf_db, tmp_path):
+    def test_reports_owner_pid_when_skipped(self, mock_minigraf_db, tmp_path, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -1736,9 +1830,62 @@ class TestMinigrafIngestStatus:
             "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
         }
+        monkeypatch.setattr(mcp_server, "_pid_is_alive", lambda pid: True)
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["status"] == "skipped"
         assert result["owner_pid"] == 424242
+        assert result["stale"] is False
+
+    def test_skipped_status_is_stale_when_owner_pid_dead(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": 424242,
+        }
+        monkeypatch.setattr(mcp_server, "_pid_is_alive", lambda pid: False)
+        result = mcp_server.handle_minigraf_ingest_status()
+        assert result["stale"] is True
+
+    def test_error_status_reports_stale_when_holder_pid_dead(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "",
+            "error": "Database is locked by another process (lock file: x.graph.lock, holder PID: 424242).",
+            "owner_pid": None,
+        }
+        monkeypatch.setattr(mcp_server, "_pid_is_alive", lambda pid: False)
+        result = mcp_server.handle_minigraf_ingest_status()
+        assert result["stale"] is True
+
+    def test_error_status_not_stale_when_holder_pid_alive(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "",
+            "error": "Database is locked by another process (lock file: x.graph.lock, holder PID: 424242).",
+            "owner_pid": None,
+        }
+        monkeypatch.setattr(mcp_server, "_pid_is_alive", lambda pid: True)
+        result = mcp_server.handle_minigraf_ingest_status()
+        assert result["stale"] is False
+
+    def test_error_status_omits_stale_when_no_pid_in_message(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": "corrupt graph file", "owner_pid": None,
+        }
+        result = mcp_server.handle_minigraf_ingest_status()
+        assert "stale" not in result
 
     def test_returns_total_ingested_from_graph(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -2649,6 +2796,27 @@ class TestRunIngestion:
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         assert mcp_server._ingest_progress["status"] == "complete"
         assert mcp_server._ingest_progress["processed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_sets_error_at_timestamp_on_failure(self, mock_minigraf_db, git_repo, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+
+        def raise_error(repo_path, watermark, branch):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(mcp_server, "_git_commits", raise_error)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "error"
+        assert "boom" in mcp_server._ingest_progress["error"]
+        assert mcp_server._ingest_progress["error_at"] is not None
+        assert mcp_server._ingest_progress["error_at"].endswith("Z")
 
     @pytest.mark.asyncio
     async def test_watermark_updated_after_each_commit(self, mock_minigraf_db, git_repo):

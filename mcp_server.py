@@ -73,11 +73,23 @@ _server_ref: Optional[Server] = None
 _LOCK_RETRY_MAX = 5
 _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
 
+# Extended retry budget for the one-time startup/manual-trigger lock
+# acquisition only (_load_ingestion_preload_state) — separate from
+# _LOCK_RETRY_MAX/_LOCK_RETRY_BASE above, which gate synchronous
+# per-request paths (call_tool, IndexCache rebuild) where long blocking
+# would be harmful. This path runs on a dedicated worker thread and can
+# afford to be patient enough to survive a typical orphan-process cleanup
+# window (SIGTERM grace period before SIGKILL) instead of giving up in
+# ~1.55s and entering a permanent "error" state (#106).
+_INGEST_LOCK_RETRY_BASE = 0.05     # seconds; matches _LOCK_RETRY_BASE for consistency
+_INGEST_LOCK_RETRY_CAP = 15.0      # seconds; per-attempt sleep never exceeds this
+_INGEST_LOCK_RETRY_BUDGET = 120.0  # seconds; total time before giving up
+
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-    "current_commit": "", "error": None, "owner_pid": None,
+    "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -769,20 +781,27 @@ def _stale_lock_holder_pid(exc: Exception) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Conservative liveness check: only a positive ProcessLookupError counts
+    as dead. Uncertain cases (PermissionError, other OSError) are treated as
+    alive rather than risking a false "safe to proceed" signal.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # PermissionError or other — can't confirm death, assume alive
+    return True
+
+
 def _clear_stale_lock(path: str, holder_pid: int) -> bool:
     """Remove path's lock file if its recorded holder process is no longer alive.
 
     Returns True if a stale lock was removed.
     """
-    try:
-        os.kill(holder_pid, 0)
+    if _pid_is_alive(holder_pid):
         return False  # holder still alive (or we lack permission to tell — leave it)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        return False
-    except OSError:
-        return False
     try:
         os.remove(path + ".lock")
         return True
@@ -814,13 +833,7 @@ def _live_lock_holder_pid(path: str) -> Optional[int]:
     pid = int(holder)
     if pid == os.getpid():
         return None  # our own leaked handle, not another process
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return None  # holder no longer running
-    except OSError:
-        pass  # PermissionError or other — can't confirm death, assume alive
-    return pid
+    return pid if _pid_is_alive(pid) else None
 
 
 def _try_open_with_self_heal(path: str) -> MiniGrafDb:
@@ -868,6 +881,36 @@ def _open_db_at_with_retry(path: str) -> MiniGrafDb:
             if attempt < _LOCK_RETRY_MAX - 1:
                 time.sleep(delay)
                 delay *= 2
+    assert last_exc is not None
+    raise last_exc
+
+
+def _open_db_at_with_extended_retry(path: str) -> MiniGrafDb:
+    """Open MiniGrafDb at path, retrying lock contention with a much longer
+    time-budgeted backoff than _open_db_at_with_retry.
+
+    Used only by _load_ingestion_preload_state, which runs on a dedicated
+    worker thread (see issue #103) and can afford to wait out a typical
+    orphan-process cleanup window instead of giving up after ~1.55s and
+    leaving _run_ingestion permanently stuck in an "error" state (#106).
+    Self-heals a dead holder's lock on every attempt via
+    _try_open_with_self_heal, exactly like _open_db_at_with_retry.
+    """
+    deadline = time.monotonic() + _INGEST_LOCK_RETRY_BUDGET
+    delay = _INGEST_LOCK_RETRY_BASE
+    last_exc: Optional[Exception] = None
+    while True:
+        try:
+            return _try_open_with_self_heal(path)
+        except Exception as e:
+            if not _is_lock_error(e):
+                raise
+            last_exc = e
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, _INGEST_LOCK_RETRY_CAP)
     assert last_exc is not None
     raise last_exc
 
@@ -2884,10 +2927,15 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     queries contain no internal awaits, so running them directly on the event
     loop thread starves the stdio handshake for as long as they take — on a
     large enough graph, longer than a client's connection timeout (issue #103).
-    Uses get_db()'s blocking lock-retry rather than _ensure_db_async()'s
-    event-loop-safe variant precisely because this now runs off that thread.
+    Uses _open_db_at_with_extended_retry's much longer blocking lock-retry
+    (rather than get_db()'s ~1.55s budget or _ensure_db_async()'s
+    event-loop-safe variant) precisely because this runs off that thread and
+    can afford to wait out a typical orphan cleanup window instead of
+    entering a permanent "error" state (#106). Mirrors get_db()'s
+    "reuse the already-open handle" short-circuit rather than reopening
+    unconditionally.
     """
-    db = get_db()
+    db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
     watermark = _watermark_query(db)
     prior_ingested = _count_commit_entities(db)
     entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
@@ -3308,6 +3356,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # exception propagating through it) — nothing left to clean up.
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
+        _ingest_progress["error_at"] = _now_utc_ms()
         _db = None
 
 
@@ -3347,7 +3396,7 @@ async def handle_minigraf_ingest_git(
         }
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-        "current_commit": "", "error": None, "owner_pid": None,
+        "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
@@ -3362,6 +3411,18 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
     result["processed_this_run"] = (
         _ingest_progress["processed"] - _ingest_progress.get("prior_ingested", 0)
     )
+    # Staleness: a terminal error/skipped state can outlive the condition
+    # that caused it (e.g. the orphaned holder it names has since died) —
+    # re-check liveness on every poll instead of echoing a dead PID forever.
+    # Purely informational: never auto-retries ingestion (#106).
+    if _ingest_progress["status"] == "error":
+        holder_pid = _stale_lock_holder_pid(_ingest_progress.get("error") or "")
+        if holder_pid is not None:
+            result["stale"] = not _pid_is_alive(holder_pid)
+    elif _ingest_progress["status"] == "skipped":
+        owner_pid = _ingest_progress.get("owner_pid")
+        if owner_pid is not None:
+            result["stale"] = not _pid_is_alive(owner_pid)
     if _ingest_progress["status"] != "running":
         try:
             db = get_db()
@@ -3606,7 +3667,11 @@ _TOOLS: List[Tool] = [
             "status is one of: idle, running, complete, error, skipped. "
             "skipped means another live process already owns the graph lock "
             "(see owner_pid) — this server will not start ingestion on its own; "
-            "call minigraf_ingest_git again later if you want to retry."
+            "call minigraf_ingest_git again later if you want to retry. "
+            "For error and skipped, a stale field may be present: stale=true means "
+            "the condition that caused this state (the cited or owning PID) is no "
+            "longer alive, so a minigraf_ingest_git retry is likely to succeed now; "
+            "error also includes error_at, the timestamp the failure occurred."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
@@ -3711,7 +3776,7 @@ async def main() -> None:
     # Set MINIGRAF_NO_AUTO_INGEST=1 to skip auto-start (used by eval sandboxes).
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-        "current_commit": "", "error": None, "owner_pid": None,
+        "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         # Proactive check-before-attempt: if another live process already
