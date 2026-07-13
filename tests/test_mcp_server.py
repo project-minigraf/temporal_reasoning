@@ -2745,6 +2745,27 @@ class TestRunIngestion:
         assert mcp_server._ingest_progress["processed"] == 2
 
     @pytest.mark.asyncio
+    async def test_sets_error_at_timestamp_on_failure(self, mock_minigraf_db, git_repo, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+
+        def raise_error(repo_path, watermark, branch):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(mcp_server, "_git_commits", raise_error)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "error"
+        assert "boom" in mcp_server._ingest_progress["error"]
+        assert mcp_server._ingest_progress["error_at"] is not None
+        assert mcp_server._ingest_progress["error_at"].endswith("Z")
+
+    @pytest.mark.asyncio
     async def test_watermark_updated_after_each_commit(self, mock_minigraf_db, git_repo):
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})

@@ -89,7 +89,7 @@ _INGEST_LOCK_RETRY_BUDGET = 120.0  # seconds; total time before giving up
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-    "current_commit": "", "error": None, "owner_pid": None,
+    "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -3356,6 +3356,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # exception propagating through it) — nothing left to clean up.
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
+        _ingest_progress["error_at"] = _now_utc_ms()
         _db = None
 
 
@@ -3395,7 +3396,7 @@ async def handle_minigraf_ingest_git(
         }
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-        "current_commit": "", "error": None, "owner_pid": None,
+        "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
@@ -3759,7 +3760,7 @@ async def main() -> None:
     # Set MINIGRAF_NO_AUTO_INGEST=1 to skip auto-start (used by eval sandboxes).
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-        "current_commit": "", "error": None, "owner_pid": None,
+        "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         # Proactive check-before-attempt: if another live process already
