@@ -3395,7 +3395,7 @@ async def handle_minigraf_ingest_git(
             "error": f"Not a git repository (or git not found): {repo}",
         }
     _ingest_progress = {
-        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+        "status": "starting", "processed": 0, "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch))
@@ -3791,6 +3791,7 @@ async def main() -> None:
             _ingest_progress["status"] = "skipped"
             _ingest_progress["owner_pid"] = holder_pid
         else:
+            _ingest_progress["status"] = "starting"
             _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
 
     loop = asyncio.get_running_loop()

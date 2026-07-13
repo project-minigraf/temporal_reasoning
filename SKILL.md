@@ -260,7 +260,7 @@ Returns `{"ok": true, "rule": "..."}` on success, or `{"ok": false, "error": "..
 
 Start background ingestion of code structure from git history into the bi-temporal graph. Returns immediately — ingestion runs as an asyncio background task.
 
-**Always call `minigraf_ingest_status` first.** Only call `minigraf_ingest_git` if status shows `idle`. If status is `running` or `complete`, do not start a new ingestion — report the current status to the user instead.
+**Always call `minigraf_ingest_status` first.** Only call `minigraf_ingest_git` if status shows `idle`. If status is `starting`, `running`, or `complete`, do not start a new ingestion — report the current status to the user instead.
 
 ```python
 # Step 1: check status
@@ -294,7 +294,12 @@ minigraf_ingest_status()
 #    "total": 47, "current_commit": "a3f2bc...", "error": null}
 ```
 
-`status` is one of: `idle`, `running`, `complete`, `error`, `stopped`, `skipped`.
+`status` is one of: `idle`, `starting`, `running`, `complete`, `error`, `stopped`, `skipped`.
+`starting` means a background ingestion task has been created (auto-started at
+server boot, or via `minigraf_ingest_git`) but hasn't finished its preload phase
+(re-scanning already-known entities/dependencies) yet, so `processed`/`total`
+aren't populated — a subsequent `minigraf_ingest_git` call will still be
+rejected with "already in progress" during this window, same as `running`.
 `stopped` means a graceful shutdown (session end) paused ingestion between commits —
 not a failure; the next `minigraf_ingest_git` call (or server auto-start)
 resumes from the watermark automatically. `skipped` means another live process
