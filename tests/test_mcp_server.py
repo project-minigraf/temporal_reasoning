@@ -3173,6 +3173,85 @@ class TestMainShutdown:
         await asyncio.wait_for(main_task, timeout=2)
 
 
+class TestMainAutoIngestLockCheck:
+    @pytest.mark.asyncio
+    async def test_skips_auto_ingest_when_live_holder_present(self, monkeypatch, tmp_path):
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: 424242)
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+        mcp_server._shutdown_requested.set()
+        await asyncio.wait_for(main_task, timeout=2)
+
+        assert mcp_server._ingest_task is None
+        assert mcp_server._ingest_progress["status"] == "skipped"
+        assert mcp_server._ingest_progress["owner_pid"] == 424242
+
+    @pytest.mark.asyncio
+    async def test_starts_auto_ingest_when_no_live_holder(self, monkeypatch, tmp_path):
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+
+        async def fake_run_ingestion(repo_path, branch):
+            # Wait for either shutdown or an event that never gets set.
+            # When _shutdown_requested is set, this exits cleanly.
+            done, _ = await asyncio.wait(
+                {
+                    asyncio.create_task(mcp_server._shutdown_requested.wait()),
+                    asyncio.create_task(asyncio.Event().wait()),
+                },
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+
+        assert mcp_server._ingest_task is not None
+        assert mcp_server._ingest_progress["status"] != "skipped"
+
+        mcp_server._shutdown_requested.set()
+        await asyncio.wait_for(main_task, timeout=2)
+
+
 class TestOrphanWatchdog:
     @pytest.mark.asyncio
     async def test_sets_shutdown_when_ppid_changes(self, monkeypatch):

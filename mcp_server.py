@@ -77,7 +77,7 @@ _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-    "current_commit": "", "error": None,
+    "current_commit": "", "error": None, "owner_pid": None,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -3696,10 +3696,22 @@ async def main() -> None:
     # Set MINIGRAF_NO_AUTO_INGEST=1 to skip auto-start (used by eval sandboxes).
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-        "current_commit": "", "error": None,
+        "current_commit": "", "error": None, "owner_pid": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
-        _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
+        # Proactive check-before-attempt: if another live process already
+        # owns the graph lock, don't start ingestion here at all rather
+        # than racing for it and losing (#108).
+        holder_pid = _live_lock_holder_pid(_get_graph_path())
+        if holder_pid is not None:
+            print(
+                f"[ingestion] skipped: already owned by live pid {holder_pid}",
+                file=sys.stderr,
+            )
+            _ingest_progress["status"] = "skipped"
+            _ingest_progress["owner_pid"] = holder_pid
+        else:
+            _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
