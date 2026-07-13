@@ -3411,6 +3411,18 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
     result["processed_this_run"] = (
         _ingest_progress["processed"] - _ingest_progress.get("prior_ingested", 0)
     )
+    # Staleness: a terminal error/skipped state can outlive the condition
+    # that caused it (e.g. the orphaned holder it names has since died) —
+    # re-check liveness on every poll instead of echoing a dead PID forever.
+    # Purely informational: never auto-retries ingestion (#106).
+    if _ingest_progress["status"] == "error":
+        holder_pid = _stale_lock_holder_pid(_ingest_progress.get("error") or "")
+        if holder_pid is not None:
+            result["stale"] = not _pid_is_alive(holder_pid)
+    elif _ingest_progress["status"] == "skipped":
+        owner_pid = _ingest_progress.get("owner_pid")
+        if owner_pid is not None:
+            result["stale"] = not _pid_is_alive(owner_pid)
     if _ingest_progress["status"] != "running":
         try:
             db = get_db()
@@ -3655,7 +3667,11 @@ _TOOLS: List[Tool] = [
             "status is one of: idle, running, complete, error, skipped. "
             "skipped means another live process already owns the graph lock "
             "(see owner_pid) — this server will not start ingestion on its own; "
-            "call minigraf_ingest_git again later if you want to retry."
+            "call minigraf_ingest_git again later if you want to retry. "
+            "For error and skipped, a stale field may be present: stale=true means "
+            "the condition that caused this state (the cited or owning PID) is no "
+            "longer alive, so a minigraf_ingest_git retry is likely to succeed now; "
+            "error also includes error_at, the timestamp the failure occurred."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),

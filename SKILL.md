@@ -300,7 +300,10 @@ not a failure; the next `minigraf_ingest_git` call (or server auto-start)
 resumes from the watermark automatically. `skipped` means another live process
 already owns the graph lock (its PID is in `owner_pid`) — this server will not
 attempt ingestion on its own; call `minigraf_ingest_git` again later to retry.
-`processed` is the
+For `error` and `skipped`, a `stale` field may be present: `stale: true` means the
+process that caused this state is no longer alive, so a `minigraf_ingest_git` retry
+is likely to succeed now — check it before assuming a cached error is still accurate.
+`error` also includes `error_at`, the timestamp the failure occurred. `processed` is the
 cumulative count of durably persisted commits (seeded from the true
 `:type/commit` entity count at run start, so it stays accurate even after a
 prior run was interrupted mid-way — e.g. by lock contention). `processed_this_run`
