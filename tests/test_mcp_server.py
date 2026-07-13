@@ -207,6 +207,64 @@ class TestGetDbLockRetry:
         assert mock_class.open.call_count == 2 * mcp_server._LOCK_RETRY_MAX
 
 
+class TestLiveLockHolderPid:
+    """Unit tests for _live_lock_holder_pid — the proactive pre-check used
+    to avoid racing another live process for the ingestion lock (#108)."""
+
+    def test_no_lock_file_returns_none(self, tmp_path):
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        assert mcp_server._live_lock_holder_pid(graph_path) is None
+
+    def test_unparsable_content_returns_none(self, tmp_path):
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        with open(graph_path + ".lock", "w") as f:
+            f.write("not-a-pid")
+        assert mcp_server._live_lock_holder_pid(graph_path) is None
+
+    def test_dead_holder_returns_none(self, tmp_path):
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        dead_pid = 999999  # not running on any reasonable test machine
+        with open(graph_path + ".lock", "w") as f:
+            f.write(str(dead_pid))
+        assert mcp_server._live_lock_holder_pid(graph_path) is None
+
+    def test_live_holder_returns_pid(self, tmp_path, monkeypatch):
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        other_pid = 424242
+        with open(graph_path + ".lock", "w") as f:
+            f.write(str(other_pid))
+        monkeypatch.setattr(mcp_server.os, "kill", lambda pid, sig: None)
+        assert mcp_server._live_lock_holder_pid(graph_path) == other_pid
+
+    def test_own_pid_returns_none(self, tmp_path):
+        """The lock file recording our own PID means a leaked handle from
+        this same process, not another process — never a blocker."""
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        with open(graph_path + ".lock", "w") as f:
+            f.write(str(os.getpid()))
+        assert mcp_server._live_lock_holder_pid(graph_path) is None
+
+    def test_permission_error_on_kill_treated_as_alive(self, tmp_path, monkeypatch):
+        """Can't confirm death -> conservatively assume alive (matches
+        _clear_stale_lock's existing bias)."""
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        other_pid = 424242
+        with open(graph_path + ".lock", "w") as f:
+            f.write(str(other_pid))
+
+        def raise_permission_error(pid, sig):
+            raise PermissionError()
+
+        monkeypatch.setattr(mcp_server.os, "kill", raise_permission_error)
+        assert mcp_server._live_lock_holder_pid(graph_path) == other_pid
+
+
 class TestMinigrafQuery:
     def test_returns_results_on_success(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -1670,6 +1728,18 @@ class TestMinigrafIngestStatus:
         # Must not query the graph while running
         db_instance.execute.assert_not_called()
 
+    def test_reports_owner_pid_when_skipped(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": 424242,
+        }
+        result = mcp_server.handle_minigraf_ingest_status()
+        assert result["status"] == "skipped"
+        assert result["owner_pid"] == 424242
+
     def test_returns_total_ingested_from_graph(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
@@ -2763,28 +2833,30 @@ class TestRunIngestion:
         )
 
     @pytest.mark.asyncio
-    async def test_handle_minigraf_ingest_git_returns_immediately(self, mock_minigraf_db, git_repo):
+    async def test_handle_minigraf_ingest_git_returns_immediately(self, mock_minigraf_db, git_repo, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
-            "current_commit": "", "error": None,
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
         }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is True
         assert "job_id" in result
 
     @pytest.mark.asyncio
-    async def test_second_call_while_running_returns_error(self, mock_minigraf_db, git_repo):
+    async def test_second_call_while_running_returns_error(self, mock_minigraf_db, git_repo, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
-            "current_commit": "", "error": None,
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
         }
         await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
@@ -2792,12 +2864,55 @@ class TestRunIngestion:
         assert "already in progress" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_returns_error_for_invalid_repo(self, mock_minigraf_db):
+    async def test_returns_error_for_invalid_repo(self, mock_minigraf_db, monkeypatch):
         import mcp_server
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
         mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+        }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path="/nonexistent/path")
         assert result["ok"] is False
         assert "Not a git repository" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_skips_when_live_holder_present(self, mock_minigraf_db, git_repo, tmp_path, monkeypatch):
+        import mcp_server
+        mcp_server._ingest_task = None
+        mcp_server._graph_path = str(tmp_path / "t.graph")
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+        }
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: 424242)
+
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
+
+        assert result["ok"] is False
+        assert "424242" in result["error"]
+        assert result["owner_pid"] == 424242
+        assert mcp_server._ingest_task is None
+        assert mcp_server._ingest_progress["status"] == "skipped"
+        assert mcp_server._ingest_progress["owner_pid"] == 424242
+
+    @pytest.mark.asyncio
+    async def test_proceeds_when_no_live_holder(self, mock_minigraf_db, git_repo, monkeypatch):
+        """When no live process owns the graph lock, handle_minigraf_ingest_git
+        proceeds normally and starts the ingestion task."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+        }
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
+        assert result["ok"] is True
+        assert "job_id" in result
+        assert mcp_server._ingest_task is not None
 
     @pytest.mark.asyncio
     async def test_processed_seeded_from_prior_ingested(self, mock_minigraf_db, git_repo, monkeypatch):
@@ -3112,6 +3227,85 @@ class TestMainShutdown:
         monkeypatch.setattr(mcp_server.server, "run", fake_run)
 
         main_task = asyncio.create_task(mcp_server.main())
+        await asyncio.wait_for(main_task, timeout=2)
+
+
+class TestMainAutoIngestLockCheck:
+    @pytest.mark.asyncio
+    async def test_skips_auto_ingest_when_live_holder_present(self, monkeypatch, tmp_path):
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: 424242)
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+        mcp_server._shutdown_requested.set()
+        await asyncio.wait_for(main_task, timeout=2)
+
+        assert mcp_server._ingest_task is None
+        assert mcp_server._ingest_progress["status"] == "skipped"
+        assert mcp_server._ingest_progress["owner_pid"] == 424242
+
+    @pytest.mark.asyncio
+    async def test_starts_auto_ingest_when_no_live_holder(self, monkeypatch, tmp_path):
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+
+        async def fake_run_ingestion(repo_path, branch):
+            # Wait for either shutdown or an event that never gets set.
+            # When _shutdown_requested is set, this exits cleanly.
+            done, _ = await asyncio.wait(
+                {
+                    asyncio.create_task(mcp_server._shutdown_requested.wait()),
+                    asyncio.create_task(asyncio.Event().wait()),
+                },
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+
+        assert mcp_server._ingest_task is not None
+        assert mcp_server._ingest_progress["status"] != "skipped"
+
+        mcp_server._shutdown_requested.set()
         await asyncio.wait_for(main_task, timeout=2)
 
 

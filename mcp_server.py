@@ -77,7 +77,7 @@ _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-    "current_commit": "", "error": None,
+    "current_commit": "", "error": None, "owner_pid": None,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -788,6 +788,39 @@ def _clear_stale_lock(path: str, holder_pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _live_lock_holder_pid(path: str) -> Optional[int]:
+    """Return path's lock-file holder PID if that process is live and isn't
+    us, else None.
+
+    Reads the sidecar `.lock` file directly — never attempts to open the DB,
+    so this check can never itself contend for the lock. Used as a
+    proactive pre-check before starting ingestion, to avoid racing another
+    live session for the same lock instead of losing that race (#108).
+
+    Best-effort / racy by nature (the holder can appear or disappear
+    between this check and the real open attempt) — existing retry/self-heal
+    logic (_try_open_with_self_heal, _ensure_db_async) still runs as the
+    fallback if the race is lost anyway.
+    """
+    try:
+        with open(path + ".lock") as f:
+            holder = f.read().strip()
+    except OSError:
+        return None  # no lock file
+    if not holder.isdigit():
+        return None
+    pid = int(holder)
+    if pid == os.getpid():
+        return None  # our own leaked handle, not another process
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None  # holder no longer running
+    except OSError:
+        pass  # PermissionError or other — can't confirm death, assume alive
+    return pid
 
 
 def _try_open_with_self_heal(path: str) -> MiniGrafDb:
@@ -3286,6 +3319,18 @@ async def handle_minigraf_ingest_git(
     global _ingest_task, _ingest_progress
     if _ingest_task and not _ingest_task.done():
         return {"ok": False, "error": "ingestion already in progress"}
+    # Proactive check-before-attempt: if another live process already owns
+    # the graph lock, don't start ingestion here rather than racing for it
+    # and losing (#108).
+    holder_pid = _live_lock_holder_pid(_graph_path or _get_graph_path())
+    if holder_pid is not None:
+        _ingest_progress["status"] = "skipped"
+        _ingest_progress["owner_pid"] = holder_pid
+        return {
+            "ok": False,
+            "error": f"ingestion already owned by live process (pid {holder_pid})",
+            "owner_pid": holder_pid,
+        }
     repo = repo_path or str(Path.cwd())
     try:
         check = _subprocess.run(
@@ -3302,7 +3347,7 @@ async def handle_minigraf_ingest_git(
         }
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-        "current_commit": "", "error": None,
+        "current_commit": "", "error": None, "owner_pid": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
@@ -3558,7 +3603,10 @@ _TOOLS: List[Tool] = [
         name="minigraf_ingest_status",
         description=(
             "Return the current git ingestion progress. "
-            "status is one of: idle, running, complete, error."
+            "status is one of: idle, running, complete, error, skipped. "
+            "skipped means another live process already owns the graph lock "
+            "(see owner_pid) — this server will not start ingestion on its own; "
+            "call minigraf_ingest_git again later if you want to retry."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
@@ -3663,10 +3711,22 @@ async def main() -> None:
     # Set MINIGRAF_NO_AUTO_INGEST=1 to skip auto-start (used by eval sandboxes).
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-        "current_commit": "", "error": None,
+        "current_commit": "", "error": None, "owner_pid": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
-        _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
+        # Proactive check-before-attempt: if another live process already
+        # owns the graph lock, don't start ingestion here at all rather
+        # than racing for it and losing (#108).
+        holder_pid = _live_lock_holder_pid(_get_graph_path())
+        if holder_pid is not None:
+            print(
+                f"[ingestion] skipped: already owned by live pid {holder_pid}",
+                file=sys.stderr,
+            )
+            _ingest_progress["status"] = "skipped"
+            _ingest_progress["owner_pid"] = holder_pid
+        else:
+            _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
