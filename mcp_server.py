@@ -81,6 +81,14 @@ _ingest_progress: Dict[str, Any] = {
 }
 _shutdown_requested = asyncio.Event()
 
+# PID of our immediate supervisor (e.g. `uvx`), recorded at launch. `uvx`
+# does not forward its own death to the spawned server — no signal, no stdin
+# EOF — so a dead supervisor just reparents us (typically to PID 1 or a
+# user-level systemd instance) with nothing to react to. _orphan_watchdog
+# polls os.getppid() against this to detect that case. See #104.
+_launch_ppid: Optional[int] = None
+_ORPHAN_CHECK_INTERVAL = 5.0  # seconds
+
 # ---------------------------------------------------------------------------
 # Language detection and grammar caching
 # ---------------------------------------------------------------------------
@@ -3631,9 +3639,24 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         _db = None
 
 
+async def _orphan_watchdog() -> None:
+    """Detect the case where our immediate supervisor (`uvx`) dies without
+    ever sending us a signal or closing stdin — we just get silently
+    reparented to init/systemd instead. Neither of main()'s other shutdown
+    triggers can see this, so poll os.getppid() against the PID recorded at
+    launch and request the same graceful shutdown a real SIGTERM would.
+    See #104."""
+    while not _shutdown_requested.is_set():
+        await asyncio.sleep(_ORPHAN_CHECK_INTERVAL)
+        if os.getppid() != _launch_ppid:
+            _shutdown_requested.set()
+            return
+
+
 async def main() -> None:
-    global _server_ref, _ingest_task, _ingest_progress
+    global _server_ref, _ingest_task, _ingest_progress, _launch_ppid
     _server_ref = server
+    _launch_ppid = os.getppid()
     # Auto-start incremental ingest on server startup so ingestion begins
     # immediately without waiting for a user prompt.  Runs as a background
     # asyncio task — never blocks the message loop.
@@ -3652,6 +3675,7 @@ async def main() -> None:
         except (NotImplementedError, AttributeError):
             pass  # Windows: add_signal_handler unsupported; no graceful-shutdown-by-signal there
 
+    watchdog_task = asyncio.ensure_future(_orphan_watchdog())
     try:
         async with stdio_server() as (read_stream, write_stream):
             server_task = asyncio.ensure_future(
@@ -3675,6 +3699,9 @@ async def main() -> None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await server_task
     finally:
+        watchdog_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog_task
         # The MCP server's most common "session ended" signal is stdin EOF
         # (the parent closing the pipe) rather than a delivered signal, so
         # this runs on every exit path. Give a long-running ingest a chance

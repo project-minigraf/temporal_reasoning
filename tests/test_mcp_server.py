@@ -3115,6 +3115,87 @@ class TestMainShutdown:
         await asyncio.wait_for(main_task, timeout=2)
 
 
+class TestOrphanWatchdog:
+    @pytest.mark.asyncio
+    async def test_sets_shutdown_when_ppid_changes(self, monkeypatch):
+        """If our immediate supervisor dies without forwarding a signal or
+        closing stdin, we get reparented (ppid changes, classically to 1 or
+        the reaping init/systemd pid). The watchdog must notice on its next
+        poll and set _shutdown_requested so main() exits via the same
+        graceful path as a real SIGTERM."""
+        import mcp_server
+
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._launch_ppid = 12345
+        monkeypatch.setattr(mcp_server, "_ORPHAN_CHECK_INTERVAL", 0.01)
+        monkeypatch.setattr(mcp_server.os, "getppid", lambda: 99999)
+
+        await asyncio.wait_for(mcp_server._orphan_watchdog(), timeout=2)
+
+        assert mcp_server._shutdown_requested.is_set()
+
+    @pytest.mark.asyncio
+    async def test_does_not_set_shutdown_while_ppid_unchanged(self, monkeypatch):
+        """No false positives: as long as our supervisor is still our
+        parent, the watchdog must keep polling without ever requesting
+        shutdown."""
+        import mcp_server
+
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._launch_ppid = 12345
+        monkeypatch.setattr(mcp_server, "_ORPHAN_CHECK_INTERVAL", 0.01)
+        monkeypatch.setattr(mcp_server.os, "getppid", lambda: 12345)
+
+        watchdog_task = asyncio.ensure_future(mcp_server._orphan_watchdog())
+        await asyncio.sleep(0.05)  # several poll intervals
+
+        assert not mcp_server._shutdown_requested.is_set()
+        assert not watchdog_task.done()
+
+        watchdog_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog_task
+
+    @pytest.mark.asyncio
+    async def test_main_exits_when_orphaned(self, monkeypatch):
+        """End-to-end: main() must self-terminate via the orphan watchdog
+        even when no signal ever arrives and stdin never sees EOF — the
+        exact failure mode from #104 (uvx dies, server reparents to
+        systemd --user, and just keeps running)."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_NO_AUTO_INGEST", "1")
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+        monkeypatch.setattr(mcp_server, "_ORPHAN_CHECK_INTERVAL", 0.01)
+
+        real_getppid = os.getppid()
+        # First call (inside main(), recording _launch_ppid) returns the
+        # real ppid; every call after that simulates reparenting to init.
+        ppid_calls = {"n": 0}
+
+        def fake_getppid():
+            ppid_calls["n"] += 1
+            return real_getppid if ppid_calls["n"] == 1 else 1
+
+        monkeypatch.setattr(mcp_server.os, "getppid", fake_getppid)
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            await asyncio.Event().wait()  # simulates a live connection that never completes on its own
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+
+        await asyncio.wait_for(main_task, timeout=2)
+
+
 class TestIndexCache:
     def test_get_returns_none_before_any_rebuild(self):
         from mcp_server import IndexCache
