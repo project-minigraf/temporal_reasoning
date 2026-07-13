@@ -207,6 +207,78 @@ class TestGetDbLockRetry:
         assert mock_class.open.call_count == 2 * mcp_server._LOCK_RETRY_MAX
 
 
+class TestOpenDbAtWithExtendedRetry:
+    """Unit tests for _open_db_at_with_extended_retry — the longer,
+    time-budgeted backoff used only for ingestion startup lock acquisition,
+    separate from get_db()'s ~1.55s budget (#106)."""
+
+    def test_succeeds_after_retries_within_budget(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        fake_time = {"t": 0.0}
+        monkeypatch.setattr("mcp_server.time.monotonic", lambda: fake_time["t"])
+        monkeypatch.setattr(
+            "mcp_server.time.sleep",
+            lambda s: fake_time.__setitem__("t", fake_time["t"] + s),
+        )
+        live_pid = os.getpid()  # alive -> self-heal never fires, pure backoff-then-succeed
+        lock_err = MiniGrafError(
+            f"Database is locked by another process (lock file: x.graph.lock, holder PID: {live_pid})."
+        )
+        mock_class.open.side_effect = [lock_err, lock_err, db_instance]
+        import mcp_server
+        result = mcp_server._open_db_at_with_extended_retry(str(tmp_path / "t.graph"))
+        assert result is db_instance
+        assert mock_class.open.call_count == 3
+
+    def test_gives_up_after_budget_exhausted(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        fake_time = {"t": 0.0}
+        monkeypatch.setattr("mcp_server.time.monotonic", lambda: fake_time["t"])
+        monkeypatch.setattr(
+            "mcp_server.time.sleep",
+            lambda s: fake_time.__setitem__("t", fake_time["t"] + s),
+        )
+        live_pid = os.getpid()  # alive -> self-heal never fires; pure budget exhaustion
+        lock_err = MiniGrafError(
+            f"Database is locked by another process (lock file: x.graph.lock, holder PID: {live_pid})."
+        )
+        mock_class.open.side_effect = lock_err  # always raises the same error
+        import mcp_server
+        with pytest.raises(MiniGrafError):
+            mcp_server._open_db_at_with_extended_retry(str(tmp_path / "t.graph"))
+        # Far more retries than the old ~1.55s/5-attempt budget would allow —
+        # proves the extended budget, not the general-purpose one, was used.
+        assert mock_class.open.call_count >= 10
+
+    def test_non_lock_error_propagates_immediately(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        mock_class.open.side_effect = MiniGrafError("corrupt graph file")
+        import mcp_server
+        with pytest.raises(MiniGrafError):
+            mcp_server._open_db_at_with_extended_retry(str(tmp_path / "t.graph"))
+        assert mock_class.open.call_count == 1  # no retry for non-lock errors
+
+    def test_self_heals_dead_holder_mid_loop(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        graph_path = str(tmp_path / "t.graph")
+        lock_path = graph_path + ".lock"
+        with open(lock_path, "w") as f:
+            f.write("stale")
+        dead_pid = 999999  # not running on any reasonable test machine
+        mock_class.open.side_effect = [
+            MiniGrafError(
+                f"Database is locked by another process (lock file: {lock_path}, holder PID: {dead_pid})."
+            ),
+            db_instance,
+        ]
+        import mcp_server
+        result = mcp_server._open_db_at_with_extended_retry(graph_path)
+        assert result is db_instance
+        assert not os.path.exists(lock_path)
+
+
 class TestLiveLockHolderPid:
     """Unit tests for _live_lock_holder_pid — the proactive pre-check used
     to avoid racing another live process for the ingestion lock (#108)."""

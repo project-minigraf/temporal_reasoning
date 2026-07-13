@@ -73,6 +73,18 @@ _server_ref: Optional[Server] = None
 _LOCK_RETRY_MAX = 5
 _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
 
+# Extended retry budget for the one-time startup/manual-trigger lock
+# acquisition only (_load_ingestion_preload_state) — separate from
+# _LOCK_RETRY_MAX/_LOCK_RETRY_BASE above, which gate synchronous
+# per-request paths (call_tool, IndexCache rebuild) where long blocking
+# would be harmful. This path runs on a dedicated worker thread and can
+# afford to be patient enough to survive a typical orphan-process cleanup
+# window (SIGTERM grace period before SIGKILL) instead of giving up in
+# ~1.55s and entering a permanent "error" state (#106).
+_INGEST_LOCK_RETRY_BASE = 0.05     # seconds; matches _LOCK_RETRY_BASE for consistency
+_INGEST_LOCK_RETRY_CAP = 15.0      # seconds; per-attempt sleep never exceeds this
+_INGEST_LOCK_RETRY_BUDGET = 120.0  # seconds; total time before giving up
+
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
@@ -869,6 +881,36 @@ def _open_db_at_with_retry(path: str) -> MiniGrafDb:
             if attempt < _LOCK_RETRY_MAX - 1:
                 time.sleep(delay)
                 delay *= 2
+    assert last_exc is not None
+    raise last_exc
+
+
+def _open_db_at_with_extended_retry(path: str) -> MiniGrafDb:
+    """Open MiniGrafDb at path, retrying lock contention with a much longer
+    time-budgeted backoff than _open_db_at_with_retry.
+
+    Used only by _load_ingestion_preload_state, which runs on a dedicated
+    worker thread (see issue #103) and can afford to wait out a typical
+    orphan-process cleanup window instead of giving up after ~1.55s and
+    leaving _run_ingestion permanently stuck in an "error" state (#106).
+    Self-heals a dead holder's lock on every attempt via
+    _try_open_with_self_heal, exactly like _open_db_at_with_retry.
+    """
+    deadline = time.monotonic() + _INGEST_LOCK_RETRY_BUDGET
+    delay = _INGEST_LOCK_RETRY_BASE
+    last_exc: Optional[Exception] = None
+    while True:
+        try:
+            return _try_open_with_self_heal(path)
+        except Exception as e:
+            if not _is_lock_error(e):
+                raise
+            last_exc = e
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, _INGEST_LOCK_RETRY_CAP)
     assert last_exc is not None
     raise last_exc
 
@@ -2885,10 +2927,15 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     queries contain no internal awaits, so running them directly on the event
     loop thread starves the stdio handshake for as long as they take — on a
     large enough graph, longer than a client's connection timeout (issue #103).
-    Uses get_db()'s blocking lock-retry rather than _ensure_db_async()'s
-    event-loop-safe variant precisely because this now runs off that thread.
+    Uses _open_db_at_with_extended_retry's much longer blocking lock-retry
+    (rather than get_db()'s ~1.55s budget or _ensure_db_async()'s
+    event-loop-safe variant) precisely because this runs off that thread and
+    can afford to wait out a typical orphan cleanup window instead of
+    entering a permanent "error" state (#106). Mirrors get_db()'s
+    "reuse the already-open handle" short-circuit rather than reopening
+    unconditionally.
     """
-    db = get_db()
+    db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
     watermark = _watermark_query(db)
     prior_ingested = _count_commit_entities(db)
     entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
