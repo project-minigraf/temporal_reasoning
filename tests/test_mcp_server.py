@@ -265,6 +265,28 @@ class TestLiveLockHolderPid:
         assert mcp_server._live_lock_holder_pid(graph_path) == other_pid
 
 
+class TestPidIsAlive:
+    """Unit tests for _pid_is_alive — shared conservative liveness check
+    extracted from _clear_stale_lock and _live_lock_holder_pid (#106)."""
+
+    def test_dead_pid_returns_false(self):
+        import mcp_server
+        assert mcp_server._pid_is_alive(999999) is False  # not running on any reasonable test machine
+
+    def test_live_pid_returns_true(self):
+        import mcp_server
+        assert mcp_server._pid_is_alive(os.getpid()) is True
+
+    def test_permission_error_treated_as_alive(self, monkeypatch):
+        import mcp_server
+
+        def raise_permission_error(pid, sig):
+            raise PermissionError()
+
+        monkeypatch.setattr(mcp_server.os, "kill", raise_permission_error)
+        assert mcp_server._pid_is_alive(424242) is True
+
+
 class TestMinigrafQuery:
     def test_returns_results_on_success(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db

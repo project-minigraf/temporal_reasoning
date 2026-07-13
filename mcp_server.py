@@ -769,20 +769,27 @@ def _stale_lock_holder_pid(exc: Exception) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Conservative liveness check: only a positive ProcessLookupError counts
+    as dead. Uncertain cases (PermissionError, other OSError) are treated as
+    alive rather than risking a false "safe to proceed" signal.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # PermissionError or other — can't confirm death, assume alive
+    return True
+
+
 def _clear_stale_lock(path: str, holder_pid: int) -> bool:
     """Remove path's lock file if its recorded holder process is no longer alive.
 
     Returns True if a stale lock was removed.
     """
-    try:
-        os.kill(holder_pid, 0)
+    if _pid_is_alive(holder_pid):
         return False  # holder still alive (or we lack permission to tell — leave it)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        return False
-    except OSError:
-        return False
     try:
         os.remove(path + ".lock")
         return True
@@ -814,13 +821,7 @@ def _live_lock_holder_pid(path: str) -> Optional[int]:
     pid = int(holder)
     if pid == os.getpid():
         return None  # our own leaked handle, not another process
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return None  # holder no longer running
-    except OSError:
-        pass  # PermissionError or other — can't confirm death, assume alive
-    return pid
+    return pid if _pid_is_alive(pid) else None
 
 
 def _try_open_with_self_heal(path: str) -> MiniGrafDb:
