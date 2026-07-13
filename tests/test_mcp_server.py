@@ -207,6 +207,71 @@ class TestGetDbLockRetry:
         assert mock_class.open.call_count == 2 * mcp_server._LOCK_RETRY_MAX
 
 
+class TestGetDbConcurrentResetRace:
+    """Regression test for #122: IndexCache._rebuild calls get_db() from a
+    background thread. get_db() used to read the module-level _db global
+    twice -- once in `if _db is None`, once again in `return _db` -- so if
+    call_tool()'s finally block reset _db to None in the window between
+    those two reads, get_db() returned None even though a live db existed
+    when it was called, producing "'NoneType' object has no attribute
+    'execute'" in _rebuild."""
+
+    def test_returns_live_db_despite_concurrent_reset_before_return(self):
+        import inspect
+        import sys as _sys
+        import threading
+        import mcp_server
+
+        class FakeDb:
+            def execute(self, datalog):
+                return json.dumps({"results": []})
+
+        fake_db = FakeDb()
+        mcp_server._db = fake_db
+
+        target_code = mcp_server.get_db.__code__
+        src_lines, start_line = inspect.getsourcelines(mcp_server.get_db)
+        return_line = start_line + len(src_lines) - 1
+
+        paused = threading.Event()
+        resume = threading.Event()
+        outcome = {}
+
+        def local_trace(frame, event, arg):
+            if event == "line" and frame.f_lineno == return_line:
+                paused.set()
+                resume.wait(timeout=2)
+            return local_trace
+
+        def global_trace(frame, event, arg):
+            if event == "call" and frame.f_code is target_code:
+                return local_trace
+            return None
+
+        def rebuild_worker():
+            _sys.settrace(global_trace)
+            try:
+                outcome["db"] = mcp_server.get_db()
+            finally:
+                _sys.settrace(None)
+
+        t = threading.Thread(target=rebuild_worker)
+        t.start()
+        try:
+            assert paused.wait(timeout=2), "tracer never reached get_db's return line"
+            # Simulate call_tool's finally block racing in between get_db()'s
+            # None-check and its return.
+            mcp_server._db = None
+            resume.set()
+        finally:
+            t.join(timeout=2)
+
+        assert outcome.get("db") is fake_db, (
+            "get_db() returned a stale/None value after a concurrent reset "
+            "of the global between its None-check and its return (#122)"
+        )
+
+
 class TestOpenDbAtWithExtendedRetry:
     """Unit tests for _open_db_at_with_extended_retry — the longer,
     time-budgeted backoff used only for ingestion startup lock acquisition,

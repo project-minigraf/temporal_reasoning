@@ -956,10 +956,18 @@ def get_db() -> MiniGrafDb:
     _open_db_at_with_retry) — safe here only because event-loop call sites
     (call_tool, _run_ingestion) always await _ensure_db_async() first, so _db
     is already populated by the time they reach this function.
+
+    Reads the module-level _db global into a local exactly once. IndexCache's
+    background rebuild thread also calls this function, concurrently with
+    call_tool()'s finally block resetting _db to None — reading the global a
+    second time for the return would let that reset race in between the
+    None-check and the return, yielding None even though _db was live at call
+    time (issue #122).
     """
-    if _db is None:
-        _open_db_at_with_retry(_graph_path or _get_graph_path())
-    return _db
+    db = _db
+    if db is None:
+        db = _open_db_at_with_retry(_graph_path or _get_graph_path())
+    return db
 
 
 # ---------------------------------------------------------------------------
