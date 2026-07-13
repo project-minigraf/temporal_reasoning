@@ -207,6 +207,64 @@ class TestGetDbLockRetry:
         assert mock_class.open.call_count == 2 * mcp_server._LOCK_RETRY_MAX
 
 
+class TestLiveLockHolderPid:
+    """Unit tests for _live_lock_holder_pid — the proactive pre-check used
+    to avoid racing another live process for the ingestion lock (#108)."""
+
+    def test_no_lock_file_returns_none(self, tmp_path):
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        assert mcp_server._live_lock_holder_pid(graph_path) is None
+
+    def test_unparsable_content_returns_none(self, tmp_path):
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        with open(graph_path + ".lock", "w") as f:
+            f.write("not-a-pid")
+        assert mcp_server._live_lock_holder_pid(graph_path) is None
+
+    def test_dead_holder_returns_none(self, tmp_path):
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        dead_pid = 999999  # not running on any reasonable test machine
+        with open(graph_path + ".lock", "w") as f:
+            f.write(str(dead_pid))
+        assert mcp_server._live_lock_holder_pid(graph_path) is None
+
+    def test_live_holder_returns_pid(self, tmp_path, monkeypatch):
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        other_pid = 424242
+        with open(graph_path + ".lock", "w") as f:
+            f.write(str(other_pid))
+        monkeypatch.setattr(mcp_server.os, "kill", lambda pid, sig: None)
+        assert mcp_server._live_lock_holder_pid(graph_path) == other_pid
+
+    def test_own_pid_returns_none(self, tmp_path):
+        """The lock file recording our own PID means a leaked handle from
+        this same process, not another process — never a blocker."""
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        with open(graph_path + ".lock", "w") as f:
+            f.write(str(os.getpid()))
+        assert mcp_server._live_lock_holder_pid(graph_path) is None
+
+    def test_permission_error_on_kill_treated_as_alive(self, tmp_path, monkeypatch):
+        """Can't confirm death -> conservatively assume alive (matches
+        _clear_stale_lock's existing bias)."""
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        other_pid = 424242
+        with open(graph_path + ".lock", "w") as f:
+            f.write(str(other_pid))
+
+        def raise_permission_error(pid, sig):
+            raise PermissionError()
+
+        monkeypatch.setattr(mcp_server.os, "kill", raise_permission_error)
+        assert mcp_server._live_lock_holder_pid(graph_path) == other_pid
+
+
 class TestMinigrafQuery:
     def test_returns_results_on_success(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db

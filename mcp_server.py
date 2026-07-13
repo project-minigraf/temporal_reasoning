@@ -790,6 +790,39 @@ def _clear_stale_lock(path: str, holder_pid: int) -> bool:
         return False
 
 
+def _live_lock_holder_pid(path: str) -> Optional[int]:
+    """Return path's lock-file holder PID if that process is live and isn't
+    us, else None.
+
+    Reads the sidecar `.lock` file directly — never attempts to open the DB,
+    so this check can never itself contend for the lock. Used as a
+    proactive pre-check before starting ingestion, to avoid racing another
+    live session for the same lock instead of losing that race (#108).
+
+    Best-effort / racy by nature (the holder can appear or disappear
+    between this check and the real open attempt) — existing retry/self-heal
+    logic (_try_open_with_self_heal, _ensure_db_async) still runs as the
+    fallback if the race is lost anyway.
+    """
+    try:
+        with open(path + ".lock") as f:
+            holder = f.read().strip()
+    except OSError:
+        return None  # no lock file
+    if not holder.isdigit():
+        return None
+    pid = int(holder)
+    if pid == os.getpid():
+        return None  # our own leaked handle, not another process
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None  # holder no longer running
+    except OSError:
+        pass  # PermissionError or other — can't confirm death, assume alive
+    return pid
+
+
 def _try_open_with_self_heal(path: str) -> MiniGrafDb:
     """Attempt one open, self-healing a stale lock (holder process no longer
     running) by removing it and retrying once, instead of surfacing a
