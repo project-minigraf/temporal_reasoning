@@ -3351,8 +3351,11 @@ _TOOLS: List[Tool] = [
         description=(
             "Query Minigraf's persistent bi-temporal graph memory using Datalog. "
             "Call this BEFORE answering anything about past decisions, architecture, "
-            "dependencies, or preferences. Supports :as-of for temporal queries to see "
-            "what the graph contained at a past transaction time."
+            "dependencies, or preferences. Two independent temporal axes are supported: "
+            "transaction time via :as-of N (what the graph contained as of write N) and "
+            "valid time via :valid-at \"2024-01-01\" (what was true in the world on that "
+            "date, e.g. for code-structure queries). Use :any-valid-time to ignore the "
+            "valid-time filter entirely."
         ),
         inputSchema={
             "type": "object",
