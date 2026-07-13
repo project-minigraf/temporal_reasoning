@@ -2827,8 +2827,8 @@ class TestRunIngestion:
         import mcp_server
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
-            "current_commit": "", "error": None,
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
         }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is True
@@ -2841,8 +2841,8 @@ class TestRunIngestion:
         import mcp_server
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
-            "current_commit": "", "error": None,
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
         }
         await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
@@ -2853,9 +2853,47 @@ class TestRunIngestion:
     async def test_returns_error_for_invalid_repo(self, mock_minigraf_db):
         import mcp_server
         mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+        }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path="/nonexistent/path")
         assert result["ok"] is False
         assert "Not a git repository" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_returns_error_when_live_holder_present(self, mock_minigraf_db, git_repo, monkeypatch):
+        """When another live process owns the graph lock, handle_minigraf_ingest_git
+        returns an error without starting a task."""
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: 424242)
+        mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+        }
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
+        assert result["ok"] is False
+        assert "owner" in result["error"].lower() or "held" in result["error"].lower()
+        assert mcp_server._ingest_task is None
+
+    @pytest.mark.asyncio
+    async def test_proceeds_when_no_live_holder(self, mock_minigraf_db, git_repo, monkeypatch):
+        """When no live process owns the graph lock, handle_minigraf_ingest_git
+        proceeds normally and starts the ingestion task."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+        }
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
+        assert result["ok"] is True
+        assert "job_id" in result
+        assert mcp_server._ingest_task is not None
 
     @pytest.mark.asyncio
     async def test_processed_seeded_from_prior_ingested(self, mock_minigraf_db, git_repo, monkeypatch):

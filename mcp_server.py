@@ -3333,9 +3333,19 @@ async def handle_minigraf_ingest_git(
             "ok": False,
             "error": f"Not a git repository (or git not found): {repo}",
         }
+    # Proactive check-before-attempt: if another live process already owns
+    # the graph lock, don't start ingestion here rather than racing for it
+    # and losing (#108).
+    holder_pid = _live_lock_holder_pid(_get_graph_path())
+    if holder_pid is not None:
+        return {
+            "ok": False,
+            "error": f"Graph lock already held by live process (pid {holder_pid})",
+            "owner_pid": holder_pid,
+        }
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
-        "current_commit": "", "error": None,
+        "current_commit": "", "error": None, "owner_pid": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
