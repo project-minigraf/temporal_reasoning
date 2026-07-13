@@ -273,6 +273,9 @@ minigraf_ingest_git(repo_path="/path/to/repo", branch="HEAD")
 
 # If already running:
 # → {"ok": false, "error": "ingestion already in progress"}
+
+# If another live process already owns the graph lock:
+# → {"ok": false, "error": "ingestion already owned by live process (pid 12345)", "owner_pid": 12345}
 ```
 
 Once started, inform the user that ingestion is running in the background and move on — do not poll or wait for completion.
@@ -291,10 +294,13 @@ minigraf_ingest_status()
 #    "total": 47, "current_commit": "a3f2bc...", "error": null}
 ```
 
-`status` is one of: `idle`, `running`, `complete`, `error`, `stopped`. `stopped`
-means a graceful shutdown (session end) paused ingestion between commits —
+`status` is one of: `idle`, `running`, `complete`, `error`, `stopped`, `skipped`.
+`stopped` means a graceful shutdown (session end) paused ingestion between commits —
 not a failure; the next `minigraf_ingest_git` call (or server auto-start)
-resumes from the watermark automatically. `processed` is the
+resumes from the watermark automatically. `skipped` means another live process
+already owns the graph lock (its PID is in `owner_pid`) — this server will not
+attempt ingestion on its own; call `minigraf_ingest_git` again later to retry.
+`processed` is the
 cumulative count of durably persisted commits (seeded from the true
 `:type/commit` entity count at run start, so it stays accurate even after a
 prior run was interrupted mid-way — e.g. by lock contention). `processed_this_run`

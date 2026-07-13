@@ -3603,7 +3603,10 @@ _TOOLS: List[Tool] = [
         name="minigraf_ingest_status",
         description=(
             "Return the current git ingestion progress. "
-            "status is one of: idle, running, complete, error."
+            "status is one of: idle, running, complete, error, skipped. "
+            "skipped means another live process already owns the graph lock "
+            "(see owner_pid) — this server will not start ingestion on its own; "
+            "call minigraf_ingest_git again later if you want to retry."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),

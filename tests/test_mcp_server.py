@@ -1728,6 +1728,18 @@ class TestMinigrafIngestStatus:
         # Must not query the graph while running
         db_instance.execute.assert_not_called()
 
+    def test_reports_owner_pid_when_skipped(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server._ingest_progress = {
+            "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": 424242,
+        }
+        result = mcp_server.handle_minigraf_ingest_status()
+        assert result["status"] == "skipped"
+        assert result["owner_pid"] == 424242
+
     def test_returns_total_ingested_from_graph(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
