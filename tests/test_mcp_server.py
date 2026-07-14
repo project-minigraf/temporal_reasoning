@@ -1943,6 +1943,71 @@ class TestMatchCandidatePair:
         assert result is None
 
 
+class TestMatchRenamedEntities:
+    def _parse_fn(self, source: str):
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+        tree = parser.parse(source.encode())
+        return tree.root_node.children[0]
+
+    def test_simple_rename_matched(self):
+        import mcp_server
+        old = self._parse_fn("def foo(x):\n    return x + 1\n")
+        new = self._parse_fn("def bar(x):\n    return x + 1\n")
+        removed = {"function": [("foo", old)]}
+        added = {"function": [("bar", new)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert matches == [("function", "foo", "bar")]
+        assert removed["function"] == []
+        assert added["function"] == []
+
+    def test_cascading_mutual_rename_resolves_across_rounds(self):
+        """A calls B; both A and B are renamed in the same commit."""
+        import mcp_server
+        old_a = self._parse_fn("def a(x):\n    return b(x) + 1\n")
+        old_b = self._parse_fn("def b(x):\n    return x * 2\n")
+        new_a1 = self._parse_fn("def a1(x):\n    return b1(x) + 1\n")
+        new_b1 = self._parse_fn("def b1(x):\n    return x * 2\n")
+        removed = {"function": [("a", old_a), ("b", old_b)]}
+        added = {"function": [("a1", new_a1), ("b1", new_b1)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert ("function", "a", "a1") in matches
+        assert ("function", "b", "b1") in matches
+        assert len(matches) == 2
+
+    def test_ambiguous_duplicate_bodies_not_matched(self):
+        import mcp_server
+        old1 = self._parse_fn("def stub1():\n    pass\n")
+        old2 = self._parse_fn("def stub2():\n    pass\n")
+        new1 = self._parse_fn("def stub3():\n    pass\n")
+        new2 = self._parse_fn("def stub4():\n    pass\n")
+        removed = {"function": [("stub1", old1), ("stub2", old2)]}
+        added = {"function": [("stub3", new1), ("stub4", new2)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert matches == []
+        assert len(removed["function"]) == 2
+        assert len(added["function"]) == 2
+
+    def test_below_minimum_size_not_matched(self):
+        import mcp_server
+        old = self._parse_fn("def x():\n    pass\n")
+        new = self._parse_fn("def y():\n    pass\n")
+        removed = {"function": [("x", old)]}
+        added = {"function": [("y", new)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert matches == []
+
+    def test_cross_category_no_match(self):
+        """A function and a class with coincidentally-matchable text never match across categories."""
+        import mcp_server
+        old = self._parse_fn("def foo(x):\n    return x + 1\n")
+        new = self._parse_fn("def bar(x):\n    return x + 1\n")
+        removed = {"function": [("foo", old)], "class": []}
+        added = {"function": [], "class": [("bar", new)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert matches == []
+
+
 class TestExtractFromSourceCFamily:
     """Regression tests for issue #92 bug 1: the generic `name` field lookup
     in _walk_ast doesn't match the C/C++ grammar for functions — a C/C++

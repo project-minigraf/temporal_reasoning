@@ -800,6 +800,77 @@ def _match_candidate_pair(
     return {k: v for k, v in mapping.items() if k != v} if walk(old_node, new_node) else None
 
 
+_MAX_MATCH_ROUNDS = 10
+_MIN_MATCH_BODY_LEN = 20  # normalized chars; avoids matching trivial boilerplate stubs
+
+
+def _normalize_body_for_matching(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _match_renamed_entities(
+    removed: Dict[str, List[Tuple[str, Any]]],
+    added: Dict[str, List[Tuple[str, Any]]],
+) -> List[Tuple[str, str, str]]:
+    """Round-based rename matching across entity categories, scoped to a
+    single commit's touched files (callers build removed/added from just
+    that commit — see _extract_commit's use in Task 9).
+
+    A rename confirmed in one category (e.g. a function) becomes available
+    as a "tracked, confirmed-renamed" name for other not-yet-matched pairs
+    (in the same or a different category) evaluated in a later round — this
+    resolves cascading/mutual renames within one commit regardless of
+    dependency order. Capped at _MAX_MATCH_ROUNDS as a defensive bound.
+
+    Mutates removed/added in place, removing matched entries.
+    """
+    matches: List[Tuple[str, str, str]] = []
+    confirmed: Dict[str, str] = {}  # old_name -> new_name, shared across all categories
+
+    all_names: set = set()
+    for pool in (removed, added):
+        for entries in pool.values():
+            all_names.update(name for name, _node in entries)
+
+    for _round in range(_MAX_MATCH_ROUNDS):
+        changed = False
+        tracked_names: Dict[str, Optional[str]] = {
+            name: confirmed.get(name) for name in all_names
+        }
+        for category in list(removed.keys()):
+            r_list = removed.get(category, [])
+            a_list = added.get(category, [])
+            for r_name, r_node in list(r_list):
+                r_text = _normalize_body_for_matching(r_node.text.decode("utf-8", "replace"))
+                if len(r_text) < _MIN_MATCH_BODY_LEN:
+                    continue
+                candidates = []
+                for a_name, a_node in a_list:
+                    # Exclude this specific pair's own old/new names from the
+                    # tracked set: they are exactly what's under test here
+                    # (is r_name renamed to a_name?), not an already-known
+                    # constraint. Without this, an unconfirmed entity's own
+                    # name would be treated as "must stay unchanged" and no
+                    # rename could ever be confirmed for it.
+                    pair_tracked_names = {
+                        name: target
+                        for name, target in tracked_names.items()
+                        if name != r_name and name != a_name
+                    }
+                    if _match_candidate_pair(r_node, a_node, pair_tracked_names) is not None:
+                        candidates.append((a_name, a_node))
+                if len(candidates) == 1:
+                    a_name, a_node = candidates[0]
+                    matches.append((category, r_name, a_name))
+                    confirmed[r_name] = a_name
+                    r_list.remove((r_name, r_node))
+                    a_list.remove((a_name, a_node))
+                    changed = True
+        if not changed:
+            break
+    return matches
+
+
 # ---------------------------------------------------------------------------
 # DB lifecycle
 # ---------------------------------------------------------------------------
