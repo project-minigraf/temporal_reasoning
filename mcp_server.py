@@ -986,7 +986,7 @@ def _extract_go_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     `const (...)` or `type (...)`, which do NOT wrap their specs (their
     `const_spec`/`type_spec` children stay direct children of the
     declaration node even when grouped) -- verified empirically against
-    the real installed tree-sitter-go grammar. `_iter_specs` below
+    the real installed tree-sitter-go grammar. `iter_specs` below
     unwraps a `{spec_type}_list` if present so grouped var declarations
     aren't silently dropped; it's a no-op for const/type, which never
     produce that wrapper.
