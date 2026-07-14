@@ -940,6 +940,20 @@ def _extract_rust_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                             }
         elif stmt.type == "impl_item":
             type_node = stmt.child_by_field_name("type")
+            # For a generic impl (`impl<T> Foo<T> { ... }`), the `type` field
+            # is a `generic_type` node whose own `type` sub-field holds the
+            # bare `type_identifier` ("Foo"). Unwrap it so the owning-class
+            # name matches the clean name registered for the struct itself
+            # (struct_item's `name` field never includes generic params).
+            # Verified empirically against the installed tree-sitter-rust
+            # grammar for both `impl<T> Foo<T> { const CAP: ... }` (type
+            # field = generic_type -> type = type_identifier "Foo") and
+            # `impl Foo { const ASSOC: ... }` (type field = type_identifier
+            # "Foo" directly, unchanged by this unwrap).
+            if type_node is not None and type_node.type == "generic_type":
+                inner_type_node = type_node.child_by_field_name("type")
+                if inner_type_node is not None:
+                    type_node = inner_type_node
             type_name = type_node.text.decode("utf-8") if type_node is not None else ""
             body = stmt.child_by_field_name("body")
             if body is not None:

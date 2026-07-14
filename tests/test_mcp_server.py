@@ -2065,6 +2065,23 @@ class TestRustGoCGlobalsAndFields:
         info = {n: (c, s) for n, c, s in result["fields"]}
         assert info["ASSOC_CONST"] == ("Foo", True)
 
+    def test_rust_generic_impl_const_owning_class_strips_type_params(self):
+        # For `impl<T> Foo<T> { ... }`, the impl_item's `type` field is a
+        # generic_type node whose text is "Foo<T>", not a bare
+        # type_identifier -- verified against the real installed
+        # tree-sitter-rust grammar. The owning_class recorded for an
+        # associated const must be the clean base name "Foo" (matching
+        # what struct_item's `name` field produces for the same struct
+        # elsewhere), not "Foo<T>", or the field's :class edge orphans
+        # itself from the struct's actual registered class ident.
+        import mcp_server
+        source = b"struct Foo<T> {\n    val: T,\n}\nimpl<T> Foo<T> {\n    const CAP: usize = 16;\n}\n"
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["CAP"] == ("Foo", True)
+        assert result["field_info"]["CAP"]["class"] == "Foo"
+
     def test_rust_pub_visibility_does_not_break_extraction(self):
         # `pub` is a visibility_modifier CHILD of static_item/struct_item/
         # field_declaration/const_item (verified against the real installed
