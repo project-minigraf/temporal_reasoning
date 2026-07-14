@@ -3105,13 +3105,18 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
 
 
 def _extract_commit(
-    repo_path: str, commit_hash: str
+    repo_path: str, commit_hash: str, ignore_patterns: Sequence[str] = ()
 ) -> Tuple[List[tuple], List[tuple], Dict[str, Dict[str, str]]]:
     """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse,
     plus import resolution and "if this turns out to be new" triple precomputation —
     both pure functions of this commit alone (see _known_files_at_commit and
     _precompute_file_triples), unlike the incrementally-mutated file_entities/
     entity_valid_from state only the serial main thread maintains.
+
+    ignore_patterns (see _is_ignored_path/_load_ignore_patterns) are checked first,
+    before _thread_parser even runs — an ignored file costs zero parse time and is
+    also excluded from known_files, so anything importing it falls through to the
+    external-dependency fallback instead of resolving internally (#115).
 
     Runs in a worker process via the ProcessPoolExecutor in _run_ingestion (#116 —
     a thread pool here let tree-sitter's GIL-holding C parse starve the event
@@ -3149,6 +3154,8 @@ def _extract_commit(
     segment_index: Optional[_SegmentSuffixIndex] = None
 
     for status, old_mode, new_mode, old_sha, new_sha, file_path in raw_entries:
+        if _is_ignored_path(file_path, ignore_patterns):
+            continue
         parser = _thread_parser(file_path)
         if parser is None:
             continue
@@ -3161,7 +3168,7 @@ def _extract_commit(
             continue
         extracted = _extract_from_source(content, parser, file_path)
         if known_files is None:
-            known_files = _known_files_at_commit(repo_path, commit_hash)
+            known_files = _known_files_at_commit(repo_path, commit_hash, ignore_patterns)
             segment_index = _SegmentSuffixIndex(known_files)
         precomputed = _precompute_file_triples(
             file_path, extracted, commit_ident, known_files, segment_index=segment_index,

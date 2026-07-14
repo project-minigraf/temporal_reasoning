@@ -2622,6 +2622,32 @@ class TestExtractCommit:
         assert len(results) == 2  # mod_a.py (imports mod_b) and mod_b.py both added here
         assert build_count == 1
 
+    def test_ignored_file_produces_no_results_entry(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "lib.py").write_text("def vendored_fn(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add vendored lib"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(
+            str(repo), commits[0][0], ["vendor/"]
+        )
+        assert results == []
+
+    def test_no_ignore_patterns_keeps_default_behavior(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        first_hash = commits[0][0]
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
+        assert len(results) == 1
+        assert results[0][1] == "auth.py"
+
 
 class TestIngestionWrites:
     def test_ingest_transact_uses_valid_from(self, mock_minigraf_db, tmp_path):
