@@ -735,6 +735,91 @@ def _extract_globals_and_fields(root_node: Any, lang_name: str) -> Dict[str, Any
 _GLOBAL_FIELD_EXTRACTORS: Dict[str, Callable[[Any], Dict[str, Any]]] = {}
 
 
+def _extract_python_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Python globals/fields extraction.
+
+    Only descends into: module-root direct children (globals), a
+    class_definition's body direct children (class-level/static fields),
+    and __init__'s own body direct children (self.x = ... instance
+    fields). Never recurses into any other function/method body, so a
+    known limitation is that fields first assigned outside __init__ (e.g.
+    dynamically added attributes) are not captured — deliberate, bounded
+    heuristic, not an oversight.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def plain_assignment_name(stmt_node: Any) -> Optional[Tuple[str, Any]]:
+        if stmt_node.type != "expression_statement" or stmt_node.child_count == 0:
+            return None
+        assign = stmt_node.children[0]
+        if assign.type != "assignment":
+            return None
+        left = assign.child_by_field_name("left")
+        if left is not None and left.type == "identifier":
+            return left.text.decode("utf-8"), assign
+        return None
+
+    def self_attr_assignment_name(stmt_node: Any) -> Optional[Tuple[str, Any]]:
+        if stmt_node.type != "expression_statement" or stmt_node.child_count == 0:
+            return None
+        assign = stmt_node.children[0]
+        if assign.type != "assignment":
+            return None
+        left = assign.child_by_field_name("left")
+        if left is None or left.type != "attribute":
+            return None
+        obj = left.child_by_field_name("object")
+        attr = left.child_by_field_name("attribute")
+        if obj is not None and obj.type == "identifier" and obj.text == b"self" and attr is not None:
+            return attr.text.decode("utf-8"), assign
+        return None
+
+    for stmt in root_node.children:
+        if stmt.type == "class_definition":
+            class_name_node = stmt.child_by_field_name("name")
+            class_name = class_name_node.text.decode("utf-8") if class_name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                match = plain_assignment_name(member)
+                if match:
+                    field_name, assign_node = match
+                    fields.append((field_name, class_name, True))
+                    field_info[field_name] = {
+                        "class": class_name, "static": True,
+                        "body": assign_node.text.decode("utf-8", "replace"),
+                    }
+                elif member.type == "function_definition":
+                    fn_name_node = member.child_by_field_name("name")
+                    if fn_name_node is not None and fn_name_node.text == b"__init__":
+                        fn_body = member.child_by_field_name("body")
+                        if fn_body is not None:
+                            for fn_stmt in fn_body.children:
+                                self_match = self_attr_assignment_name(fn_stmt)
+                                if self_match:
+                                    field_name, assign_node = self_match
+                                    fields.append((field_name, class_name, False))
+                                    field_info[field_name] = {
+                                        "class": class_name, "static": False,
+                                        "body": assign_node.text.decode("utf-8", "replace"),
+                                    }
+        else:
+            match = plain_assignment_name(stmt)
+            if match:
+                name, assign_node = match
+                globals_.append(name)
+                global_bodies[name] = assign_node.text.decode("utf-8", "replace")
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["python"] = _extract_python_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:

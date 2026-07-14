@@ -1886,6 +1886,57 @@ class TestExtractGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestPythonGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_python
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_python.language()))
+
+    def test_module_level_global(self):
+        import mcp_server
+        tree = self._parser().parse(b"GLOBAL_X = 5\n")
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        assert "GLOBAL_X" in result["globals"]
+        assert "GLOBAL_X = 5" in result["global_bodies"]["GLOBAL_X"]
+
+    def test_class_variable_is_static_field(self):
+        import mcp_server
+        source = b"class Foo:\n    class_var = 10\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        names = [n for n, _c, _s in result["fields"]]
+        assert "class_var" in names
+        info = result["field_info"]["class_var"]
+        assert info["class"] == "Foo"
+        assert info["static"] is True
+
+    def test_self_attribute_in_init_is_instance_field(self):
+        import mcp_server
+        source = b"class Foo:\n    def __init__(self):\n        self.instance_var = 1\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        names = [n for n, _c, _s in result["fields"]]
+        assert "instance_var" in names
+        info = result["field_info"]["instance_var"]
+        assert info["class"] == "Foo"
+        assert info["static"] is False
+
+    def test_local_variable_inside_function_not_captured(self):
+        import mcp_server
+        source = b"def foo():\n    local_x = 1\n    return local_x\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_self_attribute_outside_init_not_captured(self):
+        """Scoped deliberately to __init__ only — see design plan's stated limitation."""
+        import mcp_server
+        source = b"class Foo:\n    def other(self):\n        self.dynamic = 1\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        assert result["fields"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server
