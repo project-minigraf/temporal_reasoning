@@ -1624,6 +1624,10 @@ def _load_ignore_patterns(repo_path: str) -> List[str]:
     "#"-prefixed comments skipped) read once from repo_path's current working
     tree — not re-read per historical commit, since ignore config describes how
     this run should behave, not something that varies commit-to-commit.
+
+    Fails closed: an unreadable or undecodable .temporalignore file contributes
+    zero extra patterns (defaults + env var still apply), matching best-effort
+    conventions used elsewhere in this file (e.g. _parse_gitmodules).
     """
     patterns: List[str] = list(_DEFAULT_IGNORE_PATTERNS)
 
@@ -1633,7 +1637,11 @@ def _load_ignore_patterns(repo_path: str) -> List[str]:
 
     ignore_file = Path(repo_path) / ".temporalignore"
     if ignore_file.is_file():
-        for line in ignore_file.read_text().splitlines():
+        try:
+            lines = ignore_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            lines = []
+        for line in lines:
             line = line.strip()
             if line and not line.startswith("#"):
                 patterns.append(line)

@@ -2355,6 +2355,32 @@ class TestLoadIgnorePatterns:
         assert "from_env/" in patterns     # env var
         assert "from_file/" in patterns    # .temporalignore
 
+    def test_unreadable_temporalignore_fails_closed(self, tmp_path, monkeypatch):
+        """Unreadable .temporalignore should not abort ingestion; defaults + env patterns still apply."""
+        import mcp_server
+        from pathlib import Path
+
+        monkeypatch.delenv("MINIGRAF_INGEST_IGNORE", raising=False)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".temporalignore").write_text("from_file/\n")
+
+        # Monkeypatch Path.read_text to raise OSError for our .temporalignore file
+        original_read_text = Path.read_text
+
+        def mock_read_text(self, encoding=None, errors=None):
+            if ".temporalignore" in str(self):
+                raise OSError("Permission denied")
+            return original_read_text(self, encoding=encoding, errors=errors)
+
+        monkeypatch.setattr(Path, "read_text", mock_read_text)
+
+        # Should not raise; should return defaults at minimum
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert isinstance(patterns, list)
+        assert "vendor/" in patterns  # default should still be present
+        assert len(patterns) > 0
+
 
 class TestKnownFilesAtCommit:
     def test_returns_files_present_at_that_commit(self, git_repo):
