@@ -2183,6 +2183,111 @@ class TestRustGoCGlobalsAndFields:
         assert info["b"] == ("Foo", False)
 
 
+class TestJavaCSharpGlobalsAndFields:
+    def _java_parser(self):
+        import tree_sitter_java
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_java.language()))
+
+    def _csharp_parser(self):
+        import tree_sitter_c_sharp
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_c_sharp.language()))
+
+    def test_java_static_and_instance_fields(self):
+        import mcp_server
+        source = b"public class Foo {\n    static int staticField = 1;\n    int instanceField = 2;\n}\n"
+        tree = self._java_parser().parse(source)
+        result = mcp_server._extract_java_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+        assert result["globals"] == []
+
+    def test_csharp_static_and_instance_fields(self):
+        import mcp_server
+        source = b"public class Foo {\n    static int staticField = 1;\n    int instanceField = 2;\n}\n"
+        tree = self._csharp_parser().parse(source)
+        result = mcp_server._extract_csharp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+        assert result["globals"] == []
+
+    def test_java_multi_declarator_field_captures_all_names(self):
+        # `int a, b;` puts more than one node under the `declarator` field
+        # of a single field_declaration -- child_by_field_name (singular)
+        # only returns the first, silently dropping `b`. Verified
+        # empirically against the real installed tree-sitter-java grammar
+        # (same lesson as Go's multi-name struct field and C's
+        # multi-declarator statement); children_by_field_name (plural)
+        # must be used instead.
+        import mcp_server
+        source = b"public class Foo {\n    int a, b = 3;\n}\n"
+        tree = self._java_parser().parse(source)
+        result = mcp_server._extract_java_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", False)
+        assert info["b"] == ("Foo", False)
+
+    def test_csharp_multi_declarator_field_captures_all_names(self):
+        # Unlike Java, C#'s field_declaration wraps a single
+        # variable_declaration child whose variable_declarator children
+        # (for `int a, b;`) are all plain positional children -- iterating
+        # var_decl.children already captures all of them. This test locks
+        # in that a multi-name field isn't silently dropped.
+        import mcp_server
+        source = b"public class Foo {\n    int a, b = 3;\n}\n"
+        tree = self._csharp_parser().parse(source)
+        result = mcp_server._extract_csharp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", False)
+        assert info["b"] == ("Foo", False)
+
+    def test_java_nested_class_fields_captured(self):
+        # walk() recurses into every node (not just direct root children)
+        # to find nested class_declarations, since a nested/inner class is
+        # a real, valid Java construct. This locks in that its fields are
+        # attributed to the inner class's own name, not the outer one, and
+        # that the method body sibling isn't mistakenly walked for fields.
+        import mcp_server
+        source = (
+            b"public class Outer {\n"
+            b"    class Inner {\n"
+            b"        static int innerStatic = 5;\n"
+            b"    }\n"
+            b"    void m() {\n"
+            b"        int local = 1;\n"
+            b"    }\n"
+            b"}\n"
+        )
+        tree = self._java_parser().parse(source)
+        result = mcp_server._extract_java_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["innerStatic"] == ("Inner", True)
+        assert "local" not in info
+        assert result["globals"] == []
+
+    def test_csharp_nested_class_fields_captured(self):
+        import mcp_server
+        source = (
+            b"public class Outer {\n"
+            b"    class Inner {\n"
+            b"        static int innerStatic = 5;\n"
+            b"    }\n"
+            b"    void M() {\n"
+            b"        int local = 1;\n"
+            b"    }\n"
+            b"}\n"
+        )
+        tree = self._csharp_parser().parse(source)
+        result = mcp_server._extract_csharp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["innerStatic"] == ("Inner", True)
+        assert "local" not in info
+        assert result["globals"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server

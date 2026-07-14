@@ -1131,6 +1131,144 @@ def _extract_c_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["c"] = _extract_c_globals_and_fields
 
 
+def _extract_java_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Java globals/fields extraction.
+
+    Java has no true top-level globals -- all state lives inside a class
+    -- so this always returns "globals": []. Only descends into a
+    class_declaration's class_body direct children (field_declaration).
+    Never recurses into a method/constructor body.
+
+    `walk()` recurses into every node (not just direct children of the
+    root), unlike this plan's C/Go/Rust extractors' strictly-direct-
+    children approach -- this is still safe scope-wise because
+    class_declaration is itself a structural node (same non-ambiguity
+    argument as functions/classes in `_walk_ast`), and nested/inner
+    classes are a real, valid Java construct worth capturing fields from.
+    The recursion only ever *enters* a matched class's own member list
+    (walk_class only looks at class_node's body's direct children), never
+    a method body, so the "don't misclassify locals" invariant holds even
+    though walk() itself descends everywhere.
+
+    A field_declaration is optionally preceded by a `modifiers` wrapper
+    node (one node containing `static`/`public`/etc. as separate
+    children, e.g. "public static final") -- verified empirically against
+    the real installed tree-sitter-java grammar; static iff any child of
+    that `modifiers` node has type "static".
+
+    NOTE: `int a, b;` puts more than one node under the `declarator`
+    field of a single field_declaration -- child_by_field_name (singular)
+    only returns the first, silently dropping `b`. Verified empirically
+    (same lesson as Go's multi-name struct field and C's multi-declarator
+    statement); children_by_field_name (plural) is used instead.
+    """
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def walk_class(class_node: Any) -> None:
+        name_node = class_node.child_by_field_name("name")
+        class_name = name_node.text.decode("utf-8") if name_node else ""
+        body = class_node.child_by_field_name("body")
+        if body is None:
+            return
+        for member in body.children:
+            if member.type != "field_declaration":
+                continue
+            is_static = False
+            for child in member.children:
+                if child.type == "modifiers":
+                    is_static = any(mod.type == "static" for mod in child.children)
+            for declarator in member.children_by_field_name("declarator"):
+                if declarator.type != "variable_declarator":
+                    continue
+                fname_node = declarator.child_by_field_name("name")
+                if fname_node is not None:
+                    fname = fname_node.text.decode("utf-8")
+                    fields.append((fname, class_name, is_static))
+                    field_info[fname] = {
+                        "class": class_name, "static": is_static,
+                        "body": member.text.decode("utf-8", "replace"),
+                    }
+
+    def walk(node: Any) -> None:
+        if node.type == "class_declaration":
+            walk_class(node)
+        for child in node.children:
+            walk(child)
+
+    walk(root_node)
+    return {"globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["java"] = _extract_java_globals_and_fields
+
+
+def _extract_csharp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware C# globals/fields extraction.
+
+    C# has no true top-level globals -- all state lives inside a class --
+    so this always returns "globals": []. Only descends into a
+    class_declaration's declaration_list body direct children
+    (field_declaration). Never recurses into a method/constructor body.
+
+    `walk()` recurses into every node, same rationale and same "never
+    enters a method body" invariant as the Java extractor above -- nested
+    classes are a real, valid C# construct.
+
+    Unlike Java, a field_declaration's modifiers are direct sibling
+    children of type "modifier" (not wrapped in an intermediate node) --
+    verified empirically against the real installed tree-sitter-c-sharp
+    grammar; static iff any child has type "modifier" and text b"static".
+
+    A field_declaration wraps a single variable_declaration child, itself
+    containing one or more variable_declarator children (via field:name
+    on the declarator, not on the variable_declaration step -- the
+    variable_declaration node has no field-name of its own per the
+    verified dump, so it's located by type). `int a, b;` puts multiple
+    variable_declarator nodes as plain positional children of that one
+    variable_declaration -- iterating them directly (no field lookup)
+    already captures all of them, verified empirically.
+    """
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def walk_class(class_node: Any) -> None:
+        name_node = class_node.child_by_field_name("name")
+        class_name = name_node.text.decode("utf-8") if name_node else ""
+        body = class_node.child_by_field_name("body")
+        if body is None:
+            return
+        for member in body.children:
+            if member.type != "field_declaration":
+                continue
+            is_static = any(c.type == "modifier" and c.text == b"static" for c in member.children)
+            var_decl = next((c for c in member.children if c.type == "variable_declaration"), None)
+            if var_decl is None:
+                continue
+            for declarator in var_decl.children:
+                if declarator.type == "variable_declarator":
+                    fname_node = declarator.child_by_field_name("name")
+                    if fname_node is not None:
+                        fname = fname_node.text.decode("utf-8")
+                        fields.append((fname, class_name, is_static))
+                        field_info[fname] = {
+                            "class": class_name, "static": is_static,
+                            "body": member.text.decode("utf-8", "replace"),
+                        }
+
+    def walk(node: Any) -> None:
+        if node.type == "class_declaration":
+            walk_class(node)
+        for child in node.children:
+            walk(child)
+
+    walk(root_node)
+    return {"globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["c_sharp"] = _extract_csharp_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
