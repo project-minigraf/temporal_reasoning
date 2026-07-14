@@ -272,6 +272,63 @@ class TestGetDbConcurrentResetRace:
         )
 
 
+class TestDbNativeCallSerialization:
+    """Regression test for #110: concurrent minigraf_query calls during active
+    ingestion could silently return wrong results (ok: true) or a transient
+    'Header checksum mismatch'. Root cause: the event-loop thread (call_tool
+    handlers), the ingestion write_executor thread, and IndexCache._rebuild's
+    background thread could all call execute()/checkpoint() on the shared
+    MiniGrafDb handle at the same instant with no synchronization -- minigraf's
+    own .lock file only guarantees single-process exclusivity, not thread
+    safety of concurrent calls into one open handle. _db_execute/_db_checkpoint
+    must serialize every native call via _db_native_lock so two threads never
+    invoke the handle at the same time."""
+
+    def test_db_execute_and_checkpoint_never_overlap_across_threads(self):
+        import threading
+        import time as _time
+        import mcp_server
+
+        overlap_detected = threading.Event()
+        active = {"count": 0}
+        active_lock = threading.Lock()
+
+        class SlowFakeDb:
+            def _mark_enter_exit(self):
+                with active_lock:
+                    active["count"] += 1
+                    if active["count"] > 1:
+                        overlap_detected.set()
+                _time.sleep(0.02)
+                with active_lock:
+                    active["count"] -= 1
+
+            def execute(self, datalog):
+                self._mark_enter_exit()
+                return json.dumps({"results": []})
+
+            def checkpoint(self):
+                self._mark_enter_exit()
+
+        db = SlowFakeDb()
+
+        def worker():
+            for _ in range(5):
+                mcp_server._db_execute(db, "(query [:find ?e :where [?e :entity-type ?t]])")
+                mcp_server._db_checkpoint(db)
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert not overlap_detected.is_set(), (
+            "concurrent threads executed native db calls at the same time -- "
+            "_db_execute/_db_checkpoint must serialize via _db_native_lock (#110)"
+        )
+
+
 class TestOpenDbAtWithExtendedRetry:
     """Unit tests for _open_db_at_with_extended_retry — the longer,
     time-budgeted backoff used only for ingestion startup lock acquisition,

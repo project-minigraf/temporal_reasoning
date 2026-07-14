@@ -57,6 +57,18 @@ _user_rules: List[str] = []
 # Module-level DB instance — opened once, held for the session lifetime
 _db: Optional[MiniGrafDb] = None
 
+# Serializes every native call into the shared MiniGrafDb handle across the
+# threads that can touch it concurrently: the event-loop thread (call_tool
+# handlers), the ingestion write_executor thread, IndexCache._rebuild's
+# background thread, and worker threads used for preload/lock-retry. minigraf's
+# own sidecar .lock file only guarantees single-process exclusivity — it says
+# nothing about concurrent calls into one already-open handle from multiple
+# threads within this same process. Without this, two threads racing a
+# call/checkpoint on the same (or a handle open concurrently with another's
+# in-flight write) can observe a torn header or a mid-write index, producing
+# silently wrong query results or a transient "Header checksum mismatch" (#110).
+_db_native_lock = threading.Lock()
+
 # Track graph path and last-known mtime so we can detect external modifications.
 # minigraf's Drop impl writes to the file even for read-only handles, which
 # invalidates any other open handle's in-memory page table.  Reopening on
@@ -722,11 +734,12 @@ def _get_graph_path() -> str:
 def _open_db_at(path: str) -> MiniGrafDb:
     """Open MiniGrafDb at path, register session rules, update mtime tracking."""
     global _db, _graph_path, _db_mtime
-    _db = MiniGrafDb.open(path)
+    with _db_native_lock:
+        _db = MiniGrafDb.open(path)
     for rule in SESSION_RULES:
-        _db.execute(rule)
+        _db_execute(_db, rule)
     for rule in _user_rules:
-        _db.execute(rule)
+        _db_execute(_db, rule)
     _graph_path = path
     try:
         _db_mtime = os.path.getmtime(path)
@@ -970,6 +983,23 @@ def get_db() -> MiniGrafDb:
     return db
 
 
+def _db_execute(db: Any, datalog: str) -> str:
+    """Execute a datalog command against db, serialized via _db_native_lock.
+
+    Every call site that invokes db.execute() on the shared handle must go
+    through this (or _db_checkpoint below) rather than calling db.execute()
+    directly — see _db_native_lock's docstring for why (#110).
+    """
+    with _db_native_lock:
+        return db.execute(datalog)
+
+
+def _db_checkpoint(db: Any) -> None:
+    """Checkpoint db, serialized via _db_native_lock. See _db_execute."""
+    with _db_native_lock:
+        db.checkpoint()
+
+
 # ---------------------------------------------------------------------------
 # Result parsing
 # ---------------------------------------------------------------------------
@@ -1000,7 +1030,7 @@ def handle_minigraf_query(datalog: str) -> Dict[str, Any]:
     """Query the graph. Returns {ok, results} or {ok, error}."""
     db = get_db()
     try:
-        raw = db.execute(f"(query {datalog})")
+        raw = _db_execute(db, f"(query {datalog})")
         return _parse_query_result(raw)
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
@@ -1026,8 +1056,8 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     _refresh_if_stale()
     db = get_db()
     try:
-        raw = db.execute(f'(transact {facts} {{:valid-from "{_now_utc_ms()}"}})')
-        db.checkpoint()
+        raw = _db_execute(db, f'(transact {facts} {{:valid-from "{_now_utc_ms()}"}})')
+        _db_checkpoint(db)
         _update_mtime()
         result = _parse_tx_result(raw)
         if result["ok"]:
@@ -1045,8 +1075,8 @@ def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
     _refresh_if_stale()
     db = get_db()
     try:
-        raw = db.execute(f"(retract {facts})")
-        db.checkpoint()
+        raw = _db_execute(db, f"(retract {facts})")
+        _db_checkpoint(db)
         _update_mtime()
         result = _parse_tx_result(raw)
         if result["ok"]:
@@ -1070,7 +1100,7 @@ def handle_minigraf_rule(rule: str) -> Dict[str, Any]:
     global _user_rules
     db = get_db()
     try:
-        db.execute(f"(rule {rule})")
+        _db_execute(db, f"(rule {rule})")
         rule_expr = f"(rule {rule})"
         if rule_expr not in _user_rules:
             _user_rules.append(rule_expr)
@@ -1183,8 +1213,8 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
                                     f'[#uuid "{entity_uuid}" {a} "{escaped}"]'
                                 )
                         retract_expr = f"(retract [{' '.join(retract_triples)}])"
-                        db.execute(retract_expr)
-                        db.checkpoint()
+                        _db_execute(db, retract_expr)
+                        _db_checkpoint(db)
                         _update_mtime()
                         retracted += 1
                     except Exception:
@@ -1671,7 +1701,7 @@ def _ingest_transact(
     if not triples:
         return
     facts_str = "[" + " ".join(triples) + "]"
-    db.execute(f'(transact {facts_str} {{:valid-from "{commit_ts_iso}"}})')
+    _db_execute(db, f'(transact {facts_str} {{:valid-from "{commit_ts_iso}"}})')
 
 
 def _ingest_close(
@@ -1698,18 +1728,19 @@ def _ingest_close(
         return
     for triple in triples:
         try:
-            db.execute(f"(retract [{triple}])")
+            _db_execute(db, f"(retract [{triple}])")
         except Exception:
             pass  # best-effort: original may not exist if preload was incomplete
     facts_str = "[" + " ".join(triples) + "]"
-    db.execute(
-        f'(transact {facts_str} {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}})'
+    _db_execute(
+        db,
+        f'(transact {facts_str} {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}})',
     )
 
 
 def _watermark_query(db: Any) -> Optional[str]:
     """Return the hash of the last ingested commit, or None if no watermark exists."""
-    raw = db.execute("(query [:find ?h :where [:ingestion/watermark :hash ?h]])")
+    raw = _db_execute(db, "(query [:find ?h :where [:ingestion/watermark :hash ?h]])")
     results = json.loads(raw).get("results", [])
     return results[0][0] if results else None
 
@@ -1722,7 +1753,7 @@ def _total_ingested_query(db: Any) -> int:
     commits were durably persisted. Use _count_commit_entities for the true
     current count.
     """
-    raw = db.execute("(query [:find ?n :any-valid-time :where [:ingestion/last-run-at :total-ingested ?n]])")
+    raw = _db_execute(db, "(query [:find ?n :any-valid-time :where [:ingestion/last-run-at :total-ingested ?n]])")
     results = json.loads(raw).get("results", [])
     return int(results[0][0]) if results else 0
 
@@ -1733,7 +1764,7 @@ def _count_commit_entities(db: Any) -> int:
     Unlike _total_ingested_query, this reflects reality even after a run was
     interrupted before it could write its completion watermark.
     """
-    raw = db.execute("(query [:find (count ?e) :where [?e :entity-type :type/commit]])")
+    raw = _db_execute(db, "(query [:find (count ?e) :where [?e :entity-type :type/commit]])")
     results = json.loads(raw).get("results", [])
     return int(results[0][0]) if results else 0
 
@@ -1742,25 +1773,27 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
     """Record the last successfully ingested commit hash in the graph."""
     existing = _watermark_query(db)
     if existing:
-        db.execute(f'(retract [[:ingestion/watermark :hash "{existing}"]])')
-    db.execute(
+        _db_execute(db, f'(retract [[:ingestion/watermark :hash "{existing}"]])')
+    _db_execute(
+        db,
         f'(transact [[:ingestion/watermark :entity-type :type/ingestion] '
         f'[:ingestion/watermark :ident ":ingestion/watermark"] '
         f'[:ingestion/watermark :description "git ingestion watermark"] '
         f'[:ingestion/watermark :hash "{commit_hash}"]] '
-        f'{{:valid-from "{commit_ts_iso}"}})'
+        f'{{:valid-from "{commit_ts_iso}"}})',
     )
 
 
 def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int) -> None:
     """Record the wall-clock time, final commit hash, and cumulative ingested count."""
-    db.execute(
+    _db_execute(
+        db,
         f'(transact [[:ingestion/last-run-at :entity-type :type/ingestion] '
         f'[:ingestion/last-run-at :ident ":ingestion/last-run-at"] '
         f'[:ingestion/last-run-at :description "last ingestion run timestamp"] '
         f'[:ingestion/last-run-at :last-run-at "{run_at}"] '
         f'[:ingestion/last-run-at :last-commit "{commit_hash}"] '
-        f'[:ingestion/last-run-at :total-ingested {total_ingested}]])'
+        f'[:ingestion/last-run-at :total-ingested {total_ingested}]])',
     )
 
 
@@ -2136,8 +2169,8 @@ class IndexCache:
         try:
             db = get_db()
             boost = float(os.environ.get("MINIGRAF_MEMORY_BOOST", "2.0"))
-            raw = db.execute(
-                f'(query [:find ?e ?a ?v :valid-at "{_now_utc_ms()}" :where [?e ?a ?v]])'
+            raw = _db_execute(
+                db, f'(query [:find ?e ?a ?v :valid-at "{_now_utc_ms()}" :where [?e ?a ?v]])'
             )
             facts = json.loads(raw).get("results", [])
             new_index = FactIndex(facts, boost=boost)
@@ -2174,8 +2207,8 @@ def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
 
     for entity in entities:
         try:
-            raw = db.execute(
-                f'(query [:find ?a ?v {temporal_clauses} :where [?e ?a ?v] (contains? ?v "{entity}")])'
+            raw = _db_execute(
+                db, f'(query [:find ?a ?v {temporal_clauses} :where [?e ?a ?v] (contains? ?v "{entity}")])'
             )
             data = json.loads(raw)
             for row in data.get("results", []):
@@ -2189,8 +2222,8 @@ def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
     if not collected:
         # Broad fallback scan — still respect temporal clause
         try:
-            raw = db.execute(
-                f"(query [:find ?e ?a ?v {temporal_clauses} :where [?e ?a ?v]])"
+            raw = _db_execute(
+                db, f"(query [:find ?e ?a ?v {temporal_clauses} :where [?e ?a ?v]])"
             )
             data = json.loads(raw)
             all_results = data.get("results", [])
@@ -2325,12 +2358,12 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
                 )
             else:
                 triples = f'[{entity} {attribute} "{value}"]'
-            db.execute(f'(transact [{triples}] {{:valid-from "{now_z}"}})')
+            _db_execute(db, f'(transact [{triples}] {{:valid-from "{now_z}"}})')
             stored += 1
         except MiniGrafError:
             continue
     if stored:
-        db.checkpoint()
+        _db_checkpoint(db)
         _update_mtime()
     return stored
 
@@ -2567,8 +2600,8 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
             return {"ok": True, "stored_count": 0, "strategy": "agent"}
         _refresh_if_stale()
         db = get_db()
-        db.execute(f'(transact {datalog} {{:valid-from "{valid_at}"}})')
-        db.checkpoint()
+        _db_execute(db, f'(transact {datalog} {{:valid-from "{valid_at}"}})')
+        _db_checkpoint(db)
         _update_mtime()
         # Approximate: count "[:" occurrences as a proxy for triple count.
         stored_count = datalog.count("[:")
@@ -2808,14 +2841,15 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     for entity_type in ("module", "function", "class", "external-dependency"):
         path_attr = "path" if entity_type in ("module", "external-dependency") else "file"
         try:
-            raw = db.execute(
+            raw = _db_execute(
+                db,
                 f'(query [:find ?ident ?path ?desc ?date '
                 f':where [?e :entity-type :type/{entity_type}] '
                 f'[?e :ident ?ident] '
                 f'[?e :{path_attr} ?path] '
                 f'[?e :description ?desc] '
                 f'[?e :introduced-by ?c] '
-                f'[?c :date ?date]])'
+                f'[?c :date ?date]])',
             )
             rows = json.loads(raw).get("results", [])
             for ident, path, desc, date in rows:
@@ -2866,7 +2900,8 @@ def _preload_known_deps(
     }
 
     try:
-        raw = db.execute(
+        raw = _db_execute(
+            db,
             "(query [:find ?src ?dep ?vf "
             ":any-valid-time "
             ":where [?src :depends-on ?dep] "
@@ -2907,7 +2942,8 @@ def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
     """
     pinned: Dict[str, tuple] = {}
     try:
-        raw = db.execute(
+        raw = _db_execute(
+            db,
             "(query [:find ?e ?sha ?vf "
             ":any-valid-time "
             ":where [?e :pinned-commit ?sha] "
@@ -2981,7 +3017,7 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
             ]
             if date_raw:
                 triples.append(f'[{tag_ident} :date "{_edn_escape(date_raw)}"]')
-            db.execute(f'(transact [{" ".join(triples)}] {{:valid-from "{run_ts_iso}"}})')
+            _db_execute(db, f'(transact [{" ".join(triples)}] {{:valid-from "{run_ts_iso}"}})')
         except Exception:
             pass  # non-fatal per tag
 
@@ -3322,7 +3358,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 parent_ident = f":commit/{parent_hash[:12]}"
                                 await loop.run_in_executor(
                                     write_executor,
-                                    db.execute,
+                                    _db_execute,
+                                    db,
                                     f'(transact [[{commit_ident} :parent {parent_ident}]] '
                                     f'{{:valid-from "{commit_ts_iso}"}})',
                                 )
@@ -3330,7 +3367,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             pass  # non-fatal; parent edges are best-effort
 
                         await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason)
-                        await loop.run_in_executor(write_executor, db.checkpoint)
+                        await loop.run_in_executor(write_executor, _db_checkpoint, db)
 
                     finally:
                         _db = None  # release file lock between commits
@@ -3347,7 +3384,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     await loop.run_in_executor(
                         write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"]
                     )
-                    await loop.run_in_executor(write_executor, db.checkpoint)
+                    await loop.run_in_executor(write_executor, _db_checkpoint, db)
                 finally:
                     _db = None
 
@@ -3434,7 +3471,8 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
     if _ingest_progress["status"] != "running":
         try:
             db = get_db()
-            raw = db.execute(
+            raw = _db_execute(
+                db,
                 "(query [:find ?t ?h :any-valid-time "
                 ":where [:ingestion/last-run-at :last-run-at ?t] "
                 "[:ingestion/last-run-at :last-commit ?h]])"
