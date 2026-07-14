@@ -3229,6 +3229,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _db = None  # release file lock while enumerating commits
 
         commits = _git_commits(repo_path, watermark, branch)
+        ignore_patterns = _load_ignore_patterns(repo_path)
         repo_total_result = _subprocess.run(
             ["git", "rev-list", "--count", "HEAD"],
             cwd=repo_path, capture_output=True, text=True,
@@ -3300,7 +3301,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         commit = next(commits_iter)
                     except StopIteration:
                         return False
-                    fut = loop.run_in_executor(executor, _extract_commit, repo_path, commit[0])
+                    fut = loop.run_in_executor(
+                        executor, _extract_commit, repo_path, commit[0], ignore_patterns
+                    )
                     pending.append((commit, fut))
                     return True
 

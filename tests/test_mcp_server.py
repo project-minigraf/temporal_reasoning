@@ -4759,6 +4759,127 @@ class TestUnresolvedImportTagging:
         )
 
 
+class TestGitIngestionPathIgnore:
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+    @pytest.mark.asyncio
+    async def test_default_ignored_directory_produces_no_code_entities(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """A file under a default-ignored directory (vendor/) must not produce
+        any :type/module, :type/function, or :type/class triples."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "lib.py").write_text("def vendored_fn(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add vendored lib"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        vendored_module_ident = mcp_server._code_ident("module", "vendor/lib.py")
+        assert not any(vendored_module_ident in t for t in transact_calls)
+        assert not any(":entity-type :type/function" in t for t in transact_calls)
+        assert not any(":entity-type :type/class" in t for t in transact_calls)
+
+    @pytest.mark.asyncio
+    async def test_import_into_ignored_path_becomes_external_dependency(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Before this feature, vendor/foo.py would resolve as a normal in-tree
+        module (see _resolve_module_import's segment-suffix matcher) and
+        main.py's import of it would create an internal :depends-on edge, not
+        an external-dependency entity. Excluding vendor/ from known_files must
+        make it fall through to the same fallback used for real external
+        packages (see TestUnresolvedImportTagging)."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "foo.py").write_text("def helper(): pass\n")
+        (repo / "main.py").write_text("import vendor.foo\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add vendor and main"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        external_ident = mcp_server._canonical_ident("module", "vendor.foo")
+        assert any(
+            f"[{external_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_var_ignore_pattern_excludes_custom_directory(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """MINIGRAF_INGEST_IGNORE must add to the default ignore list, not
+        replace it — a custom pattern not in the built-in defaults must still
+        be honored."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "generated").mkdir()
+        (repo / "generated" / "codegen.py").write_text("def generated_fn(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add generated file"], cwd=repo, check=True, capture_output=True)
+
+        monkeypatch.setenv("MINIGRAF_INGEST_IGNORE", "generated/")
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        generated_module_ident = mcp_server._code_ident("module", "generated/codegen.py")
+        assert not any(generated_module_ident in t for t in transact_calls)
+
+
 class TestResolveModuleImportTieredMatcher:
     def test_exact_file_match_java_package(self):
         import mcp_server
