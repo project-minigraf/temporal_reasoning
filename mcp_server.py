@@ -1487,29 +1487,50 @@ def _git_commits(
 
 
 def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
-    """Return (status_char, old_mode, new_mode, old_sha, new_sha, path) for
-    every changed path in a commit, via a single `git diff-tree --raw` call.
+    """Return (status_char, old_mode, new_mode, old_sha, new_sha, path, old_path,
+    similarity) for every changed path in a commit, via a single
+    `git diff-tree --raw` call.
+
+    -M enables git's own content-similarity rename detection (default 50%
+    threshold, unchanged — see the 2026-07-14 rename-tracking design doc's
+    "Component 1" for why no additional threshold filtering is applied on
+    top of git's own judgment). Deliberately no -C (copy detection) — a copy
+    leaves the original in place *and* creates a new, independent entity;
+    treating it as a rename would misrepresent history.
+
+    A rename/copy raw line has TWO tab-separated paths (old, then new), not
+    one, e.g. ":100644 100644 <sha> <sha> R100\told.py\tnew.py" — naively
+    keeping the old single-partition parse would fold both paths into one
+    bogus string. old_path is "" for every non-rename status. similarity is
+    the numeric suffix of the status (e.g. 100 for "R100", 57 for "R057"),
+    None for non-rename statuses.
 
     Supersedes running diff-tree a second time just to detect gitlinks:
     --raw already carries file mode (needed to spot submodule paths, mode
     160000) in the same subprocess invocation _extract_commit already makes.
     """
     result = _subprocess.run(
-        ["git", "diff-tree", "--no-commit-id", "-r", "--raw", "--root", commit_hash],
+        ["git", "diff-tree", "--no-commit-id", "-r", "-M", "--raw", "--root", commit_hash],
         cwd=repo_path, capture_output=True, text=True, check=True,
     )
     entries = []
     for line in result.stdout.strip().splitlines():
         if not line.startswith(":"):
             continue
-        meta, sep, path = line.partition("\t")
+        meta, sep, rest = line.partition("\t")
         if not sep:
             continue
         fields = meta[1:].split(" ")
         if len(fields) < 5:
             continue
-        old_mode, new_mode, old_sha, new_sha, status = fields[0], fields[1], fields[2], fields[3], fields[4]
-        entries.append((status[0], old_mode, new_mode, old_sha, new_sha, path))
+        old_mode, new_mode, old_sha, new_sha, status_field = fields[0], fields[1], fields[2], fields[3], fields[4]
+        status = status_field[0]
+        similarity = int(status_field[1:]) if len(status_field) > 1 and status_field[1:].isdigit() else None
+        if status in ("R", "C"):
+            old_path, _, path = rest.partition("\t")
+        else:
+            old_path, path = "", rest
+        entries.append((status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity))
     return entries
 
 
@@ -1534,7 +1555,7 @@ def _gitlink_changes(raw_entries: List[tuple]) -> List[tuple]:
     commit for "remove" (needed by the caller to close the right fact).
     """
     changes = []
-    for status, old_mode, new_mode, old_sha, new_sha, path in raw_entries:
+    for status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity in raw_entries:
         old_is_link = old_mode == _GITLINK_MODE
         new_is_link = new_mode == _GITLINK_MODE
         if not old_is_link and not new_is_link:
@@ -3197,7 +3218,7 @@ def _extract_commit(
     known_files: Optional[Dict[str, List[str]]] = None
     segment_index: Optional[_SegmentSuffixIndex] = None
 
-    for status, old_mode, new_mode, old_sha, new_sha, file_path in raw_entries:
+    for status, old_mode, new_mode, old_sha, new_sha, file_path, old_path, similarity in raw_entries:
         if _is_ignored_path(file_path, ignore_patterns):
             continue
         parser = _thread_parser(file_path)

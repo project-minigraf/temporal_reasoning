@@ -2221,11 +2221,13 @@ class TestGitDiffTreeRaw:
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         entries = mcp_server._git_diff_tree_raw(str(git_repo), commits[0][0])
         assert len(entries) == 1
-        status, old_mode, new_mode, old_sha, new_sha, path = entries[0]
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
         assert status == "A"
         assert old_mode == "000000"
         assert new_mode == "100644"
         assert path == "auth.py"
+        assert old_path == ""
+        assert similarity is None
 
     def test_gitlink_add_reports_mode_160000(self, tmp_path):
         import mcp_server
@@ -2254,11 +2256,83 @@ class TestGitDiffTreeRaw:
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
         entries = mcp_server._git_diff_tree_raw(str(repo), commits[0][0])
         assert len(entries) == 1
-        status, old_mode, new_mode, old_sha, new_sha, path = entries[0]
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
         assert status == "A"
         assert new_mode == "160000"
         assert new_sha == sub_hash
         assert path == "vendor/lib"
+        assert old_path == ""
+
+    def test_pure_rename_reports_both_paths_and_similarity(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text("def login():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(repo), commits[1][0])
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
+        assert status == "R"
+        assert path == "new_name.py"
+        assert old_path == "old_name.py"
+        assert similarity == 100
+
+    def test_rename_with_content_change_reports_partial_similarity(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text(
+            "def login():\n    pass\n\ndef a():\n    pass\n\ndef b():\n    pass\n\ndef c():\n    pass\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        (repo / "new_name.py").write_text(
+            "def login():\n    pass\n\ndef a():\n    pass\n\ndef extra():\n    pass\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename and edit"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(repo), commits[1][0])
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
+        assert status == "R"
+        assert old_path == "old_name.py"
+        assert path == "new_name.py"
+        assert similarity is not None and 0 < similarity < 100
+
+    def test_unrelated_add_and_delete_not_reported_as_rename(self, tmp_path):
+        """Below git's default 50% similarity threshold, -M must NOT report a rename."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text("def login():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "rm", "old_name.py"], cwd=repo, check=True, capture_output=True)
+        (repo / "unrelated.py").write_text("class Widget:\n    def render(self):\n        return 42\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "unrelated churn"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(repo), commits[1][0])
+        statuses = {e[0] for e in entries}
+        assert statuses == {"A", "D"}
 
 
 class TestIsIgnoredPath:
@@ -2459,32 +2533,32 @@ class TestKnownFilesAtCommit:
 class TestGitlinkChanges:
     def test_non_gitlink_rows_are_ignored(self):
         import mcp_server
-        raw = [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py")]
+        raw = [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py", "", None)]
         assert mcp_server._gitlink_changes(raw) == []
 
     def test_add_when_new_mode_is_gitlink(self):
         import mcp_server
-        raw = [("A", "000000", "160000", "0" * 40, "b" * 40, "vendor/lib")]
+        raw = [("A", "000000", "160000", "0" * 40, "b" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("add", "b" * 40, "vendor/lib")]
 
     def test_bump_when_both_modes_are_gitlink(self):
         import mcp_server
-        raw = [("M", "160000", "160000", "b" * 40, "c" * 40, "vendor/lib")]
+        raw = [("M", "160000", "160000", "b" * 40, "c" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("bump", "c" * 40, "vendor/lib")]
 
     def test_remove_when_old_mode_is_gitlink(self):
         import mcp_server
-        raw = [("D", "160000", "000000", "c" * 40, "0" * 40, "vendor/lib")]
+        raw = [("D", "160000", "000000", "c" * 40, "0" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("remove", "c" * 40, "vendor/lib")]
 
     def test_type_change_into_internal_reported_as_remove(self):
         import mcp_server
-        raw = [("T", "160000", "100644", "c" * 40, "d" * 40, "vendor/lib")]
+        raw = [("T", "160000", "100644", "c" * 40, "d" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("remove", "c" * 40, "vendor/lib")]
 
     def test_type_change_into_external_reported_as_add(self):
         import mcp_server
-        raw = [("T", "100644", "160000", "d" * 40, "e" * 40, "vendor/lib")]
+        raw = [("T", "100644", "160000", "d" * 40, "e" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("add", "e" * 40, "vendor/lib")]
 
 
@@ -2578,7 +2652,7 @@ class TestExtractCommit:
         import mcp_server
         monkeypatch.setattr(
             mcp_server, "_git_diff_tree_raw",
-            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "notes.txt")],
+            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "notes.txt", "", None)],
         )
         results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), "deadbeef")
         assert results == []
@@ -2587,7 +2661,7 @@ class TestExtractCommit:
         import mcp_server
         monkeypatch.setattr(
             mcp_server, "_git_diff_tree_raw",
-            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py")],
+            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py", "", None)],
         )
 
         def boom(repo, commit, path):
