@@ -2458,6 +2458,109 @@ class TestRubyGlobalsAndFields:
         assert result["globals"] == []
 
 
+class TestPhpGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_php
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_php.language_php()))
+
+    def test_top_level_variable_is_global(self):
+        import mcp_server
+        source = b"<?php\n$globalVar = 5;\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        assert "$globalVar" in result["globals"]
+
+    def test_static_and_instance_properties(self):
+        import mcp_server
+        source = b"<?php\nclass Foo {\n    public static $staticField = 1;\n    public $instanceField = 2;\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$staticField"] == ("Foo", True)
+        assert info["$instanceField"] == ("Foo", False)
+
+    def test_multi_property_declaration_captures_all_names(self):
+        # `public static $a = 1, $b = 2;` -- a single property_declaration
+        # containing multiple property_element children -- verified
+        # empirically against the real installed tree-sitter-php grammar.
+        # This is the PHP analog of the recurring multi-declarator gap
+        # (Go/Java/C++), but here the brief's plain iteration over every
+        # property_element child already handles it correctly.
+        import mcp_server
+        source = b"<?php\nclass Foo {\n    public static $a = 1, $b = 2;\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$a"] == ("Foo", True)
+        assert info["$b"] == ("Foo", True)
+
+    def test_typed_property_still_captured(self):
+        # PHP 7.4+ typed properties (`public int $x = 5;`) add a
+        # primitive_type/named_type child to property_declaration but
+        # keep the same property_element shape -- verified empirically.
+        import mcp_server
+        source = b"<?php\nclass Foo {\n    public int $x = 5;\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$x"] == ("Foo", False)
+
+    def test_semicolon_style_namespace_globals_still_captured(self):
+        # `namespace App;` (semicolon style) does not wrap subsequent
+        # statements -- they remain direct children of `program` --
+        # verified empirically. No special-casing needed for this form.
+        import mcp_server
+        source = b"<?php\nnamespace App;\n$x = 5;\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        assert "$x" in result["globals"]
+
+    def test_block_style_namespace_globals_and_classes_captured(self):
+        # `namespace App { ... }` (block style) wraps its statements in
+        # a compound_statement exposed via field:body on
+        # namespace_definition -- verified empirically against the real
+        # installed tree-sitter-php grammar. Same shape-changing-wrapper
+        # lesson as JS's export_statement: without unwrapping, every
+        # global/class inside a block-style namespace is silently
+        # dropped, and PHP namespaces are extremely common in real code.
+        import mcp_server
+        source = (
+            b"<?php\nnamespace App {\n"
+            b"    $x = 5;\n"
+            b"    class Foo {\n        public $y = 1;\n    }\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        assert "$x" in result["globals"]
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$y"] == ("Foo", False)
+
+    def test_promoted_constructor_property_captured_as_instance_field(self):
+        # PHP 8+ constructor property promotion
+        # (`public function __construct(public int $x) {}`) produces a
+        # property_promotion_parameter node inside the constructor's
+        # formal_parameters -- NOT a property_declaration under the
+        # class body -- verified empirically. The brief's code as
+        # written only scans property_declaration nodes in the class
+        # body, so promoted properties would be silently missed without
+        # this extra handling. Promoted properties cannot carry a
+        # `static` modifier in real PHP (verified: adding one produces
+        # a parse ERROR node), so they are always instance fields.
+        import mcp_server
+        source = (
+            b"<?php\nclass Foo {\n"
+            b"    public function __construct(public int $x, private string $y = \"z\") {}\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$x"] == ("Foo", False)
+        assert info["$y"] == ("Foo", False)
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server

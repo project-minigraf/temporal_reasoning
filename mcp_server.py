@@ -1455,6 +1455,116 @@ def _extract_ruby_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["ruby"] = _extract_ruby_globals_and_fields
 
 
+def _extract_php_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware PHP globals/fields extraction.
+
+    Top-level `$x = 5;` is `expression_statement > assignment_expression`
+    with field:left = variable_name -> global. `class Foo { ... }` is
+    class_declaration with field:body = declaration_list; each member is
+    a property_declaration containing an optional static_modifier child
+    and one or more property_element children (field:name =
+    variable_name) -> field.
+
+    Multi-property declarations (`public static $a = 1, $b = 2;`)
+    already work with plain iteration: verified empirically that a
+    single property_declaration node holds multiple property_element
+    children directly, unlike the multi-declarator gaps found in every
+    other C-family language in this plan (Go/Java/C++) -- no unwrapping
+    needed here.
+
+    Typed properties (`public int $x = 5;`, PHP 7.4+) add a
+    primitive_type/named_type child to property_declaration but keep the
+    same property_element shape -- verified empirically -- so no special
+    handling is required.
+
+    Namespaces have two forms, verified empirically against the real
+    installed tree-sitter-php grammar:
+      - Semicolon style (`namespace App; $x = 5;`) does NOT wrap
+        subsequent statements; they remain direct children of `program`,
+        so the plain top-level loop already sees them.
+      - Block style (`namespace App { $x = 5; }`) wraps its statements in
+        a compound_statement exposed via namespace_definition's
+        field:body. Without recursing into it, every global/class inside
+        a block-style namespace would be silently dropped -- the same
+        shape-changing-wrapper lesson as JS's export_statement. PHP
+        namespaces are extremely common in real-world code, so
+        namespace_definition nodes are unwrapped recursively (namespaces
+        can themselves be nested).
+
+    PHP 8+ constructor property promotion
+    (`public function __construct(public int $x) {}`) produces a
+    property_promotion_parameter node inside the constructor's
+    formal_parameters -- NOT a property_declaration under the class
+    body -- verified empirically, so it requires separate handling.
+    Promoted properties cannot carry a `static` modifier in real PHP
+    (verified: adding one produces a parse ERROR node), so they are
+    always recorded as instance (non-static) fields.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def handle_class(stmt: Any) -> None:
+        name_node = stmt.child_by_field_name("name")
+        class_name = name_node.text.decode("utf-8") if name_node else ""
+        body = stmt.child_by_field_name("body")
+        if body is None:
+            return
+        for member in body.children:
+            if member.type == "property_declaration":
+                is_static = any(c.type == "static_modifier" for c in member.children)
+                for elem in member.children:
+                    if elem.type == "property_element":
+                        elem_name_node = elem.child_by_field_name("name")
+                        if elem_name_node is not None:
+                            fname = elem_name_node.text.decode("utf-8")
+                            fields.append((fname, class_name, is_static))
+                            field_info[fname] = {
+                                "class": class_name, "static": is_static,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+            elif member.type == "method_declaration":
+                method_name_node = member.child_by_field_name("name")
+                if method_name_node is not None and method_name_node.text == b"__construct":
+                    params = member.child_by_field_name("parameters")
+                    if params is not None:
+                        for param in params.children:
+                            if param.type == "property_promotion_parameter":
+                                param_name_node = param.child_by_field_name("name")
+                                if param_name_node is not None:
+                                    fname = param_name_node.text.decode("utf-8")
+                                    fields.append((fname, class_name, False))
+                                    field_info[fname] = {
+                                        "class": class_name, "static": False,
+                                        "body": param.text.decode("utf-8", "replace"),
+                                    }
+
+    def handle_stmts(stmts: Sequence[Any]) -> None:
+        for stmt in stmts:
+            if stmt.type == "expression_statement" and stmt.child_count > 0:
+                expr = stmt.children[0]
+                if expr.type == "assignment_expression":
+                    left = expr.child_by_field_name("left")
+                    if left is not None and left.type == "variable_name":
+                        name = left.text.decode("utf-8")
+                        globals_.append(name)
+                        global_bodies[name] = stmt.text.decode("utf-8", "replace")
+            elif stmt.type == "class_declaration":
+                handle_class(stmt)
+            elif stmt.type == "namespace_definition":
+                ns_body = stmt.child_by_field_name("body")
+                if ns_body is not None:
+                    handle_stmts(ns_body.children)
+
+    handle_stmts(root_node.children)
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["php"] = _extract_php_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
