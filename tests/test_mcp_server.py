@@ -207,6 +207,65 @@ class TestGetDbLockRetry:
         assert mock_class.open.call_count == 2 * mcp_server._LOCK_RETRY_MAX
 
 
+class TestTryOpenWithSelfHealReuse:
+    """Regression test for #107: minigraf_ingest_status incorrectly reported
+    "Database is locked by another process" while minigraf_ingest_git was
+    actively running. Root cause: _try_open_with_self_heal always called
+    _open_db_at(path) unconditionally, even when another thread had already
+    opened the db and populated _db in the window between this thread's
+    None-check and its own open attempt (e.g. the ingestion preload thread,
+    which opens its own handle on a worker thread, racing against an
+    _ensure_db_async() caller like minigraf_ingest_status during the
+    "starting" phase, before _run_ingestion flips status to "running").
+    That produced a second, redundant MiniGrafDb.open() from this same
+    process, which collides with the first handle's still-live lock file and
+    surfaces as "locked by another process" with the lock file's own PID
+    equal to our own."""
+
+    def test_concurrent_open_attempts_only_open_db_once(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        import threading
+        import time as _time
+
+        path = str(tmp_path / "race.graph")
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+
+        open_call_count = {"n": 0}
+        open_lock = threading.Lock()
+
+        def slow_open(p):
+            with open_lock:
+                open_call_count["n"] += 1
+            _time.sleep(0.05)  # widen the race window so racers overlap
+            return db_instance
+
+        mock_class.open.side_effect = slow_open
+
+        results = []
+        results_lock = threading.Lock()
+
+        def worker():
+            db = mcp_server._try_open_with_self_heal(path)
+            with results_lock:
+                results.append(db)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert open_call_count["n"] == 1, (
+            f"MiniGrafDb.open() called {open_call_count['n']} times for concurrent "
+            "open attempts racing on the same None _db -- _try_open_with_self_heal "
+            "must recheck _db under _db_native_lock before opening a second handle (#107)"
+        )
+        assert len(results) == 5
+        assert all(r is db_instance for r in results)
+
+
 class TestGetDbConcurrentResetRace:
     """Regression test for #122: IndexCache._rebuild calls get_db() from a
     background thread. get_db() used to read the module-level _db global
