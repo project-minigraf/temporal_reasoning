@@ -2026,6 +2026,146 @@ class TestJsFamilyGlobalsAndFields:
         assert info["c"] == ("Bar", False)
 
 
+class TestRustGoCGlobalsAndFields:
+    def _rust_parser(self):
+        import tree_sitter_rust
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_rust.language()))
+
+    def _go_parser(self):
+        import tree_sitter_go
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_go.language()))
+
+    def _c_parser(self):
+        import tree_sitter_c
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_c.language()))
+
+    def test_rust_static_and_const_are_globals(self):
+        import mcp_server
+        source = b"static GLOBAL_X: i32 = 5;\nconst GLOBAL_Y: i32 = 10;\n"
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"GLOBAL_X", "GLOBAL_Y"}
+
+    def test_rust_struct_field_is_instance_only(self):
+        import mcp_server
+        source = b"struct Foo {\n    instance_field: i32,\n}\n"
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["instance_field"] == ("Foo", False)
+
+    def test_rust_impl_const_is_static_field(self):
+        import mcp_server
+        source = b"impl Foo {\n    const ASSOC_CONST: i32 = 1;\n}\n"
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["ASSOC_CONST"] == ("Foo", True)
+
+    def test_rust_pub_visibility_does_not_break_extraction(self):
+        # `pub` is a visibility_modifier CHILD of static_item/struct_item/
+        # field_declaration/const_item (verified against the real installed
+        # tree-sitter-rust grammar) -- it does NOT wrap the declaration in a
+        # separate node the way JS's `export` does. This test locks in that
+        # finding: pub items must still be captured, with the same
+        # field:name resolution as their non-pub counterparts.
+        import mcp_server
+        source = (
+            b"pub static GLOBAL_X: i32 = 5;\n"
+            b"pub struct Foo {\n    pub instance_field: i32,\n}\n"
+            b"impl Foo {\n    pub const ASSOC_CONST: i32 = 1;\n}\n"
+        )
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        assert "GLOBAL_X" in result["globals"]
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["instance_field"] == ("Foo", False)
+        assert info["ASSOC_CONST"] == ("Foo", True)
+
+    def test_go_package_level_var_and_const_are_globals(self):
+        import mcp_server
+        source = b"package main\n\nvar GlobalX = 5\nconst GlobalY = 10\n"
+        tree = self._go_parser().parse(source)
+        result = mcp_server._extract_go_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"GlobalX", "GlobalY"}
+
+    def test_go_grouped_var_declaration_captures_all_specs(self):
+        # A grouped `var (...)` block wraps its var_spec children in an
+        # intermediate var_spec_list node in the real installed
+        # tree-sitter-go grammar -- unlike grouped const/type blocks,
+        # which don't wrap. Verified empirically; this locks in that a
+        # grouped var block (an idiomatic, common real-world Go pattern)
+        # isn't silently dropped the way an unwrapped implementation
+        # would drop it.
+        import mcp_server
+        source = b"package main\n\nvar (\n\tA = 1\n\tB = 2\n)\nconst (\n\tC = 3\n\tD = 4\n)\n"
+        tree = self._go_parser().parse(source)
+        result = mcp_server._extract_go_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"A", "B", "C", "D"}
+
+    def test_go_struct_field_is_instance_only(self):
+        import mcp_server
+        source = b"package main\n\ntype Foo struct {\n    InstanceField int\n}\n"
+        tree = self._go_parser().parse(source)
+        result = mcp_server._extract_go_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["InstanceField"] == ("Foo", False)
+
+    def test_go_multi_name_struct_field_captures_all_names(self):
+        # `X, Y int` inside a struct puts more than one node under the
+        # `name` field of a single field_declaration -- singular
+        # child_by_field_name only returns the first, silently dropping
+        # `Y`. Verified empirically against the real installed
+        # tree-sitter-go grammar; children_by_field_name (plural) is
+        # used instead.
+        import mcp_server
+        source = b"package main\n\ntype Foo struct {\n\tX, Y int\n}\n"
+        tree = self._go_parser().parse(source)
+        result = mcp_server._extract_go_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["X"] == ("Foo", False)
+        assert info["Y"] == ("Foo", False)
+
+    def test_c_file_scope_declaration_is_global(self):
+        import mcp_server
+        source = b"int global_x = 5;\nstatic int file_static_x = 10;\n"
+        tree = self._c_parser().parse(source)
+        result = mcp_server._extract_c_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"global_x", "file_static_x"}
+
+    def test_c_struct_field_is_instance_only(self):
+        import mcp_server
+        source = b"struct Foo {\n    int instance_field;\n};\n"
+        tree = self._c_parser().parse(source)
+        result = mcp_server._extract_c_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["instance_field"] == ("Foo", False)
+
+    def test_c_multi_declarator_statement_captures_all_names(self):
+        # `int a, b = 2;` puts more than one node under the `declarator`
+        # field of a single `declaration` node -- child_by_field_name
+        # (singular) only returns the first one, silently dropping `b`.
+        # Verified empirically against the real installed tree-sitter-c
+        # grammar; children_by_field_name (plural) must be used instead.
+        import mcp_server
+        source = b"int a, b = 2;\n"
+        tree = self._c_parser().parse(source)
+        result = mcp_server._extract_c_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"a", "b"}
+
+    def test_c_multi_declarator_struct_field_captures_all_names(self):
+        import mcp_server
+        source = b"struct Foo {\n    int a, b;\n};\n"
+        tree = self._c_parser().parse(source)
+        result = mcp_server._extract_c_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", False)
+        assert info["b"] == ("Foo", False)
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server

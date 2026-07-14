@@ -893,6 +893,230 @@ _GLOBAL_FIELD_EXTRACTORS["javascript"] = _extract_js_family_globals_and_fields
 _GLOBAL_FIELD_EXTRACTORS["typescript"] = _extract_js_family_globals_and_fields
 
 
+def _extract_rust_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Rust globals/fields extraction.
+
+    Only descends into: module-root direct children (`static_item`/
+    `const_item` globals, `struct_item` field lists) and, as the one
+    deliberate exception to "fields are always instance-only" in this
+    language, an `impl_item` block's direct `const_item` children --
+    treated as static fields of the impl'd type (the closest Rust analog
+    to a class-static constant). Never recurses into a function/method
+    body.
+
+    A leading `pub` visibility_modifier is a CHILD of static_item/
+    const_item/struct_item/field_declaration in the real installed
+    tree-sitter-rust grammar, not a wrapping node (unlike JS's `export`
+    wrapping the declaration in an export_statement) -- so no unwrapping
+    step is needed here; `child_by_field_name("name")` resolves correctly
+    regardless of `pub`. Verified empirically before writing this code.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    for stmt in root_node.children:
+        if stmt.type in ("static_item", "const_item"):
+            name_node = stmt.child_by_field_name("name")
+            if name_node is not None:
+                name = name_node.text.decode("utf-8")
+                globals_.append(name)
+                global_bodies[name] = stmt.text.decode("utf-8", "replace")
+        elif stmt.type == "struct_item":
+            struct_name_node = stmt.child_by_field_name("name")
+            struct_name = struct_name_node.text.decode("utf-8") if struct_name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is not None:
+                for member in body.children:
+                    if member.type == "field_declaration":
+                        fname_node = member.child_by_field_name("name")
+                        if fname_node is not None:
+                            fname = fname_node.text.decode("utf-8")
+                            fields.append((fname, struct_name, False))
+                            field_info[fname] = {
+                                "class": struct_name, "static": False,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+        elif stmt.type == "impl_item":
+            type_node = stmt.child_by_field_name("type")
+            type_name = type_node.text.decode("utf-8") if type_node is not None else ""
+            body = stmt.child_by_field_name("body")
+            if body is not None:
+                for member in body.children:
+                    if member.type == "const_item":
+                        cname_node = member.child_by_field_name("name")
+                        if cname_node is not None:
+                            cname = cname_node.text.decode("utf-8")
+                            fields.append((cname, type_name, True))
+                            field_info[cname] = {
+                                "class": type_name, "static": True,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["rust"] = _extract_rust_globals_and_fields
+
+
+def _extract_go_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Go globals/fields extraction.
+
+    Only descends into: file-root direct children (`var_declaration`/
+    `const_declaration` globals, via their `var_spec`/`const_spec`
+    children) and a `type_declaration > type_spec`'s `struct_type` body
+    direct children (fields). Never recurses into a function/method body.
+
+    Go has no export keyword -- exported identifiers are just capitalized
+    -- so there is no wrapping-node analog to JS's `export_statement` to
+    unwrap here; verified empirically that field:name resolves the same
+    way regardless of capitalization.
+
+    NOTE: `struct_type`'s `field_declaration_list` child is NOT exposed
+    via a `body` field in the real installed tree-sitter-go grammar (it's
+    a plain positional child, unlike Rust's struct_item/C's
+    struct_specifier which both do expose `field:body`) -- verified
+    empirically. It must be located by node type instead of
+    child_by_field_name("body").
+
+    NOTE: a grouped/parenthesized `var (\n A = 1\n B = 2\n)` -- an
+    idiomatic and common real-world Go pattern -- wraps its `var_spec`
+    children in an intermediate `var_spec_list` node, unlike a grouped
+    `const (...)` or `type (...)`, which do NOT wrap their specs (their
+    `const_spec`/`type_spec` children stay direct children of the
+    declaration node even when grouped) -- verified empirically against
+    the real installed tree-sitter-go grammar. `_iter_specs` below
+    unwraps a `{spec_type}_list` if present so grouped var declarations
+    aren't silently dropped; it's a no-op for const/type, which never
+    produce that wrapper.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def iter_specs(stmt: Any, spec_type: str) -> Any:
+        list_type = f"{spec_type}_list"
+        for child in stmt.children:
+            if child.type == spec_type:
+                yield child
+            elif child.type == list_type:
+                for inner in child.children:
+                    if inner.type == spec_type:
+                        yield inner
+
+    for stmt in root_node.children:
+        if stmt.type in ("var_declaration", "const_declaration"):
+            spec_type = "var_spec" if stmt.type == "var_declaration" else "const_spec"
+            for spec in iter_specs(stmt, spec_type):
+                name_node = spec.child_by_field_name("name")
+                if name_node is not None:
+                    name = name_node.text.decode("utf-8")
+                    globals_.append(name)
+                    global_bodies[name] = stmt.text.decode("utf-8", "replace")
+        elif stmt.type == "type_declaration":
+            for type_spec in stmt.children:
+                if type_spec.type != "type_spec":
+                    continue
+                type_name_node = type_spec.child_by_field_name("name")
+                type_name = type_name_node.text.decode("utf-8") if type_name_node else ""
+                struct_type = type_spec.child_by_field_name("type")
+                if struct_type is None or struct_type.type != "struct_type":
+                    continue
+                body = next(
+                    (c for c in struct_type.children if c.type == "field_declaration_list"),
+                    None,
+                )
+                if body is None:
+                    continue
+                for member in body.children:
+                    if member.type == "field_declaration":
+                        # `X, Y int` inside a struct puts more than one
+                        # node under the `name` field of one
+                        # field_declaration -- child_by_field_name
+                        # (singular) only returns the first, silently
+                        # dropping `Y`. Verified empirically; use the
+                        # plural children_by_field_name to capture all.
+                        for fname_node in member.children_by_field_name("name"):
+                            fname = fname_node.text.decode("utf-8")
+                            fields.append((fname, type_name, False))
+                            field_info[fname] = {
+                                "class": type_name, "static": False,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["go"] = _extract_go_globals_and_fields
+
+
+def _extract_c_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware C globals/fields extraction.
+
+    Only descends into: translation-unit-root direct `declaration`
+    children (globals, whether a bare `identifier` declarator or an
+    `init_declarator` wrapping one) and a `struct_specifier`'s
+    `field_declaration_list` body direct children (fields, via each
+    `field_declaration`'s `field:declarator` = `field_identifier`).
+    Never recurses into a function body.
+
+    C has no export/visibility keyword; `static`/`extern` show up as a
+    `storage_class_specifier` sibling of the declarator inside
+    `declaration`, not a wrapper around it -- verified empirically that
+    field:declarator resolves the same way with or without them present.
+
+    NOTE: a multi-declarator statement (`int a, b = 2;` at file scope, or
+    `int a, b;` inside a struct) -- an ordinary, common C pattern -- puts
+    more than one node under the `declarator` field, so
+    `child_by_field_name("declarator")` (singular) only returns the
+    first one and silently drops the rest. Verified empirically against
+    the real installed tree-sitter-c grammar; `children_by_field_name`
+    (plural) is used instead to capture all of them.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def declarator_name(node: Any) -> Optional[str]:
+        if node.type == "identifier":
+            return node.text.decode("utf-8")
+        if node.type == "init_declarator":
+            inner = node.child_by_field_name("declarator")
+            return declarator_name(inner) if inner is not None else None
+        return None
+
+    for stmt in root_node.children:
+        if stmt.type == "declaration":
+            for declarator in stmt.children_by_field_name("declarator"):
+                name = declarator_name(declarator)
+                if name:
+                    globals_.append(name)
+                    global_bodies[name] = stmt.text.decode("utf-8", "replace")
+        elif stmt.type == "struct_specifier":
+            struct_name_node = stmt.child_by_field_name("name")
+            struct_name = struct_name_node.text.decode("utf-8") if struct_name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is not None:
+                for member in body.children:
+                    if member.type == "field_declaration":
+                        for declarator in member.children_by_field_name("declarator"):
+                            if declarator.type == "field_identifier":
+                                fname = declarator.text.decode("utf-8")
+                                fields.append((fname, struct_name, False))
+                                field_info[fname] = {
+                                    "class": struct_name, "static": False,
+                                    "body": member.text.decode("utf-8", "replace"),
+                                }
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["c"] = _extract_c_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
