@@ -22,7 +22,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -714,6 +714,27 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
         _walk_ast(child, results, lang_name)
 
 
+def _extract_globals_and_fields(root_node: Any, lang_name: str) -> Dict[str, Any]:
+    """Scope-aware extraction of module-level globals and class fields.
+
+    Deliberately NOT a _walk_ast-style full-tree recursion: an assignment-
+    like node is ubiquitous (appears inside every function body too), so a
+    naive table-driven walk would misclassify every local variable as a
+    global. Each per-language function in _GLOBAL_FIELD_EXTRACTORS is
+    responsible for only descending into module-level and class-body-level
+    statements, never into a function/method body (barring a narrow,
+    per-language, deliberate exception — see each language's own extractor).
+    """
+    empty: Dict[str, Any] = {"globals": [], "global_bodies": {}, "fields": [], "field_info": {}}
+    extractor = _GLOBAL_FIELD_EXTRACTORS.get(lang_name)
+    if extractor is None or root_node is None:
+        return empty
+    return extractor(root_node)
+
+
+_GLOBAL_FIELD_EXTRACTORS: Dict[str, Callable[[Any], Dict[str, Any]]] = {}
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
@@ -727,11 +748,17 @@ def _extract_from_source(
     results: Dict[str, Any] = {
         "functions": [], "classes": [], "imports": [], "calls": [],
         "function_bodies": {}, "class_bodies": {},
+        "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
     }
     try:
         tree = parser.parse(source)
         lang_name = _EXT_TO_LANG.get(Path(file_path).suffix.lower(), "")
         _walk_ast(tree.root_node, results, lang_name)
+        gf = _extract_globals_and_fields(tree.root_node, "typescript" if lang_name == "tsx" else lang_name)
+        results["globals"] = gf["globals"]
+        results["global_bodies"] = gf["global_bodies"]
+        results["fields"] = gf["fields"]
+        results["field_info"] = gf["field_info"]
     except Exception:
         pass  # best-effort; parse failures are non-fatal
     return results

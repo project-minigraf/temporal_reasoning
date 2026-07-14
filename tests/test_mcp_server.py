@@ -1839,6 +1839,7 @@ class TestExtractFromSource:
         assert result == {
             "functions": [], "classes": [], "imports": [], "calls": [],
             "function_bodies": {}, "class_bodies": {},
+            "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
         }
 
     def test_extracts_function_bodies(self):
@@ -1854,6 +1855,35 @@ class TestExtractFromSource:
         result = mcp_server._extract_from_source(source, self._python_parser(), "models.py")
         assert "User" in result["class_bodies"]
         assert "def ok" in result["class_bodies"]["User"]
+
+
+class TestExtractGlobalsAndFields:
+    def _python_parser(self):
+        import tree_sitter_python
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_python.language()))
+
+    def test_unsupported_language_returns_empty(self):
+        import mcp_server
+        result = mcp_server._extract_globals_and_fields(None, "nonexistent_lang")
+        assert result == {"globals": [], "global_bodies": {}, "fields": [], "field_info": {}}
+
+    def test_dispatches_to_registered_language_extractor(self):
+        import mcp_server
+        sentinel = {"globals": ["X"], "global_bodies": {"X": "X = 1"}, "fields": [], "field_info": {}}
+        mcp_server._GLOBAL_FIELD_EXTRACTORS["_test_lang"] = lambda root: sentinel
+        try:
+            result = mcp_server._extract_globals_and_fields("fake_root", "_test_lang")
+            assert result == sentinel
+        finally:
+            del mcp_server._GLOBAL_FIELD_EXTRACTORS["_test_lang"]
+
+    def test_extract_from_source_merges_globals_and_fields(self):
+        import mcp_server
+        source = b"def foo(): pass"
+        result = mcp_server._extract_from_source(source, self._python_parser(), "x.py")
+        assert result["globals"] == []
+        assert result["fields"] == []
 
 
 class TestMatchCandidatePair:
