@@ -2295,6 +2295,67 @@ class TestIsIgnoredPath:
         assert mcp_server._is_ignored_path("src/main.py", ["vendor/", "*.min.js"]) is False
 
 
+class TestLoadIgnorePatterns:
+    def test_defaults_present_with_no_env_or_file(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_INGEST_IGNORE", raising=False)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert "vendor/" in patterns
+        assert "third_party/" in patterns
+        assert "3rdParty/" in patterns
+        assert "node_modules/" in patterns
+        assert "dist/" in patterns
+        assert "build/" in patterns
+        assert "*.min.js" in patterns
+        assert "*.map" in patterns
+
+    def test_env_var_patterns_are_appended(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_IGNORE", "generated/,*.pb.go")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert "generated/" in patterns
+        assert "*.pb.go" in patterns
+        assert "vendor/" in patterns  # defaults still present
+
+    def test_temporalignore_file_patterns_are_merged(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_INGEST_IGNORE", raising=False)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".temporalignore").write_text(
+            "# comment line\n\nlegacy/\n*.generated.ts\n"
+        )
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert "legacy/" in patterns
+        assert "*.generated.ts" in patterns
+        assert "vendor/" in patterns  # defaults still present
+        assert "# comment line" not in patterns
+
+    def test_missing_temporalignore_file_is_not_an_error(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_INGEST_IGNORE", raising=False)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert isinstance(patterns, list)
+        assert len(patterns) > 0
+
+    def test_all_three_sources_merge_together(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_IGNORE", "from_env/")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".temporalignore").write_text("from_file/\n")
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert "vendor/" in patterns       # default
+        assert "from_env/" in patterns     # env var
+        assert "from_file/" in patterns    # .temporalignore
+
+
 class TestKnownFilesAtCommit:
     def test_returns_files_present_at_that_commit(self, git_repo):
         import mcp_server

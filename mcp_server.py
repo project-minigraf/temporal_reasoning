@@ -1610,6 +1610,37 @@ def _is_ignored_path(file_path: str, patterns: Sequence[str]) -> bool:
     return False
 
 
+_DEFAULT_IGNORE_PATTERNS: Tuple[str, ...] = (
+    "3rdParty/", "third_party/", "vendor/", "node_modules/",
+    "dist/", "build/", "*.min.js", "*.map",
+)
+
+
+def _load_ignore_patterns(repo_path: str) -> List[str]:
+    """Resolve the effective ignore-pattern list for one ingestion run.
+
+    Merges, in order: built-in defaults, MINIGRAF_INGEST_IGNORE (comma-separated),
+    and an optional .temporalignore file (one pattern per line, blank lines and
+    "#"-prefixed comments skipped) read once from repo_path's current working
+    tree — not re-read per historical commit, since ignore config describes how
+    this run should behave, not something that varies commit-to-commit.
+    """
+    patterns: List[str] = list(_DEFAULT_IGNORE_PATTERNS)
+
+    env_patterns = os.environ.get("MINIGRAF_INGEST_IGNORE")
+    if env_patterns:
+        patterns.extend(p.strip() for p in env_patterns.split(",") if p.strip())
+
+    ignore_file = Path(repo_path) / ".temporalignore"
+    if ignore_file.is_file():
+        for line in ignore_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                patterns.append(line)
+
+    return patterns
+
+
 def _known_files_at_commit(repo_path: str, commit_hash: str) -> Dict[str, List[str]]:
     """Return {file_path: []} for every file tracked at commit_hash whose extension
     has a supported tree-sitter grammar (_EXT_TO_LANG).
