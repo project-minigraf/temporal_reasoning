@@ -2713,18 +2713,22 @@ class TestIngestionWrites:
         assert "1017" in call_args
         assert ":valid-from" not in call_args
 
-    def test_run_ingestion_writes_last_run_on_completion(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_run_ingestion_writes_last_run_on_completion(self, mock_minigraf_db, git_repo, monkeypatch):
+        """Uses the real git_repo fixture (2 real commits) rather than
+        faking a commit list + empty _git_diff_tree_raw: _extract_commit
+        runs in a spawned worker process (#116), which re-imports
+        mcp_server fresh and never sees _git_diff_tree_raw patched on this
+        (parent) process's module object — a fabricated commit hash against
+        a non-git tmp_path would just make the real git call fail in the
+        worker. _last_run_write itself still runs on write_executor, an
+        in-process thread, so patching it here still works as before.
+        """
         mock_class, db_instance = mock_minigraf_db
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        mcp_server.open_db(str(git_repo / "t.graph"))
 
-        monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
-        monkeypatch.setattr(
-            mcp_server, "_git_commits",
-            lambda repo, watermark, branch: [("abc123", "2025-01-01T00:00:00Z", "author", "msg")]
-        )
-        monkeypatch.setattr(mcp_server, "_git_diff_tree_raw", lambda repo, commit: [])
-        monkeypatch.setattr(mcp_server, "_watermark_update", lambda db, h, ts, r: None)
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        last_hash = commits[-1][0]
 
         last_run_calls = []
         monkeypatch.setattr(
@@ -2732,12 +2736,12 @@ class TestIngestionWrites:
             lambda db, h, t, n: last_run_calls.append((h, t, n))
         )
 
-        asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
+        asyncio.run(mcp_server._run_ingestion(str(git_repo), "HEAD"))
 
         assert len(last_run_calls) == 1
-        assert last_run_calls[0][0] == "abc123"
+        assert last_run_calls[0][0] == last_hash
         assert last_run_calls[0][1].endswith("Z")
-        assert last_run_calls[0][2] == 1  # 1 commit processed
+        assert last_run_calls[0][2] == 2  # 2 commits processed
 
     def test_run_ingestion_writes_last_run_when_no_commits(self, mock_minigraf_db, tmp_path, monkeypatch):
         mock_class, db_instance = mock_minigraf_db
@@ -3413,8 +3417,15 @@ class TestRunIngestionConcurrency:
 
     @pytest.mark.asyncio
     async def test_one_commits_file_failure_does_not_affect_other_commits(
-        self, mock_minigraf_db, git_repo, monkeypatch
+        self, mock_minigraf_db, git_repo
     ):
+        """A file-content fetch failure must be induced for real, not via
+        monkeypatch: _extract_commit runs in a spawned worker process
+        (#116), which re-imports mcp_server fresh and never sees a patch
+        applied to this (parent) process's module object. Corrupting the
+        actual loose git blob object for auth.py makes `git show
+        <hash>:auth.py` genuinely fail inside the worker, exercising the
+        same try/except continue path the old monkeypatch used to reach."""
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
@@ -3426,20 +3437,93 @@ class TestRunIngestionConcurrency:
 
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         failing_hash = commits[0][0]
-        real_content = mcp_server._git_file_content
 
-        def flaky(repo, commit, path):
-            if commit == failing_hash:
-                raise mcp_server.MiniGrafError("simulated failure for one commit's file")
-            return real_content(repo, commit, path)
+        blob_sha = _subprocess.run(
+            ["git", "rev-parse", f"{failing_hash}:auth.py"],
+            cwd=git_repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        object_path = git_repo / ".git" / "objects" / blob_sha[:2] / blob_sha[2:]
+        assert object_path.is_file(), "expected a loose object for a freshly committed blob"
+        object_path.chmod(0o644)  # git writes loose objects read-only
+        object_path.write_bytes(b"not a valid git object")
 
-        monkeypatch.setattr(mcp_server, "_git_file_content", flaky)
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         # Both commits still get counted as processed even though the first
         # commit's only changed file failed to fetch.
         assert mcp_server._ingest_progress["status"] == "complete"
         assert mcp_server._ingest_progress["processed"] == 2
+
+
+class TestRunIngestionEventLoopResponsiveness:
+    @pytest.mark.asyncio
+    async def test_event_loop_stays_responsive_during_heavy_extraction(
+        self, mock_minigraf_db, tmp_path
+    ):
+        """#116: tree-sitter's C parse holds the GIL for its whole duration
+        (confirmed empirically — a single hammering thread stalls a
+        concurrent event loop's asyncio.sleep(0) ticks by tens of ms per
+        tick vs sub-millisecond baseline). Extraction must therefore run in
+        real OS processes, not GIL-sharing threads, so a heavy commit's
+        parse work cannot starve the MCP server's event loop.
+
+        Uses one giant function body (30k trivial statements) rather than
+        many small functions: parse time scales with statement count
+        (~500ms here) while the *extracted* output stays a single
+        function entity (~1KB pickled) — this isolates "the parse itself
+        holds the GIL for the whole commit" (the bug) from "deserializing
+        a large extracted result briefly holds the GIL" (an unavoidable,
+        output-sized, sub-commit-duration cost of any cross-process
+        handoff). A thread pool would freeze the loop for close to the
+        full ~500ms parse; a process pool's residual cost is bounded by
+        the tiny output, not the parse time.
+        """
+        db_instance = mock_minigraf_db[1]
+        db_instance.execute.return_value = json.dumps({"results": []})
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        big_body = "".join(f"    x{i} = {i} + a * {i}\n" for i in range(30000))
+        big_source = "def one_big_function(a):\n" + big_body + "    return x0\n"
+        (repo / "big.py").write_text(big_source)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add big file"], cwd=repo, check=True, capture_output=True)
+
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        gaps = []
+
+        async def heartbeat():
+            last = time.monotonic()
+            while True:
+                await asyncio.sleep(0)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        hb_task = asyncio.ensure_future(heartbeat())
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            hb_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hb_task
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        max_gap = max(gaps) if gaps else 0.0
+        assert max_gap < 0.2, (
+            f"event loop tick blocked for {max_gap * 1000:.1f}ms during extraction "
+            "(a GIL-bound thread pool would block for close to the full ~1s parse here)"
+        )
 
 
 class TestRunIngestionShutdown:

@@ -11,6 +11,7 @@ import configparser
 import contextlib
 import datetime
 import json
+import multiprocessing
 import os
 import re
 import signal
@@ -151,9 +152,9 @@ def _build_parser(lang_name: str) -> Any:
     Also used by _thread_parser to build a private-to-this-thread instance
     once _get_parser has already proven the grammar loads; an unexpected
     failure there is left to propagate to the caller (Task 3's
-    _extract_commit, running in a worker thread) rather than being
-    swallowed, consistent with how any other producer-task exception is
-    handled.
+    _extract_commit, running in a worker process — see #116) rather than
+    being swallowed, consistent with how any other producer-task exception
+    is handled.
     """
     module_name = _LANG_MODULE_OVERRIDES.get(lang_name, f"tree_sitter_{lang_name}")
     mod = __import__(module_name, fromlist=["language"])
@@ -3048,8 +3049,11 @@ def _extract_commit(
     _precompute_file_triples), unlike the incrementally-mutated file_entities/
     entity_valid_from state only the serial main thread maintains.
 
-    Runs in a worker thread via the ThreadPoolExecutor in _run_ingestion. Touches no
-    shared mutable state and no DB. Returns (file_results, gitlink_changes, gitmodules_map):
+    Runs in a worker process via the ProcessPoolExecutor in _run_ingestion (#116 —
+    a thread pool here let tree-sitter's GIL-holding C parse starve the event
+    loop). Touches no shared mutable state and no DB — a hard requirement now
+    that this crosses a process boundary, not just a nice property. Returns
+    (file_results, gitlink_changes, gitmodules_map):
 
       file_results: one entry per changed file that has a supported parser, as
         (status, file_path, extracted, precomputed). A/M files whose content fetch
@@ -3112,12 +3116,23 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 
     Extraction (git show + tree-sitter parse) for upcoming commits runs
-    ahead of time on a thread pool via a bounded sliding-window pipeline;
-    all DB-writing bookkeeping below stays strictly sequential, one commit
-    at a time, exactly as before this pipeline was introduced — the actual
-    db.execute()/checkpoint() calls just run on a dedicated single-worker
-    executor (write_executor) instead of inline on the event-loop thread, so
-    each fsync no longer blocks concurrent call_tool() requests.
+    ahead of time on a process pool (#116) via a bounded sliding-window
+    pipeline; all DB-writing bookkeeping below stays strictly sequential,
+    one commit at a time, exactly as before this pipeline was introduced —
+    the actual db.execute()/checkpoint() calls just run on a dedicated
+    single-worker thread executor (write_executor) instead of inline on the
+    event-loop thread, so each fsync no longer blocks concurrent
+    call_tool() requests. write_executor also runs the extraction process
+    pool's own (blocking) shutdown for the same reason — see its
+    construction below.
+
+    Note on failure isolation: a worker process crashing outright (OOM
+    kill, native segfault in tree-sitter) raises BrokenProcessPool for
+    every pending future in the sliding window, not just the commit that
+    triggered it — a strictly worse blast radius than the old thread pool,
+    where a crash would have taken down this whole server process anyway.
+    Ordinary exceptions (bad git ref, unreadable blob, unsupported syntax)
+    are unaffected and still fail only the one commit as before.
     """
     global _db, _ingest_progress
     # Safe to clear unconditionally: handle_minigraf_ingest_git refuses to start a
@@ -3156,7 +3171,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         last_hash = watermark or ""
 
         env_workers = os.environ.get("MINIGRAF_INGEST_WORKERS")
-        max_workers = int(env_workers) if env_workers else min(32, (os.cpu_count() or 1) + 4)
+        # CPU-bound-appropriate default: one worker per core, not the
+        # I/O-bound ThreadPoolExecutor heuristic (cpu_count() + 4) this used
+        # before #116 — extra worker *processes* beyond the core count only
+        # add context-switch overhead for a pool that's actually saturating
+        # the CPU (see #116, "needs a process pool"). Still capped at 32:
+        # each worker is now a spawned OS process that re-imports this whole
+        # module (plus whichever tree-sitter grammars it touches), far
+        # pricier per-worker than a thread, so an uncapped cpu_count() on a
+        # very high-core host would spawn an excessive number of them.
+        max_workers = int(env_workers) if env_workers else min(32, (os.cpu_count() or 1))
         pipeline_depth = max_workers * 2
 
         completed_all = True
@@ -3168,11 +3192,35 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # concurrent call_tool() requests while a write's fsync is in flight,
         # instead of blocking the whole loop for that call. A single worker keeps
         # writes strictly one-at-a-time, matching the existing invariant that only
-        # one commit's write section ever holds _db/db at once.
+        # one commit's write section ever holds _db/db at once. Also reused below
+        # (#116) to run the extraction ProcessPoolExecutor's blocking shutdown()
+        # off the event-loop thread — that reuse is only safe because this pool
+        # isn't shut down itself until the outer `finally` further down, after
+        # the extraction pool's own shutdown has already been submitted to it.
         write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Extraction (git show + tree-sitter parse + triple construction) runs
+            # in real OS processes, not threads (#116): tree-sitter's C parse holds
+            # the GIL for its whole duration (confirmed empirically — a single
+            # busy thread stalls a concurrent event loop's asyncio.sleep(0) ticks
+            # by tens of ms per tick vs sub-millisecond baseline), so a thread pool
+            # here would starve the event loop for as long as a heavy commit takes
+            # to parse, exactly the symptom #116 reports. An explicit "spawn"
+            # context is used rather than the platform default ("fork" on Linux)
+            # because worker processes are created lazily as commits are submitted
+            # below, by which point write_executor's thread and IndexCache's
+            # background rebuild thread (see #122) may already be alive in this
+            # process — forking with other threads running risks inheriting a
+            # lock one of them held at the instant of fork, which would deadlock
+            # forever in the child. spawn starts each worker from a clean
+            # interpreter instead, at the one-time cost of re-importing this
+            # module per worker process (not per commit).
+            mp_context = multiprocessing.get_context("spawn")
+            executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_workers, mp_context=mp_context
+            )
+            try:
                 commits_iter = iter(commits)
                 pending: Any = deque()
 
@@ -3392,6 +3440,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
+            finally:
+                # ProcessPoolExecutor.shutdown(wait=True) blocks joining the
+                # worker OS processes — measured ~90ms even for a pool that
+                # never did any real work, entirely from process-exit
+                # teardown, not GIL contention. That's a plain blocking call:
+                # running it inline here would stall the event loop for that
+                # whole span, undoing this fix's own purpose in its teardown.
+                # Routing it through write_executor keeps the wait off the
+                # event-loop thread, same as every other blocking call above.
+                await loop.run_in_executor(write_executor, executor.shutdown)
 
             if completed_all:
                 now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
