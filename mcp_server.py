@@ -1916,6 +1916,8 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
             ":contains": str, ":depends-on": str, ":calls": str,
             # commit cross-references
             ":introduced-by": str, ":modified-in": str,
+            # rename/move continuity (see 2026-07-14 rename-tracking design doc)
+            ":renamed-from": str, ":renamed-to": str,
         },
     },
     "function": {
@@ -1923,6 +1925,7 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
         "optional": {
             ":file": str, ":alias": str,
             ":introduced-by": str, ":modified-in": str,
+            ":renamed-from": str, ":renamed-to": str,
         },
     },
     "class": {
@@ -1930,6 +1933,23 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
         "optional": {
             ":file": str, ":alias": str,
             ":introduced-by": str, ":modified-in": str,
+            ":renamed-from": str, ":renamed-to": str,
+        },
+    },
+    "variable": {
+        "required": {":description": str},
+        "optional": {
+            ":file": str, ":alias": str,
+            ":introduced-by": str, ":modified-in": str,
+            ":renamed-from": str, ":renamed-to": str,
+        },
+    },
+    "field": {
+        "required": {":description": str},
+        "optional": {
+            ":file": str, ":alias": str, ":class": str, ":static": bool,
+            ":introduced-by": str, ":modified-in": str,
+            ":renamed-from": str, ":renamed-to": str,
         },
     },
     "ingestion": {

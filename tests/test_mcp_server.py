@@ -5559,3 +5559,18 @@ class TestExtractImportName:
         assert "os" in result
         assert "github.com/user/pkg" in result
 
+
+def test_schema_has_renamed_from_and_to_on_code_entities():
+    import mcp_server
+    for entity_type in ("module", "function", "class", "variable", "field"):
+        optional = mcp_server.MINIGRAF_SCHEMA[entity_type]["optional"]
+        assert optional[":renamed-from"] is str
+        assert optional[":renamed-to"] is str
+
+
+def test_schema_has_variable_and_field_types():
+    import mcp_server
+    assert mcp_server.MINIGRAF_SCHEMA["variable"]["required"][":description"] is str
+    field_optional = mcp_server.MINIGRAF_SCHEMA["field"]["optional"]
+    assert field_optional[":static"] is bool
+    assert field_optional[":class"] is str
