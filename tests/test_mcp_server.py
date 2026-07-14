@@ -2627,13 +2627,14 @@ class TestExtractCommit:
         results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
 
         assert len(results) == 1
-        status, file_path, extracted, precomputed = results[0]
+        status, file_path, extracted, precomputed, old_path = results[0]
         assert status == "A"
         assert file_path == "auth.py"
         assert "login" in extracted["functions"]
         assert "resolved_imports" in precomputed
         assert "function_entries" in precomputed
         assert "class_entries" in precomputed
+        assert old_path == ""
         assert gitlink_changes == []
         assert gitmodules_map == {}
 
@@ -2755,6 +2756,38 @@ class TestExtractCommit:
         results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
         assert len(results) == 1
         assert results[0][1] == "auth.py"
+
+
+class TestExtractCommitRename:
+    def test_rename_status_extracts_new_path_and_tags_old_path(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text("def login():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(repo), commits[1][0])[:3]
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = mcp_server._extract_commit(str(repo), commits[1][0])[0][0]
+        assert status == "R"
+        assert file_path == "new_name.py"
+        assert old_path == "old_name.py"
+        assert "login" in extracted["functions"]
+
+    def test_non_rename_status_has_empty_old_path(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        results = mcp_server._extract_commit(str(git_repo), commits[0][0])[0]
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "A"
+        assert old_path == ""
 
 
 class TestIngestionWrites:

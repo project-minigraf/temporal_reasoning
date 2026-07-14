@@ -3190,11 +3190,14 @@ def _extract_commit(
     (file_results, gitlink_changes, gitmodules_map):
 
       file_results: one entry per changed file that has a supported parser, as
-        (status, file_path, extracted, precomputed). A/M files whose content fetch
-        fails are omitted entirely, mirroring the previous inline `continue` — same
-        as before this pipeline existed. For a "D" (deleted) file, extracted and
-        precomputed are both None — the main thread only needs file_path to know
-        what to close.
+        (status, file_path, extracted, precomputed, old_path). A/M files whose
+        content fetch fails are omitted entirely, mirroring the previous inline
+        `continue` — same as before this pipeline existed. For a "D" (deleted)
+        file, extracted and precomputed are both None — the main thread only
+        needs file_path to know what to close. old_path is the pre-rename path
+        for "R" entries and "" for every other status (A/M/D) — kept as a fixed
+        5th tuple element rather than variable arity so downstream consumers
+        (_run_ingestion) can unpack uniformly.
       gitlink_changes: _gitlink_changes' output — gitlink-involving rows, never fed
         through the tree-sitter parser (gitlink paths never have a resolvable extension).
       gitmodules_map: path -> {"name", "url"}, populated only when this commit has at
@@ -3225,7 +3228,7 @@ def _extract_commit(
         if parser is None:
             continue
         if status == "D":
-            results.append((status, file_path, None, None))
+            results.append((status, file_path, None, None, ""))
             continue
         try:
             content = _git_file_content(repo_path, commit_hash, file_path)
@@ -3238,7 +3241,7 @@ def _extract_commit(
         precomputed = _precompute_file_triples(
             file_path, extracted, commit_ident, known_files, segment_index=segment_index,
         )
-        results.append((status, file_path, extracted, precomputed))
+        results.append((status, file_path, extracted, precomputed, old_path if status == "R" else ""))
 
     gitlink_changes = _gitlink_changes(raw_entries)
     gitmodules_map: Dict[str, Dict[str, str]] = {}
@@ -3407,7 +3410,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         close_items: List[tuple] = []  # (triples, original_ts_iso)
                         dep_add_triples: List[str] = []  # :depends-on triples to transact individually
 
-                        for status, file_path, extracted, precomputed in extracted_files:
+                        for status, file_path, extracted, precomputed, old_path in extracted_files:
                             if status == "D":
                                 # Close module and all known child entities for this file
                                 idents = file_entities.get(file_path, [_code_ident("module", file_path)])
