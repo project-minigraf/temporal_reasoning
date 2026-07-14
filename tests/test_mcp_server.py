@@ -2253,6 +2253,48 @@ class TestGitDiffTreeRaw:
         assert path == "vendor/lib"
 
 
+class TestIsIgnoredPath:
+    def test_directory_pattern_matches_nested_path(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("src/vendor/foo.js", ["vendor/"]) is True
+
+    def test_directory_pattern_matches_top_level_path(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("vendor/bar.js", ["vendor/"]) is True
+
+    def test_directory_pattern_does_not_match_substring(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("vendored_thing.js", ["vendor/"]) is False
+
+    def test_glob_pattern_matches_basename(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("dist/app.min.js", ["*.min.js"]) is True
+
+    def test_glob_pattern_no_match_on_unrelated_file(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("dist/app.js", ["*.min.js"]) is False
+
+    def test_map_glob_pattern_matches(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("dist/app.js.map", ["*.map"]) is True
+
+    def test_exact_segment_match(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("a/node_modules/pkg/index.js", ["node_modules"]) is True
+
+    def test_exact_basename_match(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("some/path/README.md", ["README.md"]) is True
+
+    def test_no_patterns_never_matches(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("src/main.py", []) is False
+
+    def test_no_matching_pattern_returns_false(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("src/main.py", ["vendor/", "*.min.js"]) is False
+
+
 class TestKnownFilesAtCommit:
     def test_returns_files_present_at_that_commit(self, git_repo):
         import mcp_server

@@ -10,6 +10,7 @@ import concurrent.futures
 import configparser
 import contextlib
 import datetime
+import fnmatch
 import json
 import multiprocessing
 import os
@@ -21,7 +22,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -1580,6 +1581,33 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
         cwd=repo_path, capture_output=True, check=True,
     )
     return result.stdout
+
+
+def _is_ignored_path(file_path: str, patterns: Sequence[str]) -> bool:
+    """Simplified .gitignore-style match: no negation, no ** anchoring, no new
+    dependency (see 2026-07-14 path-ignore design doc's "Matching" section for
+    why full gitignore semantics via pathspec were rejected).
+
+    - Pattern ending in "/": matches if that name is any path segment
+      (directory-anywhere-in-path semantics — "vendor/" matches both
+      "src/vendor/foo.js" and "vendor/bar.js", but never a bare substring
+      like "vendored_thing.js").
+    - Pattern containing a glob char (*, ?, [): fnmatch against the
+      basename, then the full path.
+    - Otherwise: exact match against any path segment or the basename.
+    """
+    segments = Path(file_path).parts
+    basename = segments[-1] if segments else file_path
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            if pattern.rstrip("/") in segments:
+                return True
+        elif any(ch in pattern for ch in "*?["):
+            if fnmatch.fnmatch(basename, pattern) or fnmatch.fnmatch(file_path, pattern):
+                return True
+        elif pattern in segments or pattern == basename:
+            return True
+    return False
 
 
 def _known_files_at_commit(repo_path: str, commit_hash: str) -> Dict[str, List[str]]:
