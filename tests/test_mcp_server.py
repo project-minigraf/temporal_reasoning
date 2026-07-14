@@ -2383,6 +2383,81 @@ class TestCppGlobalsAndFields:
         assert "method" not in names
 
 
+class TestRubyGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_ruby
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_ruby.language()))
+
+    def test_global_variable_and_constant_are_globals(self):
+        import mcp_server
+        source = b"$global_var = 5\nCONST_VAR = 10\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"$global_var", "CONST_VAR"}
+
+    def test_class_variable_is_static_instance_variable_in_initialize_is_not(self):
+        import mcp_server
+        source = b"class Foo\n  @@class_var = 1\n  def initialize\n    @instance_var = 2\n  end\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["@@class_var"] == ("Foo", True)
+        assert info["@instance_var"] == ("Foo", False)
+
+    def test_multi_assignment_globals_captures_all_names(self):
+        # `$a, $b = 1, 2` wraps the left side in a left_assignment_list
+        # node instead of exposing a bare global_variable/constant
+        # directly under field:left -- verified empirically against the
+        # real installed tree-sitter-ruby grammar. Same lesson as the
+        # multi-declarator gaps found in Go/C/Java/C++: must unwrap
+        # left_assignment_list to avoid silently dropping every name but
+        # the first.
+        import mcp_server
+        source = b"$a, $b = 1, 2\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"$a", "$b"}
+
+    def test_multi_assignment_class_and_instance_variables_captures_all_names(self):
+        import mcp_server
+        source = b"class Foo\n  @@a, @@b = 1, 2\n  def initialize\n    @x, @y = 1, 2\n  end\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["@@a"] == ("Foo", True)
+        assert info["@@b"] == ("Foo", True)
+        assert info["@x"] == ("Foo", False)
+        assert info["@y"] == ("Foo", False)
+
+    def test_attr_accessor_call_not_captured_as_field(self):
+        # attr_accessor/attr_reader/attr_writer are ordinary method calls
+        # (node type `call`) in the grammar, not assignments -- verified
+        # empirically. Out of scope for this task (which only looks at
+        # `@x = ...` inside initialize); they must not be misclassified
+        # as fields.
+        import mcp_server
+        source = b"class Foo\n  attr_accessor :bar\n  def initialize\n    @baz = 1\n  end\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        names = [n for n, _, _ in result["fields"]]
+        assert "bar" not in names
+        assert names == ["@baz"]
+
+    def test_module_is_not_treated_as_class(self):
+        # `module Foo ... end` parses as a `module` node, distinct from
+        # `class` -- verified empirically. The brief scopes this
+        # extractor to `class` specifically, so module bodies (which can
+        # also hold constants/class variables) must not be walked into
+        # for field extraction.
+        import mcp_server
+        source = b"module Baz\n  @@mod_var = 1\n  CONST_IN_MOD = 5\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        assert result["fields"] == []
+        assert result["globals"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server

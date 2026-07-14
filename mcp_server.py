@@ -1353,6 +1353,108 @@ def _extract_cpp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["cpp"] = _extract_cpp_globals_and_fields
 
 
+def _extract_ruby_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Ruby globals/fields extraction.
+
+    Ruby's grammar distinguishes `$global`/`CONST`/`@@class_var`/
+    `@instance_var` via distinct node types (global_variable, constant,
+    class_variable, instance_variable), so -- unlike every other
+    language in this plan -- no heuristic modifier-inspection is needed;
+    classification is purely by field:left's node type.
+
+    Only descends into: program-root direct children (globals, from a
+    top-level `assignment` whose field:left is global_variable/constant),
+    a `class` node's field:body (body_statement) direct children
+    (class_variable assignment -> static field), and a `method` named
+    "initialize" that is itself a direct child of that same body_statement
+    (its own field:body's direct-child assignments with field:left of
+    type instance_variable -> instance field). Never recurses into any
+    other method body.
+
+    A `module Foo ... end` node has type "module", not "class" -- a
+    distinct node type in the real installed tree-sitter-ruby grammar
+    even though it exposes the same name/body fields -- so it is simply
+    not matched by the `stmt.type == "class"` check below; module-level
+    constants/class variables are out of scope for this extractor by
+    design. Verified empirically.
+
+    `attr_accessor`/`attr_reader`/`attr_writer` are ordinary method
+    calls (node type `call`), not assignments -- verified empirically --
+    so they are naturally excluded without any special-casing.
+
+    NOTE: Ruby's multi-assignment (`$a, $b = 1, 2` or, inside a class,
+    `@@a, @@b = 1, 2` / `@x, @y = 1, 2`) wraps the left side in a
+    `left_assignment_list` node instead of exposing a bare
+    global_variable/constant/class_variable/instance_variable directly
+    under field:left -- verified empirically against the real installed
+    tree-sitter-ruby grammar. Same lesson as the multi-declarator gaps
+    found in every other language in this plan (Go/C/Java/C++): iterate
+    `left_assignment_list`'s children too, or every name but the first
+    is silently dropped.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def left_targets(left_node: Any, target_types: Tuple[str, ...]) -> List[Any]:
+        if left_node.type in target_types:
+            return [left_node]
+        if left_node.type == "left_assignment_list":
+            return [c for c in left_node.children if c.type in target_types]
+        return []
+
+    for stmt in root_node.children:
+        if stmt.type == "assignment":
+            left = stmt.child_by_field_name("left")
+            if left is None:
+                continue
+            for target in left_targets(left, ("global_variable", "constant")):
+                name = target.text.decode("utf-8")
+                globals_.append(name)
+                global_bodies[name] = stmt.text.decode("utf-8", "replace")
+        elif stmt.type == "class":
+            name_node = stmt.child_by_field_name("name")
+            class_name = name_node.text.decode("utf-8") if name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                if member.type == "assignment":
+                    left = member.child_by_field_name("left")
+                    if left is None:
+                        continue
+                    for target in left_targets(left, ("class_variable",)):
+                        fname = target.text.decode("utf-8")
+                        fields.append((fname, class_name, True))
+                        field_info[fname] = {
+                            "class": class_name, "static": True,
+                            "body": member.text.decode("utf-8", "replace"),
+                        }
+                elif member.type == "method":
+                    method_name_node = member.child_by_field_name("name")
+                    if method_name_node is not None and method_name_node.text == b"initialize":
+                        method_body = member.child_by_field_name("body")
+                        if method_body is not None:
+                            for inner in method_body.children:
+                                if inner.type == "assignment":
+                                    left = inner.child_by_field_name("left")
+                                    if left is None:
+                                        continue
+                                    for target in left_targets(left, ("instance_variable",)):
+                                        fname = target.text.decode("utf-8")
+                                        fields.append((fname, class_name, False))
+                                        field_info[fname] = {
+                                            "class": class_name, "static": False,
+                                            "body": inner.text.decode("utf-8", "replace"),
+                                        }
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["ruby"] = _extract_ruby_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
