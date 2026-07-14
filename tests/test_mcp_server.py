@@ -1957,7 +1957,13 @@ class TestMatchRenamedEntities:
         removed = {"function": [("foo", old)]}
         added = {"function": [("bar", new)]}
         matches = mcp_server._match_renamed_entities(removed, added)
-        assert matches == [("function", "foo", "bar")]
+        # 5-tuples now: (category, old_name, old_node, new_name, new_node) —
+        # project down to the name-only shape and check node identity separately.
+        assert len(matches) == 1
+        category, old_name, old_node, new_name, new_node = matches[0]
+        assert (category, old_name, new_name) == ("function", "foo", "bar")
+        assert old_node is old
+        assert new_node is new
         assert removed["function"] == []
         assert added["function"] == []
 
@@ -1971,8 +1977,9 @@ class TestMatchRenamedEntities:
         removed = {"function": [("a", old_a), ("b", old_b)]}
         added = {"function": [("a1", new_a1), ("b1", new_b1)]}
         matches = mcp_server._match_renamed_entities(removed, added)
-        assert ("function", "a", "a1") in matches
-        assert ("function", "b", "b1") in matches
+        projected = [(category, old_name, new_name) for category, old_name, _, new_name, _ in matches]
+        assert ("function", "a", "a1") in projected
+        assert ("function", "b", "b1") in projected
         assert len(matches) == 2
 
     def test_ambiguous_duplicate_bodies_not_matched(self):
@@ -2006,6 +2013,19 @@ class TestMatchRenamedEntities:
         added = {"function": [], "class": [("bar", new)]}
         matches = mcp_server._match_renamed_entities(removed, added)
         assert matches == []
+
+
+class TestCollectEntityNodes:
+    def test_collects_function_and_class_nodes_by_name(self):
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+        source = b"def foo():\n    pass\n\nclass Bar:\n    pass\n"
+        tree = parser.parse(source)
+        result = mcp_server._collect_entity_nodes(tree.root_node, "python")
+        assert "foo" in result["function"]
+        assert result["function"]["foo"].type == "function_definition"
+        assert "Bar" in result["class"]
+        assert result["class"]["Bar"].type == "class_definition"
 
 
 class TestExtractFromSourceCFamily:
@@ -2793,7 +2813,7 @@ class TestExtractCommit:
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         first_hash = commits[0][0]
 
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo), first_hash)
 
         assert len(results) == 1
         status, file_path, extracted, precomputed, old_path = results[0]
@@ -2812,7 +2832,7 @@ class TestExtractCommit:
         commits = mcp_server._git_commits(str(git_repo_with_deletion), watermark_hash=None)
         delete_hash = commits[-1][0]
 
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
 
         d_entries = [r for r in results if r[0] == "D"]
         assert len(d_entries) == 1
@@ -2824,7 +2844,7 @@ class TestExtractCommit:
             mcp_server, "_git_diff_tree_raw",
             lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "notes.txt", "", None)],
         )
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo), "deadbeef")
         assert results == []
 
     def test_content_fetch_failure_is_omitted_not_raised(self, git_repo, monkeypatch):
@@ -2838,7 +2858,7 @@ class TestExtractCommit:
             raise mcp_server.MiniGrafError("simulated git-show failure")
 
         monkeypatch.setattr(mcp_server, "_git_file_content", boom)
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo), "deadbeef")
         assert results == []
 
     def test_gitlink_add_is_reported_separately_from_file_results(self, tmp_path):
@@ -2870,7 +2890,7 @@ class TestExtractCommit:
         _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
 
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(repo), commits[0][0])
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(repo), commits[0][0])
 
         # Neither the gitlink path (vendor/lib) nor .gitmodules itself has a
         # resolvable extension (_EXT_TO_LANG has no entry for either), so
@@ -2895,7 +2915,7 @@ class TestExtractCommit:
             original_init(self, *args, **kwargs)
 
         monkeypatch.setattr(mcp_server._SegmentSuffixIndex, "__init__", counting_init)
-        results, _, _ = mcp_server._extract_commit(str(git_repo_with_deps), commits[0][0])
+        results, _, _, _ = mcp_server._extract_commit(str(git_repo_with_deps), commits[0][0])
 
         assert len(results) == 2  # mod_a.py (imports mod_b) and mod_b.py both added here
         assert build_count == 1
@@ -2913,7 +2933,7 @@ class TestExtractCommit:
         _subprocess.run(["git", "commit", "-m", "add vendored lib"], cwd=repo, check=True, capture_output=True)
 
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(
             str(repo), commits[0][0], ["vendor/"]
         )
         assert results == []
@@ -2922,7 +2942,7 @@ class TestExtractCommit:
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         first_hash = commits[0][0]
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo), first_hash)
         assert len(results) == 1
         assert results[0][1] == "auth.py"
 
@@ -2957,6 +2977,27 @@ class TestExtractCommitRename:
         status, file_path, extracted, precomputed, old_path = results[0]
         assert status == "A"
         assert old_path == ""
+
+    def test_cross_file_move_produces_renamed_pair(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "fileA.py").write_text(
+            "def stayHere(x):\n    return x + 1\n\ndef moveMe(x):\n    return x * 2 + 7\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "fileA.py").write_text("def stayHere(x):\n    return x + 1\n")
+        (repo / "fileB.py").write_text("def moveMe(x):\n    return x * 2 + 7\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "move function"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        assert ("function", "fileA.py", "moveMe", "fileB.py", "moveMe") in renamed_pairs
 
 
 class TestIngestionWrites:

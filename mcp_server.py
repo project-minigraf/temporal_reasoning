@@ -811,7 +811,7 @@ def _normalize_body_for_matching(text: str) -> str:
 def _match_renamed_entities(
     removed: Dict[str, List[Tuple[str, Any]]],
     added: Dict[str, List[Tuple[str, Any]]],
-) -> List[Tuple[str, str, str]]:
+) -> List[Tuple[str, str, Any, str, Any]]:
     """Round-based rename matching across entity categories, scoped to a
     single commit's touched files (callers build removed/added from just
     that commit — see _extract_commit's use in Task 9).
@@ -823,8 +823,18 @@ def _match_renamed_entities(
     dependency order. Capped at _MAX_MATCH_ROUNDS as a defensive bound.
 
     Mutates removed/added in place, removing matched entries.
+
+    Returns (category, old_name, old_node, new_name, new_node) 5-tuples —
+    the matched node objects are included (not just their names) because
+    this function is file-path-agnostic by design (reused as-is for Task
+    26's globals/fields), yet callers like _extract_commit need to recover
+    which file each side came from. Two different removed entities in two
+    different deleted files can coincidentally share a name, so the name
+    alone isn't a safe lookup key back to a file — the node identity is.
+    (Retrofitted here, while wiring this into _extract_commit in Task 9,
+    from the original 3-tuple (category, old_name, new_name) shape.)
     """
-    matches: List[Tuple[str, str, str]] = []
+    matches: List[Tuple[str, str, Any, str, Any]] = []
     confirmed: Dict[str, str] = {}  # old_name -> new_name, shared across all categories
 
     all_names: set = set()
@@ -861,7 +871,7 @@ def _match_renamed_entities(
                         candidates.append((a_name, a_node))
                 if len(candidates) == 1:
                     a_name, a_node = candidates[0]
-                    matches.append((category, r_name, a_name))
+                    matches.append((category, r_name, r_node, a_name, a_node))
                     confirmed[r_name] = a_name
                     r_list.remove((r_name, r_node))
                     a_list.remove((a_name, a_node))
@@ -869,6 +879,39 @@ def _match_renamed_entities(
         if not changed:
             break
     return matches
+
+
+def _collect_entity_nodes(root_node: Any, lang_name: str) -> Dict[str, Dict[str, Any]]:
+    """Like _walk_ast, but returns live nodes keyed by name instead of text —
+    for use only inside a single worker-process call (_extract_commit), never
+    returned across the ProcessPoolExecutor boundary. Only functions/classes
+    are collected here; Task 26 extends this for globals/fields once those
+    categories exist.
+    """
+    node_types = _LANG_NODE_TYPES.get("typescript" if lang_name == "tsx" else lang_name)
+    result: Dict[str, Dict[str, Any]] = {"function": {}, "class": {}}
+    if node_types is None:
+        return result
+
+    def walk(node: Any) -> None:
+        if node.type in node_types.get("functions", set()):
+            if lang_name in ("c", "cpp"):
+                name = _c_family_function_name(node)
+                if name:
+                    result["function"][name] = node
+            else:
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    result["function"][name_node.text.decode("utf-8")] = node
+        elif node.type in node_types.get("classes", set()):
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                result["class"][name_node.text.decode("utf-8")] = node
+        for child in node.children:
+            walk(child)
+
+    walk(root_node)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3318,7 +3361,7 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
 
 def _extract_commit(
     repo_path: str, commit_hash: str, ignore_patterns: Sequence[str] = ()
-) -> Tuple[List[tuple], List[tuple], Dict[str, Dict[str, str]]]:
+) -> Tuple[List[tuple], List[tuple], Dict[str, Dict[str, str]], List[Tuple[str, str, str, str, str]]]:
     """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse,
     plus import resolution and "if this turns out to be new" triple precomputation —
     both pure functions of this commit alone (see _known_files_at_commit and
@@ -3334,7 +3377,7 @@ def _extract_commit(
     a thread pool here let tree-sitter's GIL-holding C parse starve the event
     loop). Touches no shared mutable state and no DB — a hard requirement now
     that this crosses a process boundary, not just a nice property. Returns
-    (file_results, gitlink_changes, gitmodules_map):
+    (file_results, gitlink_changes, gitmodules_map, renamed_pairs):
 
       file_results: one entry per changed file that has a supported parser, as
         (status, file_path, extracted, precomputed, old_path). A/M files whose
@@ -3350,6 +3393,13 @@ def _extract_commit(
       gitmodules_map: path -> {"name", "url"}, populated only when this commit has at
         least one gitlink "add" — avoids a wasted git-show call on the (overwhelmingly
         common) case of a commit that touches no submodules at all.
+      renamed_pairs: (category, old_file_path, old_name, new_file_path, new_name)
+        plain-string 5-tuples — one per function/class the AST-lockstep matcher
+        (_match_renamed_entities, Task 8) confirmed renamed and/or moved within
+        this commit. Deliberately plain strings, not the tree_sitter Node
+        objects _match_renamed_entities itself works with — those live only
+        for the duration of this call and cannot cross the ProcessPoolExecutor
+        boundary back to the main process (see #116).
 
     Sources both file_results and gitlink_changes from a single
     `git diff-tree --raw` call (via _git_diff_tree_raw) rather than a --name-status
@@ -3368,15 +3418,46 @@ def _extract_commit(
     known_files: Optional[Dict[str, List[str]]] = None
     segment_index: Optional[_SegmentSuffixIndex] = None
 
+    # removed/added pools for _match_renamed_entities, scoped to this commit.
+    # Populated alongside the per-file loop below; matched entirely inside
+    # this worker process — tree_sitter Node objects never cross the process
+    # boundary (#116), only the plain-string renamed_pairs derived from
+    # matches does.
+    removed_pool: Dict[str, List[Tuple[str, Any]]] = {"function": [], "class": []}
+    added_pool: Dict[str, List[Tuple[str, Any]]] = {"function": [], "class": []}
+    # (category, old_file_path, old_name, new_file_path, new_name) is only
+    # knowable once we know which FILE each pooled node came from — track
+    # that alongside the pool itself, keyed by node identity (id()), since
+    # two different removed entities in two different deleted files could
+    # coincidentally share a name.
+    node_origin: Dict[int, str] = {}  # id(node) -> file_path
+
     for status, old_mode, new_mode, old_sha, new_sha, file_path, old_path, similarity in raw_entries:
         if _is_ignored_path(file_path, ignore_patterns):
             continue
         parser = _thread_parser(file_path)
         if parser is None:
             continue
+
+        old_lang_path = old_path if status == "R" else file_path
+        old_entity_nodes: Dict[str, Dict[str, Any]] = {"function": {}, "class": {}}
+        if status in ("D", "M", "R") and old_sha and old_sha != "0" * len(old_sha):
+            try:
+                old_content = _git_blob_content(repo_path, old_sha)
+                old_tree = parser.parse(old_content)
+                old_lang = _EXT_TO_LANG.get(Path(old_lang_path).suffix.lower(), "")
+                old_entity_nodes = _collect_entity_nodes(old_tree.root_node, old_lang)
+            except Exception:
+                pass  # best-effort: matching degrades to no-match, not a hard failure
+
         if status == "D":
+            for category in ("function", "class"):
+                for name, node in old_entity_nodes[category].items():
+                    removed_pool[category].append((name, node))
+                    node_origin[id(node)] = old_lang_path
             results.append((status, file_path, None, None, ""))
             continue
+
         try:
             content = _git_file_content(repo_path, commit_hash, file_path)
         except Exception:
@@ -3390,12 +3471,67 @@ def _extract_commit(
         )
         results.append((status, file_path, extracted, precomputed, old_path if status == "R" else ""))
 
+        # Build this file's contribution to the removed/added pools. Live
+        # nodes for the NEW side come from re-parsing (extracted only carries
+        # text, per Task 6) — cheap, since this is the same content already
+        # fetched above; a second parse of the same bytes is a deliberate
+        # simplicity/cost tradeoff over threading Node references through
+        # _extract_from_source's return value, which must stay plain-data-only
+        # for other callers.
+        new_lang = _EXT_TO_LANG.get(Path(file_path).suffix.lower(), "")
+        new_tree = parser.parse(content)
+        new_entity_nodes = _collect_entity_nodes(new_tree.root_node, new_lang)
+
+        if status == "A":
+            for category in ("function", "class"):
+                for name, node in new_entity_nodes[category].items():
+                    added_pool[category].append((name, node))
+                    node_origin[id(node)] = file_path
+        elif status == "R":
+            # Ident changes for every entity in a renamed file, even ones
+            # whose text is byte-identical — pool everything on both sides,
+            # not just the local diff (unlike "M" below).
+            for category in ("function", "class"):
+                for name, node in old_entity_nodes[category].items():
+                    removed_pool[category].append((name, node))
+                    node_origin[id(node)] = old_lang_path
+                for name, node in new_entity_nodes[category].items():
+                    added_pool[category].append((name, node))
+                    node_origin[id(node)] = file_path
+        else:  # "M" — same path, only the local diff needs matching
+            for category in ("function", "class"):
+                old_names = set(old_entity_nodes[category].keys())
+                new_names = set(new_entity_nodes[category].keys())
+                for name in old_names - new_names:
+                    node = old_entity_nodes[category][name]
+                    removed_pool[category].append((name, node))
+                    node_origin[id(node)] = old_lang_path
+                for name in new_names - old_names:
+                    node = new_entity_nodes[category][name]
+                    added_pool[category].append((name, node))
+                    node_origin[id(node)] = file_path
+
+    raw_matches = _match_renamed_entities(removed_pool, added_pool)
+    # raw_matches carries the matched node objects themselves (see Task 8's
+    # _match_renamed_entities retrofit), so file paths can be recovered
+    # directly via node_origin — no second pass or pre-mutation snapshot
+    # needed. (The brief's original sketch tried to translate from bare
+    # (category, old_name, new_name) 3-tuples, which loses the file path
+    # whenever a name collides across two different files touched in the
+    # same commit; that gap is why _match_renamed_entities' return type was
+    # widened to include the nodes.)
+    renamed_pairs: List[Tuple[str, str, str, str, str]] = []
+    for category, old_name, old_node, new_name, new_node in raw_matches:
+        renamed_pairs.append((
+            category, node_origin[id(old_node)], old_name, node_origin[id(new_node)], new_name,
+        ))
+
     gitlink_changes = _gitlink_changes(raw_entries)
     gitmodules_map: Dict[str, Dict[str, str]] = {}
     if any(kind == "add" for kind, _, _ in gitlink_changes):
         gitmodules_map = _git_gitmodules_at(repo_path, commit_hash)
 
-    return results, gitlink_changes, gitmodules_map
+    return results, gitlink_changes, gitmodules_map, renamed_pairs
 
 
 async def _run_ingestion(repo_path: str, branch: str) -> None:
@@ -3532,7 +3668,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         break
 
                     (commit_hash, commit_ts_iso, author, subject), fut = pending.popleft()
-                    extracted_files, gitlink_changes, gitmodules_map = await fut
+                    # renamed_pairs (Task 9's 4th _extract_commit return element) is
+                    # unpacked here but not yet consumed — Task 10 wires it into
+                    # :renamed-from/:renamed-to triple emission for functions/classes.
+                    # Widening this unpack now (rather than leaving it a 3-tuple) is
+                    # required as soon as _extract_commit returns 4 elements: every
+                    # ingestion run — including the many existing tests that drive
+                    # _run_ingestion through a real ProcessPoolExecutor worker — would
+                    # otherwise fail with "too many values to unpack".
+                    extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
                     submit_next()
 
                     last_hash = commit_hash
