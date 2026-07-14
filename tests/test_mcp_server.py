@@ -5059,6 +5059,43 @@ class TestRunIngestionBitemporalClose:
         assert f"{new_module_ident} :renamed-from {old_module_ident}" in transact_calls, \
             "New module's open triples must include :renamed-from pointing at the old ident"
 
+    @pytest.mark.asyncio
+    async def test_in_file_function_rename_links_via_rename_edges(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def oldName(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def newName(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename fn"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        old_fn_ident = mcp_server._code_ident("function", "auth.py", "oldName")
+        new_fn_ident = mcp_server._code_ident("function", "auth.py", "newName")
+
+        assert any(f"{old_fn_ident} :renamed-to {new_fn_ident}" in t for t in close_triples_seen)
+        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
+        assert f"{new_fn_ident} :renamed-from {old_fn_ident}" in transact_calls
+
 
 # ---------------------------------------------------------------------------
 # Fixtures for bi-temporal :depends-on integration tests

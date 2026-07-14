@@ -3807,6 +3807,23 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         )
                                 file_deps[file_path] = current_deps
 
+                        # Function/class rename linkage (Task 9's renamed_pairs).
+                        # Module-level linkage is handled separately per-file
+                        # above (Task 5) since it comes from git's own -M
+                        # detection, not this commit-wide matcher.
+                        for category, old_file, old_name, new_file, new_name in renamed_pairs:
+                            old_ident = _code_ident(category, old_file, old_name)
+                            new_ident = _code_ident(category, new_file, new_name)
+                            add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
+                            old_desc = entity_descriptions.get(old_ident, old_name)
+                            old_module_ident = _code_ident("module", old_file)
+                            orig_ts = entity_valid_from.get(old_ident, commit_ts_iso)
+                            close_items.append((
+                                _build_close_triples(old_ident, old_desc, old_module_ident)
+                                + [f"[{old_ident} :renamed-to {new_ident}]"],
+                                orig_ts,
+                            ))
+
                         # Process gitlink changes (submodule add/bump/remove).
                         # The "remove" case's interaction with the ordinary per-file module-open
                         # logic (elsewhere in this loop) is only sound because real submodule paths
