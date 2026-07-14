@@ -2253,6 +2253,135 @@ class TestGitDiffTreeRaw:
         assert path == "vendor/lib"
 
 
+class TestIsIgnoredPath:
+    def test_directory_pattern_matches_nested_path(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("src/vendor/foo.js", ["vendor/"]) is True
+
+    def test_directory_pattern_matches_top_level_path(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("vendor/bar.js", ["vendor/"]) is True
+
+    def test_directory_pattern_does_not_match_substring(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("vendored_thing.js", ["vendor/"]) is False
+
+    def test_glob_pattern_matches_basename(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("dist/app.min.js", ["*.min.js"]) is True
+
+    def test_glob_pattern_no_match_on_unrelated_file(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("dist/app.js", ["*.min.js"]) is False
+
+    def test_map_glob_pattern_matches(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("dist/app.js.map", ["*.map"]) is True
+
+    def test_exact_segment_match(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("a/node_modules/pkg/index.js", ["node_modules"]) is True
+
+    def test_exact_basename_match(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("some/path/README.md", ["README.md"]) is True
+
+    def test_no_patterns_never_matches(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("src/main.py", []) is False
+
+    def test_no_matching_pattern_returns_false(self):
+        import mcp_server
+        assert mcp_server._is_ignored_path("src/main.py", ["vendor/", "*.min.js"]) is False
+
+
+class TestLoadIgnorePatterns:
+    def test_defaults_present_with_no_env_or_file(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_INGEST_IGNORE", raising=False)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert "vendor/" in patterns
+        assert "third_party/" in patterns
+        assert "3rdParty/" in patterns
+        assert "node_modules/" in patterns
+        assert "dist/" in patterns
+        assert "build/" in patterns
+        assert "*.min.js" in patterns
+        assert "*.map" in patterns
+
+    def test_env_var_patterns_are_appended(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_IGNORE", "generated/,*.pb.go")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert "generated/" in patterns
+        assert "*.pb.go" in patterns
+        assert "vendor/" in patterns  # defaults still present
+
+    def test_temporalignore_file_patterns_are_merged(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_INGEST_IGNORE", raising=False)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".temporalignore").write_text(
+            "# comment line\n\nlegacy/\n*.generated.ts\n"
+        )
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert "legacy/" in patterns
+        assert "*.generated.ts" in patterns
+        assert "vendor/" in patterns  # defaults still present
+        assert "# comment line" not in patterns
+
+    def test_missing_temporalignore_file_is_not_an_error(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_INGEST_IGNORE", raising=False)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert isinstance(patterns, list)
+        assert len(patterns) > 0
+
+    def test_all_three_sources_merge_together(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_IGNORE", "from_env/")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".temporalignore").write_text("from_file/\n")
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert "vendor/" in patterns       # default
+        assert "from_env/" in patterns     # env var
+        assert "from_file/" in patterns    # .temporalignore
+
+    def test_unreadable_temporalignore_fails_closed(self, tmp_path, monkeypatch):
+        """Unreadable .temporalignore should not abort ingestion; defaults + env patterns still apply."""
+        import mcp_server
+        from pathlib import Path
+
+        monkeypatch.delenv("MINIGRAF_INGEST_IGNORE", raising=False)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".temporalignore").write_text("from_file/\n")
+
+        # Monkeypatch Path.read_text to raise OSError for our .temporalignore file
+        original_read_text = Path.read_text
+
+        def mock_read_text(self, encoding=None, errors=None):
+            if ".temporalignore" in str(self):
+                raise OSError("Permission denied")
+            return original_read_text(self, encoding=encoding, errors=errors)
+
+        monkeypatch.setattr(Path, "read_text", mock_read_text)
+
+        # Should not raise; should return defaults at minimum
+        patterns = mcp_server._load_ignore_patterns(str(repo))
+        assert isinstance(patterns, list)
+        assert "vendor/" in patterns  # default should still be present
+        assert len(patterns) > 0
+
+
 class TestKnownFilesAtCommit:
     def test_returns_files_present_at_that_commit(self, git_repo):
         import mcp_server
@@ -2293,6 +2422,30 @@ class TestKnownFilesAtCommit:
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         known = mcp_server._known_files_at_commit(str(git_repo), commits[0][0])
         assert known["auth.py"] == []
+
+    def test_ignored_path_excluded_even_with_supported_extension(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "main.py").write_text("def f(): pass\n")
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "lib.py").write_text("def g(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        known = mcp_server._known_files_at_commit(str(repo), commits[0][0], ["vendor/"])
+        assert "main.py" in known
+        assert "vendor/lib.py" not in known
+
+    def test_no_ignore_patterns_keeps_default_behavior(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        known = mcp_server._known_files_at_commit(str(git_repo), commits[0][0])
+        assert "auth.py" in known
 
 
 class TestGitlinkChanges:
@@ -2494,6 +2647,32 @@ class TestExtractCommit:
 
         assert len(results) == 2  # mod_a.py (imports mod_b) and mod_b.py both added here
         assert build_count == 1
+
+    def test_ignored_file_produces_no_results_entry(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "lib.py").write_text("def vendored_fn(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add vendored lib"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(
+            str(repo), commits[0][0], ["vendor/"]
+        )
+        assert results == []
+
+    def test_no_ignore_patterns_keeps_default_behavior(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        first_hash = commits[0][0]
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
+        assert len(results) == 1
+        assert results[0][1] == "auth.py"
 
 
 class TestIngestionWrites:
@@ -4604,6 +4783,127 @@ class TestUnresolvedImportTagging:
         assert not any(
             f"[{missing_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
         )
+
+
+class TestGitIngestionPathIgnore:
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+    @pytest.mark.asyncio
+    async def test_default_ignored_directory_produces_no_code_entities(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """A file under a default-ignored directory (vendor/) must not produce
+        any :type/module, :type/function, or :type/class triples."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "lib.py").write_text("def vendored_fn(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add vendored lib"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        vendored_module_ident = mcp_server._code_ident("module", "vendor/lib.py")
+        assert not any(vendored_module_ident in t for t in transact_calls)
+        assert not any(":entity-type :type/function" in t for t in transact_calls)
+        assert not any(":entity-type :type/class" in t for t in transact_calls)
+
+    @pytest.mark.asyncio
+    async def test_import_into_ignored_path_becomes_external_dependency(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Before this feature, vendor/foo.py would resolve as a normal in-tree
+        module (see _resolve_module_import's segment-suffix matcher) and
+        main.py's import of it would create an internal :depends-on edge, not
+        an external-dependency entity. Excluding vendor/ from known_files must
+        make it fall through to the same fallback used for real external
+        packages (see TestUnresolvedImportTagging)."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "foo.py").write_text("def helper(): pass\n")
+        (repo / "main.py").write_text("import vendor.foo\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add vendor and main"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        external_ident = mcp_server._canonical_ident("module", "vendor.foo")
+        assert any(
+            f"[{external_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_var_ignore_pattern_excludes_custom_directory(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """MINIGRAF_INGEST_IGNORE must add to the default ignore list, not
+        replace it — a custom pattern not in the built-in defaults must still
+        be honored."""
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "generated").mkdir()
+        (repo / "generated" / "codegen.py").write_text("def generated_fn(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add generated file"], cwd=repo, check=True, capture_output=True)
+
+        monkeypatch.setenv("MINIGRAF_INGEST_IGNORE", "generated/")
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason=""):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        generated_module_ident = mcp_server._code_ident("module", "generated/codegen.py")
+        assert not any(generated_module_ident in t for t in transact_calls)
 
 
 class TestResolveModuleImportTieredMatcher:

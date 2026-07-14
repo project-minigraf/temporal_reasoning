@@ -10,6 +10,7 @@ import concurrent.futures
 import configparser
 import contextlib
 import datetime
+import fnmatch
 import json
 import multiprocessing
 import os
@@ -21,7 +22,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -1582,9 +1583,80 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
     return result.stdout
 
 
-def _known_files_at_commit(repo_path: str, commit_hash: str) -> Dict[str, List[str]]:
+def _is_ignored_path(file_path: str, patterns: Sequence[str]) -> bool:
+    """Simplified .gitignore-style match: no negation, no ** anchoring, no new
+    dependency (see 2026-07-14 path-ignore design doc's "Matching" section for
+    why full gitignore semantics via pathspec were rejected).
+
+    - Pattern ending in "/": matches if that name is any path segment
+      (directory-anywhere-in-path semantics — "vendor/" matches both
+      "src/vendor/foo.js" and "vendor/bar.js", but never a bare substring
+      like "vendored_thing.js").
+    - Pattern containing a glob char (*, ?, [): fnmatch against the
+      basename, then the full path.
+    - Otherwise: exact match against any path segment or the basename.
+    """
+    segments = Path(file_path).parts
+    basename = segments[-1] if segments else file_path
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            if pattern.rstrip("/") in segments:
+                return True
+        elif any(ch in pattern for ch in "*?["):
+            if fnmatch.fnmatch(basename, pattern) or fnmatch.fnmatch(file_path, pattern):
+                return True
+        elif pattern in segments or pattern == basename:
+            return True
+    return False
+
+
+_DEFAULT_IGNORE_PATTERNS: Tuple[str, ...] = (
+    "3rdParty/", "third_party/", "vendor/", "node_modules/",
+    "dist/", "build/", "*.min.js", "*.map",
+)
+
+
+def _load_ignore_patterns(repo_path: str) -> List[str]:
+    """Resolve the effective ignore-pattern list for one ingestion run.
+
+    Merges, in order: built-in defaults, MINIGRAF_INGEST_IGNORE (comma-separated),
+    and an optional .temporalignore file (one pattern per line, blank lines and
+    "#"-prefixed comments skipped) read once from repo_path's current working
+    tree — not re-read per historical commit, since ignore config describes how
+    this run should behave, not something that varies commit-to-commit.
+
+    Fails closed: an unreadable or undecodable .temporalignore file contributes
+    zero extra patterns (defaults + env var still apply), matching best-effort
+    conventions used elsewhere in this file (e.g. _parse_gitmodules).
+    """
+    patterns: List[str] = list(_DEFAULT_IGNORE_PATTERNS)
+
+    env_patterns = os.environ.get("MINIGRAF_INGEST_IGNORE")
+    if env_patterns:
+        patterns.extend(p.strip() for p in env_patterns.split(",") if p.strip())
+
+    ignore_file = Path(repo_path) / ".temporalignore"
+    if ignore_file.is_file():
+        try:
+            lines = ignore_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                patterns.append(line)
+
+    return patterns
+
+
+def _known_files_at_commit(
+    repo_path: str, commit_hash: str, ignore_patterns: Sequence[str] = ()
+) -> Dict[str, List[str]]:
     """Return {file_path: []} for every file tracked at commit_hash whose extension
-    has a supported tree-sitter grammar (_EXT_TO_LANG).
+    has a supported tree-sitter grammar (_EXT_TO_LANG) and that doesn't match
+    ignore_patterns (see _is_ignored_path) — excluding a vendored path here means
+    any import resolving against it falls through to the external-dependency
+    fallback in _resolve_module_import instead of matching internally (#115).
 
     A pure function of commit_hash via `git ls-tree -r --name-only`, independent of
     ingestion progress — unlike the incrementally-mutated file_entities dict, this
@@ -1600,7 +1672,7 @@ def _known_files_at_commit(repo_path: str, commit_hash: str) -> Dict[str, List[s
     )
     known: Dict[str, List[str]] = {}
     for path in result.stdout.strip().splitlines():
-        if Path(path).suffix.lower() in _EXT_TO_LANG:
+        if Path(path).suffix.lower() in _EXT_TO_LANG and not _is_ignored_path(path, ignore_patterns):
             known[path] = []
     return known
 
@@ -3041,13 +3113,18 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
 
 
 def _extract_commit(
-    repo_path: str, commit_hash: str
+    repo_path: str, commit_hash: str, ignore_patterns: Sequence[str] = ()
 ) -> Tuple[List[tuple], List[tuple], Dict[str, Dict[str, str]]]:
     """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse,
     plus import resolution and "if this turns out to be new" triple precomputation —
     both pure functions of this commit alone (see _known_files_at_commit and
     _precompute_file_triples), unlike the incrementally-mutated file_entities/
     entity_valid_from state only the serial main thread maintains.
+
+    ignore_patterns (see _is_ignored_path/_load_ignore_patterns) are checked first,
+    before _thread_parser even runs — an ignored file costs zero parse time and is
+    also excluded from known_files, so anything importing it falls through to the
+    external-dependency fallback instead of resolving internally (#115).
 
     Runs in a worker process via the ProcessPoolExecutor in _run_ingestion (#116 —
     a thread pool here let tree-sitter's GIL-holding C parse starve the event
@@ -3085,6 +3162,8 @@ def _extract_commit(
     segment_index: Optional[_SegmentSuffixIndex] = None
 
     for status, old_mode, new_mode, old_sha, new_sha, file_path in raw_entries:
+        if _is_ignored_path(file_path, ignore_patterns):
+            continue
         parser = _thread_parser(file_path)
         if parser is None:
             continue
@@ -3097,7 +3176,7 @@ def _extract_commit(
             continue
         extracted = _extract_from_source(content, parser, file_path)
         if known_files is None:
-            known_files = _known_files_at_commit(repo_path, commit_hash)
+            known_files = _known_files_at_commit(repo_path, commit_hash, ignore_patterns)
             segment_index = _SegmentSuffixIndex(known_files)
         precomputed = _precompute_file_triples(
             file_path, extracted, commit_ident, known_files, segment_index=segment_index,
@@ -3158,6 +3237,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _db = None  # release file lock while enumerating commits
 
         commits = _git_commits(repo_path, watermark, branch)
+        ignore_patterns = _load_ignore_patterns(repo_path)
         repo_total_result = _subprocess.run(
             ["git", "rev-list", "--count", "HEAD"],
             cwd=repo_path, capture_output=True, text=True,
@@ -3229,7 +3309,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         commit = next(commits_iter)
                     except StopIteration:
                         return False
-                    fut = loop.run_in_executor(executor, _extract_commit, repo_path, commit[0])
+                    fut = loop.run_in_executor(
+                        executor, _extract_commit, repo_path, commit[0], ignore_patterns
+                    )
                     pending.append((commit, fut))
                     return True
 

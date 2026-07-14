@@ -282,6 +282,8 @@ Once started, inform the user that ingestion is running in the background and mo
 
 Auto-started at MCP server startup — the server creates a background asyncio task that calls `_run_ingestion(cwd, "HEAD")` immediately. Set `MINIGRAF_NO_AUTO_INGEST=1` to suppress this (useful in eval sandboxes). Incremental: reads the `:ingestion/watermark` entity to determine the last ingested commit, then only processes new commits.
 
+Vendored/third-party/generated paths are skipped for AST extraction by default (`3rdParty/`, `third_party/`, `vendor/`, `node_modules/`, `dist/`, `build/`, `*.min.js`, `*.map`) — no per-file entities are created for them, and any in-repo import resolving into an ignored path is tagged `:type/external-dependency` instead of an internal module dependency. Extend the ignore list with `MINIGRAF_INGEST_IGNORE` (comma-separated globs/prefixes, e.g. `MINIGRAF_INGEST_IGNORE=generated/,*.pb.go`) and/or a repo-local `.temporalignore` file (one pattern per line, `#` comments allowed) — both add to the defaults, they don't replace them. Ignore config is resolved once when ingestion starts and applies uniformly across all historical commits; it does not retroactively remove entities from a graph that was already ingested before the ignore list was added.
+
 Do not write to `:ingestion/watermark` or any `:ingestion/` entity directly.
 
 ### minigraf_ingest_status
