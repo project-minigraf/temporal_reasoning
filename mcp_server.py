@@ -3444,7 +3444,17 @@ def _extract_commit(
         if status in ("D", "M", "R") and old_sha and old_sha != "0" * len(old_sha):
             try:
                 old_content = _git_blob_content(repo_path, old_sha)
-                old_tree = parser.parse(old_content)
+                # For "R" (rename), old_lang_path is the PRE-rename path,
+                # which can map to a different language than file_path (the
+                # NEW path) on a cross-extension rename — reuse `parser`
+                # (already selected for file_path) would silently walk the
+                # old blob with the wrong grammar. _thread_parser(old_lang_path)
+                # selects the grammar matching the blob's own language. For
+                # "M"/"D", old_lang_path == file_path already (no rename), so
+                # this is the same parser instance as `parser` (thread-local
+                # cache hit) — no behavior change there.
+                old_parser = _thread_parser(old_lang_path) if status == "R" else parser
+                old_tree = old_parser.parse(old_content)
                 old_lang = _EXT_TO_LANG.get(Path(old_lang_path).suffix.lower(), "")
                 old_entity_nodes = _collect_entity_nodes(old_tree.root_node, old_lang)
             except Exception:
@@ -3478,9 +3488,21 @@ def _extract_commit(
         # simplicity/cost tradeoff over threading Node references through
         # _extract_from_source's return value, which must stay plain-data-only
         # for other callers.
+        #
+        # Wrapped best-effort, same as the old-side call above: a
+        # pathologically nested file parses fine under tree-sitter but can
+        # blow the Python recursion limit inside _collect_entity_nodes's
+        # own recursive walk() (RecursionError). Left unguarded, that
+        # exception would propagate out of _extract_commit and (in the real
+        # ProcessPoolExecutor pipeline) abort the entire ingestion run
+        # rather than just this one commit — contradicting this function's
+        # own contract that ordinary exceptions fail only the one commit.
         new_lang = _EXT_TO_LANG.get(Path(file_path).suffix.lower(), "")
-        new_tree = parser.parse(content)
-        new_entity_nodes = _collect_entity_nodes(new_tree.root_node, new_lang)
+        try:
+            new_tree = parser.parse(content)
+            new_entity_nodes = _collect_entity_nodes(new_tree.root_node, new_lang)
+        except Exception:
+            new_entity_nodes = {"function": {}, "class": {}}  # best-effort: matching degrades to no-match
 
         if status == "A":
             for category in ("function", "class"):

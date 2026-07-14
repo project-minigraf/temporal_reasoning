@@ -2946,6 +2946,53 @@ class TestExtractCommit:
         assert len(results) == 1
         assert results[0][1] == "auth.py"
 
+    def test_new_side_pathological_nesting_does_not_abort_commit(self, tmp_path):
+        """Reviewer finding 1 on Task 9 (47b962e): the new-side
+        `_collect_entity_nodes` call in _extract_commit's per-file loop was
+        NOT wrapped in a best-effort try/except, unlike the structurally
+        identical old-side call a few lines above. A file whose body is
+        pathologically deeply nested parses fine under tree-sitter (a C
+        parser) but blows the Python recursion limit in
+        _collect_entity_nodes's own recursive `walk()`, raising
+        RecursionError. Uncaught, that propagates out of _extract_commit and
+        (in the real pipeline) aborts the entire ingestion run rather than
+        just this one commit — contradicting _extract_commit's own docstring
+        promise that "ordinary exceptions... still fail only the one commit
+        as before". This must degrade gracefully: the pathological file's
+        new-side node pool ends up empty, matching just doesn't happen for
+        it, but the commit still processes and _extract_commit still returns.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        nested = "(" * 6000 + "1" + ")" * 6000
+        (repo / "deep.py").write_text(f"def f():\n    x = {nested}\n    return x\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add pathologically nested file"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+
+        # Sanity check the reproduction still triggers RecursionError from
+        # _collect_entity_nodes specifically (not _extract_from_source, which
+        # is already wrapped) before asserting _extract_commit survives it.
+        parser = mcp_server._get_parser("deep.py")
+        content = mcp_server._git_file_content(str(repo), commits[0][0], "deep.py")
+        tree = parser.parse(content)
+        with pytest.raises(RecursionError):
+            mcp_server._collect_entity_nodes(tree.root_node, "python")
+
+        results, gitlink_changes, gitmodules_map, renamed_pairs = mcp_server._extract_commit(
+            str(repo), commits[0][0]
+        )
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "A"
+        assert file_path == "deep.py"
+        assert renamed_pairs == []
+
 
 class TestExtractCommitRename:
     def test_rename_status_extracts_new_path_and_tags_old_path(self, tmp_path):
@@ -2998,6 +3045,92 @@ class TestExtractCommitRename:
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
         _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
         assert ("function", "fileA.py", "moveMe", "fileB.py", "moveMe") in renamed_pairs
+
+    def test_cross_extension_rename_parses_old_blob_with_old_grammar(self, tmp_path, monkeypatch):
+        """Reviewer finding 2 on Task 9 (47b962e): for status "R", `parser =
+        _thread_parser(file_path)` is selected using the NEW path's
+        extension, then reused to parse `old_content` (the OLD blob) even
+        when the old path's extension maps to a different language.
+        `old_lang` is correctly computed from `old_lang_path` for the
+        node-type lookup inside _collect_entity_nodes, but the Tree actually
+        walked was built with the wrong grammar — silently losing/misparsing
+        old-side structure on a genuine cross-language-extension rename.
+
+        Renames old_name.cpp (real C++ requiring the C++ grammar: a
+        destructor and an out-of-line qualified definition) to new_name.c.
+        Under the bug, `parser` is built for the NEW path's extension (.c ->
+        C grammar) and reused on the OLD (C++) blob; the C grammar cannot
+        parse `Foo::baz(...)` / `~Foo()` correctly and the class vanishes
+        entirely from the resulting tree (proven directly below), even
+        though old_lang is still correctly computed as "cpp" for the
+        node-type lookup.
+        """
+        import mcp_server
+        pytest.importorskip("tree_sitter_c")
+        pytest.importorskip("tree_sitter_cpp")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        old_source = (
+            "class Foo {\n"
+            "public:\n"
+            "    ~Foo() {}\n"
+            "};\n"
+            "int Foo::baz() { return 0; }\n"
+        )
+        (repo / "old_name.cpp").write_text(old_source)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add cpp file"], cwd=repo, check=True, capture_output=True)
+        # A pure rename (no content change) so git's rename detection reports
+        # status "R" with 100% similarity rather than a delete+add pair —
+        # the new file's content doesn't matter for what this test checks
+        # (the OLD blob's grammar), only its extension does.
+        _subprocess.run(["git", "mv", "old_name.cpp", "new_name.c"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename cpp to c"], cwd=repo, check=True, capture_output=True)
+
+        # Sanity check: prove the wrong-grammar parse actually loses the
+        # class, so this test would fail before the fix and isn't
+        # vacuously true.
+        mcp_server._grammar_cache.clear()
+        c_parser = mcp_server._get_parser("new_name.c")
+        cpp_parser = mcp_server._get_parser("old_name.cpp")
+        wrong_tree = c_parser.parse(old_source.encode())
+        correct_tree = cpp_parser.parse(old_source.encode())
+        wrong_result = mcp_server._collect_entity_nodes(wrong_tree.root_node, "cpp")
+        correct_result = mcp_server._collect_entity_nodes(correct_tree.root_node, "cpp")
+        assert wrong_result["class"] == {}
+        assert "Foo" in correct_result["class"]
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        rename_hash = commits[1][0]
+
+        captured_old_side = []
+        original_collect = mcp_server._collect_entity_nodes
+
+        def spy(root_node, lang_name):
+            result = original_collect(root_node, lang_name)
+            if lang_name == "cpp":
+                captured_old_side.append(result)
+            return result
+
+        monkeypatch.setattr(mcp_server, "_collect_entity_nodes", spy)
+
+        results, gitlink_changes, gitmodules_map, renamed_pairs = mcp_server._extract_commit(
+            str(repo), rename_hash
+        )
+
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "R"
+        assert file_path == "new_name.c"
+        assert old_path == "old_name.cpp"
+
+        assert len(captured_old_side) == 1
+        assert "Foo" in captured_old_side[0]["class"]
+        assert "baz" in captured_old_side[0]["function"]
+        assert "~Foo" in captured_old_side[0]["function"]
 
 
 class TestIngestionWrites:
