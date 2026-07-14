@@ -2561,6 +2561,103 @@ class TestPhpGlobalsAndFields:
         assert info["$y"] == ("Foo", False)
 
 
+class TestKotlinGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_kotlin
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_kotlin.language()))
+
+    def test_top_level_property_is_global(self):
+        import mcp_server
+        tree = self._parser().parse(b"val globalX = 5\n")
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_companion_object_property_is_static_plain_is_instance(self):
+        import mcp_server
+        source = b"class Foo {\n    companion object {\n        val staticField = 1\n    }\n    val instanceField = 2\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_top_level_destructuring_declaration_captures_all_names(self):
+        # `val (a, b) = Pair(1, 2)` wraps its names in a
+        # multi_variable_declaration instead of a bare
+        # variable_declaration -- verified empirically against the real
+        # installed tree-sitter-kotlin grammar. Same multi-declarator
+        # lesson as every prior language in this plan (Go/C/Java/C++/
+        # Ruby): every identifier inside it must be extracted, not just
+        # treated as absent.
+        import mcp_server
+        source = b"val (a, b) = Pair(1, 2)\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_primary_constructor_val_param_is_instance_field_plain_param_excluded(self):
+        # Kotlin's primary-constructor property shorthand (`class
+        # Foo(val x: Int)`) is an idiomatic and extremely common way to
+        # declare instance fields (near-universal in `data class`), but
+        # it is structurally a class_parameter inside primary_
+        # constructor's class_parameters list -- NOT a property_
+        # declaration under class_body -- verified empirically. A plain
+        # constructor parameter with neither `val` nor `var` (`y: Int`
+        # below) is not a property and must be excluded.
+        import mcp_server
+        source = b"class Foo(val x: Int, y: Int) {\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Foo", False)
+        assert "y" not in info
+
+    def test_data_class_constructor_properties_and_body_property_combined(self):
+        import mcp_server
+        source = (
+            b"data class Point(val x: Int, val y: Int) {\n"
+            b"    val label = \"point\"\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Point", False)
+        assert info["y"] == ("Point", False)
+        assert info["label"] == ("Point", False)
+
+    def test_nested_class_not_recursed_into(self):
+        # Fields two classes deep are out of scope, consistent with
+        # every other language in this plan: only class_body's direct
+        # children are inspected, so a nested class_declaration is
+        # skipped without crashing and without contributing its own
+        # field to the outer class.
+        import mcp_server
+        source = (
+            b"class Outer {\n"
+            b"    class Inner {\n"
+            b"        val innerField = 3\n"
+            b"    }\n"
+            b"    val outerField = 4\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["outerField"] == ("Outer", False)
+        assert "innerField" not in info
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"fun main() {\n    println(\"hi\")\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server

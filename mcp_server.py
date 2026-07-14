@@ -1565,6 +1565,134 @@ def _extract_php_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["php"] = _extract_php_globals_and_fields
 
 
+def _extract_kotlin_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Kotlin globals/fields extraction.
+
+    Top-level `val`/`var` is a property_declaration directly under
+    source_file, wrapping a variable_declaration (single name) or a
+    multi_variable_declaration (destructuring, e.g. `val (a, b) =
+    ...`) -- NEITHER exposes a named field for the identifier(s) in the
+    real installed tree-sitter-kotlin grammar, verified empirically, so
+    both are located purely by node type. `class Foo { ... }` is a
+    class_declaration whose `class_body` child is likewise not exposed
+    via a named field (only `name` is a named field on
+    class_declaration) -- verified empirically. A property_declaration
+    that is a direct child of class_body is an instance field; one
+    nested inside a companion_object's own class_body is Kotlin's
+    static-equivalent.
+
+    Multi-declarator/destructuring (`val (a, b) = Pair(1, 2)`) wraps
+    its names in multi_variable_declaration instead of a bare
+    variable_declaration -- verified empirically, same lesson as the
+    multi-declarator gaps found in every prior language in this plan
+    (Go/C/Java/C++/Ruby): every identifier inside it is extracted, not
+    just treated as absent.
+
+    Kotlin's primary-constructor property shorthand (`class Foo(val x:
+    Int)`) is an idiomatic and extremely common way to declare instance
+    fields (near-universal in `data class`), but it is structurally a
+    class_parameter inside primary_constructor's class_parameters list
+    -- NOT a property_declaration under class_body -- verified
+    empirically. class_parameter exposes no named fields either; its
+    optional `val`/`var` keyword child and its `identifier` name child
+    are both located by node type, taking only the direct-child
+    identifier so the nested one inside the parameter's type
+    annotation (e.g. `Int` in `val x: Int`) is never matched. A
+    class_parameter with neither a `val` nor `var` child is a plain
+    (non-property) constructor parameter and is excluded. These are
+    always instance fields: Kotlin has no syntax for a `val`/`var`
+    primary-constructor parameter inside a companion object (companion
+    objects are declared with `object`, which has no primary
+    constructor), so no static variant of this exists.
+
+    Never recurses into a nested class_declaration found inside a
+    class_body (fields two classes deep are out of scope, consistent
+    with every other language in this plan) or into any function/method
+    body.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def property_names(prop_node: Any) -> List[str]:
+        names: List[str] = []
+        for child in prop_node.children:
+            if child.type == "variable_declaration":
+                for inner in child.children:
+                    if inner.type == "identifier":
+                        names.append(inner.text.decode("utf-8"))
+                        break
+            elif child.type == "multi_variable_declaration":
+                for decl in child.children:
+                    if decl.type == "variable_declaration":
+                        for inner in decl.children:
+                            if inner.type == "identifier":
+                                names.append(inner.text.decode("utf-8"))
+                                break
+        return names
+
+    def record_constructor_param_fields(class_node: Any, class_name: str) -> None:
+        primary_ctor = next((c for c in class_node.children if c.type == "primary_constructor"), None)
+        if primary_ctor is None:
+            return
+        params = next((c for c in primary_ctor.children if c.type == "class_parameters"), None)
+        if params is None:
+            return
+        for param in params.children:
+            if param.type != "class_parameter":
+                continue
+            if not any(c.type in ("val", "var") for c in param.children):
+                continue
+            name_node = next((c for c in param.children if c.type == "identifier"), None)
+            if name_node is None:
+                continue
+            fname = name_node.text.decode("utf-8")
+            fields.append((fname, class_name, False))
+            field_info[fname] = {
+                "class": class_name, "static": False,
+                "body": param.text.decode("utf-8", "replace"),
+            }
+
+    for stmt in root_node.children:
+        if stmt.type == "property_declaration":
+            for name in property_names(stmt):
+                globals_.append(name)
+                global_bodies[name] = stmt.text.decode("utf-8", "replace")
+        elif stmt.type == "class_declaration":
+            name_node = stmt.child_by_field_name("name")
+            class_name = name_node.text.decode("utf-8") if name_node else ""
+            record_constructor_param_fields(stmt, class_name)
+            class_body = next((c for c in stmt.children if c.type == "class_body"), None)
+            if class_body is None:
+                continue
+            for member in class_body.children:
+                if member.type == "property_declaration":
+                    for fname in property_names(member):
+                        fields.append((fname, class_name, False))
+                        field_info[fname] = {
+                            "class": class_name, "static": False,
+                            "body": member.text.decode("utf-8", "replace"),
+                        }
+                elif member.type == "companion_object":
+                    companion_body = next((c for c in member.children if c.type == "class_body"), None)
+                    if companion_body is None:
+                        continue
+                    for inner_member in companion_body.children:
+                        if inner_member.type == "property_declaration":
+                            for fname in property_names(inner_member):
+                                fields.append((fname, class_name, True))
+                                field_info[fname] = {
+                                    "class": class_name, "static": True,
+                                    "body": inner_member.text.decode("utf-8", "replace"),
+                                }
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["kotlin"] = _extract_kotlin_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
