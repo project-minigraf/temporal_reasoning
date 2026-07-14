@@ -4684,7 +4684,7 @@ class TestRunIngestionBitemporalClose:
             "login() still present in file must not be closed"
 
     @pytest.mark.asyncio
-    async def test_renamed_file_closes_old_entities_and_opens_new(
+    async def test_renamed_file_links_old_and_new_via_rename_edges(
         self, mock_minigraf_db, git_repo_with_rename, monkeypatch
     ):
         mock_class, db_instance = mock_minigraf_db
@@ -4702,14 +4702,19 @@ class TestRunIngestionBitemporalClose:
         await mcp_server._run_ingestion(str(git_repo_with_rename), "HEAD")
 
         old_module_ident = mcp_server._code_ident("module", "old_auth.py")
+        new_module_ident = mcp_server._code_ident("module", "new_auth.py")
         new_fn_ident = mcp_server._code_ident("function", "new_auth.py", "login")
 
         assert any(old_module_ident in t for t in close_triples_seen), \
-            "Old module entities must be closed when file is renamed"
+            "Old module entities must still be closed when file is renamed"
+        assert any(f"{old_module_ident} :renamed-to {new_module_ident}" in t for t in close_triples_seen), \
+            "Old module's close triples must include :renamed-to pointing at the new ident"
 
         transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
         assert new_fn_ident in transact_calls, \
-            "New module entities must be created after file is renamed"
+            "New module's entities must still be created after file is renamed"
+        assert f"{new_module_ident} :renamed-from {old_module_ident}" in transact_calls, \
+            "New module's open triples must include :renamed-from pointing at the old ident"
 
 
 # ---------------------------------------------------------------------------

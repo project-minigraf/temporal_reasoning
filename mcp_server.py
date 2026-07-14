@@ -3428,7 +3428,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
                                     )
                                 file_deps.pop(file_path, None)
-                            else:  # A or M
+                            else:  # A or M or R
+                                if status == "R" and old_path:
+                                    old_module_ident = _code_ident("module", old_path)
+                                    new_module_ident = _code_ident("module", file_path)
+                                    add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
+                                    old_desc = entity_descriptions.get(old_module_ident, old_path)
+                                    orig_ts = entity_valid_from.get(old_module_ident, commit_ts_iso)
+                                    close_items.append((
+                                        _build_close_triples(old_module_ident, old_desc, old_module_ident)
+                                        + [f"[{old_module_ident} :renamed-to {new_module_ident}]"],
+                                        orig_ts,
+                                    ))
                                 previous_idents = set(file_entities.get(file_path, []))
                                 triples = _build_code_triples(
                                     file_path, extracted, commit_ts_iso, entity_valid_from,
