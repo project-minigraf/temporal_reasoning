@@ -1641,9 +1641,14 @@ def _load_ignore_patterns(repo_path: str) -> List[str]:
     return patterns
 
 
-def _known_files_at_commit(repo_path: str, commit_hash: str) -> Dict[str, List[str]]:
+def _known_files_at_commit(
+    repo_path: str, commit_hash: str, ignore_patterns: Sequence[str] = ()
+) -> Dict[str, List[str]]:
     """Return {file_path: []} for every file tracked at commit_hash whose extension
-    has a supported tree-sitter grammar (_EXT_TO_LANG).
+    has a supported tree-sitter grammar (_EXT_TO_LANG) and that doesn't match
+    ignore_patterns (see _is_ignored_path) — excluding a vendored path here means
+    any import resolving against it falls through to the external-dependency
+    fallback in _resolve_module_import instead of matching internally (#115).
 
     A pure function of commit_hash via `git ls-tree -r --name-only`, independent of
     ingestion progress — unlike the incrementally-mutated file_entities dict, this
@@ -1659,7 +1664,7 @@ def _known_files_at_commit(repo_path: str, commit_hash: str) -> Dict[str, List[s
     )
     known: Dict[str, List[str]] = {}
     for path in result.stdout.strip().splitlines():
-        if Path(path).suffix.lower() in _EXT_TO_LANG:
+        if Path(path).suffix.lower() in _EXT_TO_LANG and not _is_ignored_path(path, ignore_patterns):
             known[path] = []
     return known
 
