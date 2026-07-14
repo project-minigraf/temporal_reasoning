@@ -760,14 +760,20 @@ def _match_candidate_pair(
     Internally, `mapping`/`reverse` record EVERY local identifier
     correspondence seen (including identity ones, e.g. an untouched
     parameter name) so consistency and injectivity can be enforced across
-    the whole pair. `renamed` mirrors only the entries where the old and
-    new text actually differ; that's what gets returned, per the docstring
-    contract above (identity-only correspondences shouldn't show up in the
-    reported bijection).
+    the whole pair. `reverse` is seeded up front with every tracked entity's
+    new-side text (its confirmed rename target, or its own unchanged name
+    when tracked_names[name] is None) — otherwise a local/untracked
+    identifier could silently claim the exact new text already reserved for
+    a different, tracked entity, which is a real injectivity violation (two
+    distinct old tokens collapsing onto one new token) that the tracked-name
+    equality check alone doesn't catch since it lives in a disjoint
+    namespace from `mapping`/`reverse`.
     """
     mapping: Dict[str, str] = {}
-    reverse: Dict[str, str] = {}
-    renamed: Dict[str, str] = {}
+    reverse: Dict[str, str] = {
+        (target if target is not None else name): name
+        for name, target in tracked_names.items()
+    }
 
     def walk(a: Any, b: Any) -> bool:
         if a.type != b.type:
@@ -785,15 +791,14 @@ def _match_candidate_pair(
                     return False
                 mapping[a_text] = b_text
                 reverse[b_text] = a_text
-                if a_text != b_text:
-                    renamed[a_text] = b_text
                 return True
             return a_text == b_text
         if a.child_count != b.child_count:
             return False
         return all(walk(ac, bc) for ac, bc in zip(a.children, b.children))
 
-    return renamed if walk(old_node, new_node) else None
+    return {k: v for k, v in mapping.items() if k != v} if walk(old_node, new_node) else None
+
 
 # ---------------------------------------------------------------------------
 # DB lifecycle

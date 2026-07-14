@@ -1918,6 +1918,30 @@ class TestMatchCandidatePair:
         result = mcp_server._match_candidate_pair(old, new, {})
         assert result is None
 
+    def test_local_identifier_colliding_with_confirmed_tracked_rename_does_not_match(self):
+        """A local (untracked) old identifier 'y' must not be allowed to map
+        to 'helper_new' when 'helper_new' is already claimed as the confirmed
+        new name of a different, tracked old entity 'helper_old'. Both old
+        tokens are genuinely distinct, so collapsing them onto the same new
+        token violates injectivity even though 'y' isn't itself tracked."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = helper_old(x)\n    return y\n")
+        new = self._parse(
+            "def foo(x):\n    helper_new = helper_new(x)\n    return helper_new\n"
+        )
+        result = mcp_server._match_candidate_pair(old, new, {"helper_old": "helper_new"})
+        assert result is None
+
+    def test_local_identifier_colliding_with_unchanged_tracked_name_does_not_match(self):
+        """Same collision, but the tracked entity is unchanged (tracked_names
+        value is None) rather than renamed: a local old identifier must not
+        be allowed to map to the tracked entity's own (unchanged) text."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = helper(x)\n    return y\n")
+        new = self._parse("def foo(x):\n    helper = helper(x)\n    return helper\n")
+        result = mcp_server._match_candidate_pair(old, new, {"helper": None})
+        assert result is None
+
 
 class TestExtractFromSourceCFamily:
     """Regression tests for issue #92 bug 1: the generic `name` field lookup
