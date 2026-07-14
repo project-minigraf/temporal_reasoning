@@ -736,6 +736,65 @@ def _extract_from_source(
         pass  # best-effort; parse failures are non-fatal
     return results
 
+
+def _match_candidate_pair(
+    old_node: Any, new_node: Any, tracked_names: Dict[str, Optional[str]]
+) -> Optional[Dict[str, str]]:
+    """Lockstep-walk two tree-sitter nodes, allowing local (untracked)
+    identifiers to differ under a one-to-one bijective mapping.
+
+    tracked_names maps every entity name known in this commit's context to
+    either None (must appear unchanged) or a confirmed new name (must appear
+    renamed to exactly that). Any identifier NOT a key in tracked_names is
+    treated as local/unresolved and is free to differ, as long as the
+    mapping stays consistent (same old token always maps to the same new
+    token) and injective (no two distinct old tokens collapse onto one new
+    token) for THIS candidate pair only — the mapping is never reused across
+    other pairs or persisted as an entity.
+
+    Returns the discovered bijection dict on a full match (empty dict if no
+    local identifiers were involved — plain exact match is the case where
+    the bijection happens to be the identity mapping), or None if the nodes
+    don't match structurally or a tracked/bijection constraint is violated.
+
+    Internally, `mapping`/`reverse` record EVERY local identifier
+    correspondence seen (including identity ones, e.g. an untouched
+    parameter name) so consistency and injectivity can be enforced across
+    the whole pair. `renamed` mirrors only the entries where the old and
+    new text actually differ; that's what gets returned, per the docstring
+    contract above (identity-only correspondences shouldn't show up in the
+    reported bijection).
+    """
+    mapping: Dict[str, str] = {}
+    reverse: Dict[str, str] = {}
+    renamed: Dict[str, str] = {}
+
+    def walk(a: Any, b: Any) -> bool:
+        if a.type != b.type:
+            return False
+        if a.child_count == 0 and b.child_count == 0:
+            a_text = a.text.decode("utf-8", "replace")
+            b_text = b.text.decode("utf-8", "replace")
+            if a.type == "identifier" or a.type.endswith("_identifier"):
+                if a_text in tracked_names:
+                    expected = tracked_names[a_text]
+                    return b_text == (expected if expected is not None else a_text)
+                if a_text in mapping:
+                    return mapping[a_text] == b_text
+                if b_text in reverse:
+                    return False
+                mapping[a_text] = b_text
+                reverse[b_text] = a_text
+                if a_text != b_text:
+                    renamed[a_text] = b_text
+                return True
+            return a_text == b_text
+        if a.child_count != b.child_count:
+            return False
+        return all(walk(ac, bc) for ac, bc in zip(a.children, b.children))
+
+    return renamed if walk(old_node, new_node) else None
+
 # ---------------------------------------------------------------------------
 # DB lifecycle
 # ---------------------------------------------------------------------------

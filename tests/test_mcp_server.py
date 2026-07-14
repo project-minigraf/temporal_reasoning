@@ -1856,6 +1856,69 @@ class TestExtractFromSource:
         assert "def ok" in result["class_bodies"]["User"]
 
 
+class TestMatchCandidatePair:
+    def _parse(self, source: str):
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+        tree = parser.parse(source.encode())
+        # first top-level statement's node (a function_definition, in every fixture below)
+        return tree.root_node.children[0]
+
+    def test_identical_bodies_match_with_empty_bijection(self):
+        import mcp_server
+        old = self._parse("def foo(x):\n    return x + 1\n")
+        new = self._parse("def foo(x):\n    return x + 1\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result == {}
+
+    def test_renamed_local_variable_matches_via_bijection(self):
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = x + 1\n    return y\n")
+        new = self._parse("def foo(x):\n    z = x + 1\n    return z\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result == {"y": "z"}
+
+    def test_inconsistent_local_rename_does_not_match(self):
+        """y is renamed to z in one spot but stays y in another -> not a valid bijection."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = x + 1\n    return y + y\n")
+        new = self._parse("def foo(x):\n    z = x + 1\n    return z + y\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result is None
+
+    def test_two_distinct_locals_collapsing_onto_one_new_name_does_not_match(self):
+        """y and w are two distinct old locals; if both map to the same new
+        name 'z' that is not a valid bijection (not injective) even though
+        each individual old->new mapping is internally consistent."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = x + 1\n    w = x + 2\n    return y + w\n")
+        new = self._parse("def foo(x):\n    z = x + 1\n    z = x + 2\n    return z + z\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result is None
+
+    def test_tracked_entity_with_confirmed_rename_must_match_new_name(self):
+        """Body calls a helper that was itself confirmed renamed this round."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    return helper_old(x)\n")
+        new = self._parse("def foo(x):\n    return helper_new(x)\n")
+        result = mcp_server._match_candidate_pair(old, new, {"helper_old": "helper_new"})
+        assert result == {}
+
+    def test_tracked_entity_without_rename_must_match_exactly(self):
+        old = self._parse("def foo(x):\n    return helper(x)\n")
+        new = self._parse("def foo(x):\n    return other(x)\n")
+        import mcp_server
+        result = mcp_server._match_candidate_pair(old, new, {"helper": None})
+        assert result is None
+
+    def test_structurally_different_bodies_do_not_match(self):
+        import mcp_server
+        old = self._parse("def foo(x):\n    return x + 1\n")
+        new = self._parse("def foo(x):\n    if x:\n        return x\n    return 1\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result is None
+
+
 class TestExtractFromSourceCFamily:
     """Regression tests for issue #92 bug 1: the generic `name` field lookup
     in _walk_ast doesn't match the C/C++ grammar for functions — a C/C++
