@@ -33,6 +33,9 @@ skills/
 # Git worktrees
 .worktrees/
 
+# Subagent-driven-development scratch (progress ledger, task briefs/reports)
+.superpowers/
+
 #IDEs
 .idea
 
