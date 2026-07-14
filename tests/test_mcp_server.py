@@ -1836,7 +1836,24 @@ class TestExtractFromSource:
         import mcp_server
         # Passing None as parser triggers AttributeError → except block returns empty dict
         result = mcp_server._extract_from_source(b"def foo(): pass", None, "x.py")
-        assert result == {"functions": [], "classes": [], "imports": [], "calls": []}
+        assert result == {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "function_bodies": {}, "class_bodies": {},
+        }
+
+    def test_extracts_function_bodies(self):
+        import mcp_server
+        source = b"def login(user):\n    return user.ok\n"
+        result = mcp_server._extract_from_source(source, self._python_parser(), "auth.py")
+        assert "login" in result["function_bodies"]
+        assert "return user.ok" in result["function_bodies"]["login"]
+
+    def test_extracts_class_bodies(self):
+        import mcp_server
+        source = b"class User:\n    def ok(self):\n        return True\n"
+        result = mcp_server._extract_from_source(source, self._python_parser(), "models.py")
+        assert "User" in result["class_bodies"]
+        assert "def ok" in result["class_bodies"]["User"]
 
 
 class TestExtractFromSourceCFamily:

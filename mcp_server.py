@@ -686,15 +686,20 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
             name = _c_family_function_name(node)
             if name:
                 results["functions"].append(name)
+                results["function_bodies"][name] = node.text.decode("utf-8", errors="replace")
         else:
             name_node = node.child_by_field_name("name")
             if name_node:
-                results["functions"].append(name_node.text.decode("utf-8"))
+                name = name_node.text.decode("utf-8")
+                results["functions"].append(name)
+                results["function_bodies"][name] = node.text.decode("utf-8", errors="replace")
 
     elif node.type in node_types.get("classes", set()):
         name_node = node.child_by_field_name("name")
         if name_node:
-            results["classes"].append(name_node.text.decode("utf-8"))
+            name = name_node.text.decode("utf-8")
+            results["classes"].append(name)
+            results["class_bodies"][name] = node.text.decode("utf-8", errors="replace")
 
     elif node.type in node_types.get("imports", set()):
         names = _extract_import_name(node, lang_name)
@@ -711,10 +716,17 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
 
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
-) -> Dict[str, List[str]]:
-    """Parse source bytes and extract functions, classes, imports, calls."""
-    results: Dict[str, List[str]] = {
-        "functions": [], "classes": [], "imports": [], "calls": []
+) -> Dict[str, Any]:
+    """Parse source bytes and extract functions, classes, imports, calls, and
+    (for functions/classes) their own full source text — the latter used by
+    the rename matcher (see _match_renamed_entities) to compare old vs. new
+    bodies. Body text is captured here, inside the worker process, because
+    tree_sitter Node objects themselves cannot cross the ProcessPoolExecutor
+    boundary (see #116) — only the decoded text can.
+    """
+    results: Dict[str, Any] = {
+        "functions": [], "classes": [], "imports": [], "calls": [],
+        "function_bodies": {}, "class_bodies": {},
     }
     try:
         tree = parser.parse(source)
