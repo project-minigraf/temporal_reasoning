@@ -3477,6 +3477,95 @@ class TestPrecomputeFileTriples:
         assert dep_ident == mcp_server._canonical_ident("module", "totally_unknown_crate")
 
 
+class TestPrecomputeGlobalsAndFields:
+    def test_global_entries_shape(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "function_bodies": {}, "class_bodies": {},
+            "globals": ["GLOBAL_X"], "global_bodies": {"GLOBAL_X": "GLOBAL_X = 5"},
+            "fields": [], "field_info": {},
+        }
+        result = mcp_server._precompute_file_triples(
+            "config.py", extracted, ":commit/abc123", {}, segment_index=None,
+        )
+        assert len(result["global_entries"]) == 1
+        ident, name, triples = result["global_entries"][0]
+        assert ident == mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
+        assert name == "GLOBAL_X"
+        assert f"[{ident} :entity-type :type/variable]" in triples
+        assert f"[{ident} :introduced-by :commit/abc123]" in triples
+
+    def test_field_entries_shape_disambiguates_by_class(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": ["Foo"], "imports": [], "calls": [],
+            "function_bodies": {}, "class_bodies": {"Foo": "class Foo: ..."},
+            "globals": [], "global_bodies": {},
+            "fields": [("staticField", "Foo", True)],
+            "field_info": {"staticField": {"class": "Foo", "static": True, "body": "staticField = 1"}},
+        }
+        result = mcp_server._precompute_file_triples(
+            "models.py", extracted, ":commit/abc123", {}, segment_index=None,
+        )
+        assert len(result["field_entries"]) == 1
+        ident, name, triples = result["field_entries"][0]
+        expected_ident = mcp_server._code_ident("field", "models.py", "Foo.staticField")
+        assert ident == expected_ident
+        assert f"[{ident} :entity-type :type/field]" in triples
+        assert f"[{ident} :static true]" in triples
+        class_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        assert f"[{ident} :class {class_ident}]" in triples
+
+
+class TestBuildCodeTriplesGlobalsAndFields:
+    def test_new_global_writes_full_triples(self):
+        import mcp_server
+        extracted = {"functions": [], "classes": [], "imports": [], "calls": [],
+                     "function_bodies": {}, "class_bodies": {},
+                     "globals": ["GLOBAL_X"], "global_bodies": {"GLOBAL_X": "GLOBAL_X = 5"},
+                     "fields": [], "field_info": {}}
+        precomputed = mcp_server._precompute_file_triples("config.py", extracted, ":commit/c1", {})
+        entity_valid_from, entity_descriptions, file_entities = {}, {}, {}
+        triples = mcp_server._build_code_triples(
+            "config.py", extracted, "2024-01-01T00:00:00Z", entity_valid_from,
+            entity_descriptions, file_entities, ":commit/c1", precomputed,
+        )
+        ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
+        assert any(f"{ident} :entity-type :type/variable" in t for t in triples)
+        assert ident in entity_valid_from
+
+    def test_preexisting_global_only_gets_modified_in(self):
+        import mcp_server
+        extracted = {"functions": [], "classes": [], "imports": [], "calls": [],
+                     "function_bodies": {}, "class_bodies": {},
+                     "globals": ["GLOBAL_X"], "global_bodies": {"GLOBAL_X": "GLOBAL_X = 6"},
+                     "fields": [], "field_info": {}}
+        precomputed = mcp_server._precompute_file_triples("config.py", extracted, ":commit/c2", {})
+        ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
+        module_ident = mcp_server._code_ident("module", "config.py")
+        # Module must already be known too, otherwise _build_code_triples treats
+        # it as newly introduced and emits module_candidate_triples alongside
+        # the global's :modified-in line, breaking the strict equality below.
+        entity_valid_from = {
+            module_ident: "2024-01-01T00:00:00Z",
+            ident: "2024-01-01T00:00:00Z",
+        }
+        entity_descriptions = {module_ident: "config.py", ident: "GLOBAL_X"}
+        file_entities = {"config.py": [module_ident, ident]}
+        triples = mcp_server._build_code_triples(
+            "config.py", extracted, "2024-01-02T00:00:00Z", entity_valid_from,
+            entity_descriptions, file_entities, ":commit/c2", precomputed,
+        )
+        # Both the already-known module and the already-known global only get
+        # a :modified-in edge — none of the candidate (:entity-type, :ident, …)
+        # triples are re-asserted.
+        assert triples == [
+            f"[{module_ident} :modified-in :commit/c2]",
+            f"[{ident} :modified-in :commit/c2]",
+        ]
+
+
 class TestPreloadKnownDeps:
     def test_reloads_open_depends_on_edge(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db

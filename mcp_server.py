@@ -3051,6 +3051,35 @@ def _precompute_file_triples(
             f"[{cls_ident} :introduced-by {commit_ident}]",
         ]))
 
+    global_entries: List[Tuple[str, str, List[str]]] = []
+    for gvar_name in extracted.get("globals", []):
+        gvar_ident = _code_ident("variable", file_path, gvar_name)
+        global_entries.append((gvar_ident, gvar_name, [
+            f"[{gvar_ident} :entity-type :type/variable]",
+            f'[{gvar_ident} :ident "{gvar_ident}"]',
+            f'[{gvar_ident} :description "{_edn_escape(gvar_name)}"]',
+            f'[{gvar_ident} :file "{_edn_escape(file_path)}"]',
+            f"[{module_ident} :contains {gvar_ident}]",
+            f"[{gvar_ident} :introduced-by {commit_ident}]",
+        ]))
+
+    field_entries: List[Tuple[str, str, List[str]]] = []
+    for field_name, owning_class, is_static in extracted.get("fields", []):
+        qualified_name = f"{owning_class}.{field_name}"
+        field_ident = _code_ident("field", file_path, qualified_name)
+        class_ident = _code_ident("class", file_path, owning_class)
+        static_literal = "true" if is_static else "false"
+        field_entries.append((field_ident, qualified_name, [
+            f"[{field_ident} :entity-type :type/field]",
+            f'[{field_ident} :ident "{field_ident}"]',
+            f'[{field_ident} :description "{_edn_escape(qualified_name)}"]',
+            f'[{field_ident} :file "{_edn_escape(file_path)}"]',
+            f"[{field_ident} :class {class_ident}]",
+            f"[{field_ident} :static {static_literal}]",
+            f"[{module_ident} :contains {field_ident}]",
+            f"[{field_ident} :introduced-by {commit_ident}]",
+        ]))
+
     resolved_imports: List[Tuple[str, str, bool]] = []
     for import_name in set(extracted.get("imports", [])):
         dep_ident, is_resolved = _resolve_module_import(
@@ -3063,6 +3092,8 @@ def _precompute_file_triples(
         "module_candidate_triples": module_candidate_triples,
         "function_entries": function_entries,
         "class_entries": class_entries,
+        "global_entries": global_entries,
+        "field_entries": field_entries,
         "resolved_imports": resolved_imports,
     }
 
@@ -3135,6 +3166,26 @@ def _build_code_triples(
             # Pre-existing class: record that this commit modified it
             triples.append(f"[{cls_ident} :modified-in {commit_ident}]")
 
+    for gvar_ident, gvar_name, candidate_triples in precomputed["global_entries"]:
+        if gvar_ident not in entity_valid_from:
+            triples += candidate_triples
+            if gvar_ident not in idents_for_file:
+                idents_for_file.append(gvar_ident)
+            entity_valid_from[gvar_ident] = commit_ts_iso
+            entity_descriptions[gvar_ident] = gvar_name
+        else:
+            triples.append(f"[{gvar_ident} :modified-in {commit_ident}]")
+
+    for field_ident, field_name, candidate_triples in precomputed["field_entries"]:
+        if field_ident not in entity_valid_from:
+            triples += candidate_triples
+            if field_ident not in idents_for_file:
+                idents_for_file.append(field_ident)
+            entity_valid_from[field_ident] = commit_ts_iso
+            entity_descriptions[field_ident] = field_name
+        else:
+            triples.append(f"[{field_ident} :modified-in {commit_ident}]")
+
     return triples
 
 
@@ -3175,7 +3226,7 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     except Exception:
         pass
 
-    for entity_type in ("module", "function", "class", "external-dependency"):
+    for entity_type in ("module", "function", "class", "variable", "field", "external-dependency"):
         path_attr = "path" if entity_type in ("module", "external-dependency") else "file"
         try:
             raw = _db_execute(
