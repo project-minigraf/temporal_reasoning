@@ -1583,6 +1583,22 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
     return result.stdout
 
 
+def _git_blob_content(repo_path: str, blob_sha: str) -> bytes:
+    """Return raw bytes of a blob by its own SHA, independent of any commit/path.
+
+    Used to fetch a file's *old* content directly from _git_diff_tree_raw's
+    old_sha field (a plain blob SHA) when comparing pre/post rename or
+    modification content — cheaper than resolving a parent commit hash and
+    re-deriving the old path, and correct even when the old path no longer
+    exists at any reachable commit-ish (e.g. mid-history rewrites).
+    """
+    result = _subprocess.run(
+        ["git", "cat-file", "blob", blob_sha],
+        cwd=repo_path, capture_output=True, check=True,
+    )
+    return result.stdout
+
+
 def _is_ignored_path(file_path: str, patterns: Sequence[str]) -> bool:
     """Simplified .gitignore-style match: no negation, no ** anchoring, no new
     dependency (see 2026-07-14 path-ignore design doc's "Matching" section for

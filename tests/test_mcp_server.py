@@ -2206,6 +2206,14 @@ class TestGitHelpers:
         content = mcp_server._git_file_content(str(git_repo), first_hash, "auth.py")
         assert b"def login" in content
 
+    def test_git_blob_content_returns_raw_bytes(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(git_repo), commits[0][0])
+        _, _, _, _, new_sha, _ = entries[0][:6]
+        content = mcp_server._git_blob_content(str(git_repo), new_sha)
+        assert b"def login" in content
+
 
 class TestGitDiffTreeRaw:
     def test_regular_file_add(self, git_repo):
