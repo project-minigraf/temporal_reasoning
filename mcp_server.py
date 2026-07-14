@@ -820,6 +820,59 @@ def _extract_python_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["python"] = _extract_python_globals_and_fields
 
 
+def _extract_js_family_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware JavaScript/TypeScript globals/fields extraction.
+
+    Only descends into: program-root direct children (globals, from
+    lexical_declaration/variable_declaration's variable_declarator
+    children) and a class_declaration's class_body direct children
+    (field_definition for JS, public_field_definition for TS). Never
+    recurses into a function/method body, so a class field assigned only
+    inside a constructor (e.g. `this.x = 1` with no class-body field
+    declaration) is not captured — deliberate, bounded heuristic
+    consistent with the Python extractor's __init__-only scope.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    for stmt in root_node.children:
+        if stmt.type in ("lexical_declaration", "variable_declaration"):
+            for child in stmt.children:
+                if child.type == "variable_declarator":
+                    name_node = child.child_by_field_name("name")
+                    if name_node is not None and name_node.type == "identifier":
+                        name = name_node.text.decode("utf-8")
+                        globals_.append(name)
+                        global_bodies[name] = stmt.text.decode("utf-8", "replace")
+        elif stmt.type == "class_declaration":
+            class_name_node = stmt.child_by_field_name("name")
+            class_name = class_name_node.text.decode("utf-8") if class_name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                if member.type not in ("field_definition", "public_field_definition"):
+                    continue
+                name_node = member.child_by_field_name("property") or member.child_by_field_name("name")
+                if name_node is None or name_node.type not in ("property_identifier",):
+                    continue
+                field_name = name_node.text.decode("utf-8")
+                is_static = any(c.type == "static" for c in member.children)
+                fields.append((field_name, class_name, is_static))
+                field_info[field_name] = {
+                    "class": class_name, "static": is_static,
+                    "body": member.text.decode("utf-8", "replace"),
+                }
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["javascript"] = _extract_js_family_globals_and_fields
+_GLOBAL_FIELD_EXTRACTORS["typescript"] = _extract_js_family_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:

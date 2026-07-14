@@ -1937,6 +1937,49 @@ class TestPythonGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestJsFamilyGlobalsAndFields:
+    def _js_parser(self):
+        import tree_sitter_javascript
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_javascript.language()))
+
+    def _ts_parser(self):
+        import tree_sitter_typescript
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_typescript.language_typescript()))
+
+    def test_js_module_level_global(self):
+        import mcp_server
+        tree = self._js_parser().parse(b"const GLOBAL_X = 5;\n")
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert "GLOBAL_X" in result["globals"]
+
+    def test_js_static_and_instance_fields(self):
+        import mcp_server
+        source = b"class Foo {\n  static staticField = 1;\n  instanceField = 2;\n}\n"
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_ts_public_field_definition_static(self):
+        import mcp_server
+        source = b"class Foo {\n  static staticField: number = 1;\n  instanceField: number = 2;\n}\n"
+        tree = self._ts_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_local_variable_not_captured(self):
+        import mcp_server
+        source = b"function foo() {\n  const localX = 1;\n  return localX;\n}\n"
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server
