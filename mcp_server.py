@@ -731,10 +731,24 @@ def _get_graph_path() -> str:
     return os.environ.get("MINIGRAF_GRAPH_PATH", str(Path.cwd() / "memory.graph"))
 
 
-def _open_db_at(path: str) -> MiniGrafDb:
-    """Open MiniGrafDb at path, register session rules, update mtime tracking."""
+def _open_db_at(path: str, *, force: bool = True) -> MiniGrafDb:
+    """Open MiniGrafDb at path, register session rules, update mtime tracking.
+
+    force=False reuses an already-open _db instead of opening a second handle,
+    checked atomically under _db_native_lock. Without this, two threads that
+    both observe _db as None (e.g. the ingestion preload thread and an
+    _ensure_db_async() caller racing during the "starting" phase, before
+    _run_ingestion flips status to "running") each call MiniGrafDb.open() on
+    the same path from this same process. The second open collides with the
+    first handle's still-held lock file and surfaces as "Database is locked
+    by another process", with the lock file's own PID equal to *our* PID
+    (#107). force=True (the default) is for callers that need a genuine
+    reopen regardless of any existing handle, e.g. _refresh_if_stale().
+    """
     global _db, _graph_path, _db_mtime
     with _db_native_lock:
+        if not force and _db is not None:
+            return _db
         _db = MiniGrafDb.open(path)
     for rule in SESSION_RULES:
         _db_execute(_db, rule)
@@ -854,19 +868,22 @@ def _try_open_with_self_heal(path: str) -> MiniGrafDb:
     running) by removing it and retrying once, instead of surfacing a
     permanent error.
 
+    Reuses an already-open _db instead of opening a redundant second handle
+    (force=False) — see _open_db_at's docstring (#107).
+
     Raises the lock-contention exception if the lock is still held by a live
     process (caller decides whether to back off and retry); raises any
     non-lock exception immediately.
     """
     try:
-        return _open_db_at(path)
+        return _open_db_at(path, force=False)
     except Exception as e:
         if not _is_lock_error(e):
             raise
         holder_pid = _stale_lock_holder_pid(e)
         if holder_pid is not None and _clear_stale_lock(path, holder_pid):
             try:
-                return _open_db_at(path)
+                return _open_db_at(path, force=False)
             except Exception as e2:
                 if not _is_lock_error(e2):
                     raise
