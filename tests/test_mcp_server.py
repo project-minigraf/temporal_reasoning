@@ -2288,6 +2288,101 @@ class TestJavaCSharpGlobalsAndFields:
         assert result["globals"] == []
 
 
+class TestCppGlobalsAndFields:
+    def _cpp_parser(self):
+        import tree_sitter_cpp
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_cpp.language()))
+
+    def test_top_level_declaration_is_global(self):
+        import mcp_server
+        tree = self._cpp_parser().parse(b"int global_x = 5;\n")
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        assert "global_x" in result["globals"]
+
+    def test_static_and_instance_class_fields(self):
+        import mcp_server
+        source = b"class Foo {\npublic:\n    static int staticField;\n    int instanceField;\n};\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_struct_fields_same_shape_as_class(self):
+        # struct_specifier and class_specifier expose field:body /
+        # field_declaration_list identically -- verified empirically
+        # against the real installed tree-sitter-cpp grammar. Structs
+        # default to public visibility but the AST shape for extracting
+        # fields is the same either way.
+        import mcp_server
+        source = b"struct Bar {\n    int a;\n    static float f;\n};\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Bar", False)
+        assert info["f"] == ("Bar", True)
+
+    def test_multiple_access_specifier_sections_do_not_affect_extraction(self):
+        # A class with several public:/private:/public: sections in
+        # sequence -- access_specifier nodes are just siblings in the
+        # field_declaration_list body and must not disrupt iteration over
+        # the field_declaration members that follow them.
+        import mcp_server
+        source = (
+            b"class Foo {\n"
+            b"public:\n"
+            b"    int pub1;\n"
+            b"private:\n"
+            b"    static int priv1;\n"
+            b"public:\n"
+            b"    int pub2;\n"
+            b"};\n"
+        )
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["pub1"] == ("Foo", False)
+        assert info["priv1"] == ("Foo", True)
+        assert info["pub2"] == ("Foo", False)
+
+    def test_multi_declarator_global_captures_all_names(self):
+        # `int a, b;` at file scope puts more than one node under the
+        # `declarator` field of a single declaration -- child_by_field_name
+        # (singular) only returns the first, silently dropping `b`.
+        # Verified empirically against the real installed tree-sitter-cpp
+        # grammar (same lesson as C/Java's multi-declarator statement);
+        # children_by_field_name (plural) must be used instead.
+        import mcp_server
+        source = b"int a, b;\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_multi_declarator_field_captures_all_names(self):
+        # Same multi-declarator gap as globals, but for class/struct
+        # fields: `int x, y;` inside a field_declaration_list.
+        import mcp_server
+        source = b"class Foo {\npublic:\n    int x, y;\n};\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Foo", False)
+        assert info["y"] == ("Foo", False)
+
+    def test_method_declaration_not_captured_as_field(self):
+        # A method's declarator is a function_declarator wrapping a
+        # field_identifier, not a bare field_identifier -- must not be
+        # misclassified as a field.
+        import mcp_server
+        source = b"class Foo {\npublic:\n    void method();\n};\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        names = [n for n, _, _ in result["fields"]]
+        assert "method" not in names
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server

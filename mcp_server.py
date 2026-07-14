@@ -1269,6 +1269,90 @@ def _extract_csharp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["c_sharp"] = _extract_csharp_globals_and_fields
 
 
+def _extract_cpp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware C++ globals/fields extraction.
+
+    Top-level `int x = 5;` is a `declaration` directly under
+    `translation_unit`, same shape as C -- reuses C's declarator_name
+    helper (identifier, or init_declarator wrapping one).
+
+    `class Foo { ... };` / `struct Foo { ... };` are `class_specifier` /
+    `struct_specifier` nodes with `field:body` = `field_declaration_list`;
+    verified empirically against the real installed tree-sitter-cpp
+    grammar that both node types expose `name`/`body` fields identically,
+    so class and struct fields are handled by the same code path (structs
+    default to public, classes to private, but that doesn't affect the
+    AST shape used here). `access_specifier` nodes (public:/private:/
+    protected:) are just plain sibling children of field_declaration_list
+    -- multiple such sections in one class don't disrupt iteration since
+    non-field_declaration members are simply skipped.
+
+    Each member `field_declaration` optionally has a
+    `storage_class_specifier` child with text b"static"; a plain
+    (non-method) field's declarator is directly a `field_identifier`, not
+    wrapped in `init_declarator` (unlike C's free variable declarations,
+    verified empirically). A method declaration's declarator is a
+    `function_declarator` wrapping a `field_identifier` -- filtering on
+    `declarator.type == "field_identifier"` naturally excludes methods.
+
+    NOTE: `int a, b;` (at file scope, or as a field inside a class/struct)
+    puts more than one node under the `declarator` field of a single
+    declaration/field_declaration -- child_by_field_name (singular) only
+    returns the first one and silently drops the rest. Verified
+    empirically against the real installed tree-sitter-cpp grammar (same
+    lesson as Task 15's C extractor and Task 16's Java extractor);
+    children_by_field_name (plural) is used instead to capture all of
+    them, for both globals and fields.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def declarator_name(node: Any) -> Optional[str]:
+        if node.type == "identifier":
+            return node.text.decode("utf-8")
+        if node.type == "init_declarator":
+            inner = node.child_by_field_name("declarator")
+            return declarator_name(inner) if inner is not None else None
+        return None
+
+    for stmt in root_node.children:
+        if stmt.type == "declaration":
+            for declarator in stmt.children_by_field_name("declarator"):
+                name = declarator_name(declarator)
+                if name:
+                    globals_.append(name)
+                    global_bodies[name] = stmt.text.decode("utf-8", "replace")
+        elif stmt.type in ("class_specifier", "struct_specifier"):
+            name_node = stmt.child_by_field_name("name")
+            class_name = name_node.text.decode("utf-8") if name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                if member.type != "field_declaration":
+                    continue
+                is_static = any(
+                    c.type == "storage_class_specifier" and c.text == b"static"
+                    for c in member.children
+                )
+                for declarator in member.children_by_field_name("declarator"):
+                    if declarator.type != "field_identifier":
+                        continue
+                    fname = declarator.text.decode("utf-8")
+                    fields.append((fname, class_name, is_static))
+                    field_info[fname] = {
+                        "class": class_name, "static": is_static,
+                        "body": member.text.decode("utf-8", "replace"),
+                    }
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["cpp"] = _extract_cpp_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
