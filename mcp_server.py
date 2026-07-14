@@ -826,9 +826,13 @@ def _extract_js_family_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     Only descends into: program-root direct children (globals, from
     lexical_declaration/variable_declaration's variable_declarator
     children) and a class_declaration's class_body direct children
-    (field_definition for JS, public_field_definition for TS). Never
-    recurses into a function/method body, so a class field assigned only
-    inside a constructor (e.g. `this.x = 1` with no class-body field
+    (field_definition for JS, public_field_definition for TS). A
+    program-root `export_statement` (covering `export const`/`export
+    let`/`export class`/`export default class`) is unwrapped via its
+    `declaration` field before the same type checks apply — this is the
+    one extra step permitted; it does not add any further recursion.
+    Never recurses into a function/method body, so a class field assigned
+    only inside a constructor (e.g. `this.x = 1` with no class-body field
     declaration) is not captured — deliberate, bounded heuristic
     consistent with the Python extractor's __init__-only scope.
     """
@@ -837,7 +841,20 @@ def _extract_js_family_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
 
-    for stmt in root_node.children:
+    for raw_stmt in root_node.children:
+        stmt = raw_stmt
+        if stmt.type == "export_statement":
+            # `export const X = 5;`, `export class Foo {...}`, and
+            # `export default class Bar {...}` all wrap the actual
+            # declaration inside an export_statement node, exposed
+            # uniformly via the `declaration` field (verified against the
+            # real installed tree-sitter-javascript/typescript grammars,
+            # including the `export default class` variant). Unwrap it
+            # once here; no further recursion is added beyond this.
+            declaration = stmt.child_by_field_name("declaration")
+            if declaration is None:
+                continue
+            stmt = declaration
         if stmt.type in ("lexical_declaration", "variable_declaration"):
             for child in stmt.children:
                 if child.type == "variable_declarator":
@@ -845,7 +862,10 @@ def _extract_js_family_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                     if name_node is not None and name_node.type == "identifier":
                         name = name_node.text.decode("utf-8")
                         globals_.append(name)
-                        global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                        # Use raw_stmt (not the unwrapped stmt) so an
+                        # exported global's body includes the `export`
+                        # keyword, matching its actual source text.
+                        global_bodies[name] = raw_stmt.text.decode("utf-8", "replace")
         elif stmt.type == "class_declaration":
             class_name_node = stmt.child_by_field_name("name")
             class_name = class_name_node.text.decode("utf-8") if class_name_node else ""

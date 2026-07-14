@@ -1979,6 +1979,52 @@ class TestJsFamilyGlobalsAndFields:
         result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
         assert result["globals"] == []
 
+    def test_export_const_captured_as_global(self):
+        import mcp_server
+        tree = self._js_parser().parse(b"export const GLOBAL_X = 5;\n")
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert "GLOBAL_X" in result["globals"]
+        assert result["global_bodies"]["GLOBAL_X"].startswith("export const")
+
+    def test_export_let_captured_as_global(self):
+        import mcp_server
+        tree = self._js_parser().parse(b"export let GLOBAL_Y = 5;\n")
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert "GLOBAL_Y" in result["globals"]
+        assert result["global_bodies"]["GLOBAL_Y"].startswith("export let")
+
+    def test_export_class_captures_fields(self):
+        import mcp_server
+        source = b"export class Foo { static a = 1; b = 2; }\n"
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", True)
+        assert info["b"] == ("Foo", False)
+
+    def test_export_default_class_captures_fields(self):
+        import mcp_server
+        source = b"export default class Bar { c = 3; }\n"
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["c"] == ("Bar", False)
+
+    def test_export_const_and_class_together(self):
+        import mcp_server
+        source = (
+            b"export const X = 5;\n"
+            b"export class Foo { static a = 1; b = 2; }\n"
+            b"export default class Bar { c = 3; }\n"
+        )
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert "X" in result["globals"]
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", True)
+        assert info["b"] == ("Foo", False)
+        assert info["c"] == ("Bar", False)
+
 
 class TestMatchCandidatePair:
     def _parse(self, source: str):
