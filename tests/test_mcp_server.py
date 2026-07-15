@@ -3435,6 +3435,63 @@ class TestMatchRenamedEntities:
         matches = mcp_server._match_renamed_entities(removed, added)
         assert matches == []
 
+    def test_field_leaf_not_captured_by_unrelated_confirmed_rename(self):
+        """Regression for the task-26 false-positive: a field is pooled under a
+        QUALIFIED key ("A.Config") but its body text contains only the BARE
+        leaf token ("Config"). If an UNRELATED entity with the same bare name
+        (a function `Config`) is confirmed-renamed to `ConfigFn` in an earlier
+        round, the field's own `Config` token must NOT inherit that constraint
+        — otherwise the field is wrongly forced to a specific candidate.
+
+        Here the field rename is genuinely ambiguous (`A.Config`'s body
+        `Config = <n>` matches BOTH `A.ConfigFn` and `A.ConfigField` as a
+        single-token rename), so the matcher must stay conservative and leave
+        the field UNMATCHED. Pre-fix, the stale `Config -> ConfigFn` constraint
+        from the function disambiguated it into the WRONG match
+        `A.Config -> A.ConfigFn`.
+        """
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+
+        def parse(src):
+            return parser.parse(src.encode()).root_node
+
+        old_root = parse(
+            "def Config(x):\n    return x + 1\n"
+            "class A:\n    Config = 1234567890123\n"
+        )
+        new_root = parse(
+            "def ConfigFn(x):\n    return x + 1\n"
+            "class A:\n    ConfigFn = 1234567890123\n    ConfigField = 1234567890123\n"
+        )
+
+        old_fn = mcp_server._collect_entity_nodes(old_root, "python")["function"]
+        new_fn = mcp_server._collect_entity_nodes(new_root, "python")["function"]
+        old_fields = mcp_server._extract_globals_and_fields(old_root, "python")["field_nodes"]
+        new_fields = mcp_server._extract_globals_and_fields(new_root, "python")["field_nodes"]
+
+        removed = {
+            "function": [("Config", old_fn["Config"])],
+            "field": [("A.Config", old_fields["A.Config"])],
+        }
+        added = {
+            "function": [("ConfigFn", new_fn["ConfigFn"])],
+            "field": [
+                ("A.ConfigFn", new_fields["A.ConfigFn"]),
+                ("A.ConfigField", new_fields["A.ConfigField"]),
+            ],
+        }
+
+        matches = mcp_server._match_renamed_entities(removed, added)
+        projected = [(c, o, n) for c, o, _, n, _ in matches]
+
+        # The unrelated function rename is legitimate and expected.
+        assert ("function", "Config", "ConfigFn") in projected
+        # The field rename is genuinely ambiguous -> must stay UNMATCHED.
+        field_matches = [m for m in projected if m[0] == "field"]
+        assert field_matches == [], f"field must stay ambiguous, got {field_matches}"
+        assert ("field", "A.Config", "A.ConfigFn") not in projected
+
 
 class TestCollectEntityNodes:
     def test_collects_function_and_class_nodes_by_name(self):

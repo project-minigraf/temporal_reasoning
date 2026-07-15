@@ -2461,6 +2461,33 @@ def _normalize_body_for_matching(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _match_body_name(category: str, name: str) -> str:
+    """Map an entity's pool key to the bare identifier that actually appears in
+    its body text, for the matcher's internal name bookkeeping.
+
+    Fields are pooled under QUALIFIED keys ("Class.leaf", per Task 11) so that
+    same-named fields in different classes get distinct, collision-free
+    :type/field idents downstream — that qualification MUST stay on the pool
+    keys and on _match_renamed_entities' returned pairs (both the ident
+    construction in Task 11/27 and renamed_pairs depend on it). But a field's
+    body text only ever contains its BARE leaf identifier: the declaration
+    `Config = 1` contains the token `Config`, never `A.Config`.
+
+    _match_candidate_pair matches body-text tokens, so _match_renamed_entities'
+    tracked-name set, confirmed-rename map, and per-pair self-exclusion must all
+    key on that bare leaf, not the qualified pool key. Otherwise a field's own
+    leaf token is never excluded from its own candidate test and can be captured
+    by an UNRELATED already-confirmed rename that happens to share the bare name
+    (e.g. a function `Config`->`ConfigFn` confirmed in an earlier round), which
+    forces the field's body token to a specific new spelling and produces a
+    WRONG confirmed match. Non-field categories are already unqualified (pool
+    key == body identifier), so they pass through unchanged.
+    """
+    if category == "field":
+        return name.rsplit(".", 1)[-1]
+    return name
+
+
 def _match_renamed_entities(
     removed: Dict[str, List[Tuple[str, Any]]],
     added: Dict[str, List[Tuple[str, Any]]],
@@ -2488,12 +2515,15 @@ def _match_renamed_entities(
     from the original 3-tuple (category, old_name, new_name) shape.)
     """
     matches: List[Tuple[str, str, Any, str, Any]] = []
-    confirmed: Dict[str, str] = {}  # old_name -> new_name, shared across all categories
+    # Keyed by BARE body-text identifier (see _match_body_name), not the pool
+    # key, because a field's qualified pool key ("Class.leaf") never appears as
+    # a token in any body text — only its bare leaf does.
+    confirmed: Dict[str, str] = {}  # bare old_name -> bare new_name, shared across all categories
 
     all_names: set = set()
     for pool in (removed, added):
-        for entries in pool.values():
-            all_names.update(name for name, _node in entries)
+        for category, entries in pool.items():
+            all_names.update(_match_body_name(category, name) for name, _node in entries)
 
     for _round in range(_MAX_MATCH_ROUNDS):
         changed = False
@@ -2507,25 +2537,39 @@ def _match_renamed_entities(
                 r_text = _normalize_body_for_matching(r_node.text.decode("utf-8", "replace"))
                 if len(r_text) < _MIN_MATCH_BODY_LEN:
                     continue
+                # The bare identifier the pair-under-test actually spells in its
+                # body (equal to the pool key for non-field categories). Used
+                # for self-exclusion below so the walker treats the pair's own
+                # name as free/under-test, never as an inherited constraint.
+                r_match_name = _match_body_name(category, r_name)
                 candidates = []
                 for a_name, a_node in a_list:
+                    a_match_name = _match_body_name(category, a_name)
                     # Exclude this specific pair's own old/new names from the
                     # tracked set: they are exactly what's under test here
                     # (is r_name renamed to a_name?), not an already-known
                     # constraint. Without this, an unconfirmed entity's own
                     # name would be treated as "must stay unchanged" and no
-                    # rename could ever be confirmed for it.
+                    # rename could ever be confirmed for it. Excluding by BARE
+                    # name (not the qualified pool key) is essential for fields:
+                    # the body token is the bare leaf, so excluding "A.Config"
+                    # would leave the field's own "Config" token still bound to
+                    # an unrelated confirmed "Config"->... rename (the false
+                    # positive this fix closes).
                     pair_tracked_names = {
                         name: target
                         for name, target in tracked_names.items()
-                        if name != r_name and name != a_name
+                        if name != r_match_name and name != a_match_name
                     }
                     if _match_candidate_pair(r_node, a_node, pair_tracked_names) is not None:
                         candidates.append((a_name, a_node))
                 if len(candidates) == 1:
                     a_name, a_node = candidates[0]
+                    # Returned pair keeps the QUALIFIED pool keys (r_name/a_name)
+                    # for downstream ident construction; only the shared
+                    # confirmed map records the bare body names.
                     matches.append((category, r_name, r_node, a_name, a_node))
-                    confirmed[r_name] = a_name
+                    confirmed[r_match_name] = _match_body_name(category, a_name)
                     r_list.remove((r_name, r_node))
                     a_list.remove((a_name, a_node))
                     changed = True
