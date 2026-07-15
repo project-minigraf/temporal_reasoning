@@ -2954,6 +2954,129 @@ class TestScalaGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestHaskellGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_haskell
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_haskell.language()))
+
+    def test_zero_arg_bind_is_global(self):
+        import mcp_server
+        source = b"globalX :: Int\nglobalX = 5\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_record_fields_extracted(self):
+        import mcp_server
+        source = b"data Foo = Foo { fieldA :: Int, fieldB :: String }\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["fieldA"] == ("Foo", False)
+        assert info["fieldB"] == ("Foo", False)
+
+    def test_parameterized_function_is_not_a_global(self):
+        # A parameterized top-level declaration is a "function" node
+        # (targeted separately by _LANG_NODE_TYPES["haskell"]["functions"]),
+        # structurally distinct from a zero-argument "bind" node -- it
+        # must NOT also be picked up here as a global value.
+        import mcp_server
+        source = b"double :: Int -> Int\ndouble x = x * 2\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert "double" not in result["globals"]
+
+    def test_module_header_does_not_hide_declarations(self):
+        # `module Foo where` produces a sibling "header" field on the
+        # root node -- verified empirically -- it does NOT wrap
+        # declarations the way JS's export_statement or PHP's
+        # block-style namespace_definition do elsewhere in this plan.
+        # field:declarations still holds them directly.
+        import mcp_server
+        source = b"module Foo where\n\nglobalX :: Int\nglobalX = 5\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_tuple_pattern_bind_excluded(self):
+        # `(a, b) = (1, 2)` puts a "tuple" node in field:pattern instead
+        # of field:name holding a "variable" -- verified empirically.
+        # Deliberate simplification (not a bug): only simple
+        # single-name binds are recognized as globals here; destructured
+        # binds are silently skipped.
+        import mcp_server
+        source = b"(a, b) = (1, 2)\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_where_clause_local_binds_not_treated_as_globals(self):
+        # local_binds under a function's `where` clause are nested
+        # inside the function node's body, not direct children of
+        # field:declarations -- verified empirically -- so they are
+        # correctly excluded without any special-casing.
+        import mcp_server
+        source = b"f x = y + z\n  where\n    y = 1\n    z = 2\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_multiple_record_constructors_each_extracted(self):
+        # `data Shape = Circle {..} | Rectangle {..} | Point` -- each
+        # data_constructor within data_constructors needs its own
+        # record-shape check; a non-record constructor (Point, a
+        # "prefix" node) mixed in must not break extraction of the
+        # record ones -- verified empirically.
+        import mcp_server
+        source = (
+            b"data Shape = Circle { radius :: Double } "
+            b"| Rectangle { width :: Double, height :: Double } "
+            b"| Point\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["radius"] == ("Shape", False)
+        assert info["width"] == ("Shape", False)
+        assert info["height"] == ("Shape", False)
+        assert "Point" not in info
+
+    def test_newtype_record_field_extracted(self):
+        # `newtype Foo = Foo { unFoo :: Int }` is a completely different
+        # top-level node type ("newtype", not "data_type") -- verified
+        # empirically. Its constructor is a "newtype_constructor" node
+        # whose record child is reached via field:field (a confusingly
+        # named but real field name in the grammar) directly holding the
+        # "record" node -- there is no intermediate data_constructor
+        # wrapper the way data_type has. A newtype's single field is a
+        # very common real Haskell pattern and must be extracted.
+        import mcp_server
+        source = b"newtype Foo = Foo { unFoo :: Int }\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["unFoo"] == ("Foo", False)
+
+    def test_newtype_without_record_yields_no_fields(self):
+        # `newtype Foo = Foo Int` (no braces) puts a plain "field" node
+        # (not "record") at field:field -- verified empirically -- must
+        # not be misidentified as a record field.
+        import mcp_server
+        source = b"newtype Foo = Foo Int\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert result["fields"] == []
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"double :: Int -> Int\ndouble x = x * 2\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server

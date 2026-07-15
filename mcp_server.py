@@ -1952,6 +1952,142 @@ def _extract_scala_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["scala"] = _extract_scala_globals_and_fields
 
 
+def _extract_haskell_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Haskell top-level bindings/record-fields extraction.
+
+    Haskell is a genuinely different paradigm from every other language in
+    this plan -- no OOP, no static/instance concept, so extracted fields
+    are always `:static=False`.
+
+    A zero-argument top-level `bind` node (field:name = a `variable` node)
+    is the "global value" signal, cleanly distinguished by the grammar
+    itself from a parameterized `function` node (already targeted by
+    `_LANG_NODE_TYPES["haskell"]["functions"]`). A destructuring bind such
+    as `(a, b) = (1, 2)` puts a `tuple` node in field:pattern instead --
+    NOT field:name -- verified empirically; child_by_field_name("name")
+    correctly returns None for it, so it is silently excluded rather than
+    partially/incorrectly extracted. This is a deliberate simplification,
+    not a bug: recognizing destructured tuple binds as multiple globals
+    would require pattern-name recursion for comparatively rare top-level
+    syntax.
+
+    `module Foo where` produces a sibling `header` field on the root
+    node -- verified empirically -- it does NOT wrap the declarations the
+    way JS's export_statement or PHP's block-style namespace_definition
+    do elsewhere in this plan. field:declarations still holds top-level
+    declarations directly regardless of whether a module header is
+    present, so no unwrapping is needed.
+
+    `where`-clause local bindings (`f x = y where y = 1`) live nested
+    inside the enclosing function node's body (as a `local_binds` node),
+    NOT as direct children of field:declarations -- verified empirically
+    -- so they are correctly excluded without any special-casing, the
+    same as this extractor never recursing into function bodies elsewhere.
+
+    `data Foo = Foo { fieldA :: Int }` is `data_type` (field:name = the
+    type name) -> field:constructors -> `data_constructors` -> each
+    `data_constructor` (field:constructor) -> if that constructor is
+    specifically a `record` node -> field:fields -> `fields` -> each
+    `field` child (field:name) -> `field_name` -> `variable` (the actual
+    field name text). A `data` type with MULTIPLE constructors mixing
+    record and non-record shapes (e.g. `data Shape = Circle { radius ::
+    Double } | Rectangle { width :: Double } | Point`) works correctly
+    because each `data_constructor` within `data_constructors` gets its
+    own independent record-shape check in the loop -- verified
+    empirically; a non-record constructor (a `prefix` node, e.g. `Point`)
+    is simply skipped, not mistaken for a record.
+
+    `newtype Foo = Foo { unFoo :: Int }` -- a newtype's single record
+    field is a very common real Haskell pattern -- is a STRUCTURALLY
+    DIFFERENT top-level node from data_type: a `newtype` node (not
+    `data_type`) whose field:constructor holds a `newtype_constructor`
+    directly (no intermediate `data_constructor`/`data_constructors`
+    wrapper at all), and whose record child is reached via the
+    confusingly-named field:field (NOT field:record or field:fields) --
+    verified empirically. A braces-less newtype (`newtype Foo = Foo
+    Int`) puts a plain `field` node (not `record`) at that same
+    field:field, so the `.type != "record"` check correctly excludes it
+    without misreading its wrapped type name as a field.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def add_field_from_wrapper(field_wrapper: Any, type_name: str) -> None:
+        if field_wrapper.type != "field":
+            return
+        field_name_node = field_wrapper.child_by_field_name("name")
+        if field_name_node is None:
+            return
+        variable_node = next(
+            (c for c in field_name_node.children if c.type == "variable"), None
+        )
+        if variable_node is not None:
+            fname = variable_node.text.decode("utf-8")
+            fields.append((fname, type_name, False))
+            field_info[fname] = {
+                "class": type_name, "static": False,
+                "body": field_wrapper.text.decode("utf-8", "replace"),
+            }
+
+    def record_fields(record_node: Any, type_name: str) -> None:
+        # A record with multiple comma-separated fields (the shape
+        # data_type constructors use) wraps them in a "fields" node at
+        # field:fields. A newtype's record -- restricted by the
+        # language to exactly one field -- instead exposes that single
+        # field node directly at field:field (no wrapper) -- verified
+        # empirically. Both shapes are handled here.
+        fields_node = record_node.child_by_field_name("fields")
+        if fields_node is not None:
+            for field_wrapper in fields_node.children:
+                add_field_from_wrapper(field_wrapper, type_name)
+            return
+        single_field = record_node.child_by_field_name("field")
+        if single_field is not None:
+            add_field_from_wrapper(single_field, type_name)
+
+    declarations = root_node.child_by_field_name("declarations")
+    if declarations is None:
+        return {"globals": [], "global_bodies": {}, "fields": [], "field_info": {}}
+
+    for decl in declarations.children:
+        if decl.type == "bind":
+            name_node = decl.child_by_field_name("name")
+            if name_node is not None:
+                name = name_node.text.decode("utf-8")
+                globals_.append(name)
+                global_bodies[name] = decl.text.decode("utf-8", "replace")
+        elif decl.type == "data_type":
+            type_name_node = decl.child_by_field_name("name")
+            type_name = type_name_node.text.decode("utf-8") if type_name_node else ""
+            constructors = decl.child_by_field_name("constructors")
+            if constructors is None:
+                continue
+            for ctor_wrapper in constructors.children:
+                if ctor_wrapper.type != "data_constructor":
+                    continue
+                ctor = ctor_wrapper.child_by_field_name("constructor")
+                if ctor is None or ctor.type != "record":
+                    continue
+                record_fields(ctor, type_name)
+        elif decl.type == "newtype":
+            type_name_node = decl.child_by_field_name("name")
+            type_name = type_name_node.text.decode("utf-8") if type_name_node else ""
+            newtype_ctor = decl.child_by_field_name("constructor")
+            if newtype_ctor is None:
+                continue
+            record = newtype_ctor.child_by_field_name("field")
+            if record is None or record.type != "record":
+                continue
+            record_fields(record, type_name)
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["haskell"] = _extract_haskell_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
