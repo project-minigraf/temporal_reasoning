@@ -3063,7 +3063,7 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     _refresh_if_stale()
     db = get_db()
     try:
-        raw = _db_execute(db, f'(transact {facts} {{:valid-from "{_now_utc_ms()}"}})')
+        raw = _db_execute(db, f'(transact {{:valid-from "{_now_utc_ms()}"}} {facts})')
         _db_checkpoint(db)
         _update_mtime()
         result = _parse_tx_result(raw)
@@ -3816,7 +3816,7 @@ def _ingest_transact(
     if not triples:
         return
     facts_str = "[" + " ".join(triples) + "]"
-    _db_execute(db, f'(transact {facts_str} {{:valid-from "{commit_ts_iso}"}})')
+    _db_execute(db, f'(transact {{:valid-from "{commit_ts_iso}"}} {facts_str})')
 
 
 def _ingest_close(
@@ -3849,7 +3849,7 @@ def _ingest_close(
     facts_str = "[" + " ".join(triples) + "]"
     _db_execute(
         db,
-        f'(transact {facts_str} {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}})',
+        f'(transact {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}} {facts_str})',
     )
 
 
@@ -3891,11 +3891,11 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
         _db_execute(db, f'(retract [[:ingestion/watermark :hash "{existing}"]])')
     _db_execute(
         db,
-        f'(transact [[:ingestion/watermark :entity-type :type/ingestion] '
+        f'(transact {{:valid-from "{commit_ts_iso}"}} '
+        f'[[:ingestion/watermark :entity-type :type/ingestion] '
         f'[:ingestion/watermark :ident ":ingestion/watermark"] '
         f'[:ingestion/watermark :description "git ingestion watermark"] '
-        f'[:ingestion/watermark :hash "{commit_hash}"]] '
-        f'{{:valid-from "{commit_ts_iso}"}})',
+        f'[:ingestion/watermark :hash "{commit_hash}"]])',
     )
 
 
@@ -4493,7 +4493,7 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
                 )
             else:
                 triples = f'[{entity} {attribute} "{value}"]'
-            _db_execute(db, f'(transact [{triples}] {{:valid-from "{now_z}"}})')
+            _db_execute(db, f'(transact {{:valid-from "{now_z}"}} [{triples}])')
             stored += 1
         except MiniGrafError:
             continue
@@ -4735,7 +4735,7 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
             return {"ok": True, "stored_count": 0, "strategy": "agent"}
         _refresh_if_stale()
         db = get_db()
-        _db_execute(db, f'(transact {datalog} {{:valid-from "{valid_at}"}})')
+        _db_execute(db, f'(transact {{:valid-from "{valid_at}"}} {datalog})')
         _db_checkpoint(db)
         _update_mtime()
         # Approximate: count "[:" occurrences as a proxy for triple count.
@@ -5203,7 +5203,7 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
             ]
             if date_raw:
                 triples.append(f'[{tag_ident} :date "{_edn_escape(date_raw)}"]')
-            _db_execute(db, f'(transact [{" ".join(triples)}] {{:valid-from "{run_ts_iso}"}})')
+            _db_execute(db, f'(transact {{:valid-from "{run_ts_iso}"}} [{" ".join(triples)}])')
         except Exception:
             pass  # non-fatal per tag
 
@@ -5896,8 +5896,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     write_executor,
                                     _db_execute,
                                     db,
-                                    f'(transact [[{commit_ident} :parent {parent_ident}]] '
-                                    f'{{:valid-from "{commit_ts_iso}"}})',
+                                    f'(transact {{:valid-from "{commit_ts_iso}"}} '
+                                    f'[[{commit_ident} :parent {parent_ident}]])',
                                 )
                         except Exception:
                             pass  # non-fatal; parent edges are best-effort

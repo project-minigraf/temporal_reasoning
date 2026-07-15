@@ -5010,8 +5010,8 @@ class TestIngestionWrites:
         call_args = db_instance.execute.call_args[0][0]
         assert ':valid-from "2025-03-01T10:00:00Z"' in call_args
         assert ":valid-to" not in call_args
-        # facts vector must come before the options map
-        assert call_args.index("[:module/foo") < call_args.index(":valid-from")
+        # Documented grammar: options map must come BEFORE the fact vector.
+        assert call_args.index(":valid-from") < call_args.index("[:module/foo")
 
     def test_ingest_close_uses_valid_from_and_valid_to(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -5030,8 +5030,8 @@ class TestIngestionWrites:
         call_args = db_instance.execute.call_args[0][0]
         assert ':valid-from "2025-01-01T00:00:00Z"' in call_args
         assert ':valid-to "2025-03-01T10:00:00Z"' in call_args
-        # facts vector must come before the options map
-        assert call_args.index("[:module/foo") < call_args.index(":valid-from")
+        # Documented grammar: options map must come BEFORE the fact vector.
+        assert call_args.index(":valid-from") < call_args.index("[:module/foo")
 
     def test_watermark_update_transacts_hash(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -7219,17 +7219,17 @@ class TestRunIngestionBitemporalClose:
         then also query the real graph to confirm both rename directions
         resolve.
 
-        NOTE on the "as-of before the rename" check the review also asked for:
-        the installed minigraf 1.2.1 does not honour the `:valid-from` /
-        `:valid-to` options passed to `transact` on this code path — every fact
-        is stamped with wall-clock now and `:valid-at "<iso>"` reads cannot
-        observe a historical window (empirically verified). A point-in-time
-        "renamed-to not visible before the rename" query is therefore not
-        expressible against this build, which is *why* the whole suite mocks
-        the DB. We instead assert the equivalent invariant on the real backend:
-        the :renamed-to fact's `:valid-from` equals the RENAME commit's
-        timestamp (so it is introduced at the rename, not before) and it is
-        never emitted with a `:valid-to`.
+        Point-in-time verification: we query the real graph with `:valid-at`
+        at a timestamp BEFORE the rename commit and confirm :renamed-to /
+        :renamed-from are NOT yet visible, then query at the rename commit
+        timestamp and confirm they ARE visible. This is now expressible because
+        the `transact` argument-order bug (options map was passed AFTER the
+        fact vector, so minigraf ignored `:valid-from`/`:valid-to` and stamped
+        every fact with wall-clock now) has been fixed — the options map now
+        correctly precedes the fact vector, matching the documented grammar
+        `(transact {:valid-from ...} [facts...])`. The earlier claim that the
+        historical window "was not honoured by this build" was a symptom of
+        that bug, not a real minigraf limitation.
         """
         import mcp_server
         repo = tmp_path / "repo"
@@ -7297,6 +7297,28 @@ class TestRunIngestionBitemporalClose:
         rf = json.loads(real_execute(db, f"(query [:find ?x :where [{new_module} :renamed-from ?x]])")).get("results", [])
         assert rt == [[new_module]], f"forward :renamed-to must resolve to new module, got {rt}"
         assert rf == [[old_module]], f"reverse :renamed-from must resolve to old module, got {rf}"
+
+        # REAL point-in-time verification (the check the review originally asked
+        # for, now expressible after the transact argument-order fix): the rename
+        # edges become true AT the rename commit, so a :valid-at BEFORE that
+        # commit must NOT observe them, and a :valid-at at the rename commit must.
+        rt_before = json.loads(real_execute(
+            db, f'(query [:find ?x :valid-at "2000-01-01T00:00:00Z" :where [{old_module} :renamed-to ?x]])'
+        )).get("results", [])
+        rf_before = json.loads(real_execute(
+            db, f'(query [:find ?x :valid-at "2000-01-01T00:00:00Z" :where [{new_module} :renamed-from ?x]])'
+        )).get("results", [])
+        assert rt_before == [], f":renamed-to must NOT be visible before the rename commit, got {rt_before}"
+        assert rf_before == [], f":renamed-from must NOT be visible before the rename commit, got {rf_before}"
+
+        rt_at = json.loads(real_execute(
+            db, f'(query [:find ?x :valid-at "{rename_commit_ts}" :where [{old_module} :renamed-to ?x]])'
+        )).get("results", [])
+        rf_at = json.loads(real_execute(
+            db, f'(query [:find ?x :valid-at "{rename_commit_ts}" :where [{new_module} :renamed-from ?x]])'
+        )).get("results", [])
+        assert rt_at == [[new_module]], f":renamed-to must be visible at the rename commit, got {rt_at}"
+        assert rf_at == [[old_module]], f":renamed-from must be visible at the rename commit, got {rf_at}"
 
         mcp_server._db = None  # release the real file lock for subsequent tests
 
@@ -7485,6 +7507,60 @@ def git_repo_with_dep_removal(tmp_path):
     _subprocess.run(["git", "commit", "-m", "remove import"], cwd=repo, check=True, capture_output=True)
 
     return repo
+
+
+class TestTransactValidTimeArgumentOrder:
+    """Regression tests for the transact argument-order bug.
+
+    minigraf's documented grammar is `(transact {options} [facts...])` — the
+    valid-time options map MUST precede the fact vector. Every valid-time-bounded
+    transact in mcp_server.py historically emitted the reversed order
+    `(transact [facts...] {options})`, which minigraf silently ignored: the fact
+    was stamped with wall-clock now instead of the intended window. This meant a
+    "closed" (bounded) fact stayed visible in current-time queries forever, and
+    `:valid-at` point-in-time reads could never observe the intended window.
+
+    These tests run against a REAL temp minigraf .graph file (no MiniGrafDb mock)
+    and prove the fixed order behaves exactly as documented.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bounded_window_honoured_against_real_graph(self, tmp_path):
+        """Transact a fact with a bounded historical valid window and confirm:
+        (a) a default/current-time query does NOT see it,
+        (b) a :valid-at WITHIN the window DOES see it,
+        (c) a :valid-at BEFORE the window does NOT see it.
+        """
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(tmp_path / "vt.graph"))
+        db = mcp_server.get_db()
+
+        try:
+            # Bounded historical window: valid 2020-01-01 .. 2021-01-01 only.
+            mcp_server._db_execute(
+                db,
+                '(transact {:valid-from "2020-01-01T00:00:00Z" '
+                ':valid-to "2021-01-01T00:00:00Z"} [[:alice :employment/status :active]])',
+            )
+
+            def q(extra=""):
+                raw = mcp_server._db_execute(
+                    db, f"(query [:find ?s {extra} :where [:alice :employment/status ?s]])"
+                )
+                return json.loads(raw).get("results", [])
+
+            # (a) current time is AFTER the closed window -> not visible.
+            assert q() == [], "closed bounded fact must NOT appear in a current-time query"
+            # (b) point-in-time inside the window -> visible.
+            assert q(':valid-at "2020-06-01T00:00:00Z"') == [[":active"]], \
+                "fact must be visible at a :valid-at inside its window"
+            # (c) point-in-time before the window -> not visible.
+            assert q(':valid-at "2019-06-01T00:00:00Z"') == [], \
+                "fact must NOT be visible at a :valid-at before its window"
+        finally:
+            mcp_server._db = None  # release the real file lock for subsequent tests
 
 
 class TestRunIngestionBitemporalDeps:
