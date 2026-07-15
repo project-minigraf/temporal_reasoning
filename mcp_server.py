@@ -2393,7 +2393,12 @@ def _extract_from_source(
 
 
 def _match_candidate_pair(
-    old_node: Any, new_node: Any, tracked_names: Dict[str, Optional[str]]
+    old_node: Any,
+    new_node: Any,
+    tracked_names: Dict[str, Optional[str]],
+    tracked_reserved: Optional[Dict[str, int]] = None,
+    exclude_names: Tuple[str, ...] = (),
+    exclude_reserved: Tuple[str, ...] = (),
 ) -> Optional[Dict[str, str]]:
     """Lockstep-walk two tree-sitter nodes, allowing local (untracked)
     identifiers to differ under a one-to-one bijective mapping.
@@ -2412,23 +2417,39 @@ def _match_candidate_pair(
     the bijection happens to be the identity mapping), or None if the nodes
     don't match structurally or a tracked/bijection constraint is violated.
 
-    Internally, `mapping`/`reverse` record EVERY local identifier
+    Internally, `mapping`/`local_reverse` record EVERY local identifier
     correspondence seen (including identity ones, e.g. an untouched
     parameter name) so consistency and injectivity can be enforced across
-    the whole pair. `reverse` is seeded up front with every tracked entity's
-    new-side text (its confirmed rename target, or its own unchanged name
-    when tracked_names[name] is None) — otherwise a local/untracked
-    identifier could silently claim the exact new text already reserved for
-    a different, tracked entity, which is a real injectivity violation (two
-    distinct old tokens collapsing onto one new token) that the tracked-name
-    equality check alone doesn't catch since it lives in a disjoint
-    namespace from `mapping`/`reverse`.
+    the whole pair. Injectivity against *tracked* entities is enforced
+    separately via `tracked_reserved`, a multiset {new-side-token: count}
+    covering every tracked entity's new-side text (its confirmed rename
+    target, or its own unchanged name when tracked_names[name] is None) —
+    otherwise a local/untracked identifier could silently claim the exact
+    new text already reserved for a different, tracked entity, which is a
+    real injectivity violation (two distinct old tokens collapsing onto one
+    new token) that the tracked-name equality check alone doesn't catch
+    since it lives in a disjoint namespace from `mapping`.
+
+    Performance (see the O(n^3) matcher fix): tracked_names/tracked_reserved
+    are built ONCE per matching round by _match_renamed_entities and passed
+    in read-only, rather than reconstructed per candidate pair. The pair's
+    own two names are excluded cheaply via exclude_names (skip the tracked
+    equality constraint — they are exactly what's under test) and
+    exclude_reserved (their reserved new-side tokens, decremented from the
+    multiset so the pair may legitimately map onto them). Both are tiny
+    (<=2 entries), so exclusion is O(1) per identifier instead of an
+    O(all_names) dict rebuild per pair. When tracked_reserved is None it is
+    derived from tracked_names (the standalone/test call path); production
+    callers pass it precomputed.
     """
+    if tracked_reserved is None:
+        tracked_reserved = {}
+        for name, target in tracked_names.items():
+            tok = target if target is not None else name
+            tracked_reserved[tok] = tracked_reserved.get(tok, 0) + 1
+
     mapping: Dict[str, str] = {}
-    reverse: Dict[str, str] = {
-        (target if target is not None else name): name
-        for name, target in tracked_names.items()
-    }
+    local_reverse: Dict[str, str] = {}
 
     def walk(a: Any, b: Any) -> bool:
         if a.type != b.type:
@@ -2437,15 +2458,22 @@ def _match_candidate_pair(
             a_text = a.text.decode("utf-8", "replace")
             b_text = b.text.decode("utf-8", "replace")
             if a.type == "identifier" or a.type.endswith("_identifier"):
-                if a_text in tracked_names:
+                if a_text in tracked_names and a_text not in exclude_names:
                     expected = tracked_names[a_text]
                     return b_text == (expected if expected is not None else a_text)
                 if a_text in mapping:
                     return mapping[a_text] == b_text
-                if b_text in reverse:
+                if b_text in local_reverse:
+                    return False
+                # Injectivity vs tracked entities: b_text may not claim a
+                # new-side token already reserved by a tracked name, EXCEPT
+                # the (<=2) reserved tokens belonging to this pair's own
+                # excluded names.
+                reserved = tracked_reserved.get(b_text, 0) - exclude_reserved.count(b_text)
+                if reserved > 0:
                     return False
                 mapping[a_text] = b_text
-                reverse[b_text] = a_text
+                local_reverse[b_text] = a_text
                 return True
             return a_text == b_text
         if a.child_count != b.child_count:
@@ -2457,6 +2485,12 @@ def _match_candidate_pair(
 
 _MAX_MATCH_ROUNDS = 10
 _MIN_MATCH_BODY_LEN = 20  # normalized chars; avoids matching trivial boilerplate stubs
+# Above this total pool size (removed + added entries across all categories)
+# the matcher skips a commit entirely, mirroring git's own `-M` rename-limit
+# degradation: a missed rename is the accepted fallback, never an unbounded
+# (~cubic) stall on a 20k+-file vendored-dependency commit. Overridable via
+# MINIGRAF_MATCH_MAX_POOL, following the env-var pattern used elsewhere here.
+_MAX_MATCH_POOL_SIZE = int(os.environ.get("MINIGRAF_MATCH_MAX_POOL", "3000"))
 
 
 def _normalize_body_for_matching(text: str) -> str:
@@ -2540,6 +2574,14 @@ def _match_renamed_entities(
     # a token in any body text — only its bare leaf does.
     confirmed: Dict[str, str] = {}  # bare old_name -> bare new_name, shared across all categories
 
+    # Pool-size guard: above _MAX_MATCH_POOL_SIZE total entries the pairwise
+    # scan (inherently O(removed x added) per category per round) is skipped
+    # outright, mirroring git's -M rename-limit degradation. A missed rename
+    # is the accepted fallback; the entity is simply treated as removed+added.
+    total_pool = sum(len(v) for v in removed.values()) + sum(len(v) for v in added.values())
+    if total_pool > _MAX_MATCH_POOL_SIZE:
+        return matches
+
     all_names: set = set(unchanged_names or ())
     for pool in (removed, added):
         for category, entries in pool.items():
@@ -2551,10 +2593,18 @@ def _match_renamed_entities(
         # else None ("must match exactly"). Unchanged-tracked names (folded
         # into all_names above) therefore default to None unless a genuine
         # rename was confirmed for them this round, in which case confirmed
-        # wins.
+        # wins. Both tracked_names and its derived new-side reserved-token
+        # multiset are built ONCE per round and passed read-only into every
+        # _match_candidate_pair call — the pair's own two names are excluded
+        # cheaply per-pair (see below) instead of rebuilding an O(all_names)
+        # dict per candidate, which was the cubic term in the old code.
         tracked_names: Dict[str, Optional[str]] = {
             name: confirmed.get(name) for name in all_names
         }
+        tracked_reserved: Dict[str, int] = {}
+        for name, target in tracked_names.items():
+            tok = target if target is not None else name
+            tracked_reserved[tok] = tracked_reserved.get(tok, 0) + 1
         for category in list(removed.keys()):
             r_list = removed.get(category, [])
             a_list = added.get(category, [])
@@ -2566,28 +2616,54 @@ def _match_renamed_entities(
                 # body (equal to the pool key for non-field categories). Used
                 # for self-exclusion below so the walker treats the pair's own
                 # name as free/under-test, never as an inherited constraint.
+                # Its reserved new-side token (own confirmed target, else the
+                # name itself) is excluded from the injectivity multiset for
+                # the same reason.
                 r_match_name = _match_body_name(category, r_name)
+                r_reserved_token = confirmed.get(r_match_name, r_match_name)
                 candidates = []
                 for a_name, a_node in a_list:
                     a_match_name = _match_body_name(category, a_name)
+                    a_reserved_token = confirmed.get(a_match_name, a_match_name)
                     # Exclude this specific pair's own old/new names from the
-                    # tracked set: they are exactly what's under test here
-                    # (is r_name renamed to a_name?), not an already-known
-                    # constraint. Without this, an unconfirmed entity's own
-                    # name would be treated as "must stay unchanged" and no
-                    # rename could ever be confirmed for it. Excluding by BARE
-                    # name (not the qualified pool key) is essential for fields:
-                    # the body token is the bare leaf, so excluding "A.Config"
-                    # would leave the field's own "Config" token still bound to
-                    # an unrelated confirmed "Config"->... rename (the false
-                    # positive this fix closes).
-                    pair_tracked_names = {
-                        name: target
-                        for name, target in tracked_names.items()
-                        if name != r_match_name and name != a_match_name
-                    }
-                    if _match_candidate_pair(r_node, a_node, pair_tracked_names) is not None:
+                    # tracked-equality constraint and their reserved tokens
+                    # from the injectivity multiset: they are exactly what's
+                    # under test here (is r_name renamed to a_name?), not an
+                    # already-known constraint. Without this, an unconfirmed
+                    # entity's own name would be treated as "must stay
+                    # unchanged" and no rename could ever be confirmed for it.
+                    # Excluding by BARE name (not the qualified pool key) is
+                    # essential for fields: the body token is the bare leaf, so
+                    # excluding "A.Config" would leave the field's own "Config"
+                    # token still bound to an unrelated confirmed
+                    # "Config"->... rename (the false positive this closes).
+                    try:
+                        matched = _match_candidate_pair(
+                            r_node,
+                            a_node,
+                            tracked_names,
+                            tracked_reserved=tracked_reserved,
+                            exclude_names=(r_match_name, a_match_name),
+                            exclude_reserved=(r_reserved_token, a_reserved_token),
+                        )
+                    except RecursionError:
+                        # A single pathological pair — an AST deep enough to
+                        # survive _collect_entity_nodes but blow the recursion
+                        # limit inside the pair walk (which uses more stack per
+                        # level) — must degrade to no-match for THIS pair only,
+                        # not abort the whole commit's matching (and, via
+                        # _extract_commit's outer propagation, the entire
+                        # ingestion run). Skip it and keep testing the rest.
+                        continue
+                    if matched is not None:
                         candidates.append((a_name, a_node))
+                        # Ambiguity is already certain at 2 candidates: the
+                        # match is only kept when exactly one survives, so
+                        # walking the 3rd, 4th, ... against this same removed
+                        # entry is pure wasted work. Bail the inner scan (never
+                        # the outer removed-entries loop).
+                        if len(candidates) >= 2:
+                            break
                 if len(candidates) == 1:
                     a_name, a_node = candidates[0]
                     # Returned pair keeps the QUALIFIED pool keys (r_name/a_name)

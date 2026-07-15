@@ -3536,6 +3536,94 @@ class TestMatchRenamedEntities:
         projected = [(c, o, n) for c, o, _, n, _ in matches]
         assert projected == [("function", "process_old", "process_new")]
 
+    def test_pathological_nesting_degrades_to_no_match_not_recursionerror(self):
+        """P2 (second-pass): a pair whose AST is deep enough to survive
+        _collect_entity_nodes but blow the recursion limit inside
+        _match_candidate_pair's walk() must degrade to no-match for that pair,
+        never raise RecursionError out of _match_renamed_entities (which would
+        propagate out of _extract_commit and abort the whole ingestion run).
+
+        Depth 600 was found empirically to pass collection while breaking the
+        matcher walk pre-fix (300-400 pass both; 500+ break the matcher).
+        """
+        import mcp_server
+        depth = 600
+        nested = "(" * depth + "1" + ")" * depth
+        old = self._parse_fn(f"def f(a):\n    x = {nested}\n    return x\n")
+        new = self._parse_fn(f"def g(a):\n    x = {nested}\n    return x\n")
+        # Sanity: collection survives this depth (so the nodes ARE pooled).
+        old_root = mcp_server._get_parser("test.py").parse(
+            f"def f(a):\n    x = {nested}\n    return x\n".encode()
+        ).root_node
+        assert "f" in mcp_server._collect_entity_nodes(old_root, "python")["function"]
+        removed = {"function": [("f", old)]}
+        added = {"function": [("g", new)]}
+        # Must not raise; the pathological pair simply isn't matched.
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert matches == []
+
+    def test_pathological_pair_does_not_discard_other_commit_matches(self):
+        """Per-pair RecursionError isolation: a pathological pair in the pool
+        must not prevent an unrelated, well-formed rename in the same pool from
+        being confirmed."""
+        import mcp_server
+        depth = 600
+        nested = "(" * depth + "1" + ")" * depth
+        bad_old = self._parse_fn(f"def bad_old(a):\n    x = {nested}\n    return x\n")
+        bad_new = self._parse_fn(f"def bad_new(a):\n    x = {nested}\n    return x\n")
+        good_old = self._parse_fn("def foo(x):\n    return x + 1\n")
+        good_new = self._parse_fn("def bar(x):\n    return x + 1\n")
+        removed = {"function": [("bad_old", bad_old), ("foo", good_old)]}
+        added = {"function": [("bad_new", bad_new), ("bar", good_new)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        projected = [(c, o, n) for c, o, _, n, _ in matches]
+        assert ("function", "foo", "bar") in projected
+
+    def test_pool_size_cap_skips_matching(self, monkeypatch):
+        """P2 (second-pass): above _MAX_MATCH_POOL_SIZE total entries the
+        matcher skips entirely (git -M rename-limit style degradation) rather
+        than paying the ~cubic pairwise cost on a giant vendored-dependency
+        commit. A rename that WOULD match under a normal pool is left
+        unmatched once the cap is exceeded."""
+        import mcp_server
+        old = self._parse_fn("def foo(x):\n    return x + 1\n")
+        new = self._parse_fn("def bar(x):\n    return x + 1\n")
+        removed = {"function": [("foo", old)]}
+        added = {"function": [("bar", new)]}
+        # Sanity: matches under the default cap.
+        assert len(mcp_server._match_renamed_entities(
+            {"function": [("foo", old)]}, {"function": [("bar", new)]}
+        )) == 1
+        monkeypatch.setattr(mcp_server, "_MAX_MATCH_POOL_SIZE", 1)
+        assert mcp_server._match_renamed_entities(removed, added) == []
+        # Pools are left untouched when matching is skipped.
+        assert removed["function"] == [("foo", old)]
+        assert added["function"] == [("bar", new)]
+
+    def test_matcher_growth_is_bounded_not_cubic(self):
+        """P2 (second-pass) performance regression guard. The per-pair
+        O(all_names) dict rebuild (the cubic term) is gone; a 600x600 pool of
+        realistic small functions must complete well within a generous bound.
+        Pre-fix a 600x600 pool took ~32s (and grew ~cubically); post-fix it is
+        ~5s. The 12s bound is chosen to sit cleanly between the two — loose
+        enough to stay non-flaky on slower CI, tight enough that a regression
+        back to the cubic rebuild (which would blow past ~30s) fails here."""
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+        n = 600
+        removed = {"function": [], "class": [], "variable": [], "field": []}
+        added = {"function": [], "class": [], "variable": [], "field": []}
+        for i in range(n):
+            src_o = f"def old_{i}(a, b):\n    total = a + b + {i}\n    return total * a\n"
+            src_n = f"def new_{i}(a, b):\n    total = a + b + {i}\n    return total * a\n"
+            removed["function"].append((f"old_{i}", parser.parse(src_o.encode()).root_node.children[0]))
+            added["function"].append((f"new_{i}", parser.parse(src_n.encode()).root_node.children[0]))
+        start = time.perf_counter()
+        matches = mcp_server._match_renamed_entities(removed, added)
+        elapsed = time.perf_counter() - start
+        assert len(matches) == n
+        assert elapsed < 12.0, f"600x600 matcher took {elapsed:.2f}s (expected ~5s; cubic regression?)"
+
 
 class TestCollectEntityNodes:
     def test_collects_function_and_class_nodes_by_name(self):
@@ -4513,6 +4601,56 @@ class TestExtractCommit:
         status, file_path, extracted, precomputed, old_path = results[0]
         assert status == "A"
         assert file_path == "deep.py"
+        assert renamed_pairs == []
+
+    def test_matcher_side_pathological_nesting_does_not_abort_commit(self, tmp_path):
+        """P2 (second-pass): the `_match_renamed_entities` call in
+        _extract_commit was outside any try/except, and
+        _match_candidate_pair's walk uses more stack per AST level than
+        _collect_entity_nodes. A file whose AST depth SURVIVES collection (so
+        its nodes ARE pooled) can still blow the recursion limit inside the
+        pair walk, raising RecursionError that escapes _extract_commit and
+        aborts the whole ingestion run.
+
+        Reproduced with an in-place function rename of a body whose parenthesis
+        nesting (depth 600) passes collection on both sides but breaks the
+        matcher walk pre-fix. The commit must still process and _extract_commit
+        must still return, degrading to no confirmed rename for that pair.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        nested = "(" * 600 + "1" + ")" * 600
+        (repo / "svc.py").write_text(f"def handler_old(a):\n    x = {nested}\n    return x\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "v1"], cwd=repo, check=True, capture_output=True)
+        # Same file, function renamed in place (structurally identical body) ->
+        # the deep node lands in BOTH removed and added pools for this "M"
+        # commit, so the matcher walks it.
+        (repo / "svc.py").write_text(f"def handler_new(a):\n    x = {nested}\n    return x\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "v2"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+
+        # Sanity: collection survives on both sides (nodes ARE pooled) so the
+        # failure, if any, is inside the matcher walk — not collection.
+        parser = mcp_server._get_parser("svc.py")
+        for h in (commits[0][0], commits[1][0]):
+            content = mcp_server._git_file_content(str(repo), h, "svc.py")
+            tree = parser.parse(content)
+            mcp_server._collect_entity_nodes(tree.root_node, "python")  # must not raise
+
+        # Must not raise RecursionError; commit processes, no confirmed rename.
+        results, gitlink_changes, gitmodules_map, renamed_pairs = mcp_server._extract_commit(
+            str(repo), commits[1][0]
+        )
+        assert len(results) == 1
+        assert results[0][0] == "M"
+        assert results[0][1] == "svc.py"
         assert renamed_pairs == []
 
 
