@@ -3790,12 +3790,21 @@ def _build_close_triples(
     ident: str,
     description: str,
     module_ident: str,
+    extra_contains_parent: Optional[str] = None,
 ) -> List[str]:
     """Return triple strings needed to bi-temporally close an entity.
 
     Closes :ident (canonical existence fact), :description (with real value),
     and the parent module's :contains edge.  The module's own :contains triple
     is omitted when ident == module_ident (modules have no parent module here).
+
+    extra_contains_parent closes a SECOND :contains edge alongside the module's
+    one.  Fields with a real (extracted) owning class carry two containment
+    parents — [module :contains field] AND [class :contains field] (see
+    _precompute_file_triples) — so both must be retracted when the field closes,
+    or the class-contains edge leaks open forever.  Callers pass the field's
+    class ident here (from field_class_ident); it is ignored when None or equal
+    to ident/module_ident so non-field close sites are unaffected.
     """
     triples = [
         f'[{ident} :ident "{_edn_escape(ident)}"]',
@@ -3803,6 +3812,12 @@ def _build_close_triples(
     ]
     if ident != module_ident:
         triples.append(f"[{module_ident} :contains {ident}]")
+    if (
+        extra_contains_parent is not None
+        and extra_contains_parent != ident
+        and extra_contains_parent != module_ident
+    ):
+        triples.append(f"[{extra_contains_parent} :contains {ident}]")
     return triples
 
 
@@ -4862,21 +4877,37 @@ def _precompute_file_triples(
         ]))
 
     field_entries: List[Tuple[str, str, List[str]]] = []
+    # field_ident -> owning class_ident, but ONLY for fields whose owning class
+    # is genuinely extracted as a :type/class entity in this same file. Threaded
+    # to close sites via field_class_ident so the class-contains edge is retracted
+    # when the field closes.
+    field_class_map: Dict[str, str] = {}
+    extracted_class_names = set(extracted.get("classes", []))
     for field_name, owning_class, is_static in extracted.get("fields", []):
         qualified_name = f"{owning_class}.{field_name}"
         field_ident = _code_ident("field", file_path, qualified_name)
-        class_ident = _code_ident("class", file_path, owning_class)
         static_literal = "true" if is_static else "false"
-        field_entries.append((field_ident, qualified_name, [
+        candidate_triples = [
             f"[{field_ident} :entity-type :type/field]",
             f'[{field_ident} :ident "{field_ident}"]',
             f'[{field_ident} :description "{_edn_escape(qualified_name)}"]',
             f'[{field_ident} :file "{_edn_escape(file_path)}"]',
-            f"[{field_ident} :class {class_ident}]",
             f"[{field_ident} :static {static_literal}]",
             f"[{module_ident} :contains {field_ident}]",
             f"[{field_ident} :introduced-by {commit_ident}]",
-        ]))
+        ]
+        # Only emit class-level linkage (:class edge + class :contains edge) when
+        # the owning class is a real extracted :type/class entity. Otherwise the
+        # owner name (e.g. an Elixir defmodule attribute or a Haskell newtype) is
+        # never opened as a class, so a :class edge would dangle and a class
+        # :contains edge would point at a nonexistent parent. Module containment
+        # alone is kept in that case (see issues.md P2 findings).
+        if owning_class in extracted_class_names:
+            class_ident = _code_ident("class", file_path, owning_class)
+            candidate_triples.append(f"[{field_ident} :class {class_ident}]")
+            candidate_triples.append(f"[{class_ident} :contains {field_ident}]")
+            field_class_map[field_ident] = class_ident
+        field_entries.append((field_ident, qualified_name, candidate_triples))
 
     resolved_imports: List[Tuple[str, str, bool]] = []
     for import_name in set(extracted.get("imports", [])):
@@ -4892,6 +4923,7 @@ def _precompute_file_triples(
         "class_entries": class_entries,
         "global_entries": global_entries,
         "field_entries": field_entries,
+        "field_class_map": field_class_map,
         "resolved_imports": resolved_imports,
     }
 
@@ -4905,6 +4937,7 @@ def _build_code_triples(
     file_entities: Dict[str, List[str]],
     commit_ident: str,
     precomputed: Dict[str, Any],
+    field_class_ident: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Return Datalog triple strings for a file's extracted code entities.
 
@@ -4927,6 +4960,7 @@ def _build_code_triples(
     """
     triples: List[str] = []
     module_ident = precomputed["module_ident"]
+    field_class_map = precomputed.get("field_class_map", {})
 
     is_new_module = module_ident not in entity_valid_from
     # Track all idents for this file (for deletion cleanup)
@@ -4981,6 +5015,11 @@ def _build_code_triples(
                 idents_for_file.append(field_ident)
             entity_valid_from[field_ident] = commit_ts_iso
             entity_descriptions[field_ident] = field_name
+            # Record the field's real owning-class parent so every close path
+            # can retract the [class :contains field] edge alongside the module
+            # one. Only fields with an extracted owning class appear in the map.
+            if field_class_ident is not None and field_ident in field_class_map:
+                field_class_ident[field_ident] = field_class_map[field_ident]
         else:
             triples.append(f"[{field_ident} :modified-in {commit_ident}]")
 
@@ -5048,6 +5087,35 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
             pass
 
     return entity_valid_from, entity_descriptions, file_entities
+
+
+def _preload_field_class_idents(db: Any) -> Dict[str, str]:
+    """Reload field_ident -> owning class_ident for every field with a live :class edge.
+
+    A field only carries a :class edge when its owning class was genuinely
+    extracted as a :type/class entity (see _precompute_file_triples). Without
+    this reload, field_class_ident starts empty on every restart, so a field
+    introduced in an earlier run would have its [class :contains field] edge
+    silently leaked open when a later run closes the field (its module-contains
+    edge would still close, but not the class one). Current-time query semantics
+    naturally exclude already-closed fields' edges.
+    """
+    field_class_ident: Dict[str, str] = {}
+    try:
+        # Bind the field's :ident object (the canonical ":field/…" string), not
+        # the subject variable — minigraf returns an internal UUID for a subject
+        # in find position, whereas close sites key field_class_ident by the same
+        # ident string _code_ident produces. This mirrors _preload_known_entities.
+        raw = _db_execute(
+            db,
+            "(query [:find ?fi ?c :where "
+            "[?f :entity-type :type/field] [?f :ident ?fi] [?f :class ?c]])",
+        )
+        for field_ident, class_ident in json.loads(raw).get("results", []):
+            field_class_ident[field_ident] = class_ident
+    except Exception:
+        pass
+    return field_class_ident
 
 
 _VALID_TIME_FOREVER_MS = (1 << 63) - 1  # minigraf's i64::MAX "still open" :valid-to sentinel
@@ -5171,9 +5239,11 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
     file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
     pinned_commit_state = _preload_pinned_commits(db)
+    field_class_ident = _preload_field_class_idents(db)
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
         file_entities, file_deps, dep_valid_from, pinned_commit_state,
+        field_class_ident,
     )
 
 
@@ -5519,6 +5589,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             (
                 watermark, prior_ingested, entity_valid_from, entity_descriptions,
                 file_entities, file_deps, dep_valid_from, pinned_commit_state,
+                field_class_ident,
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`
@@ -5661,7 +5732,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     orig_ts = entity_valid_from.get(ident, commit_ts_iso)
                                     desc = entity_descriptions.get(ident, "")
                                     close_items.append(
-                                        (_build_close_triples(ident, desc, module_ident), orig_ts)
+                                        (_build_close_triples(
+                                            ident, desc, module_ident,
+                                            field_class_ident.get(ident),
+                                        ), orig_ts)
                                     )
                                 # Close all :depends-on edges for the deleted module
                                 for dep_ident in file_deps.get(file_path, set()):
@@ -5692,6 +5766,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 triples = _build_code_triples(
                                     file_path, extracted, commit_ts_iso, entity_valid_from,
                                     entity_descriptions, file_entities, commit_ident, precomputed,
+                                    field_class_ident,
                                 )
                                 add_triples.extend(triples)
                                 # Detect entities removed from a modified file.
@@ -5728,7 +5803,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         orig_ts = entity_valid_from.get(ident, commit_ts_iso)
                                         desc = entity_descriptions.get(ident, "")
                                         close_items.append(
-                                            (_build_close_triples(ident, desc, module_ident), orig_ts)
+                                            (_build_close_triples(
+                                                ident, desc, module_ident,
+                                                field_class_ident.get(ident),
+                                            ), orig_ts)
                                         )
                                 # Compute dep edges for this file and diff against previous.
                                 # Resolution itself already happened in _extract_commit
@@ -5776,7 +5854,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             old_module_ident = _code_ident("module", old_file)
                             orig_ts = entity_valid_from.get(old_ident, commit_ts_iso)
                             close_items.append((
-                                _build_close_triples(old_ident, old_desc, old_module_ident),
+                                _build_close_triples(
+                                    old_ident, old_desc, old_module_ident,
+                                    field_class_ident.get(old_ident),
+                                ),
                                 orig_ts,
                             ))
 
@@ -5803,7 +5884,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     orig_ts = entity_valid_from.get(ident, commit_ts_iso)
                                     desc = entity_descriptions.get(ident, "")
                                     close_items.append(
-                                        (_build_close_triples(ident, desc, r_old_module_ident), orig_ts)
+                                        (_build_close_triples(
+                                            ident, desc, r_old_module_ident,
+                                            field_class_ident.get(ident),
+                                        ), orig_ts)
                                     )
                                 for dep_ident in file_deps.get(r_old_path, set()):
                                     orig_ts = dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)

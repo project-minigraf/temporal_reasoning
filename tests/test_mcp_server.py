@@ -5424,6 +5424,152 @@ class TestPrecomputeGlobalsAndFields:
         assert f"[{ident} :class {class_ident}]" in triples
 
 
+class TestFieldClassContainment:
+    """Fields owned by a real (extracted) class get BOTH module- and
+    class-containment plus a :class edge; fields whose reported owner is not a
+    real extracted class fall back to module-only containment with no dangling
+    :class or class-contains edge (issues.md P2 findings)."""
+
+    def _parser(self, module_name, lang_key):
+        import mcp_server
+        import tree_sitter
+        import importlib
+        grammar_mod = importlib.import_module(module_name)
+        mcp_server._grammar_cache.clear()
+        real_lang = tree_sitter.Language(grammar_mod.language())
+        real_parser = tree_sitter.Parser(real_lang)
+        mcp_server._grammar_cache[lang_key] = real_parser
+        return real_parser
+
+    def test_real_class_field_gets_both_contains_and_class_edge(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": ["Foo"], "imports": [], "calls": [],
+            "globals": [], "fields": [("bar", "Foo", True)],
+        }
+        result = mcp_server._precompute_file_triples(
+            "models.py", extracted, ":commit/c1", {}, segment_index=None,
+        )
+        field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
+        module_ident = mcp_server._code_ident("module", "models.py")
+        class_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        _, _, triples = result["field_entries"][0]
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert f"[{class_ident} :contains {field_ident}]" in triples
+        assert f"[{field_ident} :class {class_ident}]" in triples
+        assert result["field_class_map"] == {field_ident: class_ident}
+
+    def test_field_with_no_extracted_owner_class_is_module_only(self):
+        import mcp_server
+        # owner "Ghost" is NOT in classes -> no :class, no class-contains edge.
+        extracted = {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "globals": [], "fields": [("attr", "Ghost", True)],
+        }
+        result = mcp_server._precompute_file_triples(
+            "x.py", extracted, ":commit/c1", {}, segment_index=None,
+        )
+        field_ident = mcp_server._code_ident("field", "x.py", "Ghost.attr")
+        module_ident = mcp_server._code_ident("module", "x.py")
+        class_ident = mcp_server._code_ident("class", "x.py", "Ghost")
+        _, _, triples = result["field_entries"][0]
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert all(":class " not in t for t in triples)
+        assert f"[{class_ident} :contains {field_ident}]" not in triples
+        assert result["field_class_map"] == {}
+
+    def test_elixir_module_attribute_falls_back_to_module_only(self):
+        import mcp_server
+        parser = self._parser("tree_sitter_elixir", "elixir")
+        extracted = mcp_server._extract_from_source(
+            b"defmodule Foo do\n  @attr 1\nend\n", parser, "foo.ex",
+        )
+        # Confirm the reproduction from issues.md: field extracted, no class.
+        assert extracted["fields"] == [("attr", "Foo", True)]
+        assert extracted["classes"] == []
+        result = mcp_server._precompute_file_triples(
+            "foo.ex", extracted, ":commit/c1", {}, segment_index=None,
+        )
+        field_ident = mcp_server._code_ident("field", "foo.ex", "Foo.attr")
+        module_ident = mcp_server._code_ident("module", "foo.ex")
+        class_ident = mcp_server._code_ident("class", "foo.ex", "Foo")
+        _, _, triples = result["field_entries"][0]
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert all(":class " not in t for t in triples)
+        assert f"[{class_ident} :contains {field_ident}]" not in triples
+        assert result["field_class_map"] == {}
+
+    def test_haskell_newtype_field_falls_back_to_module_only(self):
+        import mcp_server
+        parser = self._parser("tree_sitter_haskell", "haskell")
+        extracted = mcp_server._extract_from_source(
+            b"newtype Foo = Foo { unFoo :: Int }\n", parser, "foo.hs",
+        )
+        assert extracted["fields"] == [("unFoo", "Foo", False)]
+        assert extracted["classes"] == []
+        result = mcp_server._precompute_file_triples(
+            "foo.hs", extracted, ":commit/c1", {}, segment_index=None,
+        )
+        field_ident = mcp_server._code_ident("field", "foo.hs", "Foo.unFoo")
+        module_ident = mcp_server._code_ident("module", "foo.hs")
+        class_ident = mcp_server._code_ident("class", "foo.hs", "Foo")
+        _, _, triples = result["field_entries"][0]
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert all(":class " not in t for t in triples)
+        assert f"[{class_ident} :contains {field_ident}]" not in triples
+        assert result["field_class_map"] == {}
+
+    def test_build_code_triples_populates_field_class_ident(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": ["Foo"], "imports": [], "calls": [],
+            "globals": [], "fields": [("bar", "Foo", True)],
+        }
+        precomputed = mcp_server._precompute_file_triples("models.py", extracted, ":commit/c1", {})
+        field_class_ident = {}
+        mcp_server._build_code_triples(
+            "models.py", extracted, "2024-01-01T00:00:00Z", {}, {}, {}, ":commit/c1",
+            precomputed, field_class_ident,
+        )
+        field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
+        class_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        assert field_class_ident == {field_ident: class_ident}
+
+    def test_build_code_triples_omits_field_class_ident_for_dangling_owner(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "globals": [], "fields": [("attr", "Ghost", True)],
+        }
+        precomputed = mcp_server._precompute_file_triples("x.py", extracted, ":commit/c1", {})
+        field_class_ident = {}
+        mcp_server._build_code_triples(
+            "x.py", extracted, "2024-01-01T00:00:00Z", {}, {}, {}, ":commit/c1",
+            precomputed, field_class_ident,
+        )
+        assert field_class_ident == {}
+
+    def test_close_triples_retracts_extra_class_contains_edge(self):
+        import mcp_server
+        field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
+        module_ident = mcp_server._code_ident("module", "models.py")
+        class_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        triples = mcp_server._build_close_triples(
+            field_ident, "Foo.bar", module_ident, class_ident,
+        )
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert f"[{class_ident} :contains {field_ident}]" in triples
+
+    def test_close_triples_ignores_none_extra_parent(self):
+        import mcp_server
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        triples = mcp_server._build_close_triples(fn_ident, "login", module_ident, None)
+        # Only the module-contains edge, no phantom extra :contains.
+        contains = [t for t in triples if ":contains" in t]
+        assert contains == [f"[{module_ident} :contains {fn_ident}]"]
+
+
 class TestBuildCodeTriplesGlobalsAndFields:
     def test_new_global_writes_full_triples(self):
         import mcp_server
@@ -8547,3 +8693,82 @@ def test_schema_has_variable_and_field_types():
     field_optional = mcp_server.MINIGRAF_SCHEMA["field"]["optional"]
     assert field_optional[":static"] is bool
     assert field_optional[":class"] is str
+
+
+class TestFieldClassContainmentE2E:
+    """Real-backend (non-mocked) end-to-end test: a class field is queryable via
+    the class's :contains edge in the live graph, and that edge is closed when
+    the field is removed (issues.md P2: "add a graph-level test asserting a
+    class's :contains set includes its fields" + close-logic verification)."""
+
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, msg):
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def _query(self, path, q):
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(path)
+        try:
+            return json.loads(db.execute(q)).get("results", [])
+        finally:
+            del db
+
+    def test_class_contains_field_is_queryable_and_closed_on_removal(self, tmp_path, monkeypatch):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+
+        # Commit 1: a class with a field.
+        (repo / "models.py").write_text("class Account:\n    balance = 0\n")
+        self._commit(repo, "add Account")
+
+        graph_path = str(tmp_path / "e2e.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph_path)
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+
+        asyncio.run(mcp_server._run_ingestion(str(repo), "HEAD"))
+        mcp_server._db = None
+
+        class_ident = mcp_server._code_ident("class", "models.py", "Account")
+        field_ident = mcp_server._code_ident("field", "models.py", "Account.balance")
+
+        # The class :contains set includes its field (structural graph traversal).
+        contains = self._query(
+            graph_path, f"(query [:find ?f :where [{class_ident} :contains ?f]])"
+        )
+        contained = {row[0] for row in contains}
+        assert field_ident in contained, f"expected {field_ident} in class :contains {contained}"
+
+        # Commit 2: remove the field (replace with a method) so it is a removal.
+        (repo / "models.py").write_text("class Account:\n    def deposit(self):\n        pass\n")
+        self._commit(repo, "drop balance field")
+
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+        asyncio.run(mcp_server._run_ingestion(str(repo), "HEAD"))
+        mcp_server._db = None
+
+        # The class-contains edge to the removed field is CLOSED at current time.
+        contains_after = self._query(
+            graph_path, f"(query [:find ?f :where [{class_ident} :contains ?f]])"
+        )
+        contained_after = {row[0] for row in contains_after}
+        assert field_ident not in contained_after, (
+            f"class-contains edge to removed field leaked open: {contained_after}"
+        )
+
+        # And the module-contains edge to the field is closed too (no half-close).
+        module_ident = mcp_server._code_ident("module", "models.py")
+        mod_contains_after = {
+            row[0] for row in self._query(
+                graph_path, f"(query [:find ?f :where [{module_ident} :contains ?f]])"
+            )
+        }
+        assert field_ident not in mod_contains_after
