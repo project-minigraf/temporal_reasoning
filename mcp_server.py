@@ -5647,6 +5647,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         ]
                         close_items: List[tuple] = []  # (triples, original_ts_iso)
                         dep_add_triples: List[str] = []  # :depends-on triples to transact individually
+                        # Old paths of files renamed this commit (R status). Their
+                        # unmatched child entities / dependency edges are closed in a
+                        # final pass after renamed_pairs is consumed (see below).
+                        renamed_old_paths: set = set()
 
                         for status, file_path, extracted, precomputed, old_path in extracted_files:
                             if status == "D":
@@ -5668,14 +5672,20 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 file_deps.pop(file_path, None)
                             else:  # A or M or R
                                 if status == "R" and old_path:
+                                    renamed_old_paths.add(old_path)
                                     old_module_ident = _code_ident("module", old_path)
                                     new_module_ident = _code_ident("module", file_path)
                                     add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
+                                    # :renamed-to is a brand-new fact that becomes
+                                    # true at the rename commit and stays true forever
+                                    # after — it must be transacted open-ended (like
+                                    # :renamed-from), NOT closed with the old entity's
+                                    # historical valid window via _ingest_close.
+                                    add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
                                     old_desc = entity_descriptions.get(old_module_ident, old_path)
                                     orig_ts = entity_valid_from.get(old_module_ident, commit_ts_iso)
                                     close_items.append((
-                                        _build_close_triples(old_module_ident, old_desc, old_module_ident)
-                                        + [f"[{old_module_ident} :renamed-to {new_module_ident}]"],
+                                        _build_close_triples(old_module_ident, old_desc, old_module_ident),
                                         orig_ts,
                                     ))
                                 previous_idents = set(file_entities.get(file_path, []))
@@ -5695,7 +5705,25 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         current_extracted_idents.add(fn_ident)
                                     for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
                                         current_extracted_idents.add(cls_ident)
+                                    # Globals and fields are tracked in file_entities too
+                                    # (see _build_code_triples): omitting them here would
+                                    # make every still-present global/field look "removed"
+                                    # on any later edit and wrongly close it (#113).
+                                    for gvar_ident, _gvar_name, _gvar_triples in precomputed["global_entries"]:
+                                        current_extracted_idents.add(gvar_ident)
+                                    for field_ident, _field_name, _field_triples in precomputed["field_entries"]:
+                                        current_extracted_idents.add(field_ident)
                                     removed_idents = previous_idents - current_extracted_idents
+                                    # An in-place rename (old->new in the same file) is
+                                    # closed with :renamed-to linkage by the renamed_pairs
+                                    # loop below; exclude those old idents here so they are
+                                    # not ALSO closed as a plain removal (double close).
+                                    same_file_renamed_old_idents = {
+                                        _code_ident(cat, o_file, o_name)
+                                        for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+                                        if o_file == file_path
+                                    }
+                                    removed_idents -= same_file_renamed_old_idents
                                     for ident in removed_idents:
                                         orig_ts = entity_valid_from.get(ident, commit_ts_iso)
                                         desc = entity_descriptions.get(ident, "")
@@ -5740,14 +5768,49 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             old_ident = _code_ident(category, old_file, old_name)
                             new_ident = _code_ident(category, new_file, new_name)
                             add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
+                            # :renamed-to becomes true at the rename commit and stays
+                            # open-ended thereafter — transact it via the add path, do
+                            # NOT fold it into the old entity's _ingest_close window.
+                            add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
                             old_desc = entity_descriptions.get(old_ident, old_name)
                             old_module_ident = _code_ident("module", old_file)
                             orig_ts = entity_valid_from.get(old_ident, commit_ts_iso)
                             close_items.append((
-                                _build_close_triples(old_ident, old_desc, old_module_ident)
-                                + [f"[{old_ident} :renamed-to {new_ident}]"],
+                                _build_close_triples(old_ident, old_desc, old_module_ident),
                                 orig_ts,
                             ))
+
+                        # A file rename (R status) only closes the old MODULE above.
+                        # Child entities and dependency edges under the old path are
+                        # closed here as plain removals UNLESS the matcher established
+                        # a rename continuity edge for them (handled with :renamed-to
+                        # by the loop above). This runs after renamed_pairs is fully
+                        # consumed so those confirmed renames can be excluded; without
+                        # it, unmatched old children/deps leak open forever under the
+                        # old path while new ones open under the new path.
+                        if renamed_old_paths:
+                            renamed_covered_idents = {
+                                _code_ident(cat, o_file, o_name)
+                                for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+                            }
+                            for r_old_path in renamed_old_paths:
+                                r_old_module_ident = _code_ident("module", r_old_path)
+                                for ident in file_entities.get(r_old_path, []):
+                                    if ident == r_old_module_ident:
+                                        continue  # already closed by the R block above
+                                    if ident in renamed_covered_idents:
+                                        continue  # already closed with :renamed-to linkage
+                                    orig_ts = entity_valid_from.get(ident, commit_ts_iso)
+                                    desc = entity_descriptions.get(ident, "")
+                                    close_items.append(
+                                        (_build_close_triples(ident, desc, r_old_module_ident), orig_ts)
+                                    )
+                                for dep_ident in file_deps.get(r_old_path, set()):
+                                    orig_ts = dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)
+                                    close_items.append(
+                                        ([f"[{r_old_module_ident} :depends-on {dep_ident}]"], orig_ts)
+                                    )
+                                file_deps.pop(r_old_path, None)
 
                         # Process gitlink changes (submodule add/bump/remove).
                         # The "remove" case's interaction with the ordinary per-file module-open
