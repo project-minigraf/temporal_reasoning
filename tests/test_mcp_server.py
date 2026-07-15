@@ -4885,6 +4885,113 @@ class TestExtractCommitRename:
         _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
         assert ("function", "svc.py", "process_old", "svc.py", "process_new") in renamed_pairs
 
+    def _init_repo(self, repo):
+        import subprocess as _sp
+        repo.mkdir()
+        _sp.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, msg):
+        _subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def test_rename_tracked_to_unsupported_ext_emits_synthetic_delete(self, tmp_path):
+        """Forward -M regression: `git mv auth.py auth.txt`. The new path has
+        no parser, so keying the skip on it alone would drop the whole "R" row
+        and leak the old module open forever. The fix must rewrite the row as a
+        synthetic delete of the OLD path so downstream close logic runs."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+        (repo / "auth.py").write_text("AUTH_KEY = 1234567890123\n\ndef login(x):\n    return x + 1\n")
+        self._commit(repo, "add")
+        _subprocess.run(["git", "mv", "auth.py", "auth.txt"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "rename to txt")
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        # Exactly one result: a synthetic delete keyed to the OLD path.
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "D"
+        assert file_path == "auth.py"
+        assert extracted is None and precomputed is None
+        assert old_path == ""
+        # No rename linkage should be attempted for an untrackable new side.
+        assert renamed_pairs == []
+
+    def test_rename_tracked_into_ignored_dir_emits_synthetic_delete(self, tmp_path):
+        """Forward -M regression via ignore pattern: `git mv auth.py
+        vendor/auth.py` under ignore_patterns=["vendor/"]. New path is ignored,
+        old path is tracked -> synthetic delete of the old path."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+        (repo / "auth.py").write_text("AUTH_KEY = 1234567890123\n\ndef login(x):\n    return x + 1\n")
+        self._commit(repo, "add")
+        (repo / "vendor").mkdir()
+        _subprocess.run(["git", "mv", "auth.py", "vendor/auth.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "move into vendor")
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(
+            str(repo), commits[1][0], ignore_patterns=["vendor/"]
+        )
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "D"
+        assert file_path == "auth.py"
+        assert old_path == ""
+        assert renamed_pairs == []
+
+    def test_rename_unsupported_ext_to_tracked_is_plain_add(self, tmp_path):
+        """Reverse -M regression: `git mv notes.txt notes.py`. The old path was
+        never tracked (.txt has no parser), so the fix must treat the row as a
+        plain add — extracting the new path but attaching NO rename linkage
+        (no old_path), so no phantom old module gets closed downstream."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+        (repo / "notes.txt").write_text("def login(x):\n    return x + 1\n")
+        self._commit(repo, "add txt")
+        _subprocess.run(["git", "mv", "notes.txt", "notes.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "rename to py")
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "A"
+        assert file_path == "notes.py"
+        # Crucially: old_path is empty, so _run_ingestion's R-close never fires.
+        assert old_path == ""
+        assert "login" in extracted["functions"]
+        assert renamed_pairs == []
+
+    def test_rename_ignored_to_tracked_is_plain_add(self, tmp_path):
+        """Reverse -M regression via ignore pattern: moving a file OUT of an
+        ignored dir into a tracked location. Old side ignored -> plain add."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "auth.py").write_text("def login(x):\n    return x + 1\n")
+        self._commit(repo, "add vendored")
+        _subprocess.run(["git", "mv", "vendor/auth.py", "auth.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "un-vendor")
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(
+            str(repo), commits[1][0], ignore_patterns=["vendor/"]
+        )
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "A"
+        assert file_path == "auth.py"
+        assert old_path == ""
+        assert renamed_pairs == []
+
 
 class TestIngestionWrites:
     def test_ingest_transact_uses_valid_from(self, mock_minigraf_db, tmp_path):
@@ -6972,6 +7079,106 @@ class TestRunIngestionBitemporalClose:
         assert any(f"{old_ident} :renamed-to {new_ident}" in t for t in close_triples_seen)
         transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
         assert f"{new_ident} :renamed-from {old_ident}" in transact_calls
+
+    @pytest.mark.asyncio
+    async def test_rename_to_unsupported_ext_closes_old_entities(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Forward -M regression, end-to-end through _run_ingestion: renaming a
+        tracked .py to an unsupported .txt must close the old module AND its
+        child function/global via the synthetic-delete path. Pre-fix the whole
+        "R" row was dropped in _extract_commit, so nothing was ever closed and
+        the old entities leaked open forever."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("AUTH_KEY = 1234567890123\n\ndef login(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "auth.py", "auth.txt"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename to txt"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        var_ident = mcp_server._code_ident("variable", "auth.py", "AUTH_KEY")
+
+        assert any(":ident" in t and module_ident in t for t in close_triples_seen), \
+            "Old module must be closed when renamed to an unsupported extension"
+        assert any(":ident" in t and fn_ident in t for t in close_triples_seen), \
+            "Old function must be closed when its file is renamed to an unsupported extension"
+        assert any(":ident" in t and var_ident in t for t in close_triples_seen), \
+            "Old global must be closed when its file is renamed to an unsupported extension"
+        # No .txt module should ever be opened.
+        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
+        txt_module_ident = mcp_server._code_ident("module", "auth.txt")
+        assert txt_module_ident not in transact_calls, \
+            "No module entity should be created for the unsupported .txt path"
+
+    @pytest.mark.asyncio
+    async def test_rename_from_unsupported_ext_creates_no_phantom_module(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Reverse -M regression, end-to-end: renaming an unsupported .txt into
+        a tracked .py must NOT close a phantom old module (the .txt ident was
+        never opened) and must NOT write a dangling :renamed-from edge. Pre-fix
+        _run_ingestion's R-branch unconditionally closed :module/notes-txt and
+        wrote a :renamed-from pointing at it."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "notes.txt").write_text("def login(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add txt"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "notes.txt", "notes.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename to py"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        old_module_ident = mcp_server._code_ident("module", "notes.txt")
+        new_module_ident = mcp_server._code_ident("module", "notes.py")
+        new_fn_ident = mcp_server._code_ident("function", "notes.py", "login")
+
+        # No phantom old module closed, no dangling rename edges either way.
+        assert not any(old_module_ident in t for t in close_triples_seen), \
+            "The never-opened .txt module must not be closed (no phantom)"
+        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
+        assert f"{new_module_ident} :renamed-from {old_module_ident}" not in transact_calls, \
+            "No :renamed-from edge should dangle at the never-opened .txt module"
+        assert old_module_ident not in transact_calls, \
+            "The .txt module ident must appear nowhere in transacted triples"
+        # The new .py path is still ingested normally.
+        assert new_fn_ident in transact_calls, \
+            "The new .py file's entities must still be created as a plain add"
 
 
 # ---------------------------------------------------------------------------

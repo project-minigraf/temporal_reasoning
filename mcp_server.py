@@ -5308,8 +5308,42 @@ def _extract_commit(
         return base
 
     for status, old_mode, new_mode, old_sha, new_sha, file_path, old_path, similarity in raw_entries:
-        if _is_ignored_path(file_path, ignore_patterns):
+        # Trackable == not ignored AND has a supported parser. Short-circuits
+        # so an ignored path never pays for a parser build (see the docstring's
+        # "ignored file costs zero parse time" contract).
+        new_trackable = (
+            not _is_ignored_path(file_path, ignore_patterns)
+            and _thread_parser(file_path) is not None
+        )
+        if status == "R":
+            # -M folds a rename's old+new sides into ONE "R" row, but each side
+            # can have a different trackability (cross-extension rename, or a
+            # move into/out of an ignored directory). Keying the skip on the
+            # NEW path alone (as A/M/D do) silently drops the whole row when the
+            # new side is untrackable — leaking the old module/children/deps
+            # open forever — and, in reverse, closes a phantom old module that
+            # was never opened. So resolve the OLD side independently, with its
+            # own ignore/parser lookup keyed on old_path's extension.
+            old_trackable = (
+                not _is_ignored_path(old_path, ignore_patterns)
+                and _thread_parser(old_path) is not None
+            )
+            if old_trackable and not new_trackable:
+                # Forward (tracked -> unsupported/ignored): rewrite the row as a
+                # synthetic delete of the OLD path so the existing "D" handling
+                # below closes the old module, its children, and its deps.
+                status, file_path, old_path = "D", old_path, ""
+            elif new_trackable and not old_trackable:
+                # Reverse (unsupported/ignored -> tracked): the new path is a
+                # brand-new entity and the old ident was never opened. Treat as
+                # a plain add — no rename linkage, no old-module close.
+                status, old_path = "A", ""
+            elif not new_trackable:  # neither side trackable — nothing to do
+                continue
+            # else: both sides trackable — unchanged "R" handling below.
+        elif not new_trackable:
             continue
+
         parser = _thread_parser(file_path)
         if parser is None:
             continue
