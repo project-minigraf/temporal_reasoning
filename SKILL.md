@@ -421,7 +421,7 @@ Ident: `:module/<slugified-path-or-import-name>` (shares the module ident namesp
 
 Vendored-in-tree code checked in as regular files (not a git submodule) is parsed as ordinary `:type/module`/`:function`/`:class` entities like any first-party code — only real gitlinks (mode `160000`) and genuinely-unresolved imports get the external marker.
 
-**Supported languages for AST extraction:** Python, JavaScript, TypeScript (+ TSX/JSX), Rust, Go, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Scala, Haskell, Lua, Elixir. Files in other languages are tracked as modules (with `:introduced-by`/`:modified-in`) but yield no function or class entities.
+**Supported languages for AST extraction:** Python, JavaScript, TypeScript (+ TSX/JSX), Rust, Go, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Scala, Haskell, Lua, Elixir. Files in other languages are tracked as modules (with `:introduced-by`/`:modified-in`) but yield no function, class, variable, or field entities.
 
 **Pre-registered SESSION_RULES** — these are always available; no `minigraf_rule` call needed:
 
