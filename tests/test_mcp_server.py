@@ -2777,6 +2777,183 @@ class TestSwiftGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestScalaGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_scala
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_scala.language()))
+
+    def test_top_level_object_members_are_globals(self):
+        import mcp_server
+        source = b"object Globals {\n  val globalX = 5\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_class_members_are_instance_fields(self):
+        import mcp_server
+        source = b"class Foo {\n  val instanceField = 2\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_tuple_destructuring_captures_all_names(self):
+        # `val (a, b) = (1, 2)` puts a tuple_pattern in field:pattern
+        # instead of a bare identifier -- verified empirically. Same
+        # multi-declarator lesson as nearly every other language in
+        # this plan: every identifier inside it must be extracted.
+        import mcp_server
+        source = b"object O {\n  val (a, b) = (1, 2)\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_nested_tuple_destructuring_captures_all_names(self):
+        import mcp_server
+        source = b"object O {\n  val (a, (b, c)) = (1, (2, 3))\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        for name in ("a", "b", "c"):
+            assert name in result["globals"]
+
+    def test_comma_separated_multi_name_binding_captures_all_names(self):
+        # `val a, b = 5` binds both names to the same value via an
+        # "identifiers" node in field:pattern -- a structurally
+        # DIFFERENT shape from tuple destructuring, verified
+        # empirically. Both must be handled.
+        import mcp_server
+        source = b"object O {\n  val a, b = 5\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_primary_constructor_val_param_is_instance_field_plain_param_excluded(self):
+        # `class Foo(val x: Int, y: Int)` -- x is a val/var-marked
+        # class_parameter (idiomatic, extremely common for case
+        # classes); y has neither val nor var and is a plain
+        # constructor parameter, excluded -- same shape as Kotlin's
+        # analogous primary-constructor shorthand.
+        import mcp_server
+        source = b"class Foo(val x: Int, y: Int) {\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Foo", False)
+        assert "y" not in info
+
+    def test_case_class_implicit_val_param_excluded(self):
+        # Case class parameters without an explicit val/var keyword are
+        # semantically public vals in real Scala, but recognizing that
+        # requires keying off the `case` child -- separate semantic
+        # inference outside the structural, by-keyword scope of this
+        # extension -- so it is deliberately excluded, not extracted.
+        import mcp_server
+        source = b"case class Foo(x: Int, y: String)\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert "x" not in info
+        assert "y" not in info
+
+    def test_constructor_param_and_body_val_combined(self):
+        import mcp_server
+        source = (
+            b"class Point(val x: Int, val y: Int) {\n"
+            b"    val label = \"point\"\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Point", False)
+        assert info["y"] == ("Point", False)
+        assert info["label"] == ("Point", False)
+
+    def test_braced_package_block_is_unwrapped(self):
+        # `package foo { ... }` wraps its contents in package_clause's
+        # field:body -- the same shape-changing-wrapper hazard as JS's
+        # export_statement and PHP's block-style namespace_definition
+        # -- verified empirically. Without unwrapping, everything
+        # inside would be silently dropped.
+        import mcp_server
+        source = (
+            b"package foo {\n"
+            b"  object Globals {\n"
+            b"    val globalX = 5\n"
+            b"  }\n"
+            b"  class Foo {\n"
+            b"    val instanceField = 2\n"
+            b"  }\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert "globalX" in result["globals"]
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_bare_package_clause_does_not_hide_siblings(self):
+        # The bare `package foo` form (no braces) does NOT wrap
+        # subsequent statements -- they remain direct siblings under
+        # compilation_unit -- verified empirically, so no unwrapping
+        # is needed (and none should be attempted) for this form.
+        import mcp_server
+        source = b"package foo\n\nobject Globals {\n  val globalX = 5\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_nested_object_inside_class_is_not_a_globals_namespace(self):
+        # Deliberate simplification: only a TOP-LEVEL (or
+        # package-wrapped top-level) object_definition is a globals
+        # namespace. One nested inside a class's template_body is out
+        # of scope -- it doesn't match the val/var_definition type
+        # filter used there, so it is silently skipped, and no
+        # companion-object pairing is ever attempted.
+        import mcp_server
+        source = (
+            b"class Foo {\n"
+            b"  object Inner {\n"
+            b"    val innerX = 1\n"
+            b"  }\n"
+            b"  val instanceField = 2\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert "innerX" not in result["globals"]
+        assert "innerX" not in info
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_nested_class_not_recursed_into(self):
+        import mcp_server
+        source = (
+            b"class Outer {\n"
+            b"    class Inner {\n"
+            b"        val innerField = 3\n"
+            b"    }\n"
+            b"    val outerField = 4\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["outerField"] == ("Outer", False)
+        assert "innerField" not in info
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"def main(): Unit = {\n  println(\"hi\")\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server

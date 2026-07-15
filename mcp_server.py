@@ -1801,6 +1801,157 @@ def _extract_swift_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["swift"] = _extract_swift_globals_and_fields
 
 
+def _extract_scala_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Scala globals/fields extraction.
+
+    Deliberate simplification (do not "fix" -- this is an intentional,
+    reasoned non-goal, not an oversight): Scala's closest analog to
+    "static" is a companion `object` sharing a class's name, but
+    matching an object_definition to its companion class_definition by
+    name -- and only then treating its members as that class's static
+    fields -- is real extra complexity for a niche pattern. Instead, a
+    top-level object_definition (direct child of compilation_unit, or
+    of a package block -- see below) is treated as a globals namespace,
+    not a fields-owner: its members are extracted as plain
+    module-level globals, no `:class` edge and no `:static` concept
+    invoked at all. Only genuine class_definition members become
+    instance fields, always `:static=False` (Scala classes have no
+    static-member concept). A nested object_definition found inside a
+    class's template_body is out of scope (it simply doesn't match the
+    val_definition/var_definition type filter used there, so it is
+    skipped without special-casing).
+
+    `class Foo { val instanceField = 2 }` is class_definition with
+    field:body = template_body, containing val_definition/
+    var_definition members whose field:pattern normally holds a plain
+    identifier -- verified empirically against the real installed
+    tree-sitter-scala grammar.
+
+    Multi-binding in one val/var statement is real in Scala and comes
+    in TWO distinct structural forms, both verified empirically (same
+    multi-declarator lesson as nearly every other language in this
+    plan):
+      - Tuple destructuring (`val (a, b) = (1, 2)`) puts a
+        tuple_pattern in field:pattern, whose children are `(`, `,`,
+        `)`, and nested identifier/tuple_pattern nodes (tuple patterns
+        can nest, e.g. `val (a, (b, c)) = ...`).
+      - Comma-separated multi-name binding (`val a, b = 5`, binding
+        both names to the same value) puts an "identifiers" node --
+        NOT a tuple_pattern -- in field:pattern, whose children are
+        `,`-separated identifier nodes.
+    Both shapes are handled by a single recursive pattern_names()
+    helper so no destructured/multi-bound name is silently dropped.
+
+    Scala's primary-constructor property shorthand (`class Foo(val x:
+    Int, var y: String)`) is idiomatic and extremely common (case
+    classes in particular), but it is structurally a class_parameter
+    inside class_definition's own field:class_parameters list -- NOT a
+    val_definition/var_definition under template_body -- verified
+    empirically, the same kind of justified, narrowly-scoped extension
+    Kotlin's task added for its analogous primary-constructor shorthand.
+    Unlike Kotlin's grammar, tree-sitter-scala DOES expose a `name`
+    field directly on class_parameter, so no by-type child search is
+    needed for the identifier; only the optional `val`/`var` keyword
+    child is found by type (it carries no field name). A
+    class_parameter with neither a `val` nor `var` child is a plain
+    (non-property) constructor parameter and is excluded -- this
+    deliberately also excludes case class parameters that lack an
+    explicit `val`/`var` keyword, even though Scala implicitly treats
+    unmarked case class parameters as public vals; recognizing that
+    implicit rule would require keying off the class_definition's
+    `case` child, a separate semantic inference beyond the structural,
+    by-keyword scope of this extension, so it is left out.
+
+    Scala's `package foo { ... }` block form wraps its contents in
+    package_clause's field:body (a template_body) -- verified
+    empirically -- the same shape-changing-wrapper hazard as JS's
+    export_statement and PHP's block-style namespace_definition
+    elsewhere in this plan. Without unwrapping it, every global/class
+    inside a braced package block would be silently dropped. The bare
+    `package foo` form (no braces) does NOT wrap subsequent statements
+    -- they remain direct siblings under compilation_unit, verified
+    empirically -- so no special handling is needed for that form.
+    package_clause blocks can nest, so they are unwrapped recursively.
+
+    Never recurses into a class_definition's or object_definition's
+    template_body looking for further nested class/object definitions,
+    nor into any function/method body.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def pattern_names(pattern: Any) -> List[str]:
+        if pattern is None:
+            return []
+        if pattern.type == "identifier":
+            return [pattern.text.decode("utf-8")]
+        if pattern.type in ("tuple_pattern", "identifiers"):
+            names: List[str] = []
+            for child in pattern.children:
+                names.extend(pattern_names(child))
+            return names
+        return []
+
+    def record_constructor_param_fields(class_node: Any, class_name: str) -> None:
+        params = class_node.child_by_field_name("class_parameters")
+        if params is None:
+            return
+        for param in params.children:
+            if param.type != "class_parameter":
+                continue
+            if not any(c.type in ("val", "var") for c in param.children):
+                continue
+            name_node = param.child_by_field_name("name")
+            if name_node is None:
+                continue
+            fname = name_node.text.decode("utf-8")
+            fields.append((fname, class_name, False))
+            field_info[fname] = {
+                "class": class_name, "static": False,
+                "body": param.text.decode("utf-8", "replace"),
+            }
+
+    def handle_stmts(stmts: Sequence[Any]) -> None:
+        for stmt in stmts:
+            if stmt.type == "object_definition":
+                body = stmt.child_by_field_name("body")
+                if body is None:
+                    continue
+                for member in body.children:
+                    if member.type in ("val_definition", "var_definition"):
+                        for name in pattern_names(member.child_by_field_name("pattern")):
+                            globals_.append(name)
+                            global_bodies[name] = member.text.decode("utf-8", "replace")
+            elif stmt.type == "class_definition":
+                name_node = stmt.child_by_field_name("name")
+                class_name = name_node.text.decode("utf-8") if name_node else ""
+                record_constructor_param_fields(stmt, class_name)
+                body = stmt.child_by_field_name("body")
+                if body is None:
+                    continue
+                for member in body.children:
+                    if member.type in ("val_definition", "var_definition"):
+                        for name in pattern_names(member.child_by_field_name("pattern")):
+                            fields.append((name, class_name, False))
+                            field_info[name] = {
+                                "class": class_name, "static": False,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+            elif stmt.type == "package_clause":
+                pkg_body = stmt.child_by_field_name("body")
+                if pkg_body is not None:
+                    handle_stmts(pkg_body.children)
+
+    handle_stmts(root_node.children)
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["scala"] = _extract_scala_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
