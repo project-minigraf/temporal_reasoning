@@ -1866,11 +1866,17 @@ class TestExtractGlobalsAndFields:
     def test_unsupported_language_returns_empty(self):
         import mcp_server
         result = mcp_server._extract_globals_and_fields(None, "nonexistent_lang")
-        assert result == {"globals": [], "global_bodies": {}, "fields": [], "field_info": {}}
+        assert result == {
+            "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
+            "global_nodes": {}, "field_nodes": {},
+        }
 
     def test_dispatches_to_registered_language_extractor(self):
         import mcp_server
-        sentinel = {"globals": ["X"], "global_bodies": {"X": "X = 1"}, "fields": [], "field_info": {}}
+        sentinel = {
+            "globals": ["X"], "global_bodies": {"X": "X = 1"}, "fields": [], "field_info": {},
+            "global_nodes": {}, "field_nodes": {},
+        }
         mcp_server._GLOBAL_FIELD_EXTRACTORS["_test_lang"] = lambda root: sentinel
         try:
             result = mcp_server._extract_globals_and_fields("fake_root", "_test_lang")
@@ -4546,6 +4552,31 @@ class TestExtractCommitRename:
         assert "Foo" in captured_old_side[0]["class"]
         assert "baz" in captured_old_side[0]["function"]
         assert "~Foo" in captured_old_side[0]["function"]
+
+    def test_global_rename_produces_renamed_pair(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        # Value padded to a 13-digit literal (not the brief's bare "12345")
+        # so the assignment's normalized body clears _match_renamed_entities'
+        # _MIN_MATCH_BODY_LEN=20 floor (Task 8) -- confirmed empirically that
+        # the brief's literal "GLOBAL_X = 12345" (16 normalized chars) is
+        # silently dropped as a "trivial stub" before this padding was added,
+        # producing an empty renamed_pairs regardless of the pooling/matcher
+        # logic under test here.
+        (repo / "config.py").write_text("GLOBAL_X = 1234567890123\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "config.py").write_text("GLOBAL_Y = 1234567890123\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename global"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        assert ("variable", "config.py", "GLOBAL_X", "config.py", "GLOBAL_Y") in renamed_pairs
 
 
 class TestIngestionWrites:

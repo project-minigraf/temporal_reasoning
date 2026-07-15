@@ -725,7 +725,10 @@ def _extract_globals_and_fields(root_node: Any, lang_name: str) -> Dict[str, Any
     statements, never into a function/method body (barring a narrow,
     per-language, deliberate exception — see each language's own extractor).
     """
-    empty: Dict[str, Any] = {"globals": [], "global_bodies": {}, "fields": [], "field_info": {}}
+    empty: Dict[str, Any] = {
+        "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
+        "global_nodes": {}, "field_nodes": {},
+    }
     extractor = _GLOBAL_FIELD_EXTRACTORS.get(lang_name)
     if extractor is None or root_node is None:
         return empty
@@ -748,8 +751,10 @@ def _extract_python_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def plain_assignment_name(stmt_node: Any) -> Optional[Tuple[str, Any]]:
         if stmt_node.type != "expression_statement" or stmt_node.child_count == 0:
@@ -793,6 +798,7 @@ def _extract_python_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                         "class": class_name, "static": True,
                         "body": assign_node.text.decode("utf-8", "replace"),
                     }
+                    field_nodes[f"{class_name}.{field_name}"] = assign_node
                 elif member.type == "function_definition":
                     fn_name_node = member.child_by_field_name("name")
                     if fn_name_node is not None and fn_name_node.text == b"__init__":
@@ -807,14 +813,20 @@ def _extract_python_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                         "class": class_name, "static": False,
                                         "body": assign_node.text.decode("utf-8", "replace"),
                                     }
+                                    field_nodes[f"{class_name}.{field_name}"] = assign_node
         else:
             match = plain_assignment_name(stmt)
             if match:
                 name, assign_node = match
                 globals_.append(name)
                 global_bodies[name] = assign_node.text.decode("utf-8", "replace")
+                global_nodes[name] = assign_node
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["python"] = _extract_python_globals_and_fields
@@ -838,8 +850,10 @@ def _extract_js_family_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     for raw_stmt in root_node.children:
         stmt = raw_stmt
@@ -866,6 +880,7 @@ def _extract_js_family_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                         # exported global's body includes the `export`
                         # keyword, matching its actual source text.
                         global_bodies[name] = raw_stmt.text.decode("utf-8", "replace")
+                        global_nodes[name] = raw_stmt
         elif stmt.type == "class_declaration":
             class_name_node = stmt.child_by_field_name("name")
             class_name = class_name_node.text.decode("utf-8") if class_name_node else ""
@@ -885,8 +900,13 @@ def _extract_js_family_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                     "class": class_name, "static": is_static,
                     "body": member.text.decode("utf-8", "replace"),
                 }
+                field_nodes[f"{class_name}.{field_name}"] = member
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["javascript"] = _extract_js_family_globals_and_fields
@@ -913,8 +933,10 @@ def _extract_rust_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     for stmt in root_node.children:
         if stmt.type in ("static_item", "const_item"):
@@ -923,6 +945,7 @@ def _extract_rust_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 name = name_node.text.decode("utf-8")
                 globals_.append(name)
                 global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                global_nodes[name] = stmt
         elif stmt.type == "struct_item":
             struct_name_node = stmt.child_by_field_name("name")
             struct_name = struct_name_node.text.decode("utf-8") if struct_name_node else ""
@@ -938,6 +961,7 @@ def _extract_rust_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                 "class": struct_name, "static": False,
                                 "body": member.text.decode("utf-8", "replace"),
                             }
+                            field_nodes[f"{struct_name}.{fname}"] = member
         elif stmt.type == "impl_item":
             type_node = stmt.child_by_field_name("type")
             # For a generic impl (`impl<T> Foo<T> { ... }`), the `type` field
@@ -967,8 +991,13 @@ def _extract_rust_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                 "class": type_name, "static": True,
                                 "body": member.text.decode("utf-8", "replace"),
                             }
+                            field_nodes[f"{type_name}.{cname}"] = member
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["rust"] = _extract_rust_globals_and_fields
@@ -1007,8 +1036,10 @@ def _extract_go_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def iter_specs(stmt: Any, spec_type: str) -> Any:
         list_type = f"{spec_type}_list"
@@ -1029,6 +1060,7 @@ def _extract_go_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                     name = name_node.text.decode("utf-8")
                     globals_.append(name)
                     global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                    global_nodes[name] = stmt
         elif stmt.type == "type_declaration":
             for type_spec in stmt.children:
                 if type_spec.type != "type_spec":
@@ -1059,8 +1091,13 @@ def _extract_go_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                 "class": type_name, "static": False,
                                 "body": member.text.decode("utf-8", "replace"),
                             }
+                            field_nodes[f"{type_name}.{fname}"] = member
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["go"] = _extract_go_globals_and_fields
@@ -1091,8 +1128,10 @@ def _extract_c_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def declarator_name(node: Any) -> Optional[str]:
         if node.type == "identifier":
@@ -1109,6 +1148,7 @@ def _extract_c_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 if name:
                     globals_.append(name)
                     global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                    global_nodes[name] = stmt
         elif stmt.type == "struct_specifier":
             struct_name_node = stmt.child_by_field_name("name")
             struct_name = struct_name_node.text.decode("utf-8") if struct_name_node else ""
@@ -1124,8 +1164,13 @@ def _extract_c_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                     "class": struct_name, "static": False,
                                     "body": member.text.decode("utf-8", "replace"),
                                 }
+                                field_nodes[f"{struct_name}.{fname}"] = member
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["c"] = _extract_c_globals_and_fields
@@ -1164,6 +1209,7 @@ def _extract_java_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def walk_class(class_node: Any) -> None:
         name_node = class_node.child_by_field_name("name")
@@ -1189,6 +1235,7 @@ def _extract_java_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                         "class": class_name, "static": is_static,
                         "body": member.text.decode("utf-8", "replace"),
                     }
+                    field_nodes[f"{class_name}.{fname}"] = member
 
     def walk(node: Any) -> None:
         if node.type == "class_declaration":
@@ -1197,7 +1244,10 @@ def _extract_java_globals_and_fields(root_node: Any) -> Dict[str, Any]:
             walk(child)
 
     walk(root_node)
-    return {"globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info}
+    return {
+        "globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info,
+        "global_nodes": {}, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["java"] = _extract_java_globals_and_fields
@@ -1231,6 +1281,7 @@ def _extract_csharp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def walk_class(class_node: Any) -> None:
         name_node = class_node.child_by_field_name("name")
@@ -1255,6 +1306,7 @@ def _extract_csharp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                             "class": class_name, "static": is_static,
                             "body": member.text.decode("utf-8", "replace"),
                         }
+                        field_nodes[f"{class_name}.{fname}"] = member
 
     def walk(node: Any) -> None:
         if node.type == "class_declaration":
@@ -1263,7 +1315,10 @@ def _extract_csharp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
             walk(child)
 
     walk(root_node)
-    return {"globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info}
+    return {
+        "globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info,
+        "global_nodes": {}, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["c_sharp"] = _extract_csharp_globals_and_fields
@@ -1306,8 +1361,10 @@ def _extract_cpp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def declarator_name(node: Any) -> Optional[str]:
         if node.type == "identifier":
@@ -1324,6 +1381,7 @@ def _extract_cpp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 if name:
                     globals_.append(name)
                     global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                    global_nodes[name] = stmt
         elif stmt.type in ("class_specifier", "struct_specifier"):
             name_node = stmt.child_by_field_name("name")
             class_name = name_node.text.decode("utf-8") if name_node else ""
@@ -1346,8 +1404,13 @@ def _extract_cpp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                         "class": class_name, "static": is_static,
                         "body": member.text.decode("utf-8", "replace"),
                     }
+                    field_nodes[f"{class_name}.{fname}"] = member
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["cpp"] = _extract_cpp_globals_and_fields
@@ -1394,8 +1457,10 @@ def _extract_ruby_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def left_targets(left_node: Any, target_types: Tuple[str, ...]) -> List[Any]:
         if left_node.type in target_types:
@@ -1413,6 +1478,7 @@ def _extract_ruby_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 name = target.text.decode("utf-8")
                 globals_.append(name)
                 global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                global_nodes[name] = stmt
         elif stmt.type == "class":
             name_node = stmt.child_by_field_name("name")
             class_name = name_node.text.decode("utf-8") if name_node else ""
@@ -1431,6 +1497,7 @@ def _extract_ruby_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                             "class": class_name, "static": True,
                             "body": member.text.decode("utf-8", "replace"),
                         }
+                        field_nodes[f"{class_name}.{fname}"] = member
                 elif member.type == "method":
                     method_name_node = member.child_by_field_name("name")
                     if method_name_node is not None and method_name_node.text == b"initialize":
@@ -1448,8 +1515,13 @@ def _extract_ruby_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                             "class": class_name, "static": False,
                                             "body": inner.text.decode("utf-8", "replace"),
                                         }
+                                        field_nodes[f"{class_name}.{fname}"] = inner
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["ruby"] = _extract_ruby_globals_and_fields
@@ -1502,8 +1574,10 @@ def _extract_php_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def handle_class(stmt: Any) -> None:
         name_node = stmt.child_by_field_name("name")
@@ -1524,6 +1598,7 @@ def _extract_php_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                 "class": class_name, "static": is_static,
                                 "body": member.text.decode("utf-8", "replace"),
                             }
+                            field_nodes[f"{class_name}.{fname}"] = member
             elif member.type == "method_declaration":
                 method_name_node = member.child_by_field_name("name")
                 if method_name_node is not None and method_name_node.text == b"__construct":
@@ -1539,6 +1614,7 @@ def _extract_php_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                         "class": class_name, "static": False,
                                         "body": param.text.decode("utf-8", "replace"),
                                     }
+                                    field_nodes[f"{class_name}.{fname}"] = param
 
     def handle_stmts(stmts: Sequence[Any]) -> None:
         for stmt in stmts:
@@ -1550,6 +1626,7 @@ def _extract_php_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                         name = left.text.decode("utf-8")
                         globals_.append(name)
                         global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                        global_nodes[name] = stmt
             elif stmt.type == "class_declaration":
                 handle_class(stmt)
             elif stmt.type == "namespace_definition":
@@ -1559,7 +1636,11 @@ def _extract_php_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 
     handle_stmts(root_node.children)
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["php"] = _extract_php_globals_and_fields
@@ -1612,8 +1693,10 @@ def _extract_kotlin_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def property_names(prop_node: Any) -> List[str]:
         names: List[str] = []
@@ -1653,12 +1736,14 @@ def _extract_kotlin_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 "class": class_name, "static": False,
                 "body": param.text.decode("utf-8", "replace"),
             }
+            field_nodes[f"{class_name}.{fname}"] = param
 
     for stmt in root_node.children:
         if stmt.type == "property_declaration":
             for name in property_names(stmt):
                 globals_.append(name)
                 global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                global_nodes[name] = stmt
         elif stmt.type == "class_declaration":
             name_node = stmt.child_by_field_name("name")
             class_name = name_node.text.decode("utf-8") if name_node else ""
@@ -1674,6 +1759,7 @@ def _extract_kotlin_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                             "class": class_name, "static": False,
                             "body": member.text.decode("utf-8", "replace"),
                         }
+                        field_nodes[f"{class_name}.{fname}"] = member
                 elif member.type == "companion_object":
                     companion_body = next((c for c in member.children if c.type == "class_body"), None)
                     if companion_body is None:
@@ -1686,8 +1772,13 @@ def _extract_kotlin_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                     "class": class_name, "static": True,
                                     "body": inner_member.text.decode("utf-8", "replace"),
                                 }
+                                field_nodes[f"{class_name}.{fname}"] = inner_member
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["kotlin"] = _extract_kotlin_globals_and_fields
@@ -1756,8 +1847,10 @@ def _extract_swift_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def property_names(prop_node: Any) -> List[str]:
         names: List[str] = []
@@ -1772,6 +1865,7 @@ def _extract_swift_globals_and_fields(root_node: Any) -> Dict[str, Any]:
             for name in property_names(stmt):
                 globals_.append(name)
                 global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                global_nodes[name] = stmt
         elif stmt.type == "class_declaration":
             name_node = stmt.child_by_field_name("name")
             class_name = name_node.text.decode("utf-8") if name_node else ""
@@ -1794,8 +1888,13 @@ def _extract_swift_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                         "class": class_name, "static": is_static,
                         "body": member.text.decode("utf-8", "replace"),
                     }
+                    field_nodes[f"{class_name}.{fname}"] = member
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["swift"] = _extract_swift_globals_and_fields
@@ -1879,8 +1978,10 @@ def _extract_scala_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def pattern_names(pattern: Any) -> List[str]:
         if pattern is None:
@@ -1912,6 +2013,7 @@ def _extract_scala_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 "class": class_name, "static": False,
                 "body": param.text.decode("utf-8", "replace"),
             }
+            field_nodes[f"{class_name}.{fname}"] = param
 
     def handle_stmts(stmts: Sequence[Any]) -> None:
         for stmt in stmts:
@@ -1924,6 +2026,7 @@ def _extract_scala_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                         for name in pattern_names(member.child_by_field_name("pattern")):
                             globals_.append(name)
                             global_bodies[name] = member.text.decode("utf-8", "replace")
+                            global_nodes[name] = member
             elif stmt.type == "class_definition":
                 name_node = stmt.child_by_field_name("name")
                 class_name = name_node.text.decode("utf-8") if name_node else ""
@@ -1939,6 +2042,7 @@ def _extract_scala_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                 "class": class_name, "static": False,
                                 "body": member.text.decode("utf-8", "replace"),
                             }
+                            field_nodes[f"{class_name}.{name}"] = member
             elif stmt.type == "package_clause":
                 pkg_body = stmt.child_by_field_name("body")
                 if pkg_body is not None:
@@ -1946,7 +2050,11 @@ def _extract_scala_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 
     handle_stmts(root_node.children)
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["scala"] = _extract_scala_globals_and_fields
@@ -2011,8 +2119,10 @@ def _extract_haskell_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def add_field_from_wrapper(field_wrapper: Any, type_name: str) -> None:
         if field_wrapper.type != "field":
@@ -2030,6 +2140,7 @@ def _extract_haskell_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 "class": type_name, "static": False,
                 "body": field_wrapper.text.decode("utf-8", "replace"),
             }
+            field_nodes[f"{type_name}.{fname}"] = field_wrapper
 
     def record_fields(record_node: Any, type_name: str) -> None:
         # A record with multiple comma-separated fields (the shape
@@ -2049,7 +2160,10 @@ def _extract_haskell_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 
     declarations = root_node.child_by_field_name("declarations")
     if declarations is None:
-        return {"globals": [], "global_bodies": {}, "fields": [], "field_info": {}}
+        return {
+            "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
+            "global_nodes": {}, "field_nodes": {},
+        }
 
     for decl in declarations.children:
         if decl.type == "bind":
@@ -2058,6 +2172,7 @@ def _extract_haskell_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 name = name_node.text.decode("utf-8")
                 globals_.append(name)
                 global_bodies[name] = decl.text.decode("utf-8", "replace")
+                global_nodes[name] = decl
         elif decl.type == "data_type":
             type_name_node = decl.child_by_field_name("name")
             type_name = type_name_node.text.decode("utf-8") if type_name_node else ""
@@ -2082,7 +2197,11 @@ def _extract_haskell_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 continue
             record_fields(record, type_name)
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["haskell"] = _extract_haskell_globals_and_fields
@@ -2127,6 +2246,7 @@ def _extract_lua_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     globals_: List[str] = []
     global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
 
     for stmt in root_node.children:
         if stmt.type != "assignment_statement":
@@ -2140,8 +2260,12 @@ def _extract_lua_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                 name = name_node.text.decode("utf-8")
                 globals_.append(name)
                 global_bodies[name] = stmt_text
+                global_nodes[name] = stmt
 
-    return {"globals": globals_, "global_bodies": global_bodies, "fields": [], "field_info": {}}
+    return {
+        "globals": globals_, "global_bodies": global_bodies, "fields": [], "field_info": {},
+        "global_nodes": global_nodes, "field_nodes": {},
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["lua"] = _extract_lua_globals_and_fields
@@ -2196,6 +2320,7 @@ def _extract_elixir_globals_and_fields(root_node: Any) -> Dict[str, Any]:
     """
     fields: List[Tuple[str, str, bool]] = []
     field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
 
     def walk(node: Any) -> None:
         if node.type == "call":
@@ -2222,11 +2347,15 @@ def _extract_elixir_globals_and_fields(root_node: Any) -> Dict[str, Any]:
                                         "class": module_name, "static": True,
                                         "body": member.text.decode("utf-8", "replace"),
                                     }
+                                    field_nodes[f"{module_name}.{fname}"] = member
         for child in node.children:
             walk(child)
 
     walk(root_node)
-    return {"globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info}
+    return {
+        "globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info,
+        "global_nodes": {}, "field_nodes": field_nodes,
+    }
 
 
 _GLOBAL_FIELD_EXTRACTORS["elixir"] = _extract_elixir_globals_and_fields
@@ -4998,14 +5127,31 @@ def _extract_commit(
     # this worker process — tree_sitter Node objects never cross the process
     # boundary (#116), only the plain-string renamed_pairs derived from
     # matches does.
-    removed_pool: Dict[str, List[Tuple[str, Any]]] = {"function": [], "class": []}
-    added_pool: Dict[str, List[Tuple[str, Any]]] = {"function": [], "class": []}
+    removed_pool: Dict[str, List[Tuple[str, Any]]] = {
+        "function": [], "class": [], "variable": [], "field": [],
+    }
+    added_pool: Dict[str, List[Tuple[str, Any]]] = {
+        "function": [], "class": [], "variable": [], "field": [],
+    }
     # (category, old_file_path, old_name, new_file_path, new_name) is only
     # knowable once we know which FILE each pooled node came from — track
     # that alongside the pool itself, keyed by node identity (id()), since
     # two different removed entities in two different deleted files could
     # coincidentally share a name.
     node_origin: Dict[int, str] = {}  # id(node) -> file_path
+
+    def collect_all_nodes(root: Any, lang: str) -> Dict[str, Dict[str, Any]]:
+        # Widens _collect_entity_nodes's function/class-only result with the
+        # variable/field categories from Component 3 (Tasks 13-25), reusing
+        # _extract_globals_and_fields directly (not through
+        # _extract_from_source) so its live-node keys — never exposed across
+        # the ProcessPoolExecutor boundary — are available here, entirely
+        # inside this worker process (Task 26).
+        base = _collect_entity_nodes(root, lang)
+        gf = _extract_globals_and_fields(root, "typescript" if lang == "tsx" else lang)
+        base["variable"] = dict(gf.get("global_nodes", {}))
+        base["field"] = dict(gf.get("field_nodes", {}))
+        return base
 
     for status, old_mode, new_mode, old_sha, new_sha, file_path, old_path, similarity in raw_entries:
         if _is_ignored_path(file_path, ignore_patterns):
@@ -5015,7 +5161,9 @@ def _extract_commit(
             continue
 
         old_lang_path = old_path if status == "R" else file_path
-        old_entity_nodes: Dict[str, Dict[str, Any]] = {"function": {}, "class": {}}
+        old_entity_nodes: Dict[str, Dict[str, Any]] = {
+            "function": {}, "class": {}, "variable": {}, "field": {},
+        }
         if status in ("D", "M", "R") and old_sha and old_sha != "0" * len(old_sha):
             try:
                 old_content = _git_blob_content(repo_path, old_sha)
@@ -5031,12 +5179,12 @@ def _extract_commit(
                 old_parser = _thread_parser(old_lang_path) if status == "R" else parser
                 old_tree = old_parser.parse(old_content)
                 old_lang = _EXT_TO_LANG.get(Path(old_lang_path).suffix.lower(), "")
-                old_entity_nodes = _collect_entity_nodes(old_tree.root_node, old_lang)
+                old_entity_nodes = collect_all_nodes(old_tree.root_node, old_lang)
             except Exception:
                 pass  # best-effort: matching degrades to no-match, not a hard failure
 
         if status == "D":
-            for category in ("function", "class"):
+            for category in ("function", "class", "variable", "field"):
                 for name, node in old_entity_nodes[category].items():
                     removed_pool[category].append((name, node))
                     node_origin[id(node)] = old_lang_path
@@ -5075,12 +5223,14 @@ def _extract_commit(
         new_lang = _EXT_TO_LANG.get(Path(file_path).suffix.lower(), "")
         try:
             new_tree = parser.parse(content)
-            new_entity_nodes = _collect_entity_nodes(new_tree.root_node, new_lang)
+            new_entity_nodes = collect_all_nodes(new_tree.root_node, new_lang)
         except Exception:
-            new_entity_nodes = {"function": {}, "class": {}}  # best-effort: matching degrades to no-match
+            new_entity_nodes = {
+                "function": {}, "class": {}, "variable": {}, "field": {},
+            }  # best-effort: matching degrades to no-match
 
         if status == "A":
-            for category in ("function", "class"):
+            for category in ("function", "class", "variable", "field"):
                 for name, node in new_entity_nodes[category].items():
                     added_pool[category].append((name, node))
                     node_origin[id(node)] = file_path
@@ -5088,7 +5238,7 @@ def _extract_commit(
             # Ident changes for every entity in a renamed file, even ones
             # whose text is byte-identical — pool everything on both sides,
             # not just the local diff (unlike "M" below).
-            for category in ("function", "class"):
+            for category in ("function", "class", "variable", "field"):
                 for name, node in old_entity_nodes[category].items():
                     removed_pool[category].append((name, node))
                     node_origin[id(node)] = old_lang_path
@@ -5096,7 +5246,7 @@ def _extract_commit(
                     added_pool[category].append((name, node))
                     node_origin[id(node)] = file_path
         else:  # "M" — same path, only the local diff needs matching
-            for category in ("function", "class"):
+            for category in ("function", "class", "variable", "field"):
                 old_names = set(old_entity_nodes[category].keys())
                 new_names = set(new_entity_nodes[category].keys())
                 for name in old_names - new_names:
