@@ -3154,6 +3154,123 @@ class TestLuaGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestElixirGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_elixir
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_elixir.language()))
+
+    def test_module_attribute_is_static_field(self):
+        import mcp_server
+        source = b"defmodule Foo do\n  @module_attr 5\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["module_attr"] == ("Foo", True)
+        assert result["globals"] == []
+
+    def test_globals_always_empty(self):
+        # Elixir has no top-level mutable globals outside module attributes --
+        # verified empirically there is no syntactic form that would produce one.
+        import mcp_server
+        source = b"defmodule Foo do\n  @a 1\n  @b 2\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["global_bodies"] == {}
+
+    def test_multiple_attributes_in_one_module(self):
+        import mcp_server
+        source = b"defmodule Foo do\n  @a 1\n  @b 2\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", True)
+        assert info["b"] == ("Foo", True)
+
+    def test_nested_module_attribute_attributed_to_inner_module(self):
+        # A nested `defmodule` is itself a `call` node reachable by the
+        # recursive walk -- verified empirically its own do_block members
+        # are scanned independently of the outer module's, so an inner
+        # module's attribute must be attributed to the inner module's name,
+        # not the outer one.
+        import mcp_server
+        source = (
+            b"defmodule Outer do\n"
+            b"  @outer_attr 1\n\n"
+            b"  defmodule Inner do\n"
+            b"    @inner_attr 2\n"
+            b"  end\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["outer_attr"] == ("Outer", True)
+        assert info["inner_attr"] == ("Inner", True)
+        assert result["globals"] == []
+
+    def test_dotted_nested_module_name(self):
+        # `defmodule Foo.Bar do ... end` is a single call whose alias node's
+        # text is the full dotted name "Foo.Bar" -- verified empirically --
+        # rather than two levels of AST nesting.
+        import mcp_server
+        source = b"defmodule Foo.Bar do\n  @attr 1\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["attr"] == ("Foo.Bar", True)
+
+    def test_attribute_reference_without_value_not_captured_as_field(self):
+        # `@attr` (no value, a read-reference to a previously defined
+        # attribute) parses with operand type "identifier", not "call" --
+        # verified empirically -- so it is correctly excluded here; only
+        # `@attr value` (operand type "call") defines a field.
+        import mcp_server
+        source = (
+            b"defmodule Foo do\n"
+            b"  @attr 1\n"
+            b"  def bar do\n"
+            b"    @attr\n"
+            b"  end\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["attr"] == ("Foo", True)
+        assert len(result["fields"]) == 1
+
+    def test_moduledoc_and_doc_attributes_are_captured_as_fields(self):
+        # @moduledoc/@doc/@spec parse identically to any other module
+        # attribute (unary_operator -> call with an identifier target) --
+        # verified empirically -- so this extractor does not special-case
+        # them as noise, consistent with no other language task in this
+        # plan inventing bespoke exclusion lists for built-in
+        # annotations/decorators. Documented here as a known characteristic,
+        # not a bug.
+        import mcp_server
+        source = (
+            b"defmodule Foo do\n"
+            b'  @moduledoc "hi"\n'
+            b"  @attr 1\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["moduledoc"] == ("Foo", True)
+        assert info["attr"] == ("Foo", True)
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"defmodule Foo do\n  def bar do\n    :ok\n  end\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server

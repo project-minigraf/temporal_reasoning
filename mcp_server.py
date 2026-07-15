@@ -2147,6 +2147,91 @@ def _extract_lua_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["lua"] = _extract_lua_globals_and_fields
 
 
+def _extract_elixir_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Extract Elixir module attributes as static fields of their module.
+
+    Elixir has no top-level mutable globals outside module attributes --
+    verified empirically there is no syntactic construct (destructuring or
+    otherwise) that produces one -- so `"globals"` is always empty here.
+
+    A module is a `call` node whose `field:target` is an `identifier` with
+    text `"defmodule"`, whose module-name argument is an `alias` node inside
+    an `arguments` child, and which has a `do_block` child holding the
+    module's body. A module attribute (`@module_attr 5`) is a
+    `unary_operator` with `field:operator` text `"@"` and `field:operand` a
+    `call` node whose `field:target` is the attribute's name; it is treated
+    as a `:static=True` field of the enclosing module -- the closest Elixir
+    analog to compile-time class-scoped state.
+
+    Verified empirically: unlike `field:target`/`field:operator`/
+    `field:operand` (which do resolve via `child_by_field_name`), the
+    `arguments` child of a `defmodule` call is *not* exposed under a field
+    name here -- `child_by_field_name("arguments")` returns None even though
+    an `arguments` node is present as a plain (unnamed-field) child. It must
+    be located by scanning `node.children` for `type == "arguments"`
+    instead, matching the existing precedent in `_elixir_module_name` above.
+
+    Nested modules (`defmodule Foo do defmodule Bar do ... end end`) are
+    handled correctly by this recursive walk: each `defmodule` call's own
+    `do_block` is scanned only for its *direct* children when processing
+    that module, and a nested `defmodule` call is itself just another node
+    the walk recurses into separately, so its attributes are attributed to
+    its own (inner) module name -- verified empirically. A dotted single
+    declaration (`defmodule Foo.Bar do ... end`) is one `call` node whose
+    `alias` node's text is already the full dotted name "Foo.Bar", not two
+    levels of AST nesting -- verified empirically.
+
+    A bare attribute reference with no value (`@attr`, reading a
+    previously-defined attribute rather than defining one) parses with
+    `operand.type == "identifier"`, not `"call"` -- verified empirically --
+    so it is naturally excluded by the `operand.type == "call"` check below
+    and never mistaken for a field definition.
+
+    `@moduledoc`/`@doc`/`@spec`/`@type` (Elixir's built-in documentation/
+    typespec attributes) parse identically to any other module attribute --
+    verified empirically, same `unary_operator` -> `call` shape -- and are
+    deliberately *not* excluded as noise here: no other language task in
+    this plan special-cases built-in annotations/decorators, and inventing
+    a bespoke exclusion list was not requested by this task's spec.
+    """
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def walk(node: Any) -> None:
+        if node.type == "call":
+            target = node.child_by_field_name("target")
+            if target is not None and target.type == "identifier" and target.text == b"defmodule":
+                arguments = next((c for c in node.children if c.type == "arguments"), None)
+                module_name = ""
+                if arguments is not None:
+                    alias_node = next((c for c in arguments.children if c.type == "alias"), None)
+                    if alias_node is not None:
+                        module_name = alias_node.text.decode("utf-8")
+                do_block = next((c for c in node.children if c.type == "do_block"), None)
+                if do_block is not None:
+                    for member in do_block.children:
+                        if member.type == "unary_operator":
+                            op = member.child_by_field_name("operator")
+                            operand = member.child_by_field_name("operand")
+                            if op is not None and op.text == b"@" and operand is not None and operand.type == "call":
+                                attr_target = operand.child_by_field_name("target")
+                                if attr_target is not None:
+                                    fname = attr_target.text.decode("utf-8")
+                                    fields.append((fname, module_name, True))
+                                    field_info[fname] = {
+                                        "class": module_name, "static": True,
+                                        "body": member.text.decode("utf-8", "replace"),
+                                    }
+        for child in node.children:
+            walk(child)
+
+    walk(root_node)
+    return {"globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["elixir"] = _extract_elixir_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
