@@ -3492,6 +3492,51 @@ class TestMatchRenamedEntities:
         assert field_matches == [], f"field must stay ambiguous, got {field_matches}"
         assert ("field", "A.Config", "A.ConfigFn") not in projected
 
+    def test_unchanged_tracked_helper_blocks_false_rename(self):
+        """P1 (second-pass): an identifier referencing a still-present, unchanged
+        tracked entity must match EXACTLY, not be treated as a free local that
+        can be bijectively substituted.
+
+        `load_users` (removed) calls unchanged helper `fetch_users`;
+        `load_orders` (added) calls unchanged helper `fetch_orders`. Bodies are
+        otherwise structurally identical. Without the unchanged-name constraint
+        the matcher maps `fetch_users -> fetch_orders` as a free-local bijection
+        and produces a FALSE rename `load_users -> load_orders`. Passing both
+        helper names as unchanged (must-match-exactly) blocks it.
+        """
+        import mcp_server
+        old = self._parse_fn(
+            "def load_users(db):\n    rows = fetch_users(db)\n    return [r for r in rows]\n"
+        )
+        new = self._parse_fn(
+            "def load_orders(db):\n    rows = fetch_orders(db)\n    return [r for r in rows]\n"
+        )
+        removed = {"function": [("load_users", old)]}
+        added = {"function": [("load_orders", new)]}
+        matches = mcp_server._match_renamed_entities(
+            removed, added, unchanged_names={"fetch_users", "fetch_orders"}
+        )
+        assert matches == [], f"expected no match, got {matches}"
+
+    def test_unchanged_helper_shared_by_genuine_rename_still_matches(self):
+        """The unchanged-name constraint must not block a genuine rename: both
+        the old and new body reference the SAME unchanged helper, so the exact
+        match is satisfied and the rename is still confirmed."""
+        import mcp_server
+        old = self._parse_fn(
+            "def process_old(db):\n    rows = fetch_data(db)\n    return [r for r in rows]\n"
+        )
+        new = self._parse_fn(
+            "def process_new(db):\n    rows = fetch_data(db)\n    return [r for r in rows]\n"
+        )
+        removed = {"function": [("process_old", old)]}
+        added = {"function": [("process_new", new)]}
+        matches = mcp_server._match_renamed_entities(
+            removed, added, unchanged_names={"fetch_data"}
+        )
+        projected = [(c, o, n) for c, o, _, n, _ in matches]
+        assert projected == [("function", "process_old", "process_new")]
+
 
 class TestCollectEntityNodes:
     def test_collects_function_and_class_nodes_by_name(self):
@@ -4634,6 +4679,74 @@ class TestExtractCommitRename:
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
         _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
         assert ("variable", "config.py", "GLOBAL_X", "config.py", "GLOBAL_Y") in renamed_pairs
+
+    def test_unchanged_helpers_block_false_rename_in_modified_file(self, tmp_path):
+        """P1 (second-pass) end-to-end repro: a modified file keeps two unchanged
+        helpers `fetch_users`/`fetch_orders`; the commit deletes `load_users`
+        (which calls `fetch_users`) and adds `load_orders` (which calls
+        `fetch_orders`), bodies otherwise structurally identical. The unchanged
+        helpers never appear in the removed/added pools, so pre-fix the matcher
+        treated `fetch_users -> fetch_orders` as a free-local bijection and
+        produced a FALSE `load_users -> load_orders` rename. Post-fix the
+        unchanged names are seeded as must-match-exactly, so NO rename is
+        produced.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "svc.py").write_text(
+            "def fetch_users(db):\n    return db.query('users')\n\n"
+            "def fetch_orders(db):\n    return db.query('orders')\n\n"
+            "def load_users(db):\n    rows = fetch_users(db)\n    return [r for r in rows]\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "svc.py").write_text(
+            "def fetch_users(db):\n    return db.query('users')\n\n"
+            "def fetch_orders(db):\n    return db.query('orders')\n\n"
+            "def load_orders(db):\n    rows = fetch_orders(db)\n    return [r for r in rows]\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "swap load fn"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        false_pairs = [
+            p for p in renamed_pairs
+            if p[0] == "function" and p[2] == "load_users" and p[4] == "load_orders"
+        ]
+        assert false_pairs == [], f"false rename produced: {false_pairs}"
+
+    def test_genuine_rename_with_unchanged_helper_still_tracked(self, tmp_path):
+        """Positive counterpart: a genuine same-file function rename whose body
+        references an UNCHANGED helper must still be detected post-fix — the
+        must-match-exactly constraint is satisfied because both bodies call the
+        same surviving helper."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "svc.py").write_text(
+            "def fetch_data(db):\n    return db.query('rows')\n\n"
+            "def process_old(db):\n    rows = fetch_data(db)\n    return [r for r in rows]\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "svc.py").write_text(
+            "def fetch_data(db):\n    return db.query('rows')\n\n"
+            "def process_new(db):\n    rows = fetch_data(db)\n    return [r for r in rows]\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename process fn"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        assert ("function", "svc.py", "process_old", "svc.py", "process_new") in renamed_pairs
 
 
 class TestIngestionWrites:

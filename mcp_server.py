@@ -22,7 +22,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -2491,6 +2491,7 @@ def _match_body_name(category: str, name: str) -> str:
 def _match_renamed_entities(
     removed: Dict[str, List[Tuple[str, Any]]],
     added: Dict[str, List[Tuple[str, Any]]],
+    unchanged_names: Optional[Set[str]] = None,
 ) -> List[Tuple[str, str, Any, str, Any]]:
     """Round-based rename matching across entity categories, scoped to a
     single commit's touched files (callers build removed/added from just
@@ -2501,6 +2502,23 @@ def _match_renamed_entities(
     (in the same or a different category) evaluated in a later round — this
     resolves cascading/mutual renames within one commit regardless of
     dependency order. Capped at _MAX_MATCH_ROUNDS as a defensive bound.
+
+    unchanged_names is the set of BARE body-text identifiers (see
+    _match_body_name) that are present, with the SAME name, on BOTH the old
+    and new side of a touched file this commit — i.e. tracked entities that
+    survived unrenamed. The design requires a reference to such an entity to
+    "match exactly" rather than be treated as a free local eligible for
+    bijective substitution. These names never appear in the removed/added
+    pools (an unchanged same-path entity is excluded from both by the "M"
+    diff), so without seeding them here the matcher would treat a reference
+    to a surviving helper as a free local and could confirm a FALSE rename
+    between two entities that merely call two different, still-present
+    helpers. They are seeded into tracked_names with target None (must appear
+    identically); a name that is ALSO confirmed renamed this round takes the
+    confirmed target instead (confirmed wins, so a genuine rename still
+    resolves). The pair under test always excludes its own name from the
+    constraint (see the self-exclusion below), so a real rename whose old and
+    new bodies share an unchanged helper still matches.
 
     Mutates removed/added in place, removing matched entries.
 
@@ -2520,13 +2538,18 @@ def _match_renamed_entities(
     # a token in any body text — only its bare leaf does.
     confirmed: Dict[str, str] = {}  # bare old_name -> bare new_name, shared across all categories
 
-    all_names: set = set()
+    all_names: set = set(unchanged_names or ())
     for pool in (removed, added):
         for category, entries in pool.items():
             all_names.update(_match_body_name(category, name) for name, _node in entries)
 
     for _round in range(_MAX_MATCH_ROUNDS):
         changed = False
+        # Seed every known name to its confirmed rename target if it has one,
+        # else None ("must match exactly"). Unchanged-tracked names (folded
+        # into all_names above) therefore default to None unless a genuine
+        # rename was confirmed for them this round, in which case confirmed
+        # wins.
         tracked_names: Dict[str, Optional[str]] = {
             name: confirmed.get(name) for name in all_names
         }
@@ -5183,6 +5206,15 @@ def _extract_commit(
     # two different removed entities in two different deleted files could
     # coincidentally share a name.
     node_origin: Dict[int, str] = {}  # id(node) -> file_path
+    # Bare body-text names (see _match_body_name) present, with the SAME name,
+    # on BOTH the old and new side of some touched file this commit — tracked
+    # entities that survived unrenamed. Passed to _match_renamed_entities so a
+    # reference to one of them must match exactly rather than be treated as a
+    # free local (see the P1 false-continuity fix). Unchanged same-path
+    # entities never enter removed_pool/added_pool (the "M" diff excludes
+    # them), so they must be threaded separately to constrain OTHER entities'
+    # candidate walks.
+    unchanged_names: Set[str] = set()
 
     def collect_all_nodes(root: Any, lang: str) -> Dict[str, Dict[str, Any]]:
         # Widens _collect_entity_nodes's function/class-only result with the
@@ -5273,6 +5305,18 @@ def _extract_commit(
                 "function": {}, "class": {}, "variable": {}, "field": {},
             }  # best-effort: matching degrades to no-match
 
+        # Record every entity whose name is present, unchanged, on BOTH sides
+        # of this file — these survive the commit unrenamed and so must be
+        # matched exactly (not treated as free locals) when they appear inside
+        # some OTHER entity's candidate body. Uses the bare body-text name
+        # (via _match_body_name) to match how the matcher keys tracked names.
+        # For "A" the old side is empty and for "D" we already `continue`d, so
+        # only "M"/"R" (both-sides) files contribute here.
+        for category in ("function", "class", "variable", "field"):
+            common = set(old_entity_nodes[category].keys()) & set(new_entity_nodes[category].keys())
+            for name in common:
+                unchanged_names.add(_match_body_name(category, name))
+
         if status == "A":
             for category in ("function", "class", "variable", "field"):
                 for name, node in new_entity_nodes[category].items():
@@ -5302,7 +5346,7 @@ def _extract_commit(
                     added_pool[category].append((name, node))
                     node_origin[id(node)] = file_path
 
-    raw_matches = _match_renamed_entities(removed_pool, added_pool)
+    raw_matches = _match_renamed_entities(removed_pool, added_pool, unchanged_names)
     # raw_matches carries the matched node objects themselves (see Task 8's
     # _match_renamed_entities retrofit), so file paths can be recovered
     # directly via node_origin — no second pass or pre-mutation snapshot
