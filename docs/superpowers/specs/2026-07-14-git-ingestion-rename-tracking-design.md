@@ -162,8 +162,15 @@ the cap only guards against pathological inputs).
   boilerplate), **skip** — do not guess. False continuity is worse than missing continuity: it
   would corrupt history in a way indistinguishable from a real rename after the fact, whereas a
   missed match just reproduces today's existing (already-accepted) disconnected behavior.
-  Same-file candidates are preferred over cross-file ones when disambiguating; if ambiguity
-  remains even within the same file, skip.
+
+  **Accepted deviation from this section's original text**: the implementation does not
+  currently prefer same-file candidates over cross-file ones when disambiguating — any 2+-way
+  ambiguity, same-file or not, is skipped uniformly. This was flagged by post-implementation
+  review as a documented behavior gap rather than fixed, since the effect is strictly
+  conservative (a same-file rename that's ambiguous only because of a coincidental cross-file
+  match is missed, never falsely matched) and the added matching complexity wasn't judged worth
+  it for a narrow edge case. Revisit if same-file-preference disambiguation turns out to matter
+  in practice.
 - Bodies below a minimum normalized size are excluded from matching entirely, to avoid spurious
   matches between trivial boilerplate (e.g. `def x(self): pass`-style stubs).
 
