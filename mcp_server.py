@@ -2088,6 +2088,65 @@ def _extract_haskell_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["haskell"] = _extract_haskell_globals_and_fields
 
 
+def _extract_lua_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Extract true top-level global variable assignments in Lua.
+
+    `_LANG_NODE_TYPES["lua"]["classes"]` is already `set()` -- Lua has no
+    class node type at all (table-based OOP is a library convention, not a
+    grammar construct) -- so fields are always empty here, consistent with
+    that existing precedent. Table-field writes (`Foo.staticField = 1`) are
+    deliberately excluded: there is no class entity for such a field to
+    attach a `:class` edge to.
+
+    A true global is an `assignment_statement` that is a *direct* child of
+    `chunk` whose `variable_list` holds one or more plain `identifier`
+    nodes (not `dot_index_expression`, the table-field-write shape) -- and
+    which is not wrapped in a `variable_declaration` (the wrapper node
+    `local` produces). Because this loop only matches `assignment_statement`
+    nodes directly under `chunk`, a `local`-wrapped assignment is
+    automatically excluded: its actual `assignment_statement` is one level
+    deeper, inside the `variable_declaration` wrapper -- verified
+    empirically.
+
+    `local function foo() ... end` and top-level `function foo() ... end`
+    both parse as `function_declaration` nodes, never `assignment_statement`
+    -- verified empirically -- so they cannot be misidentified as global
+    variable assignments here; functions are handled separately by
+    `_LANG_NODE_TYPES["lua"]["functions"]`.
+
+    Lua supports multiple assignment in one statement (`a, b = 1, 2`): the
+    `variable_list` node exposes each name via a repeated `field:name` --
+    verified empirically -- so `children_by_field_name` (plural) is used
+    instead of `child_by_field_name`, which would silently return only the
+    first name. This is the Lua analog of the multi-assignment gap found in
+    every prior language in this plan (Ruby, Kotlin, Swift, Scala). A
+    variable_list can also mix plain identifiers with dot_index_expressions
+    in the same statement (`a, Foo.x = 1, 2`) -- verified empirically --
+    each name node is checked individually so only the plain identifiers
+    are captured.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+
+    for stmt in root_node.children:
+        if stmt.type != "assignment_statement":
+            continue
+        var_list = next((c for c in stmt.children if c.type == "variable_list"), None)
+        if var_list is None:
+            continue
+        stmt_text = stmt.text.decode("utf-8", "replace")
+        for name_node in var_list.children_by_field_name("name"):
+            if name_node.type == "identifier":
+                name = name_node.text.decode("utf-8")
+                globals_.append(name)
+                global_bodies[name] = stmt_text
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": [], "field_info": {}}
+
+
+_GLOBAL_FIELD_EXTRACTORS["lua"] = _extract_lua_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:

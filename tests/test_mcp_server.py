@@ -3077,6 +3077,83 @@ class TestHaskellGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestLuaGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_lua
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_lua.language()))
+
+    def test_true_global_assignment(self):
+        import mcp_server
+        tree = self._parser().parse(b"globalX = 5\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_local_declaration_not_captured(self):
+        import mcp_server
+        tree = self._parser().parse(b"local localY = 10\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_table_field_assignment_not_captured(self):
+        import mcp_server
+        tree = self._parser().parse(b"Foo = {}\nFoo.staticField = 1\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == ["Foo"]
+        assert result["fields"] == []
+
+    def test_multiple_assignment_captures_all_names(self):
+        # `a, b = 1, 2` puts multiple identifier children under
+        # variable_list, each exposed via field:name -- verified
+        # empirically. child_by_field_name (singular) would silently
+        # return only the first ("a"), matching the multi-assignment gap
+        # that showed up in every other language in this plan (Ruby,
+        # Kotlin, Swift, Scala) -- children_by_field_name (plural) is
+        # required to capture all of them.
+        import mcp_server
+        tree = self._parser().parse(b"a, b = 1, 2\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_mixed_identifier_and_table_field_in_multi_assignment(self):
+        # `a, Foo.x = 1, 2` mixes a plain identifier with a
+        # dot_index_expression in the same variable_list -- verified
+        # empirically. Only the plain identifier is a true global; the
+        # table-field write must still be excluded.
+        import mcp_server
+        tree = self._parser().parse(b"a, Foo.x = 1, 2\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == ["a"]
+
+    def test_local_function_not_captured_as_global(self):
+        # `local function foo() ... end` parses as a function_declaration
+        # node (with a "local" child), never an assignment_statement --
+        # verified empirically -- so it cannot be misidentified as a
+        # global variable assignment. Functions are handled separately
+        # by _LANG_NODE_TYPES["lua"]["functions"].
+        import mcp_server
+        tree = self._parser().parse(b"local function foo() end\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_top_level_function_not_captured_as_global(self):
+        # `function foo() ... end` (no `local`) is also a
+        # function_declaration node, not an assignment_statement --
+        # verified empirically -- so it must not be captured here either.
+        import mcp_server
+        tree = self._parser().parse(b"function foo() end\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        tree = self._parser().parse(b"function foo() end\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server
