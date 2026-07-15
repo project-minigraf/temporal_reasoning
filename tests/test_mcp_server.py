@@ -1838,23 +1838,22 @@ class TestExtractFromSource:
         result = mcp_server._extract_from_source(b"def foo(): pass", None, "x.py")
         assert result == {
             "functions": [], "classes": [], "imports": [], "calls": [],
-            "function_bodies": {}, "class_bodies": {},
-            "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
+            "globals": [], "fields": [],
         }
 
-    def test_extracts_function_bodies(self):
+    def test_body_text_not_shipped_across_process_boundary(self):
+        """_extract_from_source's dict crosses the ProcessPoolExecutor boundary
+        (via _extract_commit), so it must NOT carry full entity body text — the
+        matcher works on live re-parsed nodes, never on this text. These four
+        keys used to be pickled per-file for no consumer (P3)."""
         import mcp_server
-        source = b"def login(user):\n    return user.ok\n"
+        source = b"GLOBAL_X = 5\n\ndef login(user):\n    return user.ok\n\nclass User:\n    field = 1\n"
         result = mcp_server._extract_from_source(source, self._python_parser(), "auth.py")
-        assert "login" in result["function_bodies"]
-        assert "return user.ok" in result["function_bodies"]["login"]
-
-    def test_extracts_class_bodies(self):
-        import mcp_server
-        source = b"class User:\n    def ok(self):\n        return True\n"
-        result = mcp_server._extract_from_source(source, self._python_parser(), "models.py")
-        assert "User" in result["class_bodies"]
-        assert "def ok" in result["class_bodies"]["User"]
+        assert "login" in result["functions"]
+        assert "User" in result["classes"]
+        assert "GLOBAL_X" in result["globals"]
+        for dead_key in ("function_bodies", "class_bodies", "global_bodies", "field_info"):
+            assert dead_key not in result, f"{dead_key} must not cross the process boundary"
 
 
 class TestExtractGlobalsAndFields:
@@ -5098,9 +5097,7 @@ class TestPrecomputeGlobalsAndFields:
         import mcp_server
         extracted = {
             "functions": [], "classes": [], "imports": [], "calls": [],
-            "function_bodies": {}, "class_bodies": {},
-            "globals": ["GLOBAL_X"], "global_bodies": {"GLOBAL_X": "GLOBAL_X = 5"},
-            "fields": [], "field_info": {},
+            "globals": ["GLOBAL_X"], "fields": [],
         }
         result = mcp_server._precompute_file_triples(
             "config.py", extracted, ":commit/abc123", {}, segment_index=None,
@@ -5116,10 +5113,8 @@ class TestPrecomputeGlobalsAndFields:
         import mcp_server
         extracted = {
             "functions": [], "classes": ["Foo"], "imports": [], "calls": [],
-            "function_bodies": {}, "class_bodies": {"Foo": "class Foo: ..."},
-            "globals": [], "global_bodies": {},
+            "globals": [],
             "fields": [("staticField", "Foo", True)],
-            "field_info": {"staticField": {"class": "Foo", "static": True, "body": "staticField = 1"}},
         }
         result = mcp_server._precompute_file_triples(
             "models.py", extracted, ":commit/abc123", {}, segment_index=None,
@@ -5138,9 +5133,7 @@ class TestBuildCodeTriplesGlobalsAndFields:
     def test_new_global_writes_full_triples(self):
         import mcp_server
         extracted = {"functions": [], "classes": [], "imports": [], "calls": [],
-                     "function_bodies": {}, "class_bodies": {},
-                     "globals": ["GLOBAL_X"], "global_bodies": {"GLOBAL_X": "GLOBAL_X = 5"},
-                     "fields": [], "field_info": {}}
+                     "globals": ["GLOBAL_X"], "fields": []}
         precomputed = mcp_server._precompute_file_triples("config.py", extracted, ":commit/c1", {})
         entity_valid_from, entity_descriptions, file_entities = {}, {}, {}
         triples = mcp_server._build_code_triples(
@@ -5154,9 +5147,7 @@ class TestBuildCodeTriplesGlobalsAndFields:
     def test_preexisting_global_only_gets_modified_in(self):
         import mcp_server
         extracted = {"functions": [], "classes": [], "imports": [], "calls": [],
-                     "function_bodies": {}, "class_bodies": {},
-                     "globals": ["GLOBAL_X"], "global_bodies": {"GLOBAL_X": "GLOBAL_X = 6"},
-                     "fields": [], "field_info": {}}
+                     "globals": ["GLOBAL_X"], "fields": []}
         precomputed = mcp_server._precompute_file_triples("config.py", extracted, ":commit/c2", {})
         ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
         module_ident = mcp_server._code_ident("module", "config.py")

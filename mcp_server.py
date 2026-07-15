@@ -686,20 +686,17 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
             name = _c_family_function_name(node)
             if name:
                 results["functions"].append(name)
-                results["function_bodies"][name] = node.text.decode("utf-8", errors="replace")
         else:
             name_node = node.child_by_field_name("name")
             if name_node:
                 name = name_node.text.decode("utf-8")
                 results["functions"].append(name)
-                results["function_bodies"][name] = node.text.decode("utf-8", errors="replace")
 
     elif node.type in node_types.get("classes", set()):
         name_node = node.child_by_field_name("name")
         if name_node:
             name = name_node.text.decode("utf-8")
             results["classes"].append(name)
-            results["class_bodies"][name] = node.text.decode("utf-8", errors="replace")
 
     elif node.type in node_types.get("imports", set()):
         names = _extract_import_name(node, lang_name)
@@ -2364,17 +2361,24 @@ _GLOBAL_FIELD_EXTRACTORS["elixir"] = _extract_elixir_globals_and_fields
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:
-    """Parse source bytes and extract functions, classes, imports, calls, and
-    (for functions/classes) their own full source text — the latter used by
-    the rename matcher (see _match_renamed_entities) to compare old vs. new
-    bodies. Body text is captured here, inside the worker process, because
-    tree_sitter Node objects themselves cannot cross the ProcessPoolExecutor
-    boundary (see #116) — only the decoded text can.
+    """Parse source bytes and extract functions, classes, imports, calls,
+    module-level globals, and class fields — the plain-data structural summary
+    of a file.
+
+    This dict crosses the ProcessPoolExecutor boundary (see #116) as part of
+    _extract_commit's return value, so it deliberately carries ONLY the
+    lightweight name/structure lists the downstream pipeline actually consumes.
+    It does NOT carry entity body text: the rename matcher
+    (_match_renamed_entities) operates on live, re-parsed tree_sitter nodes
+    collected inside the worker process (_collect_entity_nodes /
+    _extract_globals_and_fields' *_nodes keys, via _extract_commit), never on
+    decoded body text — so shipping full function/class/global bodies and
+    per-field metadata across the process boundary would be pure serialization
+    cost for no consumer.
     """
     results: Dict[str, Any] = {
         "functions": [], "classes": [], "imports": [], "calls": [],
-        "function_bodies": {}, "class_bodies": {},
-        "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
+        "globals": [], "fields": [],
     }
     try:
         tree = parser.parse(source)
@@ -2382,9 +2386,7 @@ def _extract_from_source(
         _walk_ast(tree.root_node, results, lang_name)
         gf = _extract_globals_and_fields(tree.root_node, "typescript" if lang_name == "tsx" else lang_name)
         results["globals"] = gf["globals"]
-        results["global_bodies"] = gf["global_bodies"]
         results["fields"] = gf["fields"]
-        results["field_info"] = gf["field_info"]
     except Exception:
         pass  # best-effort; parse failures are non-fatal
     return results
