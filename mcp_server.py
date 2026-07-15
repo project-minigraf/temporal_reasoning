@@ -4343,7 +4343,7 @@ def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
     for entity in entities:
         try:
             raw = _db_execute(
-                db, f'(query [:find ?a ?v {temporal_clauses} :where [?e ?a ?v] (contains? ?v "{entity}")])'
+                db, f'(query [:find ?a ?v {temporal_clauses} :where [?e ?a ?v] [(contains? ?v "{entity}")]])'
             )
             data = json.loads(raw)
             for row in data.get("results", []):

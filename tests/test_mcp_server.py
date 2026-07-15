@@ -775,6 +775,56 @@ class TestMemoryPrepareTurn:
         # Should contain a UTC timestamp like 2026-05-02T15:44:52.184Z
         assert any(re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z', c) for c in calls)
 
+    def test_contains_filter_actually_matches_against_real_graph(self, tmp_path):
+        """Real (non-mocked) backend regression test for the bare `(contains? ...)`
+        clause bug: without the enclosing brackets, `[(contains? ?v "...")]`
+        parses as a rule-invocation of a non-existent rule and silently
+        contributes zero bindings — the targeted query returns empty with no
+        error, indistinguishable at the Python level from "no match found".
+        A mock never catches this because it never parses the Datalog string.
+
+        Asserting only on the heuristic's overall return value is not enough:
+        when the targeted contains? query comes back empty, the function
+        falls back to an UNFILTERED broad scan (mcp_server.py ~4357-4367)
+        that would still surface this fact regardless of whether the
+        targeted filter itself works — that fallback path masked this exact
+        bug from an end-to-end assertion during manual verification. So this
+        spies on _db_execute to confirm the TARGETED contains? query itself
+        returns the matching row, isolating the code path the bug lives in.
+        """
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "real.graph"))
+        db = mcp_server.get_db()
+        mcp_server._db_execute(
+            db,
+            '(transact {:valid-from "2024-01-01T00:00:00Z"} '
+            '[[:decision/db :entity-type :type/decision] '
+            '[:decision/db :ident ":decision/db"] '
+            '[:decision/db :description "we use postgresql for storage"]])',
+        )
+
+        real_execute = mcp_server._db_execute
+        contains_results = []
+
+        def spy(db_arg, datalog):
+            raw = real_execute(db_arg, datalog)
+            if "contains?" in datalog and "postgresql" in datalog:
+                contains_results.append(json.loads(raw).get("results", []))
+            return raw
+
+        mcp_server._db_execute = spy
+        try:
+            mcp_server._handle_memory_prepare_turn_heuristic(
+                "what database are we using, postgresql or mysql?"
+            )
+        finally:
+            mcp_server._db_execute = real_execute
+
+        assert contains_results, "the targeted contains? query must have been issued"
+        assert any(
+            any("postgresql" in str(v) for v in row) for rows in contains_results for row in rows
+        ), "the bracketed contains? filter must itself find the matching row, not just the broad-scan fallback"
+
 
 class TestHeuristicExtraction:
     def test_extracts_decision_language(self):
