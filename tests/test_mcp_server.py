@@ -7081,6 +7081,140 @@ def git_repo_with_rename(tmp_path):
     return repo
 
 
+def _reused_path_repo(repo, variant):
+    """Build a 4-commit repo that reuses path a.py after it is closed.
+
+    commit1: add a.py with function f
+    commit2: rename a.py -> b.py  (variant="rename")  OR  delete a.py (variant="delete")
+    commit3: re-create a.py with a DIFFERENT function g (a "leave a shim" pattern)
+    commit4: edit the shim
+
+    Commit timestamps are pinned to distinct days so point-in-time queries can
+    target the window a.py's original function f was closed for.
+    """
+    env_base = dict(os.environ)
+
+    def _commit(msg, day):
+        env = dict(env_base)
+        ts = f"2020-01-0{day}T00:00:00Z"
+        env["GIT_AUTHOR_DATE"] = ts
+        env["GIT_COMMITTER_DATE"] = ts
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True, env=env)
+
+    repo.mkdir(parents=True, exist_ok=True)
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "a.py").write_text("def f():\n    return 1\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _commit("c1 add a.py f", 1)
+
+    if variant == "rename":
+        _subprocess.run(["git", "mv", "a.py", "b.py"], cwd=repo, check=True, capture_output=True)
+    else:
+        _subprocess.run(["git", "rm", "a.py"], cwd=repo, check=True, capture_output=True)
+    _commit("c2 close a.py", 2)
+
+    (repo / "a.py").write_text("def g():\n    return 2\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _commit("c3 re-add a.py g", 3)
+
+    (repo / "a.py").write_text("def g():\n    return 3\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _commit("c4 edit a.py g", 4)
+    return repo
+
+
+class TestClosedEntityLifecyclePurge:
+    """Real-backend regression tests for the closed-entity lifecycle purge.
+
+    Before the purge fix, close sites in _run_ingestion left the entity's ident
+    in the in-memory bookkeeping dicts (entity_valid_from / entity_descriptions /
+    field_class_ident / file_entities). Once closes became genuinely real (commit
+    1b2e262), reusing a closed path produced two corruptions:
+
+      * ghost entity: a NEW entity re-created at a previously-closed ident took
+        _build_code_triples' "already known" branch (its ident was still in
+        entity_valid_from) and never re-asserted :ident/:description/:path, so it
+        had no current :ident fact — invisible to nearly every query.
+      * phantom resurrection: a stale ident lingering in file_entities got closed
+        a SECOND time by a later removal diff, but with its ORIGINAL introduction
+        timestamp, widening its valid window across the span it was closed for.
+    """
+
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "",
+                "error": None, "prior_ingested": 0}
+
+    async def _ingest_and_open(self, repo, monkeypatch):
+        import mcp_server
+        graph = str(repo / "memory.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._db = None
+        mcp_server._graph_path = graph
+        mcp_server._ingest_progress = self._make_progress()
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._db = None  # release the lock so we can reopen for querying
+        from minigraf import MiniGrafDb
+        return MiniGrafDb.open(graph)
+
+    @staticmethod
+    def _results(db, datalog):
+        return json.loads(db.execute(datalog))["results"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
+    async def test_reused_path_new_entity_is_not_a_ghost(self, tmp_path, monkeypatch, variant):
+        """The module re-created at the reused path a.py must have a CURRENT
+        :ident fact (join target for nearly every query)."""
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        db = await self._ingest_and_open(repo, monkeypatch)
+
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "a.py")
+        g_ident = mcp_server._code_ident("function", "a.py", "g")
+
+        module_now = self._results(db, f'(query [:find ?i :where [{module_ident} :ident ?i]])')
+        assert module_now == [[module_ident]], \
+            f"[{variant}] re-created module at reused path has no current :ident (ghost): {module_now}"
+
+        # The re-created function g must also exist as a genuine current entity.
+        g_now = self._results(db, f'(query [:find ?i :where [{g_ident} :ident ?i]])')
+        assert g_now == [[g_ident]], f"[{variant}] re-created function g missing current :ident: {g_now}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
+    async def test_reused_path_no_phantom_resurrection_window(self, tmp_path, monkeypatch, variant):
+        """The original function f (closed at commit2) must NOT be visible at any
+        point-in-time between its close (commit2) and the final commit."""
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        db = await self._ingest_and_open(repo, monkeypatch)
+
+        import mcp_server
+        f_ident = mcp_server._code_ident("function", "a.py", "f")
+
+        # f was introduced at commit1 (2020-01-01) and closed at commit2 (2020-01-02).
+        # It must be visible strictly inside [c1, c2) and invisible at/after c2.
+        visible_before = self._results(
+            db, f'(query [:find ?i :valid-at "2020-01-01T12:00:00Z" :where [{f_ident} :ident ?i]])')
+        assert visible_before == [[f_ident]], \
+            f"[{variant}] f must remain visible within its true window [c1,c2): {visible_before}"
+
+        for label, when in [("c2", "2020-01-02T00:00:00Z"),
+                            ("between c2 and c4", "2020-01-03T00:00:00Z"),
+                            ("c4", "2020-01-04T00:00:00Z")]:
+            phantom = self._results(
+                db, f'(query [:find ?i :valid-at "{when}" :where [{f_ident} :ident ?i]])')
+            assert phantom == [], \
+                f"[{variant}] f (closed at c2) phantom-resurrected at {label} ({when}): {phantom}"
+
+        # And f must have no CURRENT :ident either.
+        assert self._results(db, f'(query [:find ?i :where [{f_ident} :ident ?i]])') == [], \
+            f"[{variant}] f (closed at c2) must not be visible at current time"
+
+
 class TestRunIngestionBitemporalClose:
     """Integration tests verifying bi-temporal correctness of entity lifecycle handling."""
 

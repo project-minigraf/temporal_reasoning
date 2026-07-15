@@ -3821,6 +3821,57 @@ def _build_close_triples(
     return triples
 
 
+def _forget_closed_entity(
+    ident: str,
+    file_path: Optional[str],
+    entity_valid_from: Dict[str, str],
+    entity_descriptions: Dict[str, str],
+    field_class_ident: Dict[str, str],
+    file_entities: Dict[str, List[str]],
+) -> None:
+    """Purge a just-closed ident from all in-memory lifecycle bookkeeping.
+
+    Once an entity's bi-temporal window is genuinely closed (i.e. the fact is
+    invisible at current time — true only since the transact-ordering fix in
+    1b2e262), its stale entries in these serially-threaded dicts must be
+    dropped so a later commit is not misled by them:
+
+    - entity_valid_from: _build_code_triples keys "is this genuinely new?" on
+      absence here. Leaving a stale entry makes a re-introduction at the same
+      ident take the "already known, only :modified-in" branch, so its
+      :ident/:description/:path/:introduced-by never get re-asserted — a ghost
+      entity with no current :ident fact.
+    - file_entities[file_path]: a stale ident lingering here is re-discovered by
+      a later commit's removal-detection diff (previous_idents - current) if the
+      path is reused, and closed a SECOND time; because entity_valid_from still
+      held its ORIGINAL introduction timestamp, that second close would span the
+      whole gap and silently resurrect the entity across its closed window.
+    - entity_descriptions / field_class_ident: purged for consistency so no
+      stale description or class-containment parent is read for a future
+      re-introduction of the same ident.
+
+    Call this at EVERY entity close site, AFTER that site has read whatever it
+    needs (description, orig_ts, class ident) to build its close triples — never
+    before. Each ident is closed at exactly one site per commit, so purging one
+    ident never removes state another site in the same commit still needs.
+
+    file_path is the owning file's path (the module the ident lives under); pass
+    None to skip the file_entities removal (e.g. idents not tracked per-file).
+    Callers that iterate a file_entities list while calling this MUST iterate a
+    copy, since this mutates file_entities[file_path] in place.
+    """
+    entity_valid_from.pop(ident, None)
+    entity_descriptions.pop(ident, None)
+    field_class_ident.pop(ident, None)
+    if file_path is not None:
+        idents = file_entities.get(file_path)
+        if idents is not None:
+            try:
+                idents.remove(ident)
+            except ValueError:
+                pass
+
+
 def _ingest_transact(
     db: Any,
     triples: List[str],
@@ -5725,8 +5776,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                         for status, file_path, extracted, precomputed, old_path in extracted_files:
                             if status == "D":
-                                # Close module and all known child entities for this file
-                                idents = file_entities.get(file_path, [_code_ident("module", file_path)])
+                                # Close module and all known child entities for this file.
+                                # Iterate a copy: _forget_closed_entity mutates
+                                # file_entities[file_path] in place as it purges.
+                                idents = list(file_entities.get(file_path, [_code_ident("module", file_path)]))
                                 module_ident = _code_ident("module", file_path)
                                 for ident in idents:
                                     orig_ts = entity_valid_from.get(ident, commit_ts_iso)
@@ -5737,6 +5790,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                             field_class_ident.get(ident),
                                         ), orig_ts)
                                     )
+                                    _forget_closed_entity(
+                                        ident, file_path, entity_valid_from,
+                                        entity_descriptions, field_class_ident, file_entities,
+                                    )
+                                # Whole file is gone: drop its (now-empty) file_entities key
+                                # so nothing stale lingers under this path (matches file_deps).
+                                file_entities.pop(file_path, None)
                                 # Close all :depends-on edges for the deleted module
                                 for dep_ident in file_deps.get(file_path, set()):
                                     orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
@@ -5762,6 +5822,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         _build_close_triples(old_module_ident, old_desc, old_module_ident),
                                         orig_ts,
                                     ))
+                                    # Purge the closed old module. Its remaining child
+                                    # entities under old_path are closed+purged by the
+                                    # renamed_old_paths pass below, which also pops the
+                                    # whole file_entities[old_path] key — so only the
+                                    # scalar dicts and the module's own list slot need
+                                    # dropping here.
+                                    _forget_closed_entity(
+                                        old_module_ident, old_path, entity_valid_from,
+                                        entity_descriptions, field_class_ident, file_entities,
+                                    )
                                 previous_idents = set(file_entities.get(file_path, []))
                                 triples = _build_code_triples(
                                     file_path, extracted, commit_ts_iso, entity_valid_from,
@@ -5807,6 +5877,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                                 ident, desc, module_ident,
                                                 field_class_ident.get(ident),
                                             ), orig_ts)
+                                        )
+                                        # File survives (M), only this child was removed:
+                                        # purge just this ident from the file's list.
+                                        _forget_closed_entity(
+                                            ident, file_path, entity_valid_from,
+                                            entity_descriptions, field_class_ident, file_entities,
                                         )
                                 # Compute dep edges for this file and diff against previous.
                                 # Resolution itself already happened in _extract_commit
@@ -5860,6 +5936,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 ),
                                 orig_ts,
                             ))
+                            _forget_closed_entity(
+                                old_ident, old_file, entity_valid_from,
+                                entity_descriptions, field_class_ident, file_entities,
+                            )
 
                         # A file rename (R status) only closes the old MODULE above.
                         # Child entities and dependency edges under the old path are
@@ -5876,11 +5956,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             }
                             for r_old_path in renamed_old_paths:
                                 r_old_module_ident = _code_ident("module", r_old_path)
-                                for ident in file_entities.get(r_old_path, []):
+                                # Iterate a copy: _forget_closed_entity mutates
+                                # file_entities[r_old_path] in place as it purges.
+                                for ident in list(file_entities.get(r_old_path, [])):
                                     if ident == r_old_module_ident:
-                                        continue  # already closed by the R block above
+                                        continue  # already closed+purged by the R block above
                                     if ident in renamed_covered_idents:
-                                        continue  # already closed with :renamed-to linkage
+                                        continue  # already closed+purged with :renamed-to linkage
                                     orig_ts = entity_valid_from.get(ident, commit_ts_iso)
                                     desc = entity_descriptions.get(ident, "")
                                     close_items.append(
@@ -5889,6 +5971,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                             field_class_ident.get(ident),
                                         ), orig_ts)
                                     )
+                                    _forget_closed_entity(
+                                        ident, r_old_path, entity_valid_from,
+                                        entity_descriptions, field_class_ident, file_entities,
+                                    )
+                                # Whole old path is gone (renamed away): drop the key so
+                                # no stale ident lingers to be re-discovered by a later
+                                # commit that reuses this path (e.g. a shim at old_path).
+                                file_entities.pop(r_old_path, None)
                                 for dep_ident in file_deps.get(r_old_path, set()):
                                     orig_ts = dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)
                                     close_items.append(
@@ -5939,6 +6029,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 desc = entity_descriptions.get(ext_ident, "")
                                 close_items.append(
                                     (_build_close_triples(ext_ident, desc, ext_ident), orig_ts)
+                                )
+                                # Submodule removed: purge lifecycle state so a later
+                                # re-add at the same path is treated as genuinely new.
+                                # (Submodule paths aren't tracked in file_entities, so the
+                                # path arg is a no-op there, but pass it for consistency.)
+                                _forget_closed_entity(
+                                    ext_ident, path, entity_valid_from,
+                                    entity_descriptions, field_class_ident, file_entities,
                                 )
                                 old_sha, pin_orig_ts = pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
                                 if old_sha is not None:
