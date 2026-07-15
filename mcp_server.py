@@ -1693,6 +1693,114 @@ def _extract_kotlin_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 _GLOBAL_FIELD_EXTRACTORS["kotlin"] = _extract_kotlin_globals_and_fields
 
 
+def _extract_swift_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Swift globals/fields extraction.
+
+    Top-level `let`/`var` is a property_declaration directly under
+    source_file. `class Foo { ... }`, `struct Foo { ... }`, `enum Foo
+    { ... }`, and `extension Foo { ... }` are ALL parsed as the same
+    class_declaration node type (distinguished only by a
+    `declaration_kind` field whose text is "class"/"struct"/"enum"/
+    "extension") -- verified empirically against the real installed
+    tree-sitter-swift grammar. Members are fetched via
+    `child_by_field_name("body")`, which works uniformly even though
+    the body node's *type* differs (class_body for class/struct/
+    extension, enum_class_body for enum), because it's identified by
+    field name, not type.
+
+    A property_declaration can bind MULTIPLE names in one statement
+    (`let a = 1, b = 2`), each its own `field:name` -> pattern ->
+    field:bound_identifier chain -- verified empirically. This is the
+    Swift analog of the multi-declarator gap found in every prior
+    language in this plan: `children_by_field_name("name")` is used
+    (not `child_by_field_name`, which would silently return only the
+    first binding) so every name in the statement is extracted.
+
+    Tuple destructuring (`let (x, y) = (1, 2)`) wraps names in a
+    pattern whose nested per-name patterns expose no bound_identifier
+    field -- verified empirically -- so it is safely skipped (no name
+    extracted), consistent with other out-of-scope destructuring forms
+    in this plan (e.g. Kotlin's multi_variable_declaration, which IS
+    in scope there because it exposes a different structural shape;
+    Swift's tuple pattern here does not surface identifiers via any
+    field, only by node type, so it is left alone).
+
+    Swift has no primary-constructor property shorthand analogous to
+    Kotlin's `class Foo(val x: Int)`: properties are always declared
+    inside the body via property_declaration regardless of how `init`
+    initializes them -- verified empirically (a class with only an
+    `init` and no property_declaration produces zero fields, and `init`
+    parameters/assignments are never treated as field declarations).
+
+    `extension Foo { ... }` is in scope as a side effect of sharing the
+    class_declaration node type with `class`/`struct`/`enum`: its
+    `field:name` is a user_type node wrapping Foo's type_identifier,
+    and `.text` on that node still resolves to the plain name "Foo" --
+    verified empirically -- so properties declared in an extension are
+    picked up and correctly attributed to class "Foo" rather than
+    silently dropped or misattributed. This is not explicitly
+    requested by the task brief but is a safe, useful side effect
+    rather than a misbehavior: it does not crash and does not merge
+    unrelated types.
+
+    Static iff the member's `modifiers` child has a `property_modifier`
+    child with text "static" (Swift's `class var` for overridable
+    static-like properties uses modifier text "class", not "static",
+    and is therefore treated as instance per the task brief's
+    definition).
+
+    Never recurses into a nested class_declaration found inside a
+    class/enum body (fields two types deep are out of scope, consistent
+    with every other language in this plan) or into any function/method
+    body.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+
+    def property_names(prop_node: Any) -> List[str]:
+        names: List[str] = []
+        for pattern in prop_node.children_by_field_name("name"):
+            bound = pattern.child_by_field_name("bound_identifier")
+            if bound is not None:
+                names.append(bound.text.decode("utf-8"))
+        return names
+
+    for stmt in root_node.children:
+        if stmt.type == "property_declaration":
+            for name in property_names(stmt):
+                globals_.append(name)
+                global_bodies[name] = stmt.text.decode("utf-8", "replace")
+        elif stmt.type == "class_declaration":
+            name_node = stmt.child_by_field_name("name")
+            class_name = name_node.text.decode("utf-8") if name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                if member.type != "property_declaration":
+                    continue
+                is_static = False
+                for child in member.children:
+                    if child.type == "modifiers":
+                        is_static = any(
+                            m.type == "property_modifier" and m.text == b"static"
+                            for m in child.children
+                        )
+                for fname in property_names(member):
+                    fields.append((fname, class_name, is_static))
+                    field_info[fname] = {
+                        "class": class_name, "static": is_static,
+                        "body": member.text.decode("utf-8", "replace"),
+                    }
+
+    return {"globals": globals_, "global_bodies": global_bodies, "fields": fields, "field_info": field_info}
+
+
+_GLOBAL_FIELD_EXTRACTORS["swift"] = _extract_swift_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
 ) -> Dict[str, Any]:

@@ -2658,6 +2658,125 @@ class TestKotlinGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestSwiftGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_swift
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_swift.language()))
+
+    def test_top_level_let_is_global(self):
+        import mcp_server
+        tree = self._parser().parse(b"let globalX = 5\n")
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_static_and_instance_properties(self):
+        import mcp_server
+        source = b"class Foo {\n    static var staticField = 1\n    var instanceField = 2\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_top_level_multi_binding_let_captures_all_names(self):
+        # `let a = 1, b = 2` binds multiple names in one
+        # property_declaration, each its own `field:name` -- verified
+        # empirically against the real installed tree-sitter-swift
+        # grammar. Same multi-declarator lesson as every prior language
+        # in this plan: every name must be extracted, not just the
+        # first.
+        import mcp_server
+        tree = self._parser().parse(b"let a = 1, b = 2\n")
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_class_multi_binding_property_captures_all_names(self):
+        import mcp_server
+        source = b"class Foo {\n    let a = 1, b = 2\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", False)
+        assert info["b"] == ("Foo", False)
+
+    def test_struct_and_enum_properties_extracted(self):
+        # struct and enum declarations share the class_declaration node
+        # type with class (distinguished only by declaration_kind), and
+        # enum's body node is a differently-typed enum_class_body --
+        # both verified empirically to work via child_by_field_name
+        # ("body"), which is keyed by field name, not node type.
+        import mcp_server
+        source = (
+            b"struct Bar {\n    var structField = 5\n}\n"
+            b"enum E {\n    static let enumField = 1\n}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["structField"] == ("Bar", False)
+        assert info["enumField"] == ("E", True)
+
+    def test_tuple_destructuring_produces_no_globals(self):
+        # `let (x, y) = (1, 2)` wraps names in a pattern whose nested
+        # per-name patterns expose no bound_identifier field -- verified
+        # empirically -- so it is safely skipped rather than crashing
+        # or misattributing a name.
+        import mcp_server
+        tree = self._parser().parse(b"let (x, y) = (1, 2)\n")
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_extension_properties_attributed_to_extended_type(self):
+        # extension Foo { ... } shares the class_declaration node type;
+        # its `name` field is a user_type wrapping Foo's
+        # type_identifier, and .text on it still resolves to plain
+        # "Foo" -- verified empirically -- so extension properties are
+        # picked up rather than silently dropped or misattributed.
+        import mcp_server
+        source = b"extension Foo {\n    var extField = 3\n    static var extStatic = 4\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["extField"] == ("Foo", False)
+        assert info["extStatic"] == ("Foo", True)
+
+    def test_init_only_class_has_no_fields(self):
+        # Swift has no primary-constructor property shorthand: a class
+        # with only an `init` method and no property_declaration
+        # produces zero fields -- verified empirically.
+        import mcp_server
+        source = b"class Foo {\n    init() { self.x = 1 }\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert result["fields"] == []
+
+    def test_nested_class_not_recursed_into(self):
+        import mcp_server
+        source = (
+            b"class Outer {\n"
+            b"    class Inner {\n"
+            b"        var innerField = 3\n"
+            b"    }\n"
+            b"    var outerField = 4\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["outerField"] == ("Outer", False)
+        assert "innerField" not in info
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"func main() {\n    print(\"hi\")\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server
