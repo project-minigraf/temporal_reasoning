@@ -4064,6 +4064,45 @@ class TestGitHelpers:
         assert b"def login" in content
 
 
+class TestDefaultGitBranch:
+    def _init_repo_with_branch(self, tmp_path, branch_name):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", branch_name], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "f.py").write_text("x = 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def test_env_var_takes_precedence_over_auto_detect(self, tmp_path, monkeypatch):
+        import mcp_server
+        repo = self._init_repo_with_branch(tmp_path, "main")
+        monkeypatch.setenv("MINIGRAF_GIT_BRANCH", "release")
+        # "release" doesn't even exist as a branch here -- the env var is
+        # trusted as-is, not validated against the repo.
+        assert mcp_server._default_git_branch(str(repo)) == "release"
+
+    def test_auto_detects_main_when_present(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_GIT_BRANCH", raising=False)
+        repo = self._init_repo_with_branch(tmp_path, "main")
+        assert mcp_server._default_git_branch(str(repo)) == "main"
+
+    def test_auto_detects_master_when_no_main(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_GIT_BRANCH", raising=False)
+        repo = self._init_repo_with_branch(tmp_path, "master")
+        assert mcp_server._default_git_branch(str(repo)) == "master"
+
+    def test_falls_back_to_head_when_neither_main_nor_master_exist(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_GIT_BRANCH", raising=False)
+        repo = self._init_repo_with_branch(tmp_path, "trunk")
+        assert mcp_server._default_git_branch(str(repo)) == "HEAD"
+
+
 class TestGitDiffTreeRaw:
     def test_regular_file_add(self, git_repo):
         import mcp_server
@@ -6069,6 +6108,60 @@ class TestRunIngestion:
         assert mcp_server._ingest_progress["status"] == "starting"
 
     @pytest.mark.asyncio
+    async def test_ingest_git_resolves_branch_via_default_when_not_specified(
+        self, mock_minigraf_db, git_repo, monkeypatch
+    ):
+        """#130: omitting `branch` must resolve through _default_git_branch,
+        not hardcode "HEAD"."""
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_default_git_branch", lambda repo_path: "resolved-branch")
+        captured = {}
+
+        async def fake_run_ingestion(repo_path, branch):
+            captured["branch"] = branch
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
+        mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+        }
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
+        await mcp_server._ingest_task
+        assert result["ok"] is True
+        assert captured["branch"] == "resolved-branch"
+
+    @pytest.mark.asyncio
+    async def test_ingest_git_explicit_branch_overrides_default(
+        self, mock_minigraf_db, git_repo, monkeypatch
+    ):
+        """An explicit `branch` argument must win over _default_git_branch,
+        which shouldn't even be consulted in that case."""
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+
+        def unexpected_call(repo_path):
+            raise AssertionError("_default_git_branch should not be called when branch is explicit")
+
+        monkeypatch.setattr(mcp_server, "_default_git_branch", unexpected_call)
+        captured = {}
+
+        async def fake_run_ingestion(repo_path, branch):
+            captured["branch"] = branch
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
+        mcp_server._ingest_task = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+        }
+        result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo), branch="feature-x")
+        await mcp_server._ingest_task
+        assert result["ok"] is True
+        assert captured["branch"] == "feature-x"
+
+    @pytest.mark.asyncio
     async def test_processed_seeded_from_prior_ingested(self, mock_minigraf_db, git_repo, monkeypatch):
         """processed starts at the true persisted commit count and increments
         cumulatively — regression test for #85 (seeding must not rely on the
@@ -6593,6 +6686,54 @@ class TestMainAutoIngestLockCheck:
 
         assert mcp_server._ingest_task is not None
         assert mcp_server._ingest_progress["status"] == "starting"
+
+        mcp_server._shutdown_requested.set()
+        await asyncio.wait_for(main_task, timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_auto_ingest_resolves_branch_via_default_git_branch(self, monkeypatch, tmp_path):
+        """#130: auto-start at server boot must resolve the branch through
+        _default_git_branch instead of hardcoding "HEAD"."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_default_git_branch", lambda repo_path: "resolved-default")
+
+        captured = {}
+
+        async def fake_run_ingestion(repo_path, branch):
+            captured["branch"] = branch
+            done, _ = await asyncio.wait(
+                {
+                    asyncio.create_task(mcp_server._shutdown_requested.wait()),
+                    asyncio.create_task(asyncio.Event().wait()),
+                },
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+
+        assert captured["branch"] == "resolved-default"
 
         mcp_server._shutdown_requested.set()
         await asyncio.wait_for(main_task, timeout=2)

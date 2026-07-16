@@ -3477,6 +3477,29 @@ def _code_ident(entity_type: str, file_path: str, name: Optional[str] = None) ->
 # ---------------------------------------------------------------------------
 
 
+def _default_git_branch(repo_path: str) -> str:
+    """Resolve the branch to ingest when the caller didn't pass one explicitly.
+
+    MINIGRAF_GIT_BRANCH (matching the other MINIGRAF_* ingestion env vars)
+    takes precedence, trusted as-is with no existence check. Otherwise
+    auto-detect the repo's actual default branch by trying main then master,
+    so ingestion tracks a stable target instead of silently following
+    whatever ref happens to be checked out (#130). Only falls back to "HEAD"
+    if neither exists.
+    """
+    env_branch = os.environ.get("MINIGRAF_GIT_BRANCH")
+    if env_branch:
+        return env_branch
+    for candidate in ("main", "master"):
+        result = _subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", candidate],
+            cwd=repo_path, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return candidate
+    return "HEAD"
+
+
 def _git_commits(
     repo_path: str,
     watermark_hash: Optional[str],
@@ -6315,7 +6338,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
 async def handle_minigraf_ingest_git(
     repo_path: Optional[str] = None,
-    branch: str = "HEAD",
+    branch: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Start background git ingestion. Returns immediately."""
     global _ingest_task, _ingest_progress
@@ -6351,7 +6374,7 @@ async def handle_minigraf_ingest_git(
         "status": "starting", "processed": 0, "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     }
-    _ingest_task = asyncio.create_task(_run_ingestion(repo, branch))
+    _ingest_task = asyncio.create_task(_run_ingestion(repo, branch or _default_git_branch(repo)))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
 
 
@@ -6608,7 +6631,11 @@ _TOOLS: List[Tool] = [
                 },
                 "branch": {
                     "type": "string",
-                    "description": "Branch or ref to walk. Defaults to HEAD.",
+                    "description": (
+                        "Branch or ref to walk. Defaults to MINIGRAF_GIT_BRANCH if "
+                        "set, otherwise auto-detects the repo's main/master branch, "
+                        "falling back to HEAD only if neither exists."
+                    ),
                 },
             },
             "required": [],
@@ -6688,7 +6715,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         if name == "minigraf_ingest_git":
             result = await handle_minigraf_ingest_git(
                 repo_path=arguments.get("repo_path"),
-                branch=arguments.get("branch", "HEAD"),
+                branch=arguments.get("branch"),
             )
             return [TextContent(type="text", text=json.dumps(result))]
 
@@ -6746,7 +6773,8 @@ async def main() -> None:
             _ingest_progress["owner_pid"] = holder_pid
         else:
             _ingest_progress["status"] = "starting"
-            _ingest_task = asyncio.create_task(_run_ingestion(str(Path.cwd()), "HEAD"))
+            cwd = str(Path.cwd())
+            _ingest_task = asyncio.create_task(_run_ingestion(cwd, _default_git_branch(cwd)))
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
