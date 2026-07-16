@@ -1461,48 +1461,36 @@ class TestHeuristicNormalization:
 
 
 class TestTransactExtractedFactsSchema:
-    def test_invalid_entity_type_is_skipped(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "1"})
+    def test_invalid_entity_type_is_skipped(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
-
         facts = [{"entity": ":service/auth", "entity_type": "service",
                   "attribute": ":description", "value": "auth service"}]
         stored = mcp_server._transact_extracted_facts(facts)
 
         assert stored == 0
-        transact_calls = [c for c in db_instance.execute.call_args_list
-                          if "transact" in str(c)]
-        assert len(transact_calls) == 0
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:service/auth :description ?d]])'
+        ))
+        assert queried["results"] == []
 
-    def test_valid_fact_is_stored(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "2"})
+    def test_valid_fact_is_stored(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
-
         facts = [{"entity": ":decision/redis", "entity_type": "decision",
                   "attribute": ":description", "value": "use Redis"}]
         stored = mcp_server._transact_extracted_facts(facts)
 
         assert stored == 1
-        # Verify :ident triple is included for audit retraction
-        transact_calls = [c for c in db_instance.execute.call_args_list
-                          if "transact" in str(c)]
-        assert len(transact_calls) == 1
-        assert ":ident" in str(transact_calls[0])
-        assert '":decision/redis"' in str(transact_calls[0])
+        desc = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert desc["results"] == [["use Redis"]]
+        ident = json.loads(real_db.execute(
+            '(query [:find ?i :where [:decision/redis :ident ?i]])'
+        ))
+        assert ident["results"] == [[":decision/redis"]]
 
-    def test_mixed_batch_stores_only_valid(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "3"})
+    def test_mixed_batch_stores_only_valid(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
-
         facts = [
             {"entity": ":decision/redis", "entity_type": "decision",
              "attribute": ":description", "value": "use Redis"},
@@ -1512,6 +1500,14 @@ class TestTransactExtractedFactsSchema:
         stored = mcp_server._transact_extracted_facts(facts)
 
         assert stored == 1
+        redis = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert redis["results"] == [["use Redis"]]
+        auth = json.loads(real_db.execute(
+            '(query [:find ?d :where [:service/auth :description ?d]])'
+        ))
+        assert auth["results"] == []
 
 
 class TestParseTransactFacts:
@@ -1552,11 +1548,8 @@ class TestParseTransactFacts:
 
 
 class TestMinigrafTransactSchema:
-    def test_rejects_unknown_entity_type(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_rejects_unknown_entity_type(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         result = mcp_server.handle_minigraf_transact(
             '[[:service/auth :description "auth service"]]',
             reason="test"
@@ -1565,25 +1558,21 @@ class TestMinigrafTransactSchema:
         assert result["ok"] is False
         assert "schema" in result["error"].lower() or "violation" in result["error"].lower()
 
-    def test_accepts_valid_fact(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "5"})
+    def test_accepts_valid_fact(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         result = mcp_server.handle_minigraf_transact(
             '[[:decision/redis :description "use Redis"]]',
             reason="test"
         )
 
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == [["use Redis"]]
 
-    def test_keyword_only_transact_bypasses_schema_validation(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "6"})
+    def test_keyword_only_transact_bypasses_schema_validation(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         # Keyword-only triple (no quoted string values) — not schema-validated by design
         result = mcp_server.handle_minigraf_transact(
             '[[:service/auth :calls :component/jwt]]',
@@ -1591,6 +1580,10 @@ class TestMinigrafTransactSchema:
         )
 
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?c :where [:service/auth :calls ?c]])'
+        ))
+        assert queried["results"] == [[":component/jwt"]]
 
 
 class TestQueryCanonicalEntities:
@@ -1784,37 +1777,32 @@ class TestMinigrafAudit:
 
 
 class TestPhase5Schema:
-    def test_module_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+    def test_module_entity_passes_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":module/src-auth-py", "entity_type": "module",
                   "attribute": ":description", "value": "src/auth.py"}]
         assert mcp_server._validate_facts(facts) == []
 
-    def test_function_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+    def test_function_entity_passes_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":function/src-auth-py-login", "entity_type": "function",
                   "attribute": ":description", "value": "login"}]
         assert mcp_server._validate_facts(facts) == []
 
-    def test_class_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+    def test_class_entity_passes_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":class/src-auth-py-user", "entity_type": "class",
                   "attribute": ":description", "value": "User"}]
         assert mcp_server._validate_facts(facts) == []
 
-    def test_ingestion_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+    def test_ingestion_entity_passes_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":ingestion/watermark", "entity_type": "ingestion",
                   "attribute": ":description", "value": "git ingestion watermark"}]
         assert mcp_server._validate_facts(facts) == []
 
-    def test_unknown_code_attr_fails_validation(self, mock_minigraf_db, tmp_path):
+    def test_unknown_code_attr_fails_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":module/foo", "entity_type": "module",
                   "attribute": ":description", "value": "foo.py"},
                  {"entity": ":module/foo", "entity_type": "module",
@@ -1822,12 +1810,42 @@ class TestPhase5Schema:
         violations = mcp_server._validate_facts(facts)
         assert any("unknown-attr" in v for v in violations)
 
-    def test_contains_rule_registered_at_startup(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_contains_rule_registered_at_startup(self, real_db):
+        """SESSION_RULES registers `linked`/`reachable` over the :contains
+        edge (module/class -> function/field structural containment):
+            (rule [(linked ?a ?b) [?a :contains ?b]])
+            (rule [(reachable ?a ?b) [?a :contains ?b]])
+        Prove those clauses were actually registered at open_db time by
+        transacting a real :contains edge and invoking `linked`/`reachable`
+        with the subject pinned to the literal entity (so the returned
+        value is the human-readable keyword, not the entity's internal
+        UUID) to confirm the rule actually derives the edge — a raw
+        [?a :contains ?b] triple pattern would pass even if the rule
+        registration silently failed, so this specifically calls through
+        the rule name.
+        """
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        executed = [call.args[0] for call in db_instance.execute.call_args_list]
-        assert any("contains" in r for r in executed)
+        real_db.execute(
+            '(transact {} [[:module/foo :contains :function/bar]])'
+        )
+
+        linked = json.loads(real_db.execute(
+            '(query [:find ?b :where (linked :module/foo ?b)])'
+        ))
+        assert linked["results"] == [[":function/bar"]]
+
+        reachable = json.loads(real_db.execute(
+            '(query [:find ?b :where (reachable :module/foo ?b)])'
+        ))
+        assert reachable["results"] == [[":function/bar"]]
+
+        # A non-matching pair must not spuriously match — proves this is a
+        # real join against the transacted data, not a rule that always
+        # succeeds regardless of the graph contents.
+        no_match = json.loads(real_db.execute(
+            '(query [:find ?b :where (linked :module/nonexistent ?b)])'
+        ))
+        assert no_match["results"] == []
 
 
 class TestGetParser:
