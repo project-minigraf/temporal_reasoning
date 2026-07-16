@@ -7327,6 +7327,11 @@ def git_repo_with_deletion(tmp_path):
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
 
+    # Sleep so the two commits land in different git-timestamp seconds (git's
+    # committer time has 1s resolution): real-backend tests point-in-time
+    # query :valid-at the add commit's timestamp to confirm the fact was open
+    # right after creation, which requires add_ts != delete_ts.
+    time.sleep(1.1)
     (repo / "auth.py").unlink()
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "delete auth"], cwd=repo, check=True, capture_output=True)
@@ -7347,6 +7352,7 @@ def git_repo_with_intra_file_deletion(tmp_path):
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
 
+    time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
     (repo / "auth.py").write_text("def login(): pass\n")
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "remove logout"], cwd=repo, check=True, capture_output=True)
@@ -7367,6 +7373,7 @@ def git_repo_with_rename(tmp_path):
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
 
+    time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
     _subprocess.run(["git", "mv", "old_auth.py", "new_auth.py"], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "rename auth"], cwd=repo, check=True, capture_output=True)
 
@@ -7515,121 +7522,204 @@ class TestRunIngestionBitemporalClose:
 
     @pytest.mark.asyncio
     async def test_file_deletion_closes_with_real_description_not_empty_string(
-        self, mock_minigraf_db, git_repo_with_deletion, monkeypatch
+        self, git_repo_with_deletion
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Verified against the REAL minigraf backend: the deleted function's
+        :description fact must be closed using its REAL value ("login"), not
+        an empty-string placeholder. If the close path used the wrong (empty)
+        value, the retract in `_ingest_close` would silently no-op (it is
+        best-effort) and the real fact would leak open forever -- observable
+        here as the fact still being visible in a current-time query after
+        the deletion commit."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_deletion / "memory.graph"))
+        repo = git_repo_with_deletion
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_deletion), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        assert close_triples_seen, "Expected _ingest_close to be called on file deletion"
-        assert not any(':description ""' in t for t in close_triples_seen), \
-            "Close triples must not use empty string as description placeholder"
-        assert any(':description "login"' in t for t in close_triples_seen), \
-            "Close triples must carry the real description of the deleted function"
+            fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+
+            # While the file existed, the REAL description was open.
+            open_desc = results(
+                f'(query [:find ?d :valid-at "{add_ts}" :where [{fn_ident} :description ?d]])'
+            )
+            assert open_desc == [["login"]], \
+                f"Expected the real description 'login' to be open after the add commit, got {open_desc}"
+
+            # After deletion, the fact must be CLOSED -- an empty-string
+            # placeholder bug would leave the real value visible forever
+            # because the retract could never match it.
+            current_desc = results(f"(query [:find ?d :where [{fn_ident} :description ?d]])")
+            assert current_desc == [], \
+                f"Deleted function's :description must be closed at current time, got {current_desc}"
+        finally:
+            mcp_server._db = None  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
     async def test_file_deletion_close_includes_ident_and_contains_triples(
-        self, mock_minigraf_db, git_repo_with_deletion, monkeypatch
+        self, git_repo_with_deletion
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Verified against the REAL backend: deleting a file must close BOTH
+        the function's own :ident fact AND the parent module's :contains
+        edge pointing at it -- not just one or the other."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_deletion / "memory.graph"))
+        repo = git_repo_with_deletion
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_deletion), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        module_ident = mcp_server._code_ident("module", "auth.py")
-        assert any(":ident" in t and fn_ident in t for t in close_triples_seen), \
-            "Close triples must include :ident fact for the deleted function"
-        assert any(":contains" in t and fn_ident in t and module_ident in t
-                   for t in close_triples_seen), \
-            "Close triples must include the module :contains edge for the deleted function"
+            fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+            module_ident = mcp_server._code_ident("module", "auth.py")
+
+            # Both facts were open right after creation.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{fn_ident} :ident ?x]])'
+            ) == [[fn_ident]]
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{module_ident} :contains ?x]])'
+            ) == [[fn_ident]]
+
+            # Both must be closed (invisible at current time) after deletion.
+            assert results(f"(query [:find ?x :where [{fn_ident} :ident ?x]])") == [], \
+                "Deleted function's :ident fact must be closed"
+            assert results(f"(query [:find ?x :where [{module_ident} :contains ?x]])") == [], \
+                "Deleted function's :contains edge from the module must be closed"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_intra_file_deletion_closes_removed_function(
-        self, mock_minigraf_db, git_repo_with_intra_file_deletion, monkeypatch
+        self, git_repo_with_intra_file_deletion
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Verified against the REAL backend: removing one function from a
+        file that still contains other functions must close only the
+        removed function's entity, leaving the still-present sibling open."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_intra_file_deletion / "memory.graph"))
+        repo = git_repo_with_intra_file_deletion
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_intra_file_deletion), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        logout_ident = mcp_server._code_ident("function", "auth.py", "logout")
-        login_ident = mcp_server._code_ident("function", "auth.py", "login")
+            logout_ident = mcp_server._code_ident("function", "auth.py", "logout")
+            login_ident = mcp_server._code_ident("function", "auth.py", "login")
 
-        assert any(logout_ident in t for t in close_triples_seen), \
-            "logout() removed from modified file must trigger a close"
-        assert not any(login_ident in t and ":ident" in t for t in close_triples_seen), \
-            "login() still present in file must not be closed"
+            # Both were open right after the add commit.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{logout_ident} :ident ?x]])'
+            ) == [[logout_ident]]
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{login_ident} :ident ?x]])'
+            ) == [[login_ident]]
+
+            # logout() removed from the modified file must be closed now.
+            assert results(f"(query [:find ?x :where [{logout_ident} :ident ?x]])") == [], \
+                "logout() removed from modified file must trigger a close"
+            # login() still present in the file must stay open.
+            assert results(f"(query [:find ?x :where [{login_ident} :ident ?x]])") == [[login_ident]], \
+                "login() still present in file must not be closed"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_renamed_file_links_old_and_new_via_rename_edges(
-        self, mock_minigraf_db, git_repo_with_rename, monkeypatch
+        self, git_repo_with_rename
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Verified against the REAL backend: renaming a file must close the
+        old module while still creating the new module's entities, and the
+        :renamed-from/:renamed-to link must stay visible at current time --
+        it must never get folded into the old module's closed window."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_rename / "memory.graph"))
+        repo = git_repo_with_rename
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_rename), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        old_module_ident = mcp_server._code_ident("module", "old_auth.py")
-        new_module_ident = mcp_server._code_ident("module", "new_auth.py")
-        new_fn_ident = mcp_server._code_ident("function", "new_auth.py", "login")
+            old_module_ident = mcp_server._code_ident("module", "old_auth.py")
+            new_module_ident = mcp_server._code_ident("module", "new_auth.py")
+            new_fn_ident = mcp_server._code_ident("function", "new_auth.py", "login")
 
-        assert any(old_module_ident in t for t in close_triples_seen), \
-            "Old module entities must still be closed when file is renamed"
-        # :renamed-to is an open-ended fact (Fix 1): it must be transacted, NOT
-        # folded into the old module's closed valid window via _ingest_close.
-        assert not any(":renamed-to" in t for t in close_triples_seen), \
-            "Old module's close triples must NOT carry :renamed-to (it is open-ended)"
+            # Old module was open right after creation.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{old_module_ident} :ident ?x]])'
+            ) == [[old_module_ident]]
 
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert new_fn_ident in transact_calls, \
-            "New module's entities must still be created after file is renamed"
-        assert f"{new_module_ident} :renamed-from {old_module_ident}" in transact_calls, \
-            "New module's open triples must include :renamed-from pointing at the old ident"
-        assert f"{old_module_ident} :renamed-to {new_module_ident}" in transact_calls, \
-            "Old module's :renamed-to must be transacted open-ended, not closed"
+            # Old module must be closed after the rename.
+            assert results(f"(query [:find ?x :where [{old_module_ident} :ident ?x]])") == [], \
+                "Old module entities must still be closed when file is renamed"
+
+            # New module's function must be created and stay open (not closed).
+            assert results(f"(query [:find ?x :where [{new_fn_ident} :ident ?x]])") == [[new_fn_ident]], \
+                "New module's entities must still be created after file is renamed"
+
+            # :renamed-to/:renamed-from must remain visible at current time
+            # (Fix 1: open-ended, not folded into the closed window).
+            assert results(
+                f"(query [:find ?x :where [{old_module_ident} :renamed-to ?x]])"
+            ) == [[new_module_ident]], \
+                "Old module's :renamed-to must be transacted open-ended, not closed"
+            assert results(
+                f"(query [:find ?x :where [{new_module_ident} :renamed-from ?x]])"
+            ) == [[old_module_ident]], \
+                "New module's open triples must include :renamed-from pointing at the old ident"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_in_file_function_rename_links_via_rename_edges(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
+        """Verified against the REAL backend, with a pass-through spy on
+        `_db_execute` (still forwards every call to the real backend and
+        lets ingestion persist) so we can count the actual retract commands
+        issued, exactly like `test_renamed_to_is_open_ended_against_real_graph`."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7642,40 +7732,67 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename fn"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+        real_execute = mcp_server._db_execute
+        executed_cmds = []
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        def spy(db, datalog):
+            executed_cmds.append(datalog)
+            return real_execute(db, datalog)
 
-        old_fn_ident = mcp_server._code_ident("function", "auth.py", "oldName")
-        new_fn_ident = mcp_server._code_ident("function", "auth.py", "newName")
+        mcp_server._db_execute = spy
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._db_execute = real_execute
 
-        # Fix 1: :renamed-to is transacted open-ended, not folded into a close.
-        assert not any(":renamed-to" in t for t in close_triples_seen)
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert f"{new_fn_ident} :renamed-from {old_fn_ident}" in transact_calls
-        assert f"{old_fn_ident} :renamed-to {new_fn_ident}" in transact_calls
-        # Fix 4: the old ident must be closed exactly ONCE (rename loop only), not
-        # also as a plain removal — count distinct close batches carrying its :ident.
-        old_ident_close_count = sum(
-            1 for t in close_triples_seen if f"{old_fn_ident} :ident" in t
-        )
-        assert old_ident_close_count == 1, \
-            f"same-file rename should close old ident once, got {old_ident_close_count}"
+        try:
+            old_fn_ident = mcp_server._code_ident("function", "auth.py", "oldName")
+            new_fn_ident = mcp_server._code_ident("function", "auth.py", "newName")
+
+            # Fix 1: :renamed-to is transacted open-ended, never carrying :valid-to.
+            renamed_to_triple = f"{old_fn_ident} :renamed-to {new_fn_ident}"
+            renamed_to_cmds = [c for c in executed_cmds if renamed_to_triple in c]
+            assert renamed_to_cmds, ":renamed-to must be emitted against the real DB"
+            for c in renamed_to_cmds:
+                assert ":valid-to" not in c, ":renamed-to must never be closed with a :valid-to"
+
+            # Fix 4: the old ident must be closed exactly ONCE (rename loop
+            # only, not also a second time as a plain removal) -- observed as
+            # exactly one retract command against its :ident fact.
+            old_ident_retracts = [
+                c for c in executed_cmds
+                if c.strip().startswith("(retract") and f"{old_fn_ident} :ident" in c
+            ]
+            assert len(old_ident_retracts) == 1, \
+                f"same-file rename should close old ident once, got {len(old_ident_retracts)}: {old_ident_retracts}"
+
+            # Real graph reflects the rename: old closed, new open, links resolve.
+            db = mcp_server.get_db()
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            assert results(f"(query [:find ?x :where [{old_fn_ident} :ident ?x]])") == [], \
+                "Old function must be closed after in-file rename"
+            assert results(f"(query [:find ?x :where [{new_fn_ident} :ident ?x]])") == [[new_fn_ident]], \
+                "New function must be open after in-file rename"
+            assert results(f"(query [:find ?x :where [{new_fn_ident} :renamed-from ?x]])") == [[old_fn_ident]]
+            assert results(f"(query [:find ?x :where [{old_fn_ident} :renamed-to ?x]])") == [[new_fn_ident]]
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_global_rename_links_via_rename_edges_end_to_end(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
+        """Verified against the REAL backend via a pass-through `_db_execute`
+        spy, same pattern as `test_in_file_function_rename_links_via_rename_edges`."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7694,44 +7811,71 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename global"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+        real_execute = mcp_server._db_execute
+        executed_cmds = []
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        def spy(db, datalog):
+            executed_cmds.append(datalog)
+            return real_execute(db, datalog)
 
-        old_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
-        new_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_Y")
+        mcp_server._db_execute = spy
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._db_execute = real_execute
 
-        # Fix 1: :renamed-to open-ended via transact, not in the close window.
-        assert not any(":renamed-to" in t for t in close_triples_seen)
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert f"{new_ident} :renamed-from {old_ident}" in transact_calls
-        assert f"{old_ident} :renamed-to {new_ident}" in transact_calls
-        # Fix 4: the renamed old global is closed once (rename loop), not twice.
-        old_ident_close_count = sum(
-            1 for t in close_triples_seen if f"{old_ident} :ident" in t
-        )
-        assert old_ident_close_count == 1, \
-            f"same-file global rename should close old ident once, got {old_ident_close_count}"
+        try:
+            old_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
+            new_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_Y")
+
+            # Fix 1: :renamed-to open-ended via transact, never with :valid-to.
+            renamed_to_triple = f"{old_ident} :renamed-to {new_ident}"
+            renamed_to_cmds = [c for c in executed_cmds if renamed_to_triple in c]
+            assert renamed_to_cmds, ":renamed-to must be emitted against the real DB"
+            for c in renamed_to_cmds:
+                assert ":valid-to" not in c, ":renamed-to must never be closed with a :valid-to"
+
+            # Fix 4: the renamed old global is closed once (rename loop), not twice.
+            old_ident_retracts = [
+                c for c in executed_cmds
+                if c.strip().startswith("(retract") and f"{old_ident} :ident" in c
+            ]
+            assert len(old_ident_retracts) == 1, \
+                f"same-file global rename should close old ident once, got {len(old_ident_retracts)}: {old_ident_retracts}"
+
+            db = mcp_server.get_db()
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            assert results(f"(query [:find ?x :where [{old_ident} :ident ?x]])") == [], \
+                "Old global must be closed after rename"
+            assert results(f"(query [:find ?x :where [{new_ident} :ident ?x]])") == [[new_ident]], \
+                "New global must be open after rename"
+            assert results(f"(query [:find ?x :where [{new_ident} :renamed-from ?x]])") == [[old_ident]]
+            assert results(f"(query [:find ?x :where [{old_ident} :renamed-to ?x]])") == [[new_ident]]
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_rename_to_unsupported_ext_closes_old_entities(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Forward -M regression, end-to-end through _run_ingestion: renaming a
         tracked .py to an unsupported .txt must close the old module AND its
         child function/global via the synthetic-delete path. Pre-fix the whole
         "R" row was dropped in _extract_commit, so nothing was ever closed and
-        the old entities leaked open forever."""
+        the old entities leaked open forever.
+
+        Verified against the REAL backend via a pass-through `_db_execute` spy
+        (real persistence) plus real bi-temporal queries: open at the add
+        commit, closed at current time."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7740,48 +7884,71 @@ class TestRunIngestionBitemporalClose:
         (repo / "auth.py").write_text("AUTH_KEY = 1234567890123\n\ndef login(x):\n    return x + 1\n")
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
         _subprocess.run(["git", "mv", "auth.py", "auth.txt"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename to txt"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+        real_execute = mcp_server._db_execute
+        executed_cmds = []
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        def spy(db, datalog):
+            executed_cmds.append(datalog)
+            return real_execute(db, datalog)
 
-        module_ident = mcp_server._code_ident("module", "auth.py")
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        var_ident = mcp_server._code_ident("variable", "auth.py", "AUTH_KEY")
+        mcp_server._db_execute = spy
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._db_execute = real_execute
 
-        assert any(":ident" in t and module_ident in t for t in close_triples_seen), \
-            "Old module must be closed when renamed to an unsupported extension"
-        assert any(":ident" in t and fn_ident in t for t in close_triples_seen), \
-            "Old function must be closed when its file is renamed to an unsupported extension"
-        assert any(":ident" in t and var_ident in t for t in close_triples_seen), \
-            "Old global must be closed when its file is renamed to an unsupported extension"
-        # No .txt module should ever be opened.
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        txt_module_ident = mcp_server._code_ident("module", "auth.txt")
-        assert txt_module_ident not in transact_calls, \
-            "No module entity should be created for the unsupported .txt path"
+        try:
+            module_ident = mcp_server._code_ident("module", "auth.py")
+            fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+            var_ident = mcp_server._code_ident("variable", "auth.py", "AUTH_KEY")
+
+            db = mcp_server.get_db()
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            for ident, label in (
+                (module_ident, "module"), (fn_ident, "function"), (var_ident, "global"),
+            ):
+                assert results(
+                    f'(query [:find ?x :valid-at "{add_ts}" :where [{ident} :ident ?x]])'
+                ) == [[ident]], f"Old {label} must have been open right after the add commit"
+                assert results(f"(query [:find ?x :where [{ident} :ident ?x]])") == [], \
+                    f"Old {label} must be closed when its file is renamed to an unsupported extension"
+
+            # No .txt module should ever be opened.
+            txt_module_ident = mcp_server._code_ident("module", "auth.txt")
+            assert not any(txt_module_ident in c for c in executed_cmds if c.strip().startswith("(transact")), \
+                "No module entity should be created for the unsupported .txt path"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_rename_from_unsupported_ext_creates_no_phantom_module(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Reverse -M regression, end-to-end: renaming an unsupported .txt into
         a tracked .py must NOT close a phantom old module (the .txt ident was
         never opened) and must NOT write a dangling :renamed-from edge. Pre-fix
         _run_ingestion's R-branch unconditionally closed :module/notes-txt and
-        wrote a :renamed-from pointing at it."""
+        wrote a :renamed-from pointing at it.
+
+        Verified against the REAL backend: since the .txt module ident was
+        never a real entity, it must have NO :ident fact at any point in time
+        -- not even right after the add commit."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7793,35 +7960,45 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "mv", "notes.txt", "notes.py"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename to py"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        old_module_ident = mcp_server._code_ident("module", "notes.txt")
-        new_module_ident = mcp_server._code_ident("module", "notes.py")
-        new_fn_ident = mcp_server._code_ident("function", "notes.py", "login")
+            old_module_ident = mcp_server._code_ident("module", "notes.txt")
+            new_module_ident = mcp_server._code_ident("module", "notes.py")
+            new_fn_ident = mcp_server._code_ident("function", "notes.py", "login")
 
-        # No phantom old module closed, no dangling rename edges either way.
-        assert not any(old_module_ident in t for t in close_triples_seen), \
-            "The never-opened .txt module must not be closed (no phantom)"
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert f"{new_module_ident} :renamed-from {old_module_ident}" not in transact_calls, \
-            "No :renamed-from edge should dangle at the never-opened .txt module"
-        assert old_module_ident not in transact_calls, \
-            "The .txt module ident must appear nowhere in transacted triples"
-        # The new .py path is still ingested normally.
-        assert new_fn_ident in transact_calls, \
-            "The new .py file's entities must still be created as a plain add"
+            # No phantom old module: it must never have had an :ident fact,
+            # not even right after the (never-ingested) add commit.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{old_module_ident} :ident ?x]])'
+            ) == [], "The never-opened .txt module must never have an :ident fact (no phantom)"
+            assert results(f"(query [:find ?x :where [{old_module_ident} :ident ?x]])") == [], \
+                "The never-opened .txt module must not be closed (no phantom)"
+
+            # No dangling :renamed-from edge either way.
+            assert results(
+                f"(query [:find ?x :where [{new_module_ident} :renamed-from ?x]])"
+            ) == [], "No :renamed-from edge should dangle at the never-opened .txt module"
+
+            # The new .py path is still ingested normally.
+            assert results(f"(query [:find ?x :where [{new_fn_ident} :ident ?x]])") == [[new_fn_ident]], \
+                "The new .py file's entities must still be created as a plain add"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_renamed_to_is_open_ended_against_real_graph(self, tmp_path):
@@ -8001,12 +8178,15 @@ class TestRunIngestionBitemporalClose:
 
     @pytest.mark.asyncio
     async def test_unchanged_global_and_field_survive_unrelated_edit(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Fix 2: an unchanged module global and class field must NOT be closed
         when a later commit only edits an unrelated function body. Pre-fix,
         current_extracted_idents omitted globals/fields, so every still-present
-        global/field looked 'removed' on any M commit and was wrongly closed."""
+        global/field looked 'removed' on any M commit and was wrongly closed.
+
+        Verified against the REAL backend: both facts must still be visible
+        in a current-time query after the unrelated edit commit."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -8024,36 +8204,49 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "edit f body"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        gvar_ident = mcp_server._code_ident("variable", "x.py", "GLOBAL_CONF")
-        field_ident = mcp_server._code_ident("field", "x.py", "C.field_a")
-        assert not any(gvar_ident in t for t in close_triples_seen), \
-            "Unchanged global must NOT be closed on an unrelated function edit"
-        assert not any(field_ident in t for t in close_triples_seen), \
-            "Unchanged field must NOT be closed on an unrelated function edit"
+            gvar_ident = mcp_server._code_ident("variable", "x.py", "GLOBAL_CONF")
+            field_ident = mcp_server._code_ident("field", "x.py", "C.field_a")
+
+            # Both were open right after the add commit.
+            assert results(f'(query [:find ?x :valid-at "{add_ts}" :where [{gvar_ident} :ident ?x]])') == [[gvar_ident]]
+            assert results(f'(query [:find ?x :valid-at "{add_ts}" :where [{field_ident} :ident ?x]])') == [[field_ident]]
+
+            # Both must STILL be open (not closed) after the unrelated edit.
+            assert results(f"(query [:find ?x :where [{gvar_ident} :ident ?x]])") == [[gvar_ident]], \
+                "Unchanged global must NOT be closed on an unrelated function edit"
+            assert results(f"(query [:find ?x :where [{field_ident} :ident ?x]])") == [[field_ident]], \
+                "Unchanged field must NOT be closed on an unrelated function edit"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_file_rename_closes_unmatched_child_and_dependency(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Fix 3: when a file is renamed, child entities the matcher could not
         confirm a continuity edge for (e.g. short/ambiguous bodies) and the old
         path's :depends-on edges must still be closed as plain removals under
         the OLD path. Pre-fix only the old module was closed, leaking unmatched
-        children and dependency edges open forever alongside the new file's."""
+        children and dependency edges open forever alongside the new file's.
+
+        Verified against the REAL backend via real bi-temporal queries."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -8065,48 +8258,64 @@ class TestRunIngestionBitemporalClose:
         (repo / "main.py").write_text("import dep\n\ndef go():\n    pass\n")
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
         _subprocess.run(["git", "mv", "main.py", "app.py"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename main to app"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        old_go = mcp_server._code_ident("function", "main.py", "go")
-        old_module = mcp_server._code_ident("module", "main.py")
-        dep_module = mcp_server._code_ident("module", "dep.py")
+            old_go = mcp_server._code_ident("function", "main.py", "go")
+            old_module = mcp_server._code_ident("module", "main.py")
+            dep_module = mcp_server._code_ident("module", "dep.py")
+            new_module = mcp_server._code_ident("module", "app.py")
 
-        # Unmatched old child closed as a PLAIN removal (no :renamed-to linkage).
-        assert any(f"{old_go} :ident" in t for t in close_triples_seen), \
-            "Unmatched old child function must be closed under the old path"
-        assert not any("renamed-to" in t and old_go in t for t in close_triples_seen), \
-            "Unmatched child has no continuity edge — must not get a :renamed-to"
-        # Old path's surviving dependency edge is closed too.
-        assert any(
-            f"{old_module} :depends-on {dep_module}" in t for t in close_triples_seen
-        ), "Old path's :depends-on edge must be closed on file rename"
-        # The new file is still ingested.
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert mcp_server._code_ident("module", "app.py") + " :entity-type" in transact_calls, \
-            "New renamed file's module must still be created"
+            # Unmatched old child was open right after add, then closed as a
+            # PLAIN removal (no :renamed-to linkage) after the rename.
+            assert results(f'(query [:find ?x :valid-at "{add_ts}" :where [{old_go} :ident ?x]])') == [[old_go]]
+            assert results(f"(query [:find ?x :where [{old_go} :ident ?x]])") == [], \
+                "Unmatched old child function must be closed under the old path"
+            assert results(f"(query [:find ?x :where [{old_go} :renamed-to ?x]])") == [], \
+                "Unmatched child has no continuity edge — must not get a :renamed-to"
+
+            # Old path's surviving dependency edge is closed too.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{old_module} :depends-on ?x]])'
+            ) == [[dep_module]]
+            assert results(f"(query [:find ?x :where [{old_module} :depends-on ?x]])") == [], \
+                "Old path's :depends-on edge must be closed on file rename"
+
+            # The new file is still ingested.
+            assert results(f"(query [:find ?x :where [{new_module} :ident ?x]])") == [[new_module]], \
+                "New renamed file's module must still be created"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_same_file_rename_closes_old_ident_exactly_once(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Fix 4: an in-place rename must close the old ident exactly once (via
         the renamed_pairs loop, with :renamed-to linkage) — not also a second
-        time as a plain removal from the M-status removal detector."""
+        time as a plain removal from the M-status removal detector.
+
+        Verified against the REAL backend, with a pass-through `_db_execute`
+        spy so we can count the actual retract commands issued, same pattern
+        as `test_in_file_function_rename_links_via_rename_edges`."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -8119,28 +8328,51 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename fn"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+        real_execute = mcp_server._db_execute
+        executed_cmds = []
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        def spy(db, datalog):
+            executed_cmds.append(datalog)
+            return real_execute(db, datalog)
 
-        old_fn = mcp_server._code_ident("function", "auth.py", "oldName")
-        close_count = sum(1 for t in close_triples_seen if f"{old_fn} :ident" in t)
-        assert close_count == 1, \
-            f"same-file rename must close old ident exactly once, got {close_count}"
-        new_fn = mcp_server._code_ident("function", "auth.py", "newName")
-        assert any(f"{old_fn} :renamed-to {new_fn}" in t for t in
-                   [c for call in db_instance.execute.call_args_list for c in [str(call)]]), \
-            "the single close path must be the rename path (with :renamed-to linkage)"
+        mcp_server._db_execute = spy
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._db_execute = real_execute
+
+        try:
+            old_fn = mcp_server._code_ident("function", "auth.py", "oldName")
+            new_fn = mcp_server._code_ident("function", "auth.py", "newName")
+
+            old_ident_retracts = [
+                c for c in executed_cmds
+                if c.strip().startswith("(retract") and f"{old_fn} :ident" in c
+            ]
+            assert len(old_ident_retracts) == 1, \
+                f"same-file rename must close old ident exactly once, got {len(old_ident_retracts)}: {old_ident_retracts}"
+
+            renamed_to_triple = f"{old_fn} :renamed-to {new_fn}"
+            assert any(renamed_to_triple in c for c in executed_cmds), \
+                "the single close path must be the rename path (with :renamed-to linkage)"
+
+            db = mcp_server.get_db()
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            assert results(f"(query [:find ?x :where [{old_fn} :ident ?x]])") == [], \
+                "Old function must be closed after same-file rename"
+            assert results(f"(query [:find ?x :where [{new_fn} :ident ?x]])") == [[new_fn]], \
+                "New function must be open after same-file rename"
+        finally:
+            mcp_server._db = None
 
 
 # ---------------------------------------------------------------------------
@@ -8179,6 +8411,7 @@ def git_repo_with_dep_removal(tmp_path):
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "add modules with dep"], cwd=repo, check=True, capture_output=True)
 
+    time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
     (repo / "mod_a.py").write_text("def main(): pass\n")
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "remove import"], cwd=repo, check=True, capture_output=True)
@@ -8248,65 +8481,94 @@ class TestRunIngestionBitemporalDeps:
 
     @pytest.mark.asyncio
     async def test_new_import_writes_depends_on_via_ingest_transact(
-        self, mock_minigraf_db, git_repo_with_deps, monkeypatch
+        self, git_repo_with_deps
     ):
-        """Adding a file with an import must call _ingest_transact with a :depends-on triple
-        using the git commit timestamp."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Adding a file with an import must write a :depends-on triple whose
+        :valid-from is the git commit timestamp.
+
+        Verified against the REAL backend: the edge must be open both right
+        after the add commit (:valid-at) and at current time."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_deps / "memory.graph"))
+        repo = git_repo_with_deps
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        transact_calls: list = []
-        real_ingest_transact = mcp_server._ingest_transact
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        def capture_transact(db, triples, ts_iso, reason=""):
-            transact_calls.extend(triples)
-            return real_ingest_transact(db, triples, ts_iso, reason)
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+            mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
+            # mod_b.py genuinely exists in file_entities, so the generalized
+            # tiered matcher (Task 12) resolves "mod_b" to the real internal
+            # module via the basename tier, instead of the old Rust-only fallback.
+            mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
 
-        await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
-
-        mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
-        # mod_b.py genuinely exists in file_entities, so the generalized
-        # tiered matcher (Task 12) now resolves "mod_b" to the real internal
-        # module via the basename tier, instead of the old Rust-only fallback.
-        mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
-        dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
-        assert any(dep_triple in t for t in transact_calls), (
-            f"Expected _ingest_transact to be called with '{dep_triple}' during commit loop, "
-            f"got: {transact_calls}"
-        )
+            at_add = results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{mod_a_ident} :depends-on ?x]])'
+            )
+            assert at_add == [[mod_b_resolved]], (
+                f"Expected {mod_a_ident} :depends-on {mod_b_resolved} to be open "
+                f"right after the add commit, got: {at_add}"
+            )
+            current = results(f"(query [:find ?x :where [{mod_a_ident} :depends-on ?x]])")
+            assert current == [[mod_b_resolved]], (
+                f"Expected the :depends-on edge to still be open at current time, got: {current}"
+            )
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_removed_import_closes_depends_on_edge(
-        self, mock_minigraf_db, git_repo_with_dep_removal, monkeypatch
+        self, git_repo_with_dep_removal
     ):
-        """Removing an import in a modified file must call _ingest_close with the
-        :depends-on triple so the edge gets a :valid-to bound."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Removing an import in a modified file must close the :depends-on
+        edge with a :valid-to bound.
+
+        Verified against the REAL backend: the edge must be open at the add
+        commit and closed (invisible) at current time, after the removal commit."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_dep_removal / "memory.graph"))
+        repo = git_repo_with_dep_removal
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen: list = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_dep_removal), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
-        mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
-        dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
-        assert any(dep_triple in t for t in close_triples_seen), (
-            f"Expected _ingest_close to be called with '{dep_triple}' when import removed, "
-            f"got: {close_triples_seen}"
-        )
+            mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
+            mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
+
+            at_add = results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{mod_a_ident} :depends-on ?x]])'
+            )
+            assert at_add == [[mod_b_resolved]], \
+                f"Expected the :depends-on edge to be open right after the add commit, got: {at_add}"
+
+            current = results(f"(query [:find ?x :where [{mod_a_ident} :depends-on ?x]])")
+            assert current == [], (
+                f"Expected the :depends-on edge to be closed (:valid-to bound) after the "
+                f"import was removed, got: {current}"
+            )
+        finally:
+            mcp_server._db = None
 
 
 class TestUnresolvedImportTagging:
