@@ -3791,6 +3791,10 @@ def _build_close_triples(
     description: str,
     module_ident: str,
     extra_contains_parent: Optional[str] = None,
+    *,
+    close_entity_type: bool = False,
+    file_value: Optional[str] = None,
+    is_static: Optional[bool] = None,
 ) -> List[str]:
     """Return triple strings needed to bi-temporally close an entity.
 
@@ -3804,7 +3808,21 @@ def _build_close_triples(
     _precompute_file_triples) — so both must be retracted when the field closes,
     or the class-contains edge leaks open forever.  Callers pass the field's
     class ident here (from field_class_ident); it is ignored when None or equal
-    to ident/module_ident so non-field close sites are unaffected.
+    to ident/module_ident so non-field close sites are unaffected. The field's
+    OWN [ident :class extra_contains_parent] edge (the reverse direction) is
+    always closed alongside it — see issue #134, this was the concrete gap that
+    let [?f :class ?c] queries without an :ident join resurrect removed fields.
+
+    close_entity_type/file_value/is_static close the remaining secondary
+    attributes flagged by #134 (:entity-type, :path/:file, :static) that
+    _precompute_file_triples asserts at introduction but this function
+    previously never retracted, letting queries that filter on them without
+    joining :ident silently include removed entities. These are opt-in
+    (default off) because this function is also called for external-dependency
+    (submodule) idents that reuse the "module" ident prefix but were never
+    actually asserted as :type/module — deriving :entity-type from the ident
+    prefix there would transact a false fact, so only call sites that KNOW
+    they're closing a real module/function/class/variable/field pass these.
     """
     triples = [
         f'[{ident} :ident "{_edn_escape(ident)}"]',
@@ -3818,6 +3836,15 @@ def _build_close_triples(
         and extra_contains_parent != module_ident
     ):
         triples.append(f"[{extra_contains_parent} :contains {ident}]")
+        triples.append(f"[{ident} :class {extra_contains_parent}]")
+    if close_entity_type:
+        entity_type = ident.split("/", 1)[0].lstrip(":")
+        triples.append(f"[{ident} :entity-type :type/{entity_type}]")
+    if file_value is not None:
+        attr = ":path" if ident == module_ident else ":file"
+        triples.append(f'[{ident} {attr} "{_edn_escape(file_value)}"]')
+    if is_static is not None:
+        triples.append(f"[{ident} :static {'true' if is_static else 'false'}]")
     return triples
 
 
@@ -3828,6 +3855,7 @@ def _forget_closed_entity(
     entity_descriptions: Dict[str, str],
     field_class_ident: Dict[str, str],
     file_entities: Dict[str, List[str]],
+    field_static_ident: Optional[Dict[str, bool]] = None,
 ) -> None:
     """Purge a just-closed ident from all in-memory lifecycle bookkeeping.
 
@@ -3846,9 +3874,9 @@ def _forget_closed_entity(
       path is reused, and closed a SECOND time; because entity_valid_from still
       held its ORIGINAL introduction timestamp, that second close would span the
       whole gap and silently resurrect the entity across its closed window.
-    - entity_descriptions / field_class_ident: purged for consistency so no
-      stale description or class-containment parent is read for a future
-      re-introduction of the same ident.
+    - entity_descriptions / field_class_ident / field_static_ident: purged for
+      consistency so no stale description, class-containment parent, or
+      :static value is read for a future re-introduction of the same ident.
 
     Call this at EVERY entity close site, AFTER that site has read whatever it
     needs (description, orig_ts, class ident) to build its close triples — never
@@ -3863,6 +3891,8 @@ def _forget_closed_entity(
     entity_valid_from.pop(ident, None)
     entity_descriptions.pop(ident, None)
     field_class_ident.pop(ident, None)
+    if field_static_ident is not None:
+        field_static_ident.pop(ident, None)
     if file_path is not None:
         idents = file_entities.get(file_path)
         if idents is not None:
@@ -4933,10 +4963,12 @@ def _precompute_file_triples(
     # to close sites via field_class_ident so the class-contains edge is retracted
     # when the field closes.
     field_class_map: Dict[str, str] = {}
+    field_static_map: Dict[str, bool] = {}
     extracted_class_names = set(extracted.get("classes", []))
     for field_name, owning_class, is_static in extracted.get("fields", []):
         qualified_name = f"{owning_class}.{field_name}"
         field_ident = _code_ident("field", file_path, qualified_name)
+        field_static_map[field_ident] = is_static
         static_literal = "true" if is_static else "false"
         candidate_triples = [
             f"[{field_ident} :entity-type :type/field]",
@@ -4975,6 +5007,7 @@ def _precompute_file_triples(
         "global_entries": global_entries,
         "field_entries": field_entries,
         "field_class_map": field_class_map,
+        "field_static_map": field_static_map,
         "resolved_imports": resolved_imports,
     }
 
@@ -4989,6 +5022,7 @@ def _build_code_triples(
     commit_ident: str,
     precomputed: Dict[str, Any],
     field_class_ident: Optional[Dict[str, str]] = None,
+    field_static_ident: Optional[Dict[str, bool]] = None,
 ) -> List[str]:
     """Return Datalog triple strings for a file's extracted code entities.
 
@@ -5012,6 +5046,7 @@ def _build_code_triples(
     triples: List[str] = []
     module_ident = precomputed["module_ident"]
     field_class_map = precomputed.get("field_class_map", {})
+    field_static_map = precomputed.get("field_static_map", {})
 
     is_new_module = module_ident not in entity_valid_from
     # Track all idents for this file (for deletion cleanup)
@@ -5071,6 +5106,10 @@ def _build_code_triples(
             # one. Only fields with an extracted owning class appear in the map.
             if field_class_ident is not None and field_ident in field_class_map:
                 field_class_ident[field_ident] = field_class_map[field_ident]
+            # Record the field's :static value so its close site can retract it
+            # (see _build_close_triples / issue #134) without re-deriving it.
+            if field_static_ident is not None and field_ident in field_static_map:
+                field_static_ident[field_ident] = field_static_map[field_ident]
         else:
             triples.append(f"[{field_ident} :modified-in {commit_ident}]")
 
@@ -5167,6 +5206,30 @@ def _preload_field_class_idents(db: Any) -> Dict[str, str]:
     except Exception:
         pass
     return field_class_ident
+
+
+def _preload_field_static_idents(db: Any) -> Dict[str, bool]:
+    """Reload field_ident -> :static value for every currently live field.
+
+    Mirrors _preload_field_class_idents (see #134): without this reload,
+    field_static_ident starts empty on every restart, so a field introduced
+    in an earlier run would have its :static fact silently leaked open when
+    a later run closes the field — _build_close_triples' is_static param
+    would get None (skip) instead of the real value, reproducing the same
+    gap this preload's sibling closes for :class.
+    """
+    field_static_ident: Dict[str, bool] = {}
+    try:
+        raw = _db_execute(
+            db,
+            "(query [:find ?fi ?s :where "
+            "[?f :entity-type :type/field] [?f :ident ?fi] [?f :static ?s]])",
+        )
+        for field_ident, static_value in json.loads(raw).get("results", []):
+            field_static_ident[field_ident] = bool(static_value)
+    except Exception:
+        pass
+    return field_static_ident
 
 
 _VALID_TIME_FOREVER_MS = (1 << 63) - 1  # minigraf's i64::MAX "still open" :valid-to sentinel
@@ -5291,10 +5354,11 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
     pinned_commit_state = _preload_pinned_commits(db)
     field_class_ident = _preload_field_class_idents(db)
+    field_static_ident = _preload_field_static_idents(db)
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
         file_entities, file_deps, dep_valid_from, pinned_commit_state,
-        field_class_ident,
+        field_class_ident, field_static_ident,
     )
 
 
@@ -5640,7 +5704,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             (
                 watermark, prior_ingested, entity_valid_from, entity_descriptions,
                 file_entities, file_deps, dep_valid_from, pinned_commit_state,
-                field_class_ident,
+                field_class_ident, field_static_ident,
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`
@@ -5788,11 +5852,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         (_build_close_triples(
                                             ident, desc, module_ident,
                                             field_class_ident.get(ident),
+                                            close_entity_type=True, file_value=file_path,
+                                            is_static=field_static_ident.get(ident),
                                         ), orig_ts)
                                     )
                                     _forget_closed_entity(
                                         ident, file_path, entity_valid_from,
                                         entity_descriptions, field_class_ident, file_entities,
+                                        field_static_ident,
                                     )
                                 # Whole file is gone: drop its (now-empty) file_entities key
                                 # so nothing stale lingers under this path (matches file_deps).
@@ -5819,7 +5886,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     old_desc = entity_descriptions.get(old_module_ident, old_path)
                                     orig_ts = entity_valid_from.get(old_module_ident, commit_ts_iso)
                                     close_items.append((
-                                        _build_close_triples(old_module_ident, old_desc, old_module_ident),
+                                        _build_close_triples(
+                                            old_module_ident, old_desc, old_module_ident,
+                                            close_entity_type=True, file_value=old_path,
+                                        ),
                                         orig_ts,
                                     ))
                                     # Purge the closed old module. Its remaining child
@@ -5831,12 +5901,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     _forget_closed_entity(
                                         old_module_ident, old_path, entity_valid_from,
                                         entity_descriptions, field_class_ident, file_entities,
+                                        field_static_ident,
                                     )
                                 previous_idents = set(file_entities.get(file_path, []))
                                 triples = _build_code_triples(
                                     file_path, extracted, commit_ts_iso, entity_valid_from,
                                     entity_descriptions, file_entities, commit_ident, precomputed,
-                                    field_class_ident,
+                                    field_class_ident, field_static_ident,
                                 )
                                 add_triples.extend(triples)
                                 # Detect entities removed from a modified file.
@@ -5876,6 +5947,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                             (_build_close_triples(
                                                 ident, desc, module_ident,
                                                 field_class_ident.get(ident),
+                                                close_entity_type=True, file_value=file_path,
+                                                is_static=field_static_ident.get(ident),
                                             ), orig_ts)
                                         )
                                         # File survives (M), only this child was removed:
@@ -5883,6 +5956,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         _forget_closed_entity(
                                             ident, file_path, entity_valid_from,
                                             entity_descriptions, field_class_ident, file_entities,
+                                            field_static_ident,
                                         )
                                 # Compute dep edges for this file and diff against previous.
                                 # Resolution itself already happened in _extract_commit
@@ -5933,12 +6007,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 _build_close_triples(
                                     old_ident, old_desc, old_module_ident,
                                     field_class_ident.get(old_ident),
+                                    close_entity_type=True, file_value=old_file,
+                                    is_static=field_static_ident.get(old_ident),
                                 ),
                                 orig_ts,
                             ))
                             _forget_closed_entity(
                                 old_ident, old_file, entity_valid_from,
                                 entity_descriptions, field_class_ident, file_entities,
+                                field_static_ident,
                             )
 
                         # A file rename (R status) only closes the old MODULE above.
@@ -5969,11 +6046,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         (_build_close_triples(
                                             ident, desc, r_old_module_ident,
                                             field_class_ident.get(ident),
+                                            close_entity_type=True, file_value=r_old_path,
+                                            is_static=field_static_ident.get(ident),
                                         ), orig_ts)
                                     )
                                     _forget_closed_entity(
                                         ident, r_old_path, entity_valid_from,
                                         entity_descriptions, field_class_ident, file_entities,
+                                        field_static_ident,
                                     )
                                 # Whole old path is gone (renamed away): drop the key so
                                 # no stale ident lingers to be re-discovered by a later
