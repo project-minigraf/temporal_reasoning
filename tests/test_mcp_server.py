@@ -8584,9 +8584,7 @@ class TestUnresolvedImportTagging:
         assert is_resolved is False
 
     @pytest.mark.asyncio
-    async def test_unresolved_import_gets_tagged_external_dependency(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_unresolved_import_gets_tagged_external_dependency(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8597,6 +8595,8 @@ class TestUnresolvedImportTagging:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -8608,16 +8608,27 @@ class TestUnresolvedImportTagging:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        tokio_ident = mcp_server._canonical_ident("module", "tokio")
-        assert any(f"[{tokio_ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
-        assert any(f'[{tokio_ident} :description "tokio"]' in t for t in transact_calls)
+            tokio_ident = mcp_server._canonical_ident("module", "tokio")
+            assert any(f"[{tokio_ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
+            assert any(f'[{tokio_ident} :description "tokio"]' in t for t in transact_calls)
+
+            # Verified against the REAL backend: the tag actually persisted,
+            # not just that a matching triple string was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{tokio_ident} :entity-type ?x]])")
+            ).get("results", [])
+            assert results == [[":type/external-dependency"]], \
+                "tokio's external-dependency tag must be queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
-    async def test_unresolved_relative_import_not_tagged_external_end_to_end(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_unresolved_relative_import_not_tagged_external_end_to_end(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8628,6 +8639,8 @@ class TestUnresolvedImportTagging:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
 
@@ -8639,12 +8652,25 @@ class TestUnresolvedImportTagging:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        missing_ident = mcp_server._canonical_ident("module", "./missing")
-        assert not any(
-            f"[{missing_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
-        )
+            missing_ident = mcp_server._canonical_ident("module", "./missing")
+            assert not any(
+                f"[{missing_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
+            )
+
+            # Verified against the REAL backend: nothing under the relative
+            # import's ident is queryable as an external-dependency.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{missing_ident} :entity-type ?x]])")
+            ).get("results", [])
+            assert results == [], \
+                "unresolved relative import must not be queryable as an entity at all"
+        finally:
+            mcp_server._db = None
 
 
 class TestGitIngestionPathIgnore:
@@ -8653,12 +8679,10 @@ class TestGitIngestionPathIgnore:
 
     @pytest.mark.asyncio
     async def test_default_ignored_directory_produces_no_code_entities(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch
     ):
         """A file under a default-ignored directory (vendor/) must not produce
         any :type/module, :type/function, or :type/class triples."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8670,6 +8694,8 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add vendored lib"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -8681,16 +8707,32 @@ class TestGitIngestionPathIgnore:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        vendored_module_ident = mcp_server._code_ident("module", "vendor/lib.py")
-        assert not any(vendored_module_ident in t for t in transact_calls)
-        assert not any(":entity-type :type/function" in t for t in transact_calls)
-        assert not any(":entity-type :type/class" in t for t in transact_calls)
+            vendored_module_ident = mcp_server._code_ident("module", "vendor/lib.py")
+            assert not any(vendored_module_ident in t for t in transact_calls)
+            assert not any(":entity-type :type/function" in t for t in transact_calls)
+            assert not any(":entity-type :type/class" in t for t in transact_calls)
+
+            # Verified against the REAL backend: nothing under vendor/ is
+            # queryable at all, not just that no matching triple was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            module_results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{vendored_module_ident} :ident ?x]])")
+            ).get("results", [])
+            assert module_results == [], "vendored module must not be queryable against the real graph"
+            func_results = json.loads(
+                real_execute(db, "(query [:find ?e :where [?e :entity-type :type/function]])")
+            ).get("results", [])
+            assert func_results == [], "no function entities should exist under the ignored vendor/ directory"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_import_into_ignored_path_becomes_external_dependency(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch
     ):
         """Before this feature, vendor/foo.py would resolve as a normal in-tree
         module (see _resolve_module_import's segment-suffix matcher) and
@@ -8698,8 +8740,6 @@ class TestGitIngestionPathIgnore:
         an external-dependency entity. Excluding vendor/ from known_files must
         make it fall through to the same fallback used for real external
         packages (see TestUnresolvedImportTagging)."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8712,6 +8752,8 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add vendor and main"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -8723,22 +8765,33 @@ class TestGitIngestionPathIgnore:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        external_ident = mcp_server._canonical_ident("module", "vendor.foo")
-        assert any(
-            f"[{external_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
-        )
+            external_ident = mcp_server._canonical_ident("module", "vendor.foo")
+            assert any(
+                f"[{external_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
+            )
+
+            # Verified against the REAL backend: the external-dependency tag
+            # actually persisted, not just that a matching triple was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{external_ident} :entity-type ?x]])")
+            ).get("results", [])
+            assert results == [[":type/external-dependency"]], \
+                "vendor.foo's external-dependency tag must be queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_env_var_ignore_pattern_excludes_custom_directory(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch
     ):
         """MINIGRAF_INGEST_IGNORE must add to the default ignore list, not
         replace it — a custom pattern not in the built-in defaults must still
         be honored."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8751,6 +8804,8 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "commit", "-m", "add generated file"], cwd=repo, check=True, capture_output=True)
 
         monkeypatch.setenv("MINIGRAF_INGEST_IGNORE", "generated/")
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -8762,10 +8817,22 @@ class TestGitIngestionPathIgnore:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        generated_module_ident = mcp_server._code_ident("module", "generated/codegen.py")
-        assert not any(generated_module_ident in t for t in transact_calls)
+            generated_module_ident = mcp_server._code_ident("module", "generated/codegen.py")
+            assert not any(generated_module_ident in t for t in transact_calls)
+
+            # Verified against the REAL backend: nothing under generated/ is
+            # queryable at all, not just that no matching triple was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{generated_module_ident} :ident ?x]])")
+            ).get("results", [])
+            assert results == [], "generated/ module must not be queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
 
 class TestResolveModuleImportTieredMatcher:
@@ -8912,11 +8979,14 @@ def git_repo_with_future_dep(tmp_path):
 class TestPerCommitAccurateImportResolution:
     @pytest.mark.asyncio
     async def test_import_of_not_yet_existing_file_tagged_external_at_introduction(
-        self, mock_minigraf_db, git_repo_with_future_dep, monkeypatch
+        self, git_repo_with_future_dep, monkeypatch
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
+        commits = mcp_server._git_commits(str(git_repo_with_future_dep), None)
+        commit1_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo_with_future_dep / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None,
@@ -8930,17 +9000,35 @@ class TestPerCommitAccurateImportResolution:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(git_repo_with_future_dep), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(git_repo_with_future_dep), "HEAD")
 
-        mod_b_external_ident = mcp_server._canonical_ident("module", "mod_b")
-        assert any(
-            f"[{mod_b_external_ident} :entity-type :type/external-dependency]" in t
-            for t in transact_calls
-        ), (
-            "mod_b.py did not exist yet at commit 1, so resolving mod_a's import "
-            "must use commit 1's own tree and tag it external — not silently "
-            "resolve against HEAD's tree, where mod_b.py exists by the end."
-        )
+            mod_b_external_ident = mcp_server._canonical_ident("module", "mod_b")
+            assert any(
+                f"[{mod_b_external_ident} :entity-type :type/external-dependency]" in t
+                for t in transact_calls
+            ), (
+                "mod_b.py did not exist yet at commit 1, so resolving mod_a's import "
+                "must use commit 1's own tree and tag it external — not silently "
+                "resolve against HEAD's tree, where mod_b.py exists by the end."
+            )
+
+            # Verified against the REAL backend: at commit 1's own timestamp,
+            # mod_b was actually queryable as an external-dependency, not just
+            # that a matching triple string was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(
+                    db,
+                    f'(query [:find ?x :valid-at "{commit1_ts}" '
+                    f':where [{mod_b_external_ident} :entity-type ?x]])',
+                )
+            ).get("results", [])
+            assert results == [[":type/external-dependency"]], \
+                "mod_b must be queryable as external-dependency at commit 1's timestamp"
+        finally:
+            mcp_server._db = None
 
 
 class TestResolveModuleImportRelative:
@@ -9029,9 +9117,7 @@ class TestRunIngestionGitlinks:
         return sub_hash
 
     @pytest.mark.asyncio
-    async def test_submodule_add_creates_external_dependency_entity(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_submodule_add_creates_external_dependency_entity(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -9040,6 +9126,8 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         sub_hash = self._add_submodule_commit(repo)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -9051,18 +9139,33 @@ class TestRunIngestionGitlinks:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        ident = mcp_server._code_ident("module", "vendor/lib")
-        assert any(f"[{ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
-        assert any(f'[{ident} :pinned-commit "{sub_hash}"]' in t for t in transact_calls)
-        assert any(f'[{ident} :submodule-name "lib"]' in t for t in transact_calls)
-        assert any(f'[{ident} :submodule-url "https://example.com/lib.git"]' in t for t in transact_calls)
+            ident = mcp_server._code_ident("module", "vendor/lib")
+            assert any(f"[{ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
+            assert any(f'[{ident} :pinned-commit "{sub_hash}"]' in t for t in transact_calls)
+            assert any(f'[{ident} :submodule-name "lib"]' in t for t in transact_calls)
+            assert any(f'[{ident} :submodule-url "https://example.com/lib.git"]' in t for t in transact_calls)
+
+            # Verified against the REAL backend, same count() pattern as
+            # test_submodule_removal_closes_entity_type_and_path_against_real_graph.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+
+            def count(attr, value):
+                raw = real_execute(db, f"(query [:find ?e :where [?e {attr} {value}]])")
+                return len(json.loads(raw).get("results", []))
+
+            assert count(":pinned-commit", f'"{sub_hash}"') == 1, \
+                "submodule's pinned-commit must be queryable against the real graph"
+            assert count(":submodule-name", '"lib"') == 1, \
+                "submodule's name must be queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
-    async def test_submodule_bump_closes_old_pinned_commit(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_submodule_bump_closes_old_pinned_commit(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -9070,6 +9173,7 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         first_sha = self._add_submodule_commit(repo)
+        time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
 
         sub_dir = tmp_path / f"{repo.name}-sub"
         _subprocess.run(["git", "-C", str(sub_dir), "commit", "--allow-empty", "-m", "bump"], check=True, capture_output=True)
@@ -9082,23 +9186,51 @@ class TestRunIngestionGitlinks:
         )
         _subprocess.run(["git", "commit", "-m", "bump submodule"], cwd=repo, check=True, capture_output=True)
 
+        commits = mcp_server._git_commits(str(repo), None)
+        first_commit_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
         close_triples_seen: list = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        real_ingest_close = mcp_server._ingest_close
 
-        ident = mcp_server._code_ident("module", "vendor/lib")
-        assert any(f'[{ident} :pinned-commit "{first_sha}"]' in t for t in close_triples_seen)
+        def capture_close(db, triples, orig_ts, commit_ts, reason=""):
+            close_triples_seen.extend(triples)
+            return real_ingest_close(db, triples, orig_ts, commit_ts, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_close", capture_close)
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+
+            ident = mcp_server._code_ident("module", "vendor/lib")
+            assert any(f'[{ident} :pinned-commit "{first_sha}"]' in t for t in close_triples_seen)
+
+            # Verified against the REAL backend via real bi-temporal queries:
+            # the old pinned-commit was open right after the add commit, then
+            # closed (no longer current) after the bump — replaced by the new sha.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            assert results(
+                f'(query [:find ?x :valid-at "{first_commit_ts}" :where [{ident} :pinned-commit ?x]])'
+            ) == [[first_sha]], "old pinned-commit must have been open right after the submodule add"
+            assert results(
+                f'(query [:find ?x :where [{ident} :pinned-commit "{first_sha}"]])'
+            ) == [], "old pinned-commit must be closed (not current) after the bump"
+            assert results(
+                f"(query [:find ?x :where [{ident} :pinned-commit ?x]])"
+            ) == [[second_sha]], "current pinned-commit must reflect the bumped submodule sha"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
-    async def test_submodule_removal_closes_entity(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_submodule_removal_closes_entity(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -9110,18 +9242,36 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "rm", "-f", "vendor/lib"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "remove submodule"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
         close_triples_seen: list = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        real_ingest_close = mcp_server._ingest_close
 
-        ident = mcp_server._code_ident("module", "vendor/lib")
-        assert any(f'[{ident} :ident "{ident}"]' in t for t in close_triples_seen)
+        def capture_close(db, triples, orig_ts, commit_ts, reason=""):
+            close_triples_seen.extend(triples)
+            return real_ingest_close(db, triples, orig_ts, commit_ts, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_close", capture_close)
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+
+            ident = mcp_server._code_ident("module", "vendor/lib")
+            assert any(f'[{ident} :ident "{ident}"]' in t for t in close_triples_seen)
+
+            # Verified against the REAL backend: the removed submodule's
+            # :ident is actually closed, not just captured in a close triple.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{ident} :ident ?x]])")
+            ).get("results", [])
+            assert results == [], \
+                "removed submodule's :ident must be closed and no longer queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_submodule_removal_closes_entity_type_and_path_against_real_graph(self, tmp_path):
