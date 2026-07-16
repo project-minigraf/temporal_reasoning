@@ -3885,11 +3885,8 @@ class TestTsxParserLoading:
 
 
 class TestMinigrafIngestStatus:
-    def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    def test_returns_idle_before_ingestion(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -3902,44 +3899,41 @@ class TestMinigrafIngestStatus:
         assert result["last_commit"] is None
         assert result["total_ingested"] is None
 
-    def test_returns_last_run_at_from_graph(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_last_run_at_from_graph(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        def execute_side_effect(query, *args, **kwargs):
-            if ":last-run-at" in query and ":last-commit" in query:
-                return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
-            return json.dumps({"results": []})
-        db_instance.execute.side_effect = execute_side_effect
+        real_db.execute(
+            '(transact {} [[:ingestion/last-run-at :entity-type :type/ingestion] '
+            '[:ingestion/last-run-at :last-run-at "2026-05-27T10:00:00Z"] '
+            '[:ingestion/last-run-at :last-commit "deadbeef"]])'
+        )
+
         result = mcp_server.handle_minigraf_ingest_status()
+
         assert result["last_run_at"] == "2026-05-27T10:00:00Z"
         assert result["last_commit"] == "deadbeef"
 
-    def test_running_status_skips_graph_query(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_running_status_skips_graph_query(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "running", "processed": 3, "total": 10,
             "current_commit": "abc123", "error": None,
         }
-        db_instance.execute.reset_mock()
-        result = mcp_server.handle_minigraf_ingest_status()
+        with execute_spy() as calls:
+            result = mcp_server.handle_minigraf_ingest_status()
+
         assert result["status"] == "running"
         assert result["processed"] == 3
         assert result["total"] == 10
         assert result["current_commit"] == "abc123"
         # Must not query the graph while running
-        db_instance.execute.assert_not_called()
+        assert calls == []
 
-    def test_reports_owner_pid_when_skipped(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_reports_owner_pid_when_skipped(self, real_db, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
@@ -3950,10 +3944,8 @@ class TestMinigrafIngestStatus:
         assert result["owner_pid"] == 424242
         assert result["stale"] is False
 
-    def test_skipped_status_is_stale_when_owner_pid_dead(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_skipped_status_is_stale_when_owner_pid_dead(self, real_db, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
@@ -3962,10 +3954,8 @@ class TestMinigrafIngestStatus:
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["stale"] is True
 
-    def test_error_status_reports_stale_when_holder_pid_dead(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_error_status_reports_stale_when_holder_pid_dead(self, real_db, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "",
@@ -3976,10 +3966,8 @@ class TestMinigrafIngestStatus:
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["stale"] is True
 
-    def test_error_status_not_stale_when_holder_pid_alive(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_error_status_not_stale_when_holder_pid_alive(self, real_db, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "",
@@ -3990,10 +3978,8 @@ class TestMinigrafIngestStatus:
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["stale"] is False
 
-    def test_error_status_omits_stale_when_no_pid_in_message(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_error_status_omits_stale_when_no_pid_in_message(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": "corrupt graph file", "owner_pid": None,
@@ -4001,57 +3987,64 @@ class TestMinigrafIngestStatus:
         result = mcp_server.handle_minigraf_ingest_status()
         assert "stale" not in result
 
-    def test_returns_total_ingested_from_graph(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_total_ingested_from_graph(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        def execute_side_effect(query, *args, **kwargs):
-            if ":last-run-at" in query and ":last-commit" in query:
-                return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
-            if ":type/commit" in query:
-                return json.dumps({"results": [[1017]]})
-            return json.dumps({"results": []})
-        db_instance.execute.side_effect = execute_side_effect
+        real_db.execute(
+            '(transact {} [[:ingestion/last-run-at :entity-type :type/ingestion] '
+            '[:ingestion/last-run-at :last-run-at "2026-05-27T10:00:00Z"] '
+            '[:ingestion/last-run-at :last-commit "deadbeef"]])'
+        )
+        # Batch all 1017 commit entities into a single transact call (one
+        # round-trip) rather than looping individual execute() calls — the
+        # count query only cares that 1017 :type/commit entities exist, not
+        # how many transacts it took to write them.
+        n = 1017
+        triples = " ".join(f"[:commit/c{i} :entity-type :type/commit]" for i in range(n))
+        real_db.execute(f"(transact {{}} [{triples}])")
+
         result = mcp_server.handle_minigraf_ingest_status()
+
         assert result["total_ingested"] == 1017
 
     def test_total_ingested_reflects_true_persisted_count_not_stale_watermark(
-        self, mock_minigraf_db, tmp_path
+        self, real_db
     ):
         """Regression test for #85: total_ingested must come from a direct
         :type/commit entity count, not the :total-ingested watermark — the
         watermark is only written on clean run completion, so after a run is
-        interrupted mid-way it drifts far below the true persisted count."""
-        mock_class, db_instance = mock_minigraf_db
+        interrupted mid-way it drifts far below the true persisted count.
+
+        A count of 50 (vs. a stale watermark of 4) is representative enough:
+        the test only needs stale-watermark-count != real-count, not any
+        specific magnitude, so it doesn't need to replay the original mock's
+        arbitrary 21715."""
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        def execute_side_effect(query, *args, **kwargs):
-            if ":last-run-at" in query and ":last-commit" in query:
-                return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
-            if ":total-ingested" in query:
-                # Stale watermark from the last *completed* run — far below reality.
-                return json.dumps({"results": [[104]]})
-            if ":type/commit" in query:
-                # True count of durably persisted commit entities.
-                return json.dumps({"results": [[21715]]})
-            return json.dumps({"results": []})
-        db_instance.execute.side_effect = execute_side_effect
-        result = mcp_server.handle_minigraf_ingest_status()
-        assert result["total_ingested"] == 21715
+        real_db.execute(
+            '(transact {} [[:ingestion/last-run-at :entity-type :type/ingestion] '
+            '[:ingestion/last-run-at :last-run-at "2026-05-27T10:00:00Z"] '
+            '[:ingestion/last-run-at :last-commit "deadbeef"] '
+            # Stale watermark from the last *completed* run — far below reality.
+            '[:ingestion/last-run-at :total-ingested 4]])'
+        )
+        n = 50
+        triples = " ".join(f"[:commit/c{i} :entity-type :type/commit]" for i in range(n))
+        real_db.execute(f"(transact {{}} [{triples}])")
 
-    def test_total_ingested_absent_returns_none(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        result = mcp_server.handle_minigraf_ingest_status()
+
+        # True count of durably persisted commit entities, not the stale watermark.
+        assert result["total_ingested"] == 50
+
+    def test_total_ingested_absent_returns_none(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
