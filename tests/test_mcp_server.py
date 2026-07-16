@@ -7653,6 +7653,61 @@ class TestRunIngestionBitemporalClose:
         mcp_server._db = None  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
+    async def test_removed_field_secondary_attrs_are_closed_against_real_graph(self, tmp_path):
+        """Issue #134: closing a field must retract :static/:class/:file/:entity-type
+        too, not just :ident/:description/:contains — otherwise a query that filters
+        on one of those secondary attributes WITHOUT joining current :ident (a
+        realistic "find all static fields" style query) still returns the field
+        after it has been removed from the source.
+
+        Verified against the REAL minigraf backend (no mock), counting rows for
+        each secondary attribute before/after the removing commit. The owning
+        class (Foo) and a sibling field (baz) are kept alive across the edit so
+        this exercises the "M status removed_idents" close path specifically,
+        with a real (non-dangling) :class edge in play.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "models.py").write_text("class Foo:\n    bar = 1\n    baz = 2\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "models.py").write_text("class Foo:\n    baz = 2\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "remove bar"], cwd=repo, check=True, capture_output=True)
+
+        # Real backend: real MiniGrafDb, real execute, real persistence.
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        real_execute = mcp_server._db_execute
+
+        def count(attr, value):
+            raw = real_execute(db, f"(query [:find ?e :where [?e {attr} {value}]])")
+            return len(json.loads(raw).get("results", []))
+
+        # Only baz should remain static/classed/filed/typed-as-field; bar's facts
+        # must be closed, not left leaking open forever.
+        assert count(":static", "true") == 1, \
+            "removed field bar must not still satisfy [?e :static true] (issue #134)"
+        assert count(":class", mcp_server._code_ident("class", "models.py", "Foo")) == 1, \
+            "removed field bar's own :class edge must be closed, not just the class's :contains edge"
+        assert count(":file", '"models.py"') == 2, \
+            "removed field bar's :file must be closed (only class Foo + field baz should remain)"
+        assert count(":entity-type", ":type/field") == 1, \
+            "removed field bar's :entity-type must be closed so type-only queries don't resurrect it"
+
+        mcp_server._db = None  # release the real file lock for subsequent tests
+
+    @pytest.mark.asyncio
     async def test_unchanged_global_and_field_survive_unrelated_edit(
         self, mock_minigraf_db, tmp_path, monkeypatch
     ):
