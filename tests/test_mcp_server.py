@@ -144,39 +144,62 @@ class TestOpenDb:
 
 
 @contextlib.contextmanager
-def _hold_lock_subprocess(path, exit_immediately=False):
+def _hold_lock_subprocess(path, exit_immediately=False, hold_seconds=None):
     """Spawn a real subprocess that opens a real MiniGrafDb at `path`, producing
     genuine cross-process lock contention.
 
-    If exit_immediately, the subprocess opens, prints its PID, and exits right
-    away; this call blocks until it's reaped, so the yielded PID is guaranteed
-    to be real and already-dead by the time control returns to the caller.
-    NOTE: the installed minigraf build resolves a dead-holder lock file
-    internally the moment MiniGrafDb.open() is next called on that path —
-    verified empirically (see task-2-report.md) — so a subprocess that exits
-    cleanly actually removes its own lock file rather than leaving a stale
-    one behind, and even a hand-written stale lock file naming a dead PID
-    lets a fresh open() succeed silently with no MiniGrafError raised at all.
-    Practical effect: real subprocess timing can reproduce "holder is alive
-    and contending" and "holder has cleanly finished", but not "open() raises
-    citing a holder that's already dead" — that combination is not
-    reachable through genuine process death on this platform, only through
-    an unschedulable microsecond TOCTOU race. Tests that need to exercise
-    mcp_server._clear_stale_lock's own dead-PID-detection logic use the PID
-    yielded here (real, verifiably dead) to reconstruct that on-disk artifact
-    by hand and call the real function directly — see
-    test_self_heals_stale_lock_from_dead_pid and
-    test_self_heals_dead_holder_mid_loop for the full rationale.
+    Exactly one of three modes applies, chosen by the arguments:
 
-    Otherwise (exit_immediately=False) the subprocess holds the lock alive
-    until the context exits — for "holder still alive" tests. Yields the
-    holder subprocess's PID.
+    - exit_immediately=True: the subprocess opens, prints its PID, and exits
+      right away; this call blocks until it's reaped, so the yielded PID is
+      guaranteed to be real and already-dead by the time control returns to
+      the caller.
+      NOTE: the installed minigraf build resolves a dead-holder lock file
+      internally the moment MiniGrafDb.open() is next called on that path —
+      verified empirically (see task-2-report.md) — so a subprocess that exits
+      cleanly actually removes its own lock file rather than leaving a stale
+      one behind, and even a hand-written stale lock file naming a dead PID
+      lets a fresh open() succeed silently with no MiniGrafError raised at
+      all. Practical effect: real subprocess timing can reproduce "holder is
+      alive and contending" and "holder has cleanly finished", but not
+      "open() raises citing a holder that's already dead" — that combination
+      is not reachable through genuine process death on this platform, only
+      through an unschedulable microsecond TOCTOU race. Tests that need to
+      exercise mcp_server._clear_stale_lock's own dead-PID-detection logic use
+      the PID yielded here (real, verifiably dead) to reconstruct that
+      on-disk artifact by hand and call the real function directly — see
+      test_self_heals_stale_lock_from_dead_pid and
+      test_self_heals_dead_holder_mid_loop for the full rationale.
+
+    - hold_seconds=<float>: the subprocess holds the lock for that many real
+      wall-clock seconds (a genuine `time.sleep` inside the subprocess, not a
+      mock) and then exits cleanly on its own — for "succeeds once real
+      contention clears within N seconds" tests. Control returns to the
+      caller as soon as the subprocess has opened the db and printed its PID
+      (i.e. while it's still holding the lock), so the caller can immediately
+      contend against it.
+
+    - neither given (the default): the subprocess holds the lock alive until
+      the `with` block exits — for "holder still alive" tests.
+
+    In every mode, yields the holder subprocess's PID, and the `finally`
+    clause guarantees the subprocess is terminated/reaped and its stdout pipe
+    closed no matter what happens inside the `with` block (including an
+    unexpected exception), so nothing leaks.
     """
+    if exit_immediately and hold_seconds is not None:
+        raise ValueError("exit_immediately and hold_seconds are mutually exclusive")
+    if hold_seconds is not None:
+        sleep_stmt = f"time.sleep({hold_seconds})\n"
+    elif exit_immediately:
+        sleep_stmt = ""
+    else:
+        sleep_stmt = "time.sleep(30)\n"
     hold_script = (
         "import minigraf, sys, time\n"
         f"db = minigraf.MiniGrafDb.open({path!r})\n"
         "print(str(__import__('os').getpid()), flush=True)\n"
-        + ("" if exit_immediately else "time.sleep(30)\n")
+        + sleep_stmt
     )
     proc = _subprocess.Popen(
         [sys.executable, "-c", hold_script],
@@ -210,19 +233,9 @@ class TestGetDbLockRetry:
         # Real backoff (not mocked) — the subprocess needs genuine wall-clock
         # time to hold the lock and then exit before a later retry attempt
         # observes it free again.
-        hold_script = (
-            "import minigraf, time\n"
-            f"db = minigraf.MiniGrafDb.open({graph_path!r})\n"
-            "print('ready', flush=True)\n"
-            "time.sleep(0.1)\n"
-        )
-        proc = _subprocess.Popen([sys.executable, "-c", hold_script], stdout=_subprocess.PIPE, text=True)
-        proc.stdout.readline()
+        with _hold_lock_subprocess(graph_path, hold_seconds=0.1):
+            result = mcp_server.get_db()
 
-        result = mcp_server.get_db()
-
-        proc.wait(timeout=5)
-        proc.stdout.close()
         assert result is not None
 
     def test_gives_up_after_max_attempts(self, tmp_path, monkeypatch):
@@ -338,19 +351,9 @@ class TestGetDbLockRetry:
         # 0, .05, .15, .35, .75s — hold the lock past the 4th attempt (~.35s)
         # but let it die before the 5th (~.75s), forcing success on the last
         # possible attempt.
-        hold_script = (
-            "import minigraf, time\n"
-            f"db = minigraf.MiniGrafDb.open({graph_path!r})\n"
-            "print('ready', flush=True)\n"
-            "time.sleep(0.5)\n"
-        )
-        proc = _subprocess.Popen([sys.executable, "-c", hold_script], stdout=_subprocess.PIPE, text=True)
-        proc.stdout.readline()
+        with _hold_lock_subprocess(graph_path, hold_seconds=0.5):
+            result = mcp_server.get_db()
 
-        result = mcp_server.get_db()
-
-        proc.wait(timeout=5)
-        proc.stdout.close()
         assert result is not None
         assert open_calls["n"] == mcp_server._LOCK_RETRY_MAX, (
             f"expected the retry loop to genuinely exhaust all "
@@ -555,19 +558,9 @@ class TestOpenDbAtWithExtendedRetry:
         # time to hold the lock and then exit before a later retry attempt
         # observes it free again. The extended retry's 120s budget is real
         # wall-clock time too, so this stays far inside it.
-        hold_script = (
-            "import minigraf, time\n"
-            f"db = minigraf.MiniGrafDb.open({graph_path!r})\n"
-            "print('ready', flush=True)\n"
-            "time.sleep(0.1)\n"
-        )
-        proc = _subprocess.Popen([sys.executable, "-c", hold_script], stdout=_subprocess.PIPE, text=True)
-        proc.stdout.readline()
+        with _hold_lock_subprocess(graph_path, hold_seconds=0.1):
+            result = mcp_server._open_db_at_with_extended_retry(graph_path)
 
-        result = mcp_server._open_db_at_with_extended_retry(graph_path)
-
-        proc.wait(timeout=5)
-        proc.stdout.close()
         assert result is not None
 
     def test_gives_up_after_budget_exhausted(self, tmp_path, monkeypatch):
