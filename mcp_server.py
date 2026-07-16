@@ -3287,6 +3287,34 @@ def _segments_end_with(full_segments: List[str], candidate_segments: List[str]) 
     return full_segments[-len(candidate_segments):] == candidate_segments
 
 
+def _dep_import_segments(import_name: str) -> List[str]:
+    """Split a dependency-edge import specifier into path segments.
+
+    Mirrors _resolve_module_import's tier-3 splitting rule exactly (slash if
+    present, else dot) so a submodule path prefix match (see
+    _submodule_path_matches_import, #112) uses the same segmentation the
+    resolver itself would have used.
+    """
+    return import_name.split("/") if "/" in import_name else import_name.split(".")
+
+
+def _submodule_path_matches_import(submodule_path: str, import_name: str) -> bool:
+    """True if a dependency-edge import specifier falls under a submodule's path.
+
+    Used to link an unresolved-import stub ident (computed via
+    _canonical_ident from the raw import specifier) to a submodule entity
+    (computed via _code_ident from its .gitmodules/gitlink path) — the two
+    are never the same ident string, so #112's fix connects them with an
+    explicit :resolves-to edge whenever the submodule's path is a whole-segment
+    prefix of the import's own segments.
+    """
+    submodule_segments = _path_segments(submodule_path)
+    import_segments = _dep_import_segments(import_name)
+    if not submodule_segments or len(submodule_segments) > len(import_segments):
+        return False
+    return import_segments[:len(submodule_segments)] == submodule_segments
+
+
 class _SegmentSuffixIndex:
     """Reverse index over file_entities' path segments, bucketed by last segment.
 
@@ -5137,19 +5165,25 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     entity_descriptions) just works for submodules without new parallel state.
     Unresolved-import placeholders (no :path) are not reloaded by this query —
     nothing in this codebase ever closes one, so the gap is harmless; see the
-    design spec's Section 2.
+    design spec's Section 2. (submodule_paths below deliberately reuses this
+    same :path-bearing external-dependency row set — see its own docstring.)
 
     Pre-seeding from `git ls-files` ensures that _resolve_module_import can
     find any module file even when processing early commits — before those files
     have been introduced in the chronological commit walk.
 
-    Returns (entity_valid_from, entity_descriptions, file_entities).
+    Returns (entity_valid_from, entity_descriptions, file_entities, submodule_paths).
     entity_valid_from maps ident → git commit timestamp of first introduction.
     entity_descriptions maps ident → human-readable name (function/class/file).
+    submodule_paths maps external-dependency (submodule) ident → its :path,
+    used by the gitlink "add"/stub-creation linking in #112's fix to tell a
+    real submodule ident apart from an unresolved-import stub ident (which
+    never has a :path).
     """
     entity_valid_from: Dict[str, str] = {}
     entity_descriptions: Dict[str, str] = {}
     file_entities: Dict[str, List[str]] = {}
+    submodule_paths: Dict[str, str] = {}
 
     # Pre-seed file_entities with all files currently in the repo
     try:
@@ -5183,10 +5217,44 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
                 file_entities.setdefault(path, [])
                 if ident not in file_entities[path]:
                     file_entities[path].append(ident)
+                if entity_type == "external-dependency":
+                    submodule_paths[ident] = path
         except Exception:
             pass
 
-    return entity_valid_from, entity_descriptions, file_entities
+    return entity_valid_from, entity_descriptions, file_entities, submodule_paths
+
+
+def _preload_unresolved_dep_idents(db: Any, submodule_paths: Dict[str, str]) -> Dict[str, str]:
+    """Reload ident -> import_name for every unresolved-import stub (#112).
+
+    _preload_known_entities' external-dependency branch requires a :path fact,
+    which only real submodule entities have — unresolved-import stubs (see
+    _run_ingestion's dep-edge handling) never get one, so they're invisible to
+    that query. This runs the same :entity-type match WITHOUT the :path
+    requirement, then subtracts submodule_paths' idents (already known
+    submodules) to get exactly the stub idents, restart-safe.
+
+    Needed so a submodule added in a later, separate ingestion run can still
+    find and link any stub created in an earlier run (see the gitlink "add"
+    handling in _run_ingestion) — without this, only same-run stubs would
+    ever get linked.
+    """
+    unresolved: Dict[str, str] = {}
+    try:
+        raw = _db_execute(
+            db,
+            "(query [:find ?ident ?desc :where "
+            "[?e :entity-type :type/external-dependency] "
+            "[?e :ident ?ident] "
+            "[?e :description ?desc]])",
+        )
+        for ident, desc in json.loads(raw).get("results", []):
+            if ident not in submodule_paths:
+                unresolved[ident] = desc
+    except Exception:
+        pass
+    return unresolved
 
 
 def _preload_field_class_idents(db: Any) -> Dict[str, str]:
@@ -5360,15 +5428,16 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
     watermark = _watermark_query(db)
     prior_ingested = _count_commit_entities(db)
-    entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
+    entity_valid_from, entity_descriptions, file_entities, submodule_paths = _preload_known_entities(db, repo_path)
     file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
     pinned_commit_state = _preload_pinned_commits(db)
     field_class_ident = _preload_field_class_idents(db)
     field_static_ident = _preload_field_static_idents(db)
+    unresolved_dep_idents = _preload_unresolved_dep_idents(db, submodule_paths)
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
         file_entities, file_deps, dep_valid_from, pinned_commit_state,
-        field_class_ident, field_static_ident,
+        field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
     )
 
 
@@ -5714,7 +5783,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             (
                 watermark, prior_ingested, entity_valid_from, entity_descriptions,
                 file_entities, file_deps, dep_valid_from, pinned_commit_state,
-                field_class_ident, field_static_ident,
+                field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`
@@ -5986,6 +6055,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                             ])
                                             entity_valid_from[dep_ident] = commit_ts_iso
                                             entity_descriptions[dep_ident] = import_name
+                                            unresolved_dep_idents[dep_ident] = import_name
+                                            # #112: an already-known submodule may be the real
+                                            # target this unresolvable import was reaching for
+                                            # (submodule directories are never in file_entities,
+                                            # so any import into one always falls through here).
+                                            for sub_ident, sub_path in submodule_paths.items():
+                                                if _submodule_path_matches_import(sub_path, import_name):
+                                                    add_triples.append(f"[{dep_ident} :resolves-to {sub_ident}]")
                                 previous_deps = file_deps.get(file_path, set())
                                 for dep_ident in current_deps - previous_deps:
                                     dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
@@ -6105,6 +6182,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 entity_valid_from[ext_ident] = commit_ts_iso
                                 entity_descriptions[ext_ident] = description
                                 pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+                                submodule_paths[ext_ident] = path
+                                # #112: link any pre-existing unresolved-import stub whose
+                                # import path reaches into this submodule — the ordering in
+                                # the issue's own repro (stub created before the submodule
+                                # was ever added), which the per-import check above can't
+                                # catch since the submodule wasn't known yet at that time.
+                                for stub_ident, import_name in unresolved_dep_idents.items():
+                                    if _submodule_path_matches_import(path, import_name):
+                                        add_triples.append(f"[{stub_ident} :resolves-to {ext_ident}]")
                             elif kind == "bump":
                                 old_sha, orig_ts = pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
                                 if old_sha is not None:

@@ -5234,7 +5234,7 @@ class TestIngestionWrites:
             "results": [[":function/auth-py-login", "auth.py", "login", "2025-01-15T10:00:00Z"]]
         })
         db = mcp_server.get_db()
-        entity_valid_from, entity_descriptions, file_entities = (
+        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
             mcp_server._preload_known_entities(db, str(git_repo))
         )
         assert entity_valid_from.get(":function/auth-py-login") == "2025-01-15T10:00:00Z"
@@ -5691,11 +5691,14 @@ class TestPreloadExternalDependencies:
         mcp_server.open_db(str(tmp_path / "memory.graph"))
         db = mcp_server.get_db()
 
-        entity_valid_from, entity_descriptions, file_entities = mcp_server._preload_known_entities(db, str(tmp_path))
+        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
+            mcp_server._preload_known_entities(db, str(tmp_path))
+        )
 
         assert ":module/vendor-lib" in entity_valid_from
         assert entity_descriptions[":module/vendor-lib"] == "lib"
         assert "vendor/lib" in file_entities
+        assert submodule_paths[":module/vendor-lib"] == "vendor/lib"
 
     def test_preload_pinned_commits_reloads_current_sha(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -6871,7 +6874,7 @@ class TestIndexCacheInvalidation:
         mcp_server.open_db(str(tmp_path / "t.graph"))
         monkeypatch.setattr(mcp_server, "_git_commits", lambda *a, **k: [])
         monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
-        monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}, {}))
+        monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}, {}, {}))
         monkeypatch.setattr(mcp_server, "_ingest_tags", lambda *a, **k: None)
         monkeypatch.setattr(mcp_server, "_last_run_write", lambda *a, **k: None)
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
@@ -8614,6 +8617,119 @@ class TestRunIngestionGitlinks:
             "removed submodule's :entity-type must be closed (issue #137)"
         assert count(":path", '"vendor/lib"') == 0, \
             "removed submodule's :path must be closed (issue #137)"
+
+        mcp_server._db = None  # release the real file lock for subsequent tests
+
+
+class TestSubmoduleDependencyLinking:
+    """Issue #112: a dependency-edge stub created from an unresolvable
+    include path (e.g. #include "vendor/libX/api.h") and the submodule's own
+    entity (from .gitmodules / gitlink mode 160000) are computed via two
+    different ident schemes — _canonical_ident("module", import_name) for the
+    stub vs. _code_ident("module", path) for the submodule — so they land as
+    permanently disconnected idents even once both exist. A :resolves-to edge
+    from the stub to the submodule must connect them.
+
+    Verified against the REAL minigraf backend (no mock), since the fix reads
+    back existing external-dependency rows via a DB query at gitlink-add time.
+    """
+
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+
+    def _add_submodule_commit(self, repo, path="vendor/libX", name="libX", url="https://example.com/libX.git"):
+        sub = repo.parent / f"{repo.name}-sub"
+        _subprocess.run(["git", "init", "-q", str(sub)], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.email", "t@t.com"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.name", "T"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "commit", "--allow-empty", "-m", "e"], check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "-C", str(sub), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        (repo / ".gitmodules").write_text(f'[submodule "{name}"]\n\tpath = {path}\n\turl = {url}\n')
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},{path}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "add", ".gitmodules"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
+        return sub_hash
+
+    @pytest.mark.asyncio
+    async def test_preexisting_stub_links_to_submodule_added_later(self, tmp_path):
+        """Issue #112's exact repro order: the unresolvable include is ingested
+        first (no submodule exists yet), then the real submodule is added and
+        ingested incrementally. The stub from step one must end up with a
+        :resolves-to edge to the submodule entity from step two."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "consumer.py").write_text("import vendor.libX.api\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add consumer"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        self._add_submodule_commit(repo)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        real_execute = mcp_server._db_execute
+
+        def rows(query):
+            raw = real_execute(db, query)
+            return json.loads(raw).get("results", [])
+
+        stub_ident = mcp_server._canonical_ident("module", "vendor.libX.api")
+        submodule_ident = mcp_server._code_ident("module", "vendor/libX")
+        assert rows(f"(query [:find ?v :where [{stub_ident} :resolves-to ?v]])") == [[submodule_ident]], \
+            "unresolved-include stub must gain a :resolves-to edge to the submodule entity (issue #112)"
+
+        mcp_server._db = None  # release the real file lock for subsequent tests
+
+    @pytest.mark.asyncio
+    async def test_stub_created_after_submodule_links_immediately(self, tmp_path):
+        """Reverse ordering: the submodule already exists, then a later commit
+        adds an include reaching under it. Since submodule directories are
+        never walked as tracked files, this import can never resolve — the fix
+        must link the new stub the moment it's created, not just at the next
+        gitlink event."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        self._add_submodule_commit(repo)
+
+        (repo / "consumer.py").write_text("import vendor.libX.api\n")
+        _subprocess.run(["git", "add", "consumer.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add consumer"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        real_execute = mcp_server._db_execute
+
+        def rows(query):
+            raw = real_execute(db, query)
+            return json.loads(raw).get("results", [])
+
+        stub_ident = mcp_server._canonical_ident("module", "vendor.libX.api")
+        submodule_ident = mcp_server._code_ident("module", "vendor/libX")
+        assert rows(f"(query [:find ?v :where [{stub_ident} :resolves-to ?v]])") == [[submodule_ident]], \
+            "stub created after the submodule already exists must link immediately (issue #112)"
 
         mcp_server._db = None  # release the real file lock for subsequent tests
 
