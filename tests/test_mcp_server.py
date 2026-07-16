@@ -5731,58 +5731,54 @@ class TestBuildCodeTriplesGlobalsAndFields:
 
 
 class TestPreloadKnownDeps:
-    # NOT MIGRATED to real_db (intentionally kept on mock_minigraf_db):
-    # investigation for #133 found that _preload_known_deps' query
-    # (`:find ?src ?dep ?vf ... :where [?src :depends-on ?dep] ...`) binds
-    # ?src directly as the subject of the :depends-on triple. Against a real
-    # minigraf backend, a subject variable resolves to minigraf's *internal*
-    # UUID for that entity, not the ":module/…" keyword ident used to create
-    # it — confirmed empirically:
-    #   db.execute('(transact [[:module/mod-a-py :entity-type :type/module]
-    #     [:module/mod-a-py :ident ":module/mod-a-py"]]))')
-    #   db.execute('(transact {:valid-from "2024-01-01T00:00:00Z"}
-    #     [[:module/mod-a-py :depends-on :module/mod-b]])')
-    #   db.execute('(query [:find ?src ?dep :where [?src :depends-on ?dep]])')
-    #   => {"results": [["6b877d67-...uuid...", ":module/mod-b"]]}
-    # _preload_known_deps then does `ident_to_file.get(src_ident)` keyed by
-    # the ":module/…" ident string, which never matches a UUID — every row
-    # is silently dropped (`continue`), so against a real backend this
-    # function returns ({}, {}) unconditionally, discarding all known deps
-    # on every restart. (_preload_known_entities avoids this by explicitly
-    # projecting `[?e :ident ?ident]` and finding ?ident instead of ?e; this
-    # function does not.) This is a real, previously-mock-hidden bug of
-    # exactly the class #133 exists to catch — but fixing it is a
-    # production-code change outside this test-migration task's scope, and
-    # a naive fix isn't as simple as adding `[?src :ident ?src-ident]`:
-    # minigraf's per-fact :db/valid-from pseudo-attribute is bound to
-    # whichever EAV clause on that variable most recently precedes it, so
-    # inserting an :ident clause AFTER `[?src :depends-on ?dep]` silently
-    # rebinds ?vf to the :ident fact's (irrelevant) valid-from instead of
-    # the :depends-on fact's — verified empirically:
-    #   [?src :depends-on ?dep] [?src :ident ?srci] [?src :db/valid-from ?vf]  -> wrong ?vf
-    #   [?src :ident ?srci] [?src :depends-on ?dep] [?src :db/valid-from ?vf]  -> correct ?vf
-    # Left mocked here (matching this file's pre-migration behavior) and
-    # flagged for a dedicated follow-up fix + real-backend test rather than
-    # silently asserting today's broken behavior as "correct" or blocking
-    # the rest of this migration task on it.
-    def test_reloads_open_depends_on_edge(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_reloads_open_depends_on_edge(self, real_db):
+        """Real-backend regression test for the #133 UUID-vs-ident bug:
+        _preload_known_deps' query used to bind the bare ?src subject
+        variable directly (`[?src :depends-on ?dep]`), which a real minigraf
+        backend resolves to its *internal* UUID rather than the
+        ":module/…" keyword ident used to create the entity — confirmed
+        empirically during the #133 investigation:
+            db.execute('(transact [[:module/mod-a-py :entity-type :type/module]
+              [:module/mod-a-py :ident ":module/mod-a-py"]]))')
+            db.execute('(transact {:valid-from "2024-01-01T00:00:00Z"}
+              [[:module/mod-a-py :depends-on :module/mod-b]])')
+            db.execute('(query [:find ?src ?dep :where [?src :depends-on ?dep]])')
+            => {"results": [["6b877d67-...uuid...", ":module/mod-b"]]}
+        `ident_to_file.get(src_ident)` was then keyed by the ":module/…"
+        ident string, which never matched a UUID — every row was silently
+        dropped, so against a real backend the function returned ({}, {})
+        unconditionally, discarding all known deps on every restart. Fixed
+        by projecting `[?src :ident ?srci]` and finding ?srci instead of
+        ?src (mirroring _preload_known_entities).
+
+        This test also proves the fix's clause ORDERING is correct, not
+        just that it returns non-empty: minigraf's per-fact :db/valid-from
+        pseudo-attribute binds to whichever EAV clause on ?src most
+        recently precedes it in clause order, so the entity's :ident fact
+        and its :depends-on fact are seeded here with deliberately
+        DIFFERENT :valid-from timestamps (2020 vs. 2024). If the :ident
+        clause were placed after :depends-on (or anywhere but immediately
+        before it), ?vf would silently rebind to the :ident fact's
+        valid-from (2020) instead of the :depends-on fact's (2024) —
+        a different, provably wrong value that this assertion would catch.
+        """
         import mcp_server
 
-        src_ident = mcp_server._code_ident("module", "mod_a.py")
-        dep_ident = mcp_server._canonical_ident("module", "mod_b")
-        # 1704067200000 ms == 2024-01-01T00:00:00.000Z
-        db_instance.execute.return_value = json.dumps(
-            {"results": [[src_ident, dep_ident, 1704067200000]]}
+        real_db.execute(
+            '(transact {:valid-from "2020-01-01T00:00:00Z"} '
+            '[[:module/mod-a-py :entity-type :type/module] '
+            '[:module/mod-a-py :ident ":module/mod-a-py"]])'
         )
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
+        real_db.execute(
+            '(transact {:valid-from "2024-01-01T00:00:00Z"} '
+            '[[:module/mod-a-py :depends-on :module/mod-b]])'
+        )
 
-        file_entities = {"mod_a.py": [src_ident]}
-        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, file_entities)
+        file_entities = {"mod_a.py": [":module/mod-a-py"]}
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(real_db, file_entities)
 
-        assert file_deps["mod_a.py"] == {dep_ident}
-        assert dep_valid_from[(src_ident, dep_ident)] == "2024-01-01T00:00:00.000Z"
+        assert file_deps["mod_a.py"] == {":module/mod-b"}
+        assert dep_valid_from[(":module/mod-a-py", ":module/mod-b")] == "2024-01-01T00:00:00.000Z"
 
     def test_query_includes_any_valid_time_and_forever_filter(self, real_db):
         """The query must ask for :any-valid-time (required for any per-fact
@@ -5844,36 +5840,42 @@ class TestPreloadExternalDependencies:
         assert "vendor/lib" in file_entities
         assert submodule_paths[":module/vendor-lib"] == "vendor/lib"
 
-    # NOT MIGRATED to real_db (intentionally kept on mock_minigraf_db): same
-    # root cause as TestPreloadKnownDeps.test_reloads_open_depends_on_edge
-    # above — _preload_pinned_commits' query binds ?e directly as the
-    # subject of `[?e :pinned-commit ?sha]`, which a real minigraf backend
-    # resolves to its internal UUID rather than the entity's ":module/…"
-    # ident (confirmed empirically the same way). Every call site that
-    # reads this function's return value (_run_ingestion's gitlink
-    # bump/remove handling) looks it up by ident string
-    # (`pinned_commit_state.get(ext_ident, ...)`), so against a real
-    # backend this lookup would always miss after a restart, silently
-    # resetting each pin's original valid-from. See the comment above
-    # test_reloads_open_depends_on_edge for the full investigation and why
-    # a fix isn't a trivial one-line change (per-fact :db/valid-from binds
-    # to whichever EAV clause on the entity variable most recently
-    # precedes it). Flagged for a dedicated follow-up rather than fixed or
-    # silently asserted as correct here.
-    def test_preload_pinned_commits_reloads_current_sha(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_preload_pinned_commits_reloads_current_sha(self, real_db):
+        """Real-backend regression test for the #133 UUID-vs-ident bug in
+        _preload_pinned_commits — same root cause as
+        TestPreloadKnownDeps.test_reloads_open_depends_on_edge:
+        the query used to bind the bare ?e subject variable directly
+        (`[?e :pinned-commit ?sha]`), which a real minigraf backend
+        resolves to its internal UUID rather than the entity's ":module/…"
+        ident. Every call site that reads this function's return value
+        (_run_ingestion's gitlink bump/remove handling) looks it up by
+        ident string (`pinned_commit_state.get(ext_ident, ...)`), so
+        against a real backend the lookup always missed after a restart,
+        silently resetting each pin's original valid-from. Fixed by
+        projecting `[?e :ident ?ei]` and finding ?ei instead of ?e.
+
+        As with the depends-on test, the :ident fact and the :pinned-commit
+        fact are seeded with deliberately DIFFERENT :valid-from timestamps
+        (2020 vs. 2026) to prove the fix's clause ORDERING (:ident before
+        :pinned-commit) is correct — not just that the result is non-empty.
+        If :ident were ordered wrong, ?vf would bind to the :ident fact's
+        valid-from (2020) instead of the :pinned-commit fact's (2026).
+        """
         import mcp_server
-        # _preload_pinned_commits' query shape is [?e ?sha ?vf] with :any-valid-time
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":module/vendor-lib", "abc123", 1735689600000]]
-        })
-        mcp_server.open_db(str(tmp_path / "memory.graph"))
-        db = mcp_server.get_db()
 
-        pinned = mcp_server._preload_pinned_commits(db)
+        real_db.execute(
+            '(transact {:valid-from "2020-01-01T00:00:00Z"} '
+            '[[:module/vendor-lib :entity-type :type/external-dependency] '
+            '[:module/vendor-lib :ident ":module/vendor-lib"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-01-01T00:00:00Z"} '
+            '[[:module/vendor-lib :pinned-commit "abc123"]])'
+        )
 
-        assert pinned[":module/vendor-lib"][0] == "abc123"
-        assert pinned[":module/vendor-lib"][1].endswith("Z")
+        pinned = mcp_server._preload_pinned_commits(real_db)
+
+        assert pinned[":module/vendor-lib"] == ("abc123", "2026-01-01T00:00:00.000Z")
 
     def test_preload_pinned_commits_returns_empty_on_query_failure(self, real_db, monkeypatch):
         """Same malformed-query technique as
