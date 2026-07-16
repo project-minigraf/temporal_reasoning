@@ -108,7 +108,7 @@ Only mint a new ident if the entity is genuinely new.
 
 Canonical ident form: lowercase, hyphens only — `:decision/redis` not `:decision/Redis_cache`.
 
-Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`, `:module/`, `:function/`, `:class/` (code structure — auto-ingested); `:commit/`, `:tag/`, `:ingestion/` are system-only (written by `minigraf_ingest_git`), do not write to them directly
+Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`, `:module/`, `:function/`, `:class/`, `:variable/`, `:field/` (code structure — auto-ingested); `:commit/`, `:tag/`, `:ingestion/` are system-only (written by `minigraf_ingest_git`), do not write to them directly
 Required attribute on all types: `:description`
 Optional attributes: `:rationale`, `:date`, `:alias`
 
@@ -346,8 +346,9 @@ Ident: `:module/<slugified-file-path>`
 | `:path` | file path |
 | `:introduced-by` (keyword ref) | commit that first added this file |
 | `:modified-in` (keyword ref) | one edge per subsequent modifying commit |
-| `:contains` (keyword ref) | functions and classes defined in this file |
+| `:contains` (keyword ref) | functions, classes, variables, and fields defined in this file |
 | `:depends-on` (keyword ref) | modules this file imports — tracked per-commit with full valid-time bounds: `:valid-from` = commit that introduced the import, `:valid-to` = commit that removed it (open-ended if still present) |
+| `:renamed-from` / `:renamed-to` (keyword ref) | rename/move continuity — see below |
 
 #### `:type/function` — one per top-level function or method
 Ident: `:function/<slugified-path-name>` (file path + `::` + function name, slugified together)
@@ -358,6 +359,7 @@ Ident: `:function/<slugified-path-name>` (file path + `::` + function name, slug
 | `:file` | source file path |
 | `:introduced-by` (keyword ref) | commit that first defined this function |
 | `:modified-in` (keyword ref) | one edge per subsequent modifying commit |
+| `:renamed-from` / `:renamed-to` (keyword ref) | rename/move continuity — see below |
 
 #### `:type/class` — one per class, struct, or type definition (same ident convention as function)
 
@@ -367,6 +369,33 @@ Ident: `:function/<slugified-path-name>` (file path + `::` + function name, slug
 | `:file` | source file path |
 | `:introduced-by` (keyword ref) | commit that first defined this class |
 | `:modified-in` (keyword ref) | one edge per subsequent modifying commit |
+| `:renamed-from` / `:renamed-to` (keyword ref) | rename/move continuity — see below |
+
+#### `:type/variable` — one per module-level global (same ident convention as function)
+
+| Attribute | Notes |
+|---|---|
+| `:description` | variable name |
+| `:file` | source file path |
+| `:introduced-by` (keyword ref) | commit that first defined this global |
+| `:modified-in` (keyword ref) | one edge per subsequent modifying commit |
+| `:renamed-from` / `:renamed-to` (keyword ref) | rename/move continuity — see below |
+
+#### `:type/field` — one per class/struct member, instance or static (ident convention: file path + `::` + `<ClassName>.<fieldName>`, slugified together)
+
+| Attribute | Notes |
+|---|---|
+| `:description` | `"<ClassName>.<fieldName>"` |
+| `:file` | source file path |
+| `:class` (keyword ref) | the owning class/struct entity |
+| `:static` | `true`/`false` — whether this is a static (class-level) field vs. an instance field |
+| `:introduced-by` (keyword ref) | commit that first defined this field |
+| `:modified-in` (keyword ref) | one edge per subsequent modifying commit |
+| `:renamed-from` / `:renamed-to` (keyword ref) | rename/move continuity — see below |
+
+**Rename/move continuity (`:renamed-from` / `:renamed-to`):** all five code entity types (module, function, class, variable, field) can carry these. When ingestion detects a rename — a file rename/move (via git's own `-M` similarity detection) or a function/class/global/field rename (via a custom AST-based matcher tolerant of local-variable renames) — the old entity is closed as usual but also gets `:renamed-to` pointing at the new entity's ident, and the new entity gets `:renamed-from` pointing back at the old one. This lets a query traverse continuous history across a rename that would otherwise look like an unrelated deletion followed by an unrelated creation.
+
+**Supported languages for `:type/variable`/`:type/field` extraction:** the same full language list as function/class extraction — see "Supported languages for AST extraction" below.
 
 #### `:type/tag` — one per git tag (system-only, not audited)
 Ident: `:tag/<slugified-tag-name>`
@@ -392,7 +421,7 @@ Ident: `:module/<slugified-path-or-import-name>` (shares the module ident namesp
 
 Vendored-in-tree code checked in as regular files (not a git submodule) is parsed as ordinary `:type/module`/`:function`/`:class` entities like any first-party code — only real gitlinks (mode `160000`) and genuinely-unresolved imports get the external marker.
 
-**Supported languages for AST extraction:** Python, JavaScript, TypeScript (+ TSX/JSX), Rust, Go, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Scala, Haskell, Lua, Elixir. Files in other languages are tracked as modules (with `:introduced-by`/`:modified-in`) but yield no function or class entities.
+**Supported languages for AST extraction:** Python, JavaScript, TypeScript (+ TSX/JSX), Rust, Go, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Scala, Haskell, Lua, Elixir. Files in other languages are tracked as modules (with `:introduced-by`/`:modified-in`) but yield no function, class, variable, or field entities.
 
 **Pre-registered SESSION_RULES** — these are always available; no `minigraf_rule` call needed:
 

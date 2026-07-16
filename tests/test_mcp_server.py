@@ -775,6 +775,56 @@ class TestMemoryPrepareTurn:
         # Should contain a UTC timestamp like 2026-05-02T15:44:52.184Z
         assert any(re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z', c) for c in calls)
 
+    def test_contains_filter_actually_matches_against_real_graph(self, tmp_path):
+        """Real (non-mocked) backend regression test for the bare `(contains? ...)`
+        clause bug: without the enclosing brackets, `[(contains? ?v "...")]`
+        parses as a rule-invocation of a non-existent rule and silently
+        contributes zero bindings — the targeted query returns empty with no
+        error, indistinguishable at the Python level from "no match found".
+        A mock never catches this because it never parses the Datalog string.
+
+        Asserting only on the heuristic's overall return value is not enough:
+        when the targeted contains? query comes back empty, the function
+        falls back to an UNFILTERED broad scan (mcp_server.py ~4357-4367)
+        that would still surface this fact regardless of whether the
+        targeted filter itself works — that fallback path masked this exact
+        bug from an end-to-end assertion during manual verification. So this
+        spies on _db_execute to confirm the TARGETED contains? query itself
+        returns the matching row, isolating the code path the bug lives in.
+        """
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "real.graph"))
+        db = mcp_server.get_db()
+        mcp_server._db_execute(
+            db,
+            '(transact {:valid-from "2024-01-01T00:00:00Z"} '
+            '[[:decision/db :entity-type :type/decision] '
+            '[:decision/db :ident ":decision/db"] '
+            '[:decision/db :description "we use postgresql for storage"]])',
+        )
+
+        real_execute = mcp_server._db_execute
+        contains_results = []
+
+        def spy(db_arg, datalog):
+            raw = real_execute(db_arg, datalog)
+            if "contains?" in datalog and "postgresql" in datalog:
+                contains_results.append(json.loads(raw).get("results", []))
+            return raw
+
+        mcp_server._db_execute = spy
+        try:
+            mcp_server._handle_memory_prepare_turn_heuristic(
+                "what database are we using, postgresql or mysql?"
+            )
+        finally:
+            mcp_server._db_execute = real_execute
+
+        assert contains_results, "the targeted contains? query must have been issued"
+        assert any(
+            any("postgresql" in str(v) for v in row) for rows in contains_results for row in rows
+        ), "the bracketed contains? filter must itself find the matching row, not just the broad-scan fallback"
+
 
 class TestHeuristicExtraction:
     def test_extracts_decision_language(self):
@@ -1836,7 +1886,1806 @@ class TestExtractFromSource:
         import mcp_server
         # Passing None as parser triggers AttributeError → except block returns empty dict
         result = mcp_server._extract_from_source(b"def foo(): pass", None, "x.py")
-        assert result == {"functions": [], "classes": [], "imports": [], "calls": []}
+        assert result == {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "globals": [], "fields": [],
+        }
+
+    def test_body_text_not_shipped_across_process_boundary(self):
+        """_extract_from_source's dict crosses the ProcessPoolExecutor boundary
+        (via _extract_commit), so it must NOT carry full entity body text — the
+        matcher works on live re-parsed nodes, never on this text. These four
+        keys used to be pickled per-file for no consumer (P3)."""
+        import mcp_server
+        source = b"GLOBAL_X = 5\n\ndef login(user):\n    return user.ok\n\nclass User:\n    field = 1\n"
+        result = mcp_server._extract_from_source(source, self._python_parser(), "auth.py")
+        assert "login" in result["functions"]
+        assert "User" in result["classes"]
+        assert "GLOBAL_X" in result["globals"]
+        for dead_key in ("function_bodies", "class_bodies", "global_bodies", "field_info"):
+            assert dead_key not in result, f"{dead_key} must not cross the process boundary"
+
+
+class TestExtractGlobalsAndFields:
+    def _python_parser(self):
+        import tree_sitter_python
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_python.language()))
+
+    def test_unsupported_language_returns_empty(self):
+        import mcp_server
+        result = mcp_server._extract_globals_and_fields(None, "nonexistent_lang")
+        assert result == {
+            "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
+            "global_nodes": {}, "field_nodes": {},
+        }
+
+    def test_dispatches_to_registered_language_extractor(self):
+        import mcp_server
+        sentinel = {
+            "globals": ["X"], "global_bodies": {"X": "X = 1"}, "fields": [], "field_info": {},
+            "global_nodes": {}, "field_nodes": {},
+        }
+        mcp_server._GLOBAL_FIELD_EXTRACTORS["_test_lang"] = lambda root: sentinel
+        try:
+            result = mcp_server._extract_globals_and_fields("fake_root", "_test_lang")
+            assert result == sentinel
+        finally:
+            del mcp_server._GLOBAL_FIELD_EXTRACTORS["_test_lang"]
+
+    def test_extract_from_source_merges_globals_and_fields(self):
+        import mcp_server
+        source = b"def foo(): pass"
+        result = mcp_server._extract_from_source(source, self._python_parser(), "x.py")
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
+class TestPythonGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_python
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_python.language()))
+
+    def test_module_level_global(self):
+        import mcp_server
+        tree = self._parser().parse(b"GLOBAL_X = 5\n")
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        assert "GLOBAL_X" in result["globals"]
+        assert "GLOBAL_X = 5" in result["global_bodies"]["GLOBAL_X"]
+
+    def test_class_variable_is_static_field(self):
+        import mcp_server
+        source = b"class Foo:\n    class_var = 10\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        names = [n for n, _c, _s in result["fields"]]
+        assert "class_var" in names
+        info = result["field_info"]["class_var"]
+        assert info["class"] == "Foo"
+        assert info["static"] is True
+
+    def test_self_attribute_in_init_is_instance_field(self):
+        import mcp_server
+        source = b"class Foo:\n    def __init__(self):\n        self.instance_var = 1\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        names = [n for n, _c, _s in result["fields"]]
+        assert "instance_var" in names
+        info = result["field_info"]["instance_var"]
+        assert info["class"] == "Foo"
+        assert info["static"] is False
+
+    def test_local_variable_inside_function_not_captured(self):
+        import mcp_server
+        source = b"def foo():\n    local_x = 1\n    return local_x\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_self_attribute_outside_init_not_captured(self):
+        """Scoped deliberately to __init__ only — see design plan's stated limitation."""
+        import mcp_server
+        source = b"class Foo:\n    def other(self):\n        self.dynamic = 1\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_python_globals_and_fields(tree.root_node)
+        assert result["fields"] == []
+
+
+class TestJsFamilyGlobalsAndFields:
+    def _js_parser(self):
+        import tree_sitter_javascript
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_javascript.language()))
+
+    def _ts_parser(self):
+        import tree_sitter_typescript
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_typescript.language_typescript()))
+
+    def test_js_module_level_global(self):
+        import mcp_server
+        tree = self._js_parser().parse(b"const GLOBAL_X = 5;\n")
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert "GLOBAL_X" in result["globals"]
+
+    def test_js_static_and_instance_fields(self):
+        import mcp_server
+        source = b"class Foo {\n  static staticField = 1;\n  instanceField = 2;\n}\n"
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_ts_public_field_definition_static(self):
+        import mcp_server
+        source = b"class Foo {\n  static staticField: number = 1;\n  instanceField: number = 2;\n}\n"
+        tree = self._ts_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_local_variable_not_captured(self):
+        import mcp_server
+        source = b"function foo() {\n  const localX = 1;\n  return localX;\n}\n"
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_export_const_captured_as_global(self):
+        import mcp_server
+        tree = self._js_parser().parse(b"export const GLOBAL_X = 5;\n")
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert "GLOBAL_X" in result["globals"]
+        assert result["global_bodies"]["GLOBAL_X"].startswith("export const")
+
+    def test_export_let_captured_as_global(self):
+        import mcp_server
+        tree = self._js_parser().parse(b"export let GLOBAL_Y = 5;\n")
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert "GLOBAL_Y" in result["globals"]
+        assert result["global_bodies"]["GLOBAL_Y"].startswith("export let")
+
+    def test_export_class_captures_fields(self):
+        import mcp_server
+        source = b"export class Foo { static a = 1; b = 2; }\n"
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", True)
+        assert info["b"] == ("Foo", False)
+
+    def test_export_default_class_captures_fields(self):
+        import mcp_server
+        source = b"export default class Bar { c = 3; }\n"
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["c"] == ("Bar", False)
+
+    def test_export_const_and_class_together(self):
+        import mcp_server
+        source = (
+            b"export const X = 5;\n"
+            b"export class Foo { static a = 1; b = 2; }\n"
+            b"export default class Bar { c = 3; }\n"
+        )
+        tree = self._js_parser().parse(source)
+        result = mcp_server._extract_js_family_globals_and_fields(tree.root_node)
+        assert "X" in result["globals"]
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", True)
+        assert info["b"] == ("Foo", False)
+        assert info["c"] == ("Bar", False)
+
+
+class TestRustGoCGlobalsAndFields:
+    def _rust_parser(self):
+        import tree_sitter_rust
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_rust.language()))
+
+    def _go_parser(self):
+        import tree_sitter_go
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_go.language()))
+
+    def _c_parser(self):
+        import tree_sitter_c
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_c.language()))
+
+    def test_rust_static_and_const_are_globals(self):
+        import mcp_server
+        source = b"static GLOBAL_X: i32 = 5;\nconst GLOBAL_Y: i32 = 10;\n"
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"GLOBAL_X", "GLOBAL_Y"}
+
+    def test_rust_struct_field_is_instance_only(self):
+        import mcp_server
+        source = b"struct Foo {\n    instance_field: i32,\n}\n"
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["instance_field"] == ("Foo", False)
+
+    def test_rust_impl_const_is_static_field(self):
+        import mcp_server
+        source = b"impl Foo {\n    const ASSOC_CONST: i32 = 1;\n}\n"
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["ASSOC_CONST"] == ("Foo", True)
+
+    def test_rust_generic_impl_const_owning_class_strips_type_params(self):
+        # For `impl<T> Foo<T> { ... }`, the impl_item's `type` field is a
+        # generic_type node whose text is "Foo<T>", not a bare
+        # type_identifier -- verified against the real installed
+        # tree-sitter-rust grammar. The owning_class recorded for an
+        # associated const must be the clean base name "Foo" (matching
+        # what struct_item's `name` field produces for the same struct
+        # elsewhere), not "Foo<T>", or the field's :class edge orphans
+        # itself from the struct's actual registered class ident.
+        import mcp_server
+        source = b"struct Foo<T> {\n    val: T,\n}\nimpl<T> Foo<T> {\n    const CAP: usize = 16;\n}\n"
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["CAP"] == ("Foo", True)
+        assert result["field_info"]["CAP"]["class"] == "Foo"
+
+    def test_rust_pub_visibility_does_not_break_extraction(self):
+        # `pub` is a visibility_modifier CHILD of static_item/struct_item/
+        # field_declaration/const_item (verified against the real installed
+        # tree-sitter-rust grammar) -- it does NOT wrap the declaration in a
+        # separate node the way JS's `export` does. This test locks in that
+        # finding: pub items must still be captured, with the same
+        # field:name resolution as their non-pub counterparts.
+        import mcp_server
+        source = (
+            b"pub static GLOBAL_X: i32 = 5;\n"
+            b"pub struct Foo {\n    pub instance_field: i32,\n}\n"
+            b"impl Foo {\n    pub const ASSOC_CONST: i32 = 1;\n}\n"
+        )
+        tree = self._rust_parser().parse(source)
+        result = mcp_server._extract_rust_globals_and_fields(tree.root_node)
+        assert "GLOBAL_X" in result["globals"]
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["instance_field"] == ("Foo", False)
+        assert info["ASSOC_CONST"] == ("Foo", True)
+
+    def test_go_package_level_var_and_const_are_globals(self):
+        import mcp_server
+        source = b"package main\n\nvar GlobalX = 5\nconst GlobalY = 10\n"
+        tree = self._go_parser().parse(source)
+        result = mcp_server._extract_go_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"GlobalX", "GlobalY"}
+
+    def test_go_grouped_var_declaration_captures_all_specs(self):
+        # A grouped `var (...)` block wraps its var_spec children in an
+        # intermediate var_spec_list node in the real installed
+        # tree-sitter-go grammar -- unlike grouped const/type blocks,
+        # which don't wrap. Verified empirically; this locks in that a
+        # grouped var block (an idiomatic, common real-world Go pattern)
+        # isn't silently dropped the way an unwrapped implementation
+        # would drop it.
+        import mcp_server
+        source = b"package main\n\nvar (\n\tA = 1\n\tB = 2\n)\nconst (\n\tC = 3\n\tD = 4\n)\n"
+        tree = self._go_parser().parse(source)
+        result = mcp_server._extract_go_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"A", "B", "C", "D"}
+
+    def test_go_struct_field_is_instance_only(self):
+        import mcp_server
+        source = b"package main\n\ntype Foo struct {\n    InstanceField int\n}\n"
+        tree = self._go_parser().parse(source)
+        result = mcp_server._extract_go_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["InstanceField"] == ("Foo", False)
+
+    def test_go_multi_name_struct_field_captures_all_names(self):
+        # `X, Y int` inside a struct puts more than one node under the
+        # `name` field of a single field_declaration -- singular
+        # child_by_field_name only returns the first, silently dropping
+        # `Y`. Verified empirically against the real installed
+        # tree-sitter-go grammar; children_by_field_name (plural) is
+        # used instead.
+        import mcp_server
+        source = b"package main\n\ntype Foo struct {\n\tX, Y int\n}\n"
+        tree = self._go_parser().parse(source)
+        result = mcp_server._extract_go_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["X"] == ("Foo", False)
+        assert info["Y"] == ("Foo", False)
+
+    def test_c_file_scope_declaration_is_global(self):
+        import mcp_server
+        source = b"int global_x = 5;\nstatic int file_static_x = 10;\n"
+        tree = self._c_parser().parse(source)
+        result = mcp_server._extract_c_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"global_x", "file_static_x"}
+
+    def test_c_struct_field_is_instance_only(self):
+        import mcp_server
+        source = b"struct Foo {\n    int instance_field;\n};\n"
+        tree = self._c_parser().parse(source)
+        result = mcp_server._extract_c_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["instance_field"] == ("Foo", False)
+
+    def test_c_multi_declarator_statement_captures_all_names(self):
+        # `int a, b = 2;` puts more than one node under the `declarator`
+        # field of a single `declaration` node -- child_by_field_name
+        # (singular) only returns the first one, silently dropping `b`.
+        # Verified empirically against the real installed tree-sitter-c
+        # grammar; children_by_field_name (plural) must be used instead.
+        import mcp_server
+        source = b"int a, b = 2;\n"
+        tree = self._c_parser().parse(source)
+        result = mcp_server._extract_c_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"a", "b"}
+
+    def test_c_multi_declarator_struct_field_captures_all_names(self):
+        import mcp_server
+        source = b"struct Foo {\n    int a, b;\n};\n"
+        tree = self._c_parser().parse(source)
+        result = mcp_server._extract_c_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", False)
+        assert info["b"] == ("Foo", False)
+
+
+class TestJavaCSharpGlobalsAndFields:
+    def _java_parser(self):
+        import tree_sitter_java
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_java.language()))
+
+    def _csharp_parser(self):
+        import tree_sitter_c_sharp
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_c_sharp.language()))
+
+    def test_java_static_and_instance_fields(self):
+        import mcp_server
+        source = b"public class Foo {\n    static int staticField = 1;\n    int instanceField = 2;\n}\n"
+        tree = self._java_parser().parse(source)
+        result = mcp_server._extract_java_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+        assert result["globals"] == []
+
+    def test_csharp_static_and_instance_fields(self):
+        import mcp_server
+        source = b"public class Foo {\n    static int staticField = 1;\n    int instanceField = 2;\n}\n"
+        tree = self._csharp_parser().parse(source)
+        result = mcp_server._extract_csharp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+        assert result["globals"] == []
+
+    def test_java_multi_declarator_field_captures_all_names(self):
+        # `int a, b;` puts more than one node under the `declarator` field
+        # of a single field_declaration -- child_by_field_name (singular)
+        # only returns the first, silently dropping `b`. Verified
+        # empirically against the real installed tree-sitter-java grammar
+        # (same lesson as Go's multi-name struct field and C's
+        # multi-declarator statement); children_by_field_name (plural)
+        # must be used instead.
+        import mcp_server
+        source = b"public class Foo {\n    int a, b = 3;\n}\n"
+        tree = self._java_parser().parse(source)
+        result = mcp_server._extract_java_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", False)
+        assert info["b"] == ("Foo", False)
+
+    def test_csharp_multi_declarator_field_captures_all_names(self):
+        # Unlike Java, C#'s field_declaration wraps a single
+        # variable_declaration child whose variable_declarator children
+        # (for `int a, b;`) are all plain positional children -- iterating
+        # var_decl.children already captures all of them. This test locks
+        # in that a multi-name field isn't silently dropped.
+        import mcp_server
+        source = b"public class Foo {\n    int a, b = 3;\n}\n"
+        tree = self._csharp_parser().parse(source)
+        result = mcp_server._extract_csharp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", False)
+        assert info["b"] == ("Foo", False)
+
+    def test_java_nested_class_fields_captured(self):
+        # walk() recurses into every node (not just direct root children)
+        # to find nested class_declarations, since a nested/inner class is
+        # a real, valid Java construct. This locks in that its fields are
+        # attributed to the inner class's own name, not the outer one, and
+        # that the method body sibling isn't mistakenly walked for fields.
+        import mcp_server
+        source = (
+            b"public class Outer {\n"
+            b"    class Inner {\n"
+            b"        static int innerStatic = 5;\n"
+            b"    }\n"
+            b"    void m() {\n"
+            b"        int local = 1;\n"
+            b"    }\n"
+            b"}\n"
+        )
+        tree = self._java_parser().parse(source)
+        result = mcp_server._extract_java_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["innerStatic"] == ("Inner", True)
+        assert "local" not in info
+        assert result["globals"] == []
+
+    def test_csharp_nested_class_fields_captured(self):
+        import mcp_server
+        source = (
+            b"public class Outer {\n"
+            b"    class Inner {\n"
+            b"        static int innerStatic = 5;\n"
+            b"    }\n"
+            b"    void M() {\n"
+            b"        int local = 1;\n"
+            b"    }\n"
+            b"}\n"
+        )
+        tree = self._csharp_parser().parse(source)
+        result = mcp_server._extract_csharp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["innerStatic"] == ("Inner", True)
+        assert "local" not in info
+        assert result["globals"] == []
+
+
+class TestCppGlobalsAndFields:
+    def _cpp_parser(self):
+        import tree_sitter_cpp
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_cpp.language()))
+
+    def test_top_level_declaration_is_global(self):
+        import mcp_server
+        tree = self._cpp_parser().parse(b"int global_x = 5;\n")
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        assert "global_x" in result["globals"]
+
+    def test_static_and_instance_class_fields(self):
+        import mcp_server
+        source = b"class Foo {\npublic:\n    static int staticField;\n    int instanceField;\n};\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_struct_fields_same_shape_as_class(self):
+        # struct_specifier and class_specifier expose field:body /
+        # field_declaration_list identically -- verified empirically
+        # against the real installed tree-sitter-cpp grammar. Structs
+        # default to public visibility but the AST shape for extracting
+        # fields is the same either way.
+        import mcp_server
+        source = b"struct Bar {\n    int a;\n    static float f;\n};\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Bar", False)
+        assert info["f"] == ("Bar", True)
+
+    def test_multiple_access_specifier_sections_do_not_affect_extraction(self):
+        # A class with several public:/private:/public: sections in
+        # sequence -- access_specifier nodes are just siblings in the
+        # field_declaration_list body and must not disrupt iteration over
+        # the field_declaration members that follow them.
+        import mcp_server
+        source = (
+            b"class Foo {\n"
+            b"public:\n"
+            b"    int pub1;\n"
+            b"private:\n"
+            b"    static int priv1;\n"
+            b"public:\n"
+            b"    int pub2;\n"
+            b"};\n"
+        )
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["pub1"] == ("Foo", False)
+        assert info["priv1"] == ("Foo", True)
+        assert info["pub2"] == ("Foo", False)
+
+    def test_multi_declarator_global_captures_all_names(self):
+        # `int a, b;` at file scope puts more than one node under the
+        # `declarator` field of a single declaration -- child_by_field_name
+        # (singular) only returns the first, silently dropping `b`.
+        # Verified empirically against the real installed tree-sitter-cpp
+        # grammar (same lesson as C/Java's multi-declarator statement);
+        # children_by_field_name (plural) must be used instead.
+        import mcp_server
+        source = b"int a, b;\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_multi_declarator_field_captures_all_names(self):
+        # Same multi-declarator gap as globals, but for class/struct
+        # fields: `int x, y;` inside a field_declaration_list.
+        import mcp_server
+        source = b"class Foo {\npublic:\n    int x, y;\n};\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Foo", False)
+        assert info["y"] == ("Foo", False)
+
+    def test_method_declaration_not_captured_as_field(self):
+        # A method's declarator is a function_declarator wrapping a
+        # field_identifier, not a bare field_identifier -- must not be
+        # misclassified as a field.
+        import mcp_server
+        source = b"class Foo {\npublic:\n    void method();\n};\n"
+        tree = self._cpp_parser().parse(source)
+        result = mcp_server._extract_cpp_globals_and_fields(tree.root_node)
+        names = [n for n, _, _ in result["fields"]]
+        assert "method" not in names
+
+
+class TestRubyGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_ruby
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_ruby.language()))
+
+    def test_global_variable_and_constant_are_globals(self):
+        import mcp_server
+        source = b"$global_var = 5\nCONST_VAR = 10\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"$global_var", "CONST_VAR"}
+
+    def test_class_variable_is_static_instance_variable_in_initialize_is_not(self):
+        import mcp_server
+        source = b"class Foo\n  @@class_var = 1\n  def initialize\n    @instance_var = 2\n  end\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["@@class_var"] == ("Foo", True)
+        assert info["@instance_var"] == ("Foo", False)
+
+    def test_multi_assignment_globals_captures_all_names(self):
+        # `$a, $b = 1, 2` wraps the left side in a left_assignment_list
+        # node instead of exposing a bare global_variable/constant
+        # directly under field:left -- verified empirically against the
+        # real installed tree-sitter-ruby grammar. Same lesson as the
+        # multi-declarator gaps found in Go/C/Java/C++: must unwrap
+        # left_assignment_list to avoid silently dropping every name but
+        # the first.
+        import mcp_server
+        source = b"$a, $b = 1, 2\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        assert set(result["globals"]) == {"$a", "$b"}
+
+    def test_multi_assignment_class_and_instance_variables_captures_all_names(self):
+        import mcp_server
+        source = b"class Foo\n  @@a, @@b = 1, 2\n  def initialize\n    @x, @y = 1, 2\n  end\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["@@a"] == ("Foo", True)
+        assert info["@@b"] == ("Foo", True)
+        assert info["@x"] == ("Foo", False)
+        assert info["@y"] == ("Foo", False)
+
+    def test_attr_accessor_call_not_captured_as_field(self):
+        # attr_accessor/attr_reader/attr_writer are ordinary method calls
+        # (node type `call`) in the grammar, not assignments -- verified
+        # empirically. Out of scope for this task (which only looks at
+        # `@x = ...` inside initialize); they must not be misclassified
+        # as fields.
+        import mcp_server
+        source = b"class Foo\n  attr_accessor :bar\n  def initialize\n    @baz = 1\n  end\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        names = [n for n, _, _ in result["fields"]]
+        assert "bar" not in names
+        assert names == ["@baz"]
+
+    def test_module_is_not_treated_as_class(self):
+        # `module Foo ... end` parses as a `module` node, distinct from
+        # `class` -- verified empirically. The brief scopes this
+        # extractor to `class` specifically, so module bodies (which can
+        # also hold constants/class variables) must not be walked into
+        # for field extraction.
+        import mcp_server
+        source = b"module Baz\n  @@mod_var = 1\n  CONST_IN_MOD = 5\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_ruby_globals_and_fields(tree.root_node)
+        assert result["fields"] == []
+        assert result["globals"] == []
+
+
+class TestPhpGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_php
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_php.language_php()))
+
+    def test_top_level_variable_is_global(self):
+        import mcp_server
+        source = b"<?php\n$globalVar = 5;\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        assert "$globalVar" in result["globals"]
+
+    def test_static_and_instance_properties(self):
+        import mcp_server
+        source = b"<?php\nclass Foo {\n    public static $staticField = 1;\n    public $instanceField = 2;\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$staticField"] == ("Foo", True)
+        assert info["$instanceField"] == ("Foo", False)
+
+    def test_multi_property_declaration_captures_all_names(self):
+        # `public static $a = 1, $b = 2;` -- a single property_declaration
+        # containing multiple property_element children -- verified
+        # empirically against the real installed tree-sitter-php grammar.
+        # This is the PHP analog of the recurring multi-declarator gap
+        # (Go/Java/C++), but here the brief's plain iteration over every
+        # property_element child already handles it correctly.
+        import mcp_server
+        source = b"<?php\nclass Foo {\n    public static $a = 1, $b = 2;\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$a"] == ("Foo", True)
+        assert info["$b"] == ("Foo", True)
+
+    def test_typed_property_still_captured(self):
+        # PHP 7.4+ typed properties (`public int $x = 5;`) add a
+        # primitive_type/named_type child to property_declaration but
+        # keep the same property_element shape -- verified empirically.
+        import mcp_server
+        source = b"<?php\nclass Foo {\n    public int $x = 5;\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$x"] == ("Foo", False)
+
+    def test_semicolon_style_namespace_globals_still_captured(self):
+        # `namespace App;` (semicolon style) does not wrap subsequent
+        # statements -- they remain direct children of `program` --
+        # verified empirically. No special-casing needed for this form.
+        import mcp_server
+        source = b"<?php\nnamespace App;\n$x = 5;\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        assert "$x" in result["globals"]
+
+    def test_block_style_namespace_globals_and_classes_captured(self):
+        # `namespace App { ... }` (block style) wraps its statements in
+        # a compound_statement exposed via field:body on
+        # namespace_definition -- verified empirically against the real
+        # installed tree-sitter-php grammar. Same shape-changing-wrapper
+        # lesson as JS's export_statement: without unwrapping, every
+        # global/class inside a block-style namespace is silently
+        # dropped, and PHP namespaces are extremely common in real code.
+        import mcp_server
+        source = (
+            b"<?php\nnamespace App {\n"
+            b"    $x = 5;\n"
+            b"    class Foo {\n        public $y = 1;\n    }\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        assert "$x" in result["globals"]
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$y"] == ("Foo", False)
+
+    def test_promoted_constructor_property_captured_as_instance_field(self):
+        # PHP 8+ constructor property promotion
+        # (`public function __construct(public int $x) {}`) produces a
+        # property_promotion_parameter node inside the constructor's
+        # formal_parameters -- NOT a property_declaration under the
+        # class body -- verified empirically. The brief's code as
+        # written only scans property_declaration nodes in the class
+        # body, so promoted properties would be silently missed without
+        # this extra handling. Promoted properties cannot carry a
+        # `static` modifier in real PHP (verified: adding one produces
+        # a parse ERROR node), so they are always instance fields.
+        import mcp_server
+        source = (
+            b"<?php\nclass Foo {\n"
+            b"    public function __construct(public int $x, private string $y = \"z\") {}\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_php_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["$x"] == ("Foo", False)
+        assert info["$y"] == ("Foo", False)
+
+
+class TestKotlinGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_kotlin
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_kotlin.language()))
+
+    def test_top_level_property_is_global(self):
+        import mcp_server
+        tree = self._parser().parse(b"val globalX = 5\n")
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_companion_object_property_is_static_plain_is_instance(self):
+        import mcp_server
+        source = b"class Foo {\n    companion object {\n        val staticField = 1\n    }\n    val instanceField = 2\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_top_level_destructuring_declaration_captures_all_names(self):
+        # `val (a, b) = Pair(1, 2)` wraps its names in a
+        # multi_variable_declaration instead of a bare
+        # variable_declaration -- verified empirically against the real
+        # installed tree-sitter-kotlin grammar. Same multi-declarator
+        # lesson as every prior language in this plan (Go/C/Java/C++/
+        # Ruby): every identifier inside it must be extracted, not just
+        # treated as absent.
+        import mcp_server
+        source = b"val (a, b) = Pair(1, 2)\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_primary_constructor_val_param_is_instance_field_plain_param_excluded(self):
+        # Kotlin's primary-constructor property shorthand (`class
+        # Foo(val x: Int)`) is an idiomatic and extremely common way to
+        # declare instance fields (near-universal in `data class`), but
+        # it is structurally a class_parameter inside primary_
+        # constructor's class_parameters list -- NOT a property_
+        # declaration under class_body -- verified empirically. A plain
+        # constructor parameter with neither `val` nor `var` (`y: Int`
+        # below) is not a property and must be excluded.
+        import mcp_server
+        source = b"class Foo(val x: Int, y: Int) {\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Foo", False)
+        assert "y" not in info
+
+    def test_data_class_constructor_properties_and_body_property_combined(self):
+        import mcp_server
+        source = (
+            b"data class Point(val x: Int, val y: Int) {\n"
+            b"    val label = \"point\"\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Point", False)
+        assert info["y"] == ("Point", False)
+        assert info["label"] == ("Point", False)
+
+    def test_nested_class_not_recursed_into(self):
+        # Fields two classes deep are out of scope, consistent with
+        # every other language in this plan: only class_body's direct
+        # children are inspected, so a nested class_declaration is
+        # skipped without crashing and without contributing its own
+        # field to the outer class.
+        import mcp_server
+        source = (
+            b"class Outer {\n"
+            b"    class Inner {\n"
+            b"        val innerField = 3\n"
+            b"    }\n"
+            b"    val outerField = 4\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["outerField"] == ("Outer", False)
+        assert "innerField" not in info
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"fun main() {\n    println(\"hi\")\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_kotlin_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
+class TestSwiftGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_swift
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_swift.language()))
+
+    def test_top_level_let_is_global(self):
+        import mcp_server
+        tree = self._parser().parse(b"let globalX = 5\n")
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_static_and_instance_properties(self):
+        import mcp_server
+        source = b"class Foo {\n    static var staticField = 1\n    var instanceField = 2\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["staticField"] == ("Foo", True)
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_top_level_multi_binding_let_captures_all_names(self):
+        # `let a = 1, b = 2` binds multiple names in one
+        # property_declaration, each its own `field:name` -- verified
+        # empirically against the real installed tree-sitter-swift
+        # grammar. Same multi-declarator lesson as every prior language
+        # in this plan: every name must be extracted, not just the
+        # first.
+        import mcp_server
+        tree = self._parser().parse(b"let a = 1, b = 2\n")
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_class_multi_binding_property_captures_all_names(self):
+        import mcp_server
+        source = b"class Foo {\n    let a = 1, b = 2\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", False)
+        assert info["b"] == ("Foo", False)
+
+    def test_struct_and_enum_properties_extracted(self):
+        # struct and enum declarations share the class_declaration node
+        # type with class (distinguished only by declaration_kind), and
+        # enum's body node is a differently-typed enum_class_body --
+        # both verified empirically to work via child_by_field_name
+        # ("body"), which is keyed by field name, not node type.
+        import mcp_server
+        source = (
+            b"struct Bar {\n    var structField = 5\n}\n"
+            b"enum E {\n    static let enumField = 1\n}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["structField"] == ("Bar", False)
+        assert info["enumField"] == ("E", True)
+
+    def test_tuple_destructuring_produces_no_globals(self):
+        # `let (x, y) = (1, 2)` wraps names in a pattern whose nested
+        # per-name patterns expose no bound_identifier field -- verified
+        # empirically -- so it is safely skipped rather than crashing
+        # or misattributing a name.
+        import mcp_server
+        tree = self._parser().parse(b"let (x, y) = (1, 2)\n")
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_extension_properties_attributed_to_extended_type(self):
+        # extension Foo { ... } shares the class_declaration node type;
+        # its `name` field is a user_type wrapping Foo's
+        # type_identifier, and .text on it still resolves to plain
+        # "Foo" -- verified empirically -- so extension properties are
+        # picked up rather than silently dropped or misattributed.
+        import mcp_server
+        source = b"extension Foo {\n    var extField = 3\n    static var extStatic = 4\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["extField"] == ("Foo", False)
+        assert info["extStatic"] == ("Foo", True)
+
+    def test_init_only_class_has_no_fields(self):
+        # Swift has no primary-constructor property shorthand: a class
+        # with only an `init` method and no property_declaration
+        # produces zero fields -- verified empirically.
+        import mcp_server
+        source = b"class Foo {\n    init() { self.x = 1 }\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert result["fields"] == []
+
+    def test_nested_class_not_recursed_into(self):
+        import mcp_server
+        source = (
+            b"class Outer {\n"
+            b"    class Inner {\n"
+            b"        var innerField = 3\n"
+            b"    }\n"
+            b"    var outerField = 4\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["outerField"] == ("Outer", False)
+        assert "innerField" not in info
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"func main() {\n    print(\"hi\")\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_swift_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
+class TestScalaGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_scala
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_scala.language()))
+
+    def test_top_level_object_members_are_globals(self):
+        import mcp_server
+        source = b"object Globals {\n  val globalX = 5\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_class_members_are_instance_fields(self):
+        import mcp_server
+        source = b"class Foo {\n  val instanceField = 2\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_tuple_destructuring_captures_all_names(self):
+        # `val (a, b) = (1, 2)` puts a tuple_pattern in field:pattern
+        # instead of a bare identifier -- verified empirically. Same
+        # multi-declarator lesson as nearly every other language in
+        # this plan: every identifier inside it must be extracted.
+        import mcp_server
+        source = b"object O {\n  val (a, b) = (1, 2)\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_nested_tuple_destructuring_captures_all_names(self):
+        import mcp_server
+        source = b"object O {\n  val (a, (b, c)) = (1, (2, 3))\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        for name in ("a", "b", "c"):
+            assert name in result["globals"]
+
+    def test_comma_separated_multi_name_binding_captures_all_names(self):
+        # `val a, b = 5` binds both names to the same value via an
+        # "identifiers" node in field:pattern -- a structurally
+        # DIFFERENT shape from tuple destructuring, verified
+        # empirically. Both must be handled.
+        import mcp_server
+        source = b"object O {\n  val a, b = 5\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_primary_constructor_val_param_is_instance_field_plain_param_excluded(self):
+        # `class Foo(val x: Int, y: Int)` -- x is a val/var-marked
+        # class_parameter (idiomatic, extremely common for case
+        # classes); y has neither val nor var and is a plain
+        # constructor parameter, excluded -- same shape as Kotlin's
+        # analogous primary-constructor shorthand.
+        import mcp_server
+        source = b"class Foo(val x: Int, y: Int) {\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Foo", False)
+        assert "y" not in info
+
+    def test_case_class_implicit_val_param_excluded(self):
+        # Case class parameters without an explicit val/var keyword are
+        # semantically public vals in real Scala, but recognizing that
+        # requires keying off the `case` child -- separate semantic
+        # inference outside the structural, by-keyword scope of this
+        # extension -- so it is deliberately excluded, not extracted.
+        import mcp_server
+        source = b"case class Foo(x: Int, y: String)\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert "x" not in info
+        assert "y" not in info
+
+    def test_constructor_param_and_body_val_combined(self):
+        import mcp_server
+        source = (
+            b"class Point(val x: Int, val y: Int) {\n"
+            b"    val label = \"point\"\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["x"] == ("Point", False)
+        assert info["y"] == ("Point", False)
+        assert info["label"] == ("Point", False)
+
+    def test_braced_package_block_is_unwrapped(self):
+        # `package foo { ... }` wraps its contents in package_clause's
+        # field:body -- the same shape-changing-wrapper hazard as JS's
+        # export_statement and PHP's block-style namespace_definition
+        # -- verified empirically. Without unwrapping, everything
+        # inside would be silently dropped.
+        import mcp_server
+        source = (
+            b"package foo {\n"
+            b"  object Globals {\n"
+            b"    val globalX = 5\n"
+            b"  }\n"
+            b"  class Foo {\n"
+            b"    val instanceField = 2\n"
+            b"  }\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert "globalX" in result["globals"]
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_bare_package_clause_does_not_hide_siblings(self):
+        # The bare `package foo` form (no braces) does NOT wrap
+        # subsequent statements -- they remain direct siblings under
+        # compilation_unit -- verified empirically, so no unwrapping
+        # is needed (and none should be attempted) for this form.
+        import mcp_server
+        source = b"package foo\n\nobject Globals {\n  val globalX = 5\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_nested_object_inside_class_is_not_a_globals_namespace(self):
+        # Deliberate simplification: only a TOP-LEVEL (or
+        # package-wrapped top-level) object_definition is a globals
+        # namespace. One nested inside a class's template_body is out
+        # of scope -- it doesn't match the val/var_definition type
+        # filter used there, so it is silently skipped, and no
+        # companion-object pairing is ever attempted.
+        import mcp_server
+        source = (
+            b"class Foo {\n"
+            b"  object Inner {\n"
+            b"    val innerX = 1\n"
+            b"  }\n"
+            b"  val instanceField = 2\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert "innerX" not in result["globals"]
+        assert "innerX" not in info
+        assert info["instanceField"] == ("Foo", False)
+
+    def test_nested_class_not_recursed_into(self):
+        import mcp_server
+        source = (
+            b"class Outer {\n"
+            b"    class Inner {\n"
+            b"        val innerField = 3\n"
+            b"    }\n"
+            b"    val outerField = 4\n"
+            b"}\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["outerField"] == ("Outer", False)
+        assert "innerField" not in info
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"def main(): Unit = {\n  println(\"hi\")\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_scala_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
+class TestHaskellGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_haskell
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_haskell.language()))
+
+    def test_zero_arg_bind_is_global(self):
+        import mcp_server
+        source = b"globalX :: Int\nglobalX = 5\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_record_fields_extracted(self):
+        import mcp_server
+        source = b"data Foo = Foo { fieldA :: Int, fieldB :: String }\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["fieldA"] == ("Foo", False)
+        assert info["fieldB"] == ("Foo", False)
+
+    def test_parameterized_function_is_not_a_global(self):
+        # A parameterized top-level declaration is a "function" node
+        # (targeted separately by _LANG_NODE_TYPES["haskell"]["functions"]),
+        # structurally distinct from a zero-argument "bind" node -- it
+        # must NOT also be picked up here as a global value.
+        import mcp_server
+        source = b"double :: Int -> Int\ndouble x = x * 2\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert "double" not in result["globals"]
+
+    def test_module_header_does_not_hide_declarations(self):
+        # `module Foo where` produces a sibling "header" field on the
+        # root node -- verified empirically -- it does NOT wrap
+        # declarations the way JS's export_statement or PHP's
+        # block-style namespace_definition do elsewhere in this plan.
+        # field:declarations still holds them directly.
+        import mcp_server
+        source = b"module Foo where\n\nglobalX :: Int\nglobalX = 5\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_tuple_pattern_bind_excluded(self):
+        # `(a, b) = (1, 2)` puts a "tuple" node in field:pattern instead
+        # of field:name holding a "variable" -- verified empirically.
+        # Deliberate simplification (not a bug): only simple
+        # single-name binds are recognized as globals here; destructured
+        # binds are silently skipped.
+        import mcp_server
+        source = b"(a, b) = (1, 2)\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_where_clause_local_binds_not_treated_as_globals(self):
+        # local_binds under a function's `where` clause are nested
+        # inside the function node's body, not direct children of
+        # field:declarations -- verified empirically -- so they are
+        # correctly excluded without any special-casing.
+        import mcp_server
+        source = b"f x = y + z\n  where\n    y = 1\n    z = 2\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_multiple_record_constructors_each_extracted(self):
+        # `data Shape = Circle {..} | Rectangle {..} | Point` -- each
+        # data_constructor within data_constructors needs its own
+        # record-shape check; a non-record constructor (Point, a
+        # "prefix" node) mixed in must not break extraction of the
+        # record ones -- verified empirically.
+        import mcp_server
+        source = (
+            b"data Shape = Circle { radius :: Double } "
+            b"| Rectangle { width :: Double, height :: Double } "
+            b"| Point\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["radius"] == ("Shape", False)
+        assert info["width"] == ("Shape", False)
+        assert info["height"] == ("Shape", False)
+        assert "Point" not in info
+
+    def test_newtype_record_field_extracted(self):
+        # `newtype Foo = Foo { unFoo :: Int }` is a completely different
+        # top-level node type ("newtype", not "data_type") -- verified
+        # empirically. Its constructor is a "newtype_constructor" node
+        # whose record child is reached via field:field (a confusingly
+        # named but real field name in the grammar) directly holding the
+        # "record" node -- there is no intermediate data_constructor
+        # wrapper the way data_type has. A newtype's single field is a
+        # very common real Haskell pattern and must be extracted.
+        import mcp_server
+        source = b"newtype Foo = Foo { unFoo :: Int }\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["unFoo"] == ("Foo", False)
+
+    def test_newtype_without_record_yields_no_fields(self):
+        # `newtype Foo = Foo Int` (no braces) puts a plain "field" node
+        # (not "record") at field:field -- verified empirically -- must
+        # not be misidentified as a record field.
+        import mcp_server
+        source = b"newtype Foo = Foo Int\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert result["fields"] == []
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"double :: Int -> Int\ndouble x = x * 2\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_haskell_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
+class TestLuaGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_lua
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_lua.language()))
+
+    def test_true_global_assignment(self):
+        import mcp_server
+        tree = self._parser().parse(b"globalX = 5\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert "globalX" in result["globals"]
+
+    def test_local_declaration_not_captured(self):
+        import mcp_server
+        tree = self._parser().parse(b"local localY = 10\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_table_field_assignment_not_captured(self):
+        import mcp_server
+        tree = self._parser().parse(b"Foo = {}\nFoo.staticField = 1\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == ["Foo"]
+        assert result["fields"] == []
+
+    def test_multiple_assignment_captures_all_names(self):
+        # `a, b = 1, 2` puts multiple identifier children under
+        # variable_list, each exposed via field:name -- verified
+        # empirically. child_by_field_name (singular) would silently
+        # return only the first ("a"), matching the multi-assignment gap
+        # that showed up in every other language in this plan (Ruby,
+        # Kotlin, Swift, Scala) -- children_by_field_name (plural) is
+        # required to capture all of them.
+        import mcp_server
+        tree = self._parser().parse(b"a, b = 1, 2\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert "a" in result["globals"]
+        assert "b" in result["globals"]
+
+    def test_mixed_identifier_and_table_field_in_multi_assignment(self):
+        # `a, Foo.x = 1, 2` mixes a plain identifier with a
+        # dot_index_expression in the same variable_list -- verified
+        # empirically. Only the plain identifier is a true global; the
+        # table-field write must still be excluded.
+        import mcp_server
+        tree = self._parser().parse(b"a, Foo.x = 1, 2\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == ["a"]
+
+    def test_local_function_not_captured_as_global(self):
+        # `local function foo() ... end` parses as a function_declaration
+        # node (with a "local" child), never an assignment_statement --
+        # verified empirically -- so it cannot be misidentified as a
+        # global variable assignment. Functions are handled separately
+        # by _LANG_NODE_TYPES["lua"]["functions"].
+        import mcp_server
+        tree = self._parser().parse(b"local function foo() end\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_top_level_function_not_captured_as_global(self):
+        # `function foo() ... end` (no `local`) is also a
+        # function_declaration node, not an assignment_statement --
+        # verified empirically -- so it must not be captured here either.
+        import mcp_server
+        tree = self._parser().parse(b"function foo() end\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        tree = self._parser().parse(b"function foo() end\n")
+        result = mcp_server._extract_lua_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
+class TestElixirGlobalsAndFields:
+    def _parser(self):
+        import tree_sitter_elixir
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_elixir.language()))
+
+    def test_module_attribute_is_static_field(self):
+        import mcp_server
+        source = b"defmodule Foo do\n  @module_attr 5\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["module_attr"] == ("Foo", True)
+        assert result["globals"] == []
+
+    def test_globals_always_empty(self):
+        # Elixir has no top-level mutable globals outside module attributes --
+        # verified empirically there is no syntactic form that would produce one.
+        import mcp_server
+        source = b"defmodule Foo do\n  @a 1\n  @b 2\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["global_bodies"] == {}
+
+    def test_multiple_attributes_in_one_module(self):
+        import mcp_server
+        source = b"defmodule Foo do\n  @a 1\n  @b 2\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["a"] == ("Foo", True)
+        assert info["b"] == ("Foo", True)
+
+    def test_nested_module_attribute_attributed_to_inner_module(self):
+        # A nested `defmodule` is itself a `call` node reachable by the
+        # recursive walk -- verified empirically its own do_block members
+        # are scanned independently of the outer module's, so an inner
+        # module's attribute must be attributed to the inner module's name,
+        # not the outer one.
+        import mcp_server
+        source = (
+            b"defmodule Outer do\n"
+            b"  @outer_attr 1\n\n"
+            b"  defmodule Inner do\n"
+            b"    @inner_attr 2\n"
+            b"  end\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["outer_attr"] == ("Outer", True)
+        assert info["inner_attr"] == ("Inner", True)
+        assert result["globals"] == []
+
+    def test_dotted_nested_module_name(self):
+        # `defmodule Foo.Bar do ... end` is a single call whose alias node's
+        # text is the full dotted name "Foo.Bar" -- verified empirically --
+        # rather than two levels of AST nesting.
+        import mcp_server
+        source = b"defmodule Foo.Bar do\n  @attr 1\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["attr"] == ("Foo.Bar", True)
+
+    def test_attribute_reference_without_value_not_captured_as_field(self):
+        # `@attr` (no value, a read-reference to a previously defined
+        # attribute) parses with operand type "identifier", not "call" --
+        # verified empirically -- so it is correctly excluded here; only
+        # `@attr value` (operand type "call") defines a field.
+        import mcp_server
+        source = (
+            b"defmodule Foo do\n"
+            b"  @attr 1\n"
+            b"  def bar do\n"
+            b"    @attr\n"
+            b"  end\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["attr"] == ("Foo", True)
+        assert len(result["fields"]) == 1
+
+    def test_moduledoc_and_doc_attributes_are_captured_as_fields(self):
+        # @moduledoc/@doc/@spec parse identically to any other module
+        # attribute (unary_operator -> call with an identifier target) --
+        # verified empirically -- so this extractor does not special-case
+        # them as noise, consistent with no other language task in this
+        # plan inventing bespoke exclusion lists for built-in
+        # annotations/decorators. Documented here as a known characteristic,
+        # not a bug.
+        import mcp_server
+        source = (
+            b"defmodule Foo do\n"
+            b'  @moduledoc "hi"\n'
+            b"  @attr 1\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        info = {n: (c, s) for n, c, s in result["fields"]}
+        assert info["moduledoc"] == ("Foo", True)
+        assert info["attr"] == ("Foo", True)
+
+    def test_no_globals_or_fields_when_absent(self):
+        import mcp_server
+        source = b"defmodule Foo do\n  def bar do\n    :ok\n  end\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._extract_elixir_globals_and_fields(tree.root_node)
+        assert result["globals"] == []
+        assert result["fields"] == []
+
+
+class TestMatchCandidatePair:
+    def _parse(self, source: str):
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+        tree = parser.parse(source.encode())
+        # first top-level statement's node (a function_definition, in every fixture below)
+        return tree.root_node.children[0]
+
+    def test_identical_bodies_match_with_empty_bijection(self):
+        import mcp_server
+        old = self._parse("def foo(x):\n    return x + 1\n")
+        new = self._parse("def foo(x):\n    return x + 1\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result == {}
+
+    def test_renamed_local_variable_matches_via_bijection(self):
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = x + 1\n    return y\n")
+        new = self._parse("def foo(x):\n    z = x + 1\n    return z\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result == {"y": "z"}
+
+    def test_inconsistent_local_rename_does_not_match(self):
+        """y is renamed to z in one spot but stays y in another -> not a valid bijection."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = x + 1\n    return y + y\n")
+        new = self._parse("def foo(x):\n    z = x + 1\n    return z + y\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result is None
+
+    def test_two_distinct_locals_collapsing_onto_one_new_name_does_not_match(self):
+        """y and w are two distinct old locals; if both map to the same new
+        name 'z' that is not a valid bijection (not injective) even though
+        each individual old->new mapping is internally consistent."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = x + 1\n    w = x + 2\n    return y + w\n")
+        new = self._parse("def foo(x):\n    z = x + 1\n    z = x + 2\n    return z + z\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result is None
+
+    def test_tracked_entity_with_confirmed_rename_must_match_new_name(self):
+        """Body calls a helper that was itself confirmed renamed this round."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    return helper_old(x)\n")
+        new = self._parse("def foo(x):\n    return helper_new(x)\n")
+        result = mcp_server._match_candidate_pair(old, new, {"helper_old": "helper_new"})
+        assert result == {}
+
+    def test_tracked_entity_without_rename_must_match_exactly(self):
+        old = self._parse("def foo(x):\n    return helper(x)\n")
+        new = self._parse("def foo(x):\n    return other(x)\n")
+        import mcp_server
+        result = mcp_server._match_candidate_pair(old, new, {"helper": None})
+        assert result is None
+
+    def test_structurally_different_bodies_do_not_match(self):
+        import mcp_server
+        old = self._parse("def foo(x):\n    return x + 1\n")
+        new = self._parse("def foo(x):\n    if x:\n        return x\n    return 1\n")
+        result = mcp_server._match_candidate_pair(old, new, {})
+        assert result is None
+
+    def test_local_identifier_colliding_with_confirmed_tracked_rename_does_not_match(self):
+        """A local (untracked) old identifier 'y' must not be allowed to map
+        to 'helper_new' when 'helper_new' is already claimed as the confirmed
+        new name of a different, tracked old entity 'helper_old'. Both old
+        tokens are genuinely distinct, so collapsing them onto the same new
+        token violates injectivity even though 'y' isn't itself tracked."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = helper_old(x)\n    return y\n")
+        new = self._parse(
+            "def foo(x):\n    helper_new = helper_new(x)\n    return helper_new\n"
+        )
+        result = mcp_server._match_candidate_pair(old, new, {"helper_old": "helper_new"})
+        assert result is None
+
+    def test_local_identifier_colliding_with_unchanged_tracked_name_does_not_match(self):
+        """Same collision, but the tracked entity is unchanged (tracked_names
+        value is None) rather than renamed: a local old identifier must not
+        be allowed to map to the tracked entity's own (unchanged) text."""
+        import mcp_server
+        old = self._parse("def foo(x):\n    y = helper(x)\n    return y\n")
+        new = self._parse("def foo(x):\n    helper = helper(x)\n    return helper\n")
+        result = mcp_server._match_candidate_pair(old, new, {"helper": None})
+        assert result is None
+
+
+class TestMatchRenamedEntities:
+    def _parse_fn(self, source: str):
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+        tree = parser.parse(source.encode())
+        return tree.root_node.children[0]
+
+    def test_simple_rename_matched(self):
+        import mcp_server
+        old = self._parse_fn("def foo(x):\n    return x + 1\n")
+        new = self._parse_fn("def bar(x):\n    return x + 1\n")
+        removed = {"function": [("foo", old)]}
+        added = {"function": [("bar", new)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        # 5-tuples now: (category, old_name, old_node, new_name, new_node) —
+        # project down to the name-only shape and check node identity separately.
+        assert len(matches) == 1
+        category, old_name, old_node, new_name, new_node = matches[0]
+        assert (category, old_name, new_name) == ("function", "foo", "bar")
+        assert old_node is old
+        assert new_node is new
+        assert removed["function"] == []
+        assert added["function"] == []
+
+    def test_cascading_mutual_rename_resolves_across_rounds(self):
+        """A calls B; both A and B are renamed in the same commit."""
+        import mcp_server
+        old_a = self._parse_fn("def a(x):\n    return b(x) + 1\n")
+        old_b = self._parse_fn("def b(x):\n    return x * 2\n")
+        new_a1 = self._parse_fn("def a1(x):\n    return b1(x) + 1\n")
+        new_b1 = self._parse_fn("def b1(x):\n    return x * 2\n")
+        removed = {"function": [("a", old_a), ("b", old_b)]}
+        added = {"function": [("a1", new_a1), ("b1", new_b1)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        projected = [(category, old_name, new_name) for category, old_name, _, new_name, _ in matches]
+        assert ("function", "a", "a1") in projected
+        assert ("function", "b", "b1") in projected
+        assert len(matches) == 2
+
+    def test_ambiguous_duplicate_bodies_not_matched(self):
+        import mcp_server
+        old1 = self._parse_fn("def stub1():\n    pass\n")
+        old2 = self._parse_fn("def stub2():\n    pass\n")
+        new1 = self._parse_fn("def stub3():\n    pass\n")
+        new2 = self._parse_fn("def stub4():\n    pass\n")
+        removed = {"function": [("stub1", old1), ("stub2", old2)]}
+        added = {"function": [("stub3", new1), ("stub4", new2)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert matches == []
+        assert len(removed["function"]) == 2
+        assert len(added["function"]) == 2
+
+    def test_below_minimum_size_not_matched(self):
+        import mcp_server
+        old = self._parse_fn("def x():\n    pass\n")
+        new = self._parse_fn("def y():\n    pass\n")
+        removed = {"function": [("x", old)]}
+        added = {"function": [("y", new)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert matches == []
+
+    def test_cross_category_no_match(self):
+        """A function and a class with coincidentally-matchable text never match across categories."""
+        import mcp_server
+        old = self._parse_fn("def foo(x):\n    return x + 1\n")
+        new = self._parse_fn("def bar(x):\n    return x + 1\n")
+        removed = {"function": [("foo", old)], "class": []}
+        added = {"function": [], "class": [("bar", new)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert matches == []
+
+    def test_field_leaf_not_captured_by_unrelated_confirmed_rename(self):
+        """Regression for the task-26 false-positive: a field is pooled under a
+        QUALIFIED key ("A.Config") but its body text contains only the BARE
+        leaf token ("Config"). If an UNRELATED entity with the same bare name
+        (a function `Config`) is confirmed-renamed to `ConfigFn` in an earlier
+        round, the field's own `Config` token must NOT inherit that constraint
+        — otherwise the field is wrongly forced to a specific candidate.
+
+        Here the field rename is genuinely ambiguous (`A.Config`'s body
+        `Config = <n>` matches BOTH `A.ConfigFn` and `A.ConfigField` as a
+        single-token rename), so the matcher must stay conservative and leave
+        the field UNMATCHED. Pre-fix, the stale `Config -> ConfigFn` constraint
+        from the function disambiguated it into the WRONG match
+        `A.Config -> A.ConfigFn`.
+        """
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+
+        def parse(src):
+            return parser.parse(src.encode()).root_node
+
+        old_root = parse(
+            "def Config(x):\n    return x + 1\n"
+            "class A:\n    Config = 1234567890123\n"
+        )
+        new_root = parse(
+            "def ConfigFn(x):\n    return x + 1\n"
+            "class A:\n    ConfigFn = 1234567890123\n    ConfigField = 1234567890123\n"
+        )
+
+        old_fn = mcp_server._collect_entity_nodes(old_root, "python")["function"]
+        new_fn = mcp_server._collect_entity_nodes(new_root, "python")["function"]
+        old_fields = mcp_server._extract_globals_and_fields(old_root, "python")["field_nodes"]
+        new_fields = mcp_server._extract_globals_and_fields(new_root, "python")["field_nodes"]
+
+        removed = {
+            "function": [("Config", old_fn["Config"])],
+            "field": [("A.Config", old_fields["A.Config"])],
+        }
+        added = {
+            "function": [("ConfigFn", new_fn["ConfigFn"])],
+            "field": [
+                ("A.ConfigFn", new_fields["A.ConfigFn"]),
+                ("A.ConfigField", new_fields["A.ConfigField"]),
+            ],
+        }
+
+        matches = mcp_server._match_renamed_entities(removed, added)
+        projected = [(c, o, n) for c, o, _, n, _ in matches]
+
+        # The unrelated function rename is legitimate and expected.
+        assert ("function", "Config", "ConfigFn") in projected
+        # The field rename is genuinely ambiguous -> must stay UNMATCHED.
+        field_matches = [m for m in projected if m[0] == "field"]
+        assert field_matches == [], f"field must stay ambiguous, got {field_matches}"
+        assert ("field", "A.Config", "A.ConfigFn") not in projected
+
+    def test_unchanged_tracked_helper_blocks_false_rename(self):
+        """P1 (second-pass): an identifier referencing a still-present, unchanged
+        tracked entity must match EXACTLY, not be treated as a free local that
+        can be bijectively substituted.
+
+        `load_users` (removed) calls unchanged helper `fetch_users`;
+        `load_orders` (added) calls unchanged helper `fetch_orders`. Bodies are
+        otherwise structurally identical. Without the unchanged-name constraint
+        the matcher maps `fetch_users -> fetch_orders` as a free-local bijection
+        and produces a FALSE rename `load_users -> load_orders`. Passing both
+        helper names as unchanged (must-match-exactly) blocks it.
+        """
+        import mcp_server
+        old = self._parse_fn(
+            "def load_users(db):\n    rows = fetch_users(db)\n    return [r for r in rows]\n"
+        )
+        new = self._parse_fn(
+            "def load_orders(db):\n    rows = fetch_orders(db)\n    return [r for r in rows]\n"
+        )
+        removed = {"function": [("load_users", old)]}
+        added = {"function": [("load_orders", new)]}
+        matches = mcp_server._match_renamed_entities(
+            removed, added, unchanged_names={"fetch_users", "fetch_orders"}
+        )
+        assert matches == [], f"expected no match, got {matches}"
+
+    def test_unchanged_helper_shared_by_genuine_rename_still_matches(self):
+        """The unchanged-name constraint must not block a genuine rename: both
+        the old and new body reference the SAME unchanged helper, so the exact
+        match is satisfied and the rename is still confirmed."""
+        import mcp_server
+        old = self._parse_fn(
+            "def process_old(db):\n    rows = fetch_data(db)\n    return [r for r in rows]\n"
+        )
+        new = self._parse_fn(
+            "def process_new(db):\n    rows = fetch_data(db)\n    return [r for r in rows]\n"
+        )
+        removed = {"function": [("process_old", old)]}
+        added = {"function": [("process_new", new)]}
+        matches = mcp_server._match_renamed_entities(
+            removed, added, unchanged_names={"fetch_data"}
+        )
+        projected = [(c, o, n) for c, o, _, n, _ in matches]
+        assert projected == [("function", "process_old", "process_new")]
+
+    def test_pathological_nesting_degrades_to_no_match_not_recursionerror(self):
+        """P2 (second-pass): a pair whose AST is deep enough to survive
+        _collect_entity_nodes but blow the recursion limit inside
+        _match_candidate_pair's walk() must degrade to no-match for that pair,
+        never raise RecursionError out of _match_renamed_entities (which would
+        propagate out of _extract_commit and abort the whole ingestion run).
+
+        Depth 600 was found empirically to pass collection while breaking the
+        matcher walk pre-fix (300-400 pass both; 500+ break the matcher).
+        """
+        import mcp_server
+        depth = 600
+        nested = "(" * depth + "1" + ")" * depth
+        old = self._parse_fn(f"def f(a):\n    x = {nested}\n    return x\n")
+        new = self._parse_fn(f"def g(a):\n    x = {nested}\n    return x\n")
+        # Sanity: collection survives this depth (so the nodes ARE pooled).
+        old_root = mcp_server._get_parser("test.py").parse(
+            f"def f(a):\n    x = {nested}\n    return x\n".encode()
+        ).root_node
+        assert "f" in mcp_server._collect_entity_nodes(old_root, "python")["function"]
+        removed = {"function": [("f", old)]}
+        added = {"function": [("g", new)]}
+        # Must not raise; the pathological pair simply isn't matched.
+        matches = mcp_server._match_renamed_entities(removed, added)
+        assert matches == []
+
+    def test_pathological_pair_does_not_discard_other_commit_matches(self):
+        """Per-pair RecursionError isolation: a pathological pair in the pool
+        must not prevent an unrelated, well-formed rename in the same pool from
+        being confirmed."""
+        import mcp_server
+        depth = 600
+        nested = "(" * depth + "1" + ")" * depth
+        bad_old = self._parse_fn(f"def bad_old(a):\n    x = {nested}\n    return x\n")
+        bad_new = self._parse_fn(f"def bad_new(a):\n    x = {nested}\n    return x\n")
+        good_old = self._parse_fn("def foo(x):\n    return x + 1\n")
+        good_new = self._parse_fn("def bar(x):\n    return x + 1\n")
+        removed = {"function": [("bad_old", bad_old), ("foo", good_old)]}
+        added = {"function": [("bad_new", bad_new), ("bar", good_new)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        projected = [(c, o, n) for c, o, _, n, _ in matches]
+        assert ("function", "foo", "bar") in projected
+
+    def test_pool_size_cap_skips_matching(self, monkeypatch):
+        """P2 (second-pass): above _MAX_MATCH_POOL_SIZE total entries the
+        matcher skips entirely (git -M rename-limit style degradation) rather
+        than paying the ~cubic pairwise cost on a giant vendored-dependency
+        commit. A rename that WOULD match under a normal pool is left
+        unmatched once the cap is exceeded."""
+        import mcp_server
+        old = self._parse_fn("def foo(x):\n    return x + 1\n")
+        new = self._parse_fn("def bar(x):\n    return x + 1\n")
+        removed = {"function": [("foo", old)]}
+        added = {"function": [("bar", new)]}
+        # Sanity: matches under the default cap.
+        assert len(mcp_server._match_renamed_entities(
+            {"function": [("foo", old)]}, {"function": [("bar", new)]}
+        )) == 1
+        monkeypatch.setattr(mcp_server, "_MAX_MATCH_POOL_SIZE", 1)
+        assert mcp_server._match_renamed_entities(removed, added) == []
+        # Pools are left untouched when matching is skipped.
+        assert removed["function"] == [("foo", old)]
+        assert added["function"] == [("bar", new)]
+
+    def test_matcher_growth_is_bounded_not_cubic(self):
+        """P2 (second-pass) performance regression guard. The per-pair
+        O(all_names) dict rebuild (the cubic term) is gone; a 600x600 pool of
+        realistic small functions must complete well within a generous bound.
+        Pre-fix a 600x600 pool took ~32s (and grew ~cubically); post-fix it is
+        ~5s. The 12s bound is chosen to sit cleanly between the two — loose
+        enough to stay non-flaky on slower CI, tight enough that a regression
+        back to the cubic rebuild (which would blow past ~30s) fails here."""
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+        n = 600
+        removed = {"function": [], "class": [], "variable": [], "field": []}
+        added = {"function": [], "class": [], "variable": [], "field": []}
+        for i in range(n):
+            src_o = f"def old_{i}(a, b):\n    total = a + b + {i}\n    return total * a\n"
+            src_n = f"def new_{i}(a, b):\n    total = a + b + {i}\n    return total * a\n"
+            removed["function"].append((f"old_{i}", parser.parse(src_o.encode()).root_node.children[0]))
+            added["function"].append((f"new_{i}", parser.parse(src_n.encode()).root_node.children[0]))
+        start = time.perf_counter()
+        matches = mcp_server._match_renamed_entities(removed, added)
+        elapsed = time.perf_counter() - start
+        assert len(matches) == n
+        assert elapsed < 12.0, f"600x600 matcher took {elapsed:.2f}s (expected ~5s; cubic regression?)"
+
+
+class TestCollectEntityNodes:
+    def test_collects_function_and_class_nodes_by_name(self):
+        import mcp_server
+        parser = mcp_server._get_parser("test.py")
+        source = b"def foo():\n    pass\n\nclass Bar:\n    pass\n"
+        tree = parser.parse(source)
+        result = mcp_server._collect_entity_nodes(tree.root_node, "python")
+        assert "foo" in result["function"]
+        assert result["function"]["foo"].type == "function_definition"
+        assert "Bar" in result["class"]
+        assert result["class"]["Bar"].type == "class_definition"
 
 
 class TestExtractFromSourceCFamily:
@@ -2206,6 +4055,14 @@ class TestGitHelpers:
         content = mcp_server._git_file_content(str(git_repo), first_hash, "auth.py")
         assert b"def login" in content
 
+    def test_git_blob_content_returns_raw_bytes(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(git_repo), commits[0][0])
+        _, _, _, _, new_sha, _ = entries[0][:6]
+        content = mcp_server._git_blob_content(str(git_repo), new_sha)
+        assert b"def login" in content
+
 
 class TestGitDiffTreeRaw:
     def test_regular_file_add(self, git_repo):
@@ -2213,11 +4070,13 @@ class TestGitDiffTreeRaw:
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         entries = mcp_server._git_diff_tree_raw(str(git_repo), commits[0][0])
         assert len(entries) == 1
-        status, old_mode, new_mode, old_sha, new_sha, path = entries[0]
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
         assert status == "A"
         assert old_mode == "000000"
         assert new_mode == "100644"
         assert path == "auth.py"
+        assert old_path == ""
+        assert similarity is None
 
     def test_gitlink_add_reports_mode_160000(self, tmp_path):
         import mcp_server
@@ -2246,11 +4105,83 @@ class TestGitDiffTreeRaw:
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
         entries = mcp_server._git_diff_tree_raw(str(repo), commits[0][0])
         assert len(entries) == 1
-        status, old_mode, new_mode, old_sha, new_sha, path = entries[0]
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
         assert status == "A"
         assert new_mode == "160000"
         assert new_sha == sub_hash
         assert path == "vendor/lib"
+        assert old_path == ""
+
+    def test_pure_rename_reports_both_paths_and_similarity(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text("def login():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(repo), commits[1][0])
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
+        assert status == "R"
+        assert path == "new_name.py"
+        assert old_path == "old_name.py"
+        assert similarity == 100
+
+    def test_rename_with_content_change_reports_partial_similarity(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text(
+            "def login():\n    pass\n\ndef a():\n    pass\n\ndef b():\n    pass\n\ndef c():\n    pass\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        (repo / "new_name.py").write_text(
+            "def login():\n    pass\n\ndef a():\n    pass\n\ndef extra():\n    pass\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename and edit"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(repo), commits[1][0])
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
+        assert status == "R"
+        assert old_path == "old_name.py"
+        assert path == "new_name.py"
+        assert similarity is not None and 0 < similarity < 100
+
+    def test_unrelated_add_and_delete_not_reported_as_rename(self, tmp_path):
+        """Below git's default 50% similarity threshold, -M must NOT report a rename."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text("def login():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "rm", "old_name.py"], cwd=repo, check=True, capture_output=True)
+        (repo / "unrelated.py").write_text("class Widget:\n    def render(self):\n        return 42\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "unrelated churn"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        entries = mcp_server._git_diff_tree_raw(str(repo), commits[1][0])
+        statuses = {e[0] for e in entries}
+        assert statuses == {"A", "D"}
 
 
 class TestIsIgnoredPath:
@@ -2451,32 +4382,32 @@ class TestKnownFilesAtCommit:
 class TestGitlinkChanges:
     def test_non_gitlink_rows_are_ignored(self):
         import mcp_server
-        raw = [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py")]
+        raw = [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py", "", None)]
         assert mcp_server._gitlink_changes(raw) == []
 
     def test_add_when_new_mode_is_gitlink(self):
         import mcp_server
-        raw = [("A", "000000", "160000", "0" * 40, "b" * 40, "vendor/lib")]
+        raw = [("A", "000000", "160000", "0" * 40, "b" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("add", "b" * 40, "vendor/lib")]
 
     def test_bump_when_both_modes_are_gitlink(self):
         import mcp_server
-        raw = [("M", "160000", "160000", "b" * 40, "c" * 40, "vendor/lib")]
+        raw = [("M", "160000", "160000", "b" * 40, "c" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("bump", "c" * 40, "vendor/lib")]
 
     def test_remove_when_old_mode_is_gitlink(self):
         import mcp_server
-        raw = [("D", "160000", "000000", "c" * 40, "0" * 40, "vendor/lib")]
+        raw = [("D", "160000", "000000", "c" * 40, "0" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("remove", "c" * 40, "vendor/lib")]
 
     def test_type_change_into_internal_reported_as_remove(self):
         import mcp_server
-        raw = [("T", "160000", "100644", "c" * 40, "d" * 40, "vendor/lib")]
+        raw = [("T", "160000", "100644", "c" * 40, "d" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("remove", "c" * 40, "vendor/lib")]
 
     def test_type_change_into_external_reported_as_add(self):
         import mcp_server
-        raw = [("T", "100644", "160000", "d" * 40, "e" * 40, "vendor/lib")]
+        raw = [("T", "100644", "160000", "d" * 40, "e" * 40, "vendor/lib", "", None)]
         assert mcp_server._gitlink_changes(raw) == [("add", "e" * 40, "vendor/lib")]
 
 
@@ -2542,16 +4473,17 @@ class TestExtractCommit:
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         first_hash = commits[0][0]
 
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo), first_hash)
 
         assert len(results) == 1
-        status, file_path, extracted, precomputed = results[0]
+        status, file_path, extracted, precomputed, old_path = results[0]
         assert status == "A"
         assert file_path == "auth.py"
         assert "login" in extracted["functions"]
         assert "resolved_imports" in precomputed
         assert "function_entries" in precomputed
         assert "class_entries" in precomputed
+        assert old_path == ""
         assert gitlink_changes == []
         assert gitmodules_map == {}
 
@@ -2560,7 +4492,7 @@ class TestExtractCommit:
         commits = mcp_server._git_commits(str(git_repo_with_deletion), watermark_hash=None)
         delete_hash = commits[-1][0]
 
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo_with_deletion), delete_hash)
 
         d_entries = [r for r in results if r[0] == "D"]
         assert len(d_entries) == 1
@@ -2570,23 +4502,23 @@ class TestExtractCommit:
         import mcp_server
         monkeypatch.setattr(
             mcp_server, "_git_diff_tree_raw",
-            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "notes.txt")],
+            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "notes.txt", "", None)],
         )
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo), "deadbeef")
         assert results == []
 
     def test_content_fetch_failure_is_omitted_not_raised(self, git_repo, monkeypatch):
         import mcp_server
         monkeypatch.setattr(
             mcp_server, "_git_diff_tree_raw",
-            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py")],
+            lambda repo, commit: [("A", "000000", "100644", "0" * 40, "a" * 40, "auth.py", "", None)],
         )
 
         def boom(repo, commit, path):
             raise mcp_server.MiniGrafError("simulated git-show failure")
 
         monkeypatch.setattr(mcp_server, "_git_file_content", boom)
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), "deadbeef")
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo), "deadbeef")
         assert results == []
 
     def test_gitlink_add_is_reported_separately_from_file_results(self, tmp_path):
@@ -2618,7 +4550,7 @@ class TestExtractCommit:
         _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
 
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(repo), commits[0][0])
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(repo), commits[0][0])
 
         # Neither the gitlink path (vendor/lib) nor .gitmodules itself has a
         # resolvable extension (_EXT_TO_LANG has no entry for either), so
@@ -2643,7 +4575,7 @@ class TestExtractCommit:
             original_init(self, *args, **kwargs)
 
         monkeypatch.setattr(mcp_server._SegmentSuffixIndex, "__init__", counting_init)
-        results, _, _ = mcp_server._extract_commit(str(git_repo_with_deps), commits[0][0])
+        results, _, _, _ = mcp_server._extract_commit(str(git_repo_with_deps), commits[0][0])
 
         assert len(results) == 2  # mod_a.py (imports mod_b) and mod_b.py both added here
         assert build_count == 1
@@ -2661,7 +4593,7 @@ class TestExtractCommit:
         _subprocess.run(["git", "commit", "-m", "add vendored lib"], cwd=repo, check=True, capture_output=True)
 
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(
             str(repo), commits[0][0], ["vendor/"]
         )
         assert results == []
@@ -2670,9 +4602,445 @@ class TestExtractCommit:
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         first_hash = commits[0][0]
-        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(git_repo), first_hash)
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(git_repo), first_hash)
         assert len(results) == 1
         assert results[0][1] == "auth.py"
+
+    def test_new_side_pathological_nesting_does_not_abort_commit(self, tmp_path):
+        """Reviewer finding 1 on Task 9 (47b962e): the new-side
+        `_collect_entity_nodes` call in _extract_commit's per-file loop was
+        NOT wrapped in a best-effort try/except, unlike the structurally
+        identical old-side call a few lines above. A file whose body is
+        pathologically deeply nested parses fine under tree-sitter (a C
+        parser) but blows the Python recursion limit in
+        _collect_entity_nodes's own recursive `walk()`, raising
+        RecursionError. Uncaught, that propagates out of _extract_commit and
+        (in the real pipeline) aborts the entire ingestion run rather than
+        just this one commit — contradicting _extract_commit's own docstring
+        promise that "ordinary exceptions... still fail only the one commit
+        as before". This must degrade gracefully: the pathological file's
+        new-side node pool ends up empty, matching just doesn't happen for
+        it, but the commit still processes and _extract_commit still returns.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        nested = "(" * 6000 + "1" + ")" * 6000
+        (repo / "deep.py").write_text(f"def f():\n    x = {nested}\n    return x\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add pathologically nested file"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+
+        # Sanity check the reproduction still triggers RecursionError from
+        # _collect_entity_nodes specifically (not _extract_from_source, which
+        # is already wrapped) before asserting _extract_commit survives it.
+        parser = mcp_server._get_parser("deep.py")
+        content = mcp_server._git_file_content(str(repo), commits[0][0], "deep.py")
+        tree = parser.parse(content)
+        with pytest.raises(RecursionError):
+            mcp_server._collect_entity_nodes(tree.root_node, "python")
+
+        results, gitlink_changes, gitmodules_map, renamed_pairs = mcp_server._extract_commit(
+            str(repo), commits[0][0]
+        )
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "A"
+        assert file_path == "deep.py"
+        assert renamed_pairs == []
+
+    def test_matcher_side_pathological_nesting_does_not_abort_commit(self, tmp_path):
+        """P2 (second-pass): the `_match_renamed_entities` call in
+        _extract_commit was outside any try/except, and
+        _match_candidate_pair's walk uses more stack per AST level than
+        _collect_entity_nodes. A file whose AST depth SURVIVES collection (so
+        its nodes ARE pooled) can still blow the recursion limit inside the
+        pair walk, raising RecursionError that escapes _extract_commit and
+        aborts the whole ingestion run.
+
+        Reproduced with an in-place function rename of a body whose parenthesis
+        nesting (depth 600) passes collection on both sides but breaks the
+        matcher walk pre-fix. The commit must still process and _extract_commit
+        must still return, degrading to no confirmed rename for that pair.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        nested = "(" * 600 + "1" + ")" * 600
+        (repo / "svc.py").write_text(f"def handler_old(a):\n    x = {nested}\n    return x\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "v1"], cwd=repo, check=True, capture_output=True)
+        # Same file, function renamed in place (structurally identical body) ->
+        # the deep node lands in BOTH removed and added pools for this "M"
+        # commit, so the matcher walks it.
+        (repo / "svc.py").write_text(f"def handler_new(a):\n    x = {nested}\n    return x\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "v2"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+
+        # Sanity: collection survives on both sides (nodes ARE pooled) so the
+        # failure, if any, is inside the matcher walk — not collection.
+        parser = mcp_server._get_parser("svc.py")
+        for h in (commits[0][0], commits[1][0]):
+            content = mcp_server._git_file_content(str(repo), h, "svc.py")
+            tree = parser.parse(content)
+            mcp_server._collect_entity_nodes(tree.root_node, "python")  # must not raise
+
+        # Must not raise RecursionError; commit processes, no confirmed rename.
+        results, gitlink_changes, gitmodules_map, renamed_pairs = mcp_server._extract_commit(
+            str(repo), commits[1][0]
+        )
+        assert len(results) == 1
+        assert results[0][0] == "M"
+        assert results[0][1] == "svc.py"
+        assert renamed_pairs == []
+
+
+class TestExtractCommitRename:
+    def test_rename_status_extracts_new_path_and_tags_old_path(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text("def login():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, gitlink_changes, gitmodules_map = mcp_server._extract_commit(str(repo), commits[1][0])[:3]
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = mcp_server._extract_commit(str(repo), commits[1][0])[0][0]
+        assert status == "R"
+        assert file_path == "new_name.py"
+        assert old_path == "old_name.py"
+        assert "login" in extracted["functions"]
+
+    def test_non_rename_status_has_empty_old_path(self, git_repo):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        results = mcp_server._extract_commit(str(git_repo), commits[0][0])[0]
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "A"
+        assert old_path == ""
+
+    def test_cross_file_move_produces_renamed_pair(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "fileA.py").write_text(
+            "def stayHere(x):\n    return x + 1\n\ndef moveMe(x):\n    return x * 2 + 7\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "fileA.py").write_text("def stayHere(x):\n    return x + 1\n")
+        (repo / "fileB.py").write_text("def moveMe(x):\n    return x * 2 + 7\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "move function"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        assert ("function", "fileA.py", "moveMe", "fileB.py", "moveMe") in renamed_pairs
+
+    def test_cross_extension_rename_parses_old_blob_with_old_grammar(self, tmp_path, monkeypatch):
+        """Reviewer finding 2 on Task 9 (47b962e): for status "R", `parser =
+        _thread_parser(file_path)` is selected using the NEW path's
+        extension, then reused to parse `old_content` (the OLD blob) even
+        when the old path's extension maps to a different language.
+        `old_lang` is correctly computed from `old_lang_path` for the
+        node-type lookup inside _collect_entity_nodes, but the Tree actually
+        walked was built with the wrong grammar — silently losing/misparsing
+        old-side structure on a genuine cross-language-extension rename.
+
+        Renames old_name.cpp (real C++ requiring the C++ grammar: a
+        destructor and an out-of-line qualified definition) to new_name.c.
+        Under the bug, `parser` is built for the NEW path's extension (.c ->
+        C grammar) and reused on the OLD (C++) blob; the C grammar cannot
+        parse `Foo::baz(...)` / `~Foo()` correctly and the class vanishes
+        entirely from the resulting tree (proven directly below), even
+        though old_lang is still correctly computed as "cpp" for the
+        node-type lookup.
+        """
+        import mcp_server
+        pytest.importorskip("tree_sitter_c")
+        pytest.importorskip("tree_sitter_cpp")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        old_source = (
+            "class Foo {\n"
+            "public:\n"
+            "    ~Foo() {}\n"
+            "};\n"
+            "int Foo::baz() { return 0; }\n"
+        )
+        (repo / "old_name.cpp").write_text(old_source)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add cpp file"], cwd=repo, check=True, capture_output=True)
+        # A pure rename (no content change) so git's rename detection reports
+        # status "R" with 100% similarity rather than a delete+add pair —
+        # the new file's content doesn't matter for what this test checks
+        # (the OLD blob's grammar), only its extension does.
+        _subprocess.run(["git", "mv", "old_name.cpp", "new_name.c"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename cpp to c"], cwd=repo, check=True, capture_output=True)
+
+        # Sanity check: prove the wrong-grammar parse actually loses the
+        # class, so this test would fail before the fix and isn't
+        # vacuously true.
+        mcp_server._grammar_cache.clear()
+        c_parser = mcp_server._get_parser("new_name.c")
+        cpp_parser = mcp_server._get_parser("old_name.cpp")
+        wrong_tree = c_parser.parse(old_source.encode())
+        correct_tree = cpp_parser.parse(old_source.encode())
+        wrong_result = mcp_server._collect_entity_nodes(wrong_tree.root_node, "cpp")
+        correct_result = mcp_server._collect_entity_nodes(correct_tree.root_node, "cpp")
+        assert wrong_result["class"] == {}
+        assert "Foo" in correct_result["class"]
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        rename_hash = commits[1][0]
+
+        captured_old_side = []
+        original_collect = mcp_server._collect_entity_nodes
+
+        def spy(root_node, lang_name):
+            result = original_collect(root_node, lang_name)
+            if lang_name == "cpp":
+                captured_old_side.append(result)
+            return result
+
+        monkeypatch.setattr(mcp_server, "_collect_entity_nodes", spy)
+
+        results, gitlink_changes, gitmodules_map, renamed_pairs = mcp_server._extract_commit(
+            str(repo), rename_hash
+        )
+
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "R"
+        assert file_path == "new_name.c"
+        assert old_path == "old_name.cpp"
+
+        assert len(captured_old_side) == 1
+        assert "Foo" in captured_old_side[0]["class"]
+        assert "baz" in captured_old_side[0]["function"]
+        assert "~Foo" in captured_old_side[0]["function"]
+
+    def test_global_rename_produces_renamed_pair(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        # Value padded to a 13-digit literal (not the brief's bare "12345")
+        # so the assignment's normalized body clears _match_renamed_entities'
+        # _MIN_MATCH_BODY_LEN=20 floor (Task 8) -- confirmed empirically that
+        # the brief's literal "GLOBAL_X = 12345" (16 normalized chars) is
+        # silently dropped as a "trivial stub" before this padding was added,
+        # producing an empty renamed_pairs regardless of the pooling/matcher
+        # logic under test here.
+        (repo / "config.py").write_text("GLOBAL_X = 1234567890123\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "config.py").write_text("GLOBAL_Y = 1234567890123\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename global"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        assert ("variable", "config.py", "GLOBAL_X", "config.py", "GLOBAL_Y") in renamed_pairs
+
+    def test_unchanged_helpers_block_false_rename_in_modified_file(self, tmp_path):
+        """P1 (second-pass) end-to-end repro: a modified file keeps two unchanged
+        helpers `fetch_users`/`fetch_orders`; the commit deletes `load_users`
+        (which calls `fetch_users`) and adds `load_orders` (which calls
+        `fetch_orders`), bodies otherwise structurally identical. The unchanged
+        helpers never appear in the removed/added pools, so pre-fix the matcher
+        treated `fetch_users -> fetch_orders` as a free-local bijection and
+        produced a FALSE `load_users -> load_orders` rename. Post-fix the
+        unchanged names are seeded as must-match-exactly, so NO rename is
+        produced.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "svc.py").write_text(
+            "def fetch_users(db):\n    return db.query('users')\n\n"
+            "def fetch_orders(db):\n    return db.query('orders')\n\n"
+            "def load_users(db):\n    rows = fetch_users(db)\n    return [r for r in rows]\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "svc.py").write_text(
+            "def fetch_users(db):\n    return db.query('users')\n\n"
+            "def fetch_orders(db):\n    return db.query('orders')\n\n"
+            "def load_orders(db):\n    rows = fetch_orders(db)\n    return [r for r in rows]\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "swap load fn"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        false_pairs = [
+            p for p in renamed_pairs
+            if p[0] == "function" and p[2] == "load_users" and p[4] == "load_orders"
+        ]
+        assert false_pairs == [], f"false rename produced: {false_pairs}"
+
+    def test_genuine_rename_with_unchanged_helper_still_tracked(self, tmp_path):
+        """Positive counterpart: a genuine same-file function rename whose body
+        references an UNCHANGED helper must still be detected post-fix — the
+        must-match-exactly constraint is satisfied because both bodies call the
+        same surviving helper."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "svc.py").write_text(
+            "def fetch_data(db):\n    return db.query('rows')\n\n"
+            "def process_old(db):\n    rows = fetch_data(db)\n    return [r for r in rows]\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "svc.py").write_text(
+            "def fetch_data(db):\n    return db.query('rows')\n\n"
+            "def process_new(db):\n    rows = fetch_data(db)\n    return [r for r in rows]\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename process fn"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        assert ("function", "svc.py", "process_old", "svc.py", "process_new") in renamed_pairs
+
+    def _init_repo(self, repo):
+        import subprocess as _sp
+        repo.mkdir()
+        _sp.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _sp.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _sp.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, msg):
+        _subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def test_rename_tracked_to_unsupported_ext_emits_synthetic_delete(self, tmp_path):
+        """Forward -M regression: `git mv auth.py auth.txt`. The new path has
+        no parser, so keying the skip on it alone would drop the whole "R" row
+        and leak the old module open forever. The fix must rewrite the row as a
+        synthetic delete of the OLD path so downstream close logic runs."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+        (repo / "auth.py").write_text("AUTH_KEY = 1234567890123\n\ndef login(x):\n    return x + 1\n")
+        self._commit(repo, "add")
+        _subprocess.run(["git", "mv", "auth.py", "auth.txt"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "rename to txt")
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        # Exactly one result: a synthetic delete keyed to the OLD path.
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "D"
+        assert file_path == "auth.py"
+        assert extracted is None and precomputed is None
+        assert old_path == ""
+        # No rename linkage should be attempted for an untrackable new side.
+        assert renamed_pairs == []
+
+    def test_rename_tracked_into_ignored_dir_emits_synthetic_delete(self, tmp_path):
+        """Forward -M regression via ignore pattern: `git mv auth.py
+        vendor/auth.py` under ignore_patterns=["vendor/"]. New path is ignored,
+        old path is tracked -> synthetic delete of the old path."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+        (repo / "auth.py").write_text("AUTH_KEY = 1234567890123\n\ndef login(x):\n    return x + 1\n")
+        self._commit(repo, "add")
+        (repo / "vendor").mkdir()
+        _subprocess.run(["git", "mv", "auth.py", "vendor/auth.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "move into vendor")
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(
+            str(repo), commits[1][0], ignore_patterns=["vendor/"]
+        )
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "D"
+        assert file_path == "auth.py"
+        assert old_path == ""
+        assert renamed_pairs == []
+
+    def test_rename_unsupported_ext_to_tracked_is_plain_add(self, tmp_path):
+        """Reverse -M regression: `git mv notes.txt notes.py`. The old path was
+        never tracked (.txt has no parser), so the fix must treat the row as a
+        plain add — extracting the new path but attaching NO rename linkage
+        (no old_path), so no phantom old module gets closed downstream."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+        (repo / "notes.txt").write_text("def login(x):\n    return x + 1\n")
+        self._commit(repo, "add txt")
+        _subprocess.run(["git", "mv", "notes.txt", "notes.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "rename to py")
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "A"
+        assert file_path == "notes.py"
+        # Crucially: old_path is empty, so _run_ingestion's R-close never fires.
+        assert old_path == ""
+        assert "login" in extracted["functions"]
+        assert renamed_pairs == []
+
+    def test_rename_ignored_to_tracked_is_plain_add(self, tmp_path):
+        """Reverse -M regression via ignore pattern: moving a file OUT of an
+        ignored dir into a tracked location. Old side ignored -> plain add."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+        (repo / "vendor").mkdir()
+        (repo / "vendor" / "auth.py").write_text("def login(x):\n    return x + 1\n")
+        self._commit(repo, "add vendored")
+        _subprocess.run(["git", "mv", "vendor/auth.py", "auth.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "un-vendor")
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(
+            str(repo), commits[1][0], ignore_patterns=["vendor/"]
+        )
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "A"
+        assert file_path == "auth.py"
+        assert old_path == ""
+        assert renamed_pairs == []
 
 
 class TestIngestionWrites:
@@ -2692,8 +5060,8 @@ class TestIngestionWrites:
         call_args = db_instance.execute.call_args[0][0]
         assert ':valid-from "2025-03-01T10:00:00Z"' in call_args
         assert ":valid-to" not in call_args
-        # facts vector must come before the options map
-        assert call_args.index("[:module/foo") < call_args.index(":valid-from")
+        # Documented grammar: options map must come BEFORE the fact vector.
+        assert call_args.index(":valid-from") < call_args.index("[:module/foo")
 
     def test_ingest_close_uses_valid_from_and_valid_to(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -2712,8 +5080,8 @@ class TestIngestionWrites:
         call_args = db_instance.execute.call_args[0][0]
         assert ':valid-from "2025-01-01T00:00:00Z"' in call_args
         assert ':valid-to "2025-03-01T10:00:00Z"' in call_args
-        # facts vector must come before the options map
-        assert call_args.index("[:module/foo") < call_args.index(":valid-from")
+        # Documented grammar: options map must come BEFORE the fact vector.
+        assert call_args.index(":valid-from") < call_args.index("[:module/foo")
 
     def test_watermark_update_transacts_hash(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
@@ -3017,6 +5385,233 @@ class TestPrecomputeFileTriples:
         import_name, dep_ident, is_resolved = result["resolved_imports"][0]
         assert is_resolved is False
         assert dep_ident == mcp_server._canonical_ident("module", "totally_unknown_crate")
+
+
+class TestPrecomputeGlobalsAndFields:
+    def test_global_entries_shape(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "globals": ["GLOBAL_X"], "fields": [],
+        }
+        result = mcp_server._precompute_file_triples(
+            "config.py", extracted, ":commit/abc123", {}, segment_index=None,
+        )
+        assert len(result["global_entries"]) == 1
+        ident, name, triples = result["global_entries"][0]
+        assert ident == mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
+        assert name == "GLOBAL_X"
+        assert f"[{ident} :entity-type :type/variable]" in triples
+        assert f"[{ident} :introduced-by :commit/abc123]" in triples
+
+    def test_field_entries_shape_disambiguates_by_class(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": ["Foo"], "imports": [], "calls": [],
+            "globals": [],
+            "fields": [("staticField", "Foo", True)],
+        }
+        result = mcp_server._precompute_file_triples(
+            "models.py", extracted, ":commit/abc123", {}, segment_index=None,
+        )
+        assert len(result["field_entries"]) == 1
+        ident, name, triples = result["field_entries"][0]
+        expected_ident = mcp_server._code_ident("field", "models.py", "Foo.staticField")
+        assert ident == expected_ident
+        assert f"[{ident} :entity-type :type/field]" in triples
+        assert f"[{ident} :static true]" in triples
+        class_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        assert f"[{ident} :class {class_ident}]" in triples
+
+
+class TestFieldClassContainment:
+    """Fields owned by a real (extracted) class get BOTH module- and
+    class-containment plus a :class edge; fields whose reported owner is not a
+    real extracted class fall back to module-only containment with no dangling
+    :class or class-contains edge (issues.md P2 findings)."""
+
+    def _parser(self, module_name, lang_key):
+        import mcp_server
+        import tree_sitter
+        import importlib
+        grammar_mod = importlib.import_module(module_name)
+        mcp_server._grammar_cache.clear()
+        real_lang = tree_sitter.Language(grammar_mod.language())
+        real_parser = tree_sitter.Parser(real_lang)
+        mcp_server._grammar_cache[lang_key] = real_parser
+        return real_parser
+
+    def test_real_class_field_gets_both_contains_and_class_edge(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": ["Foo"], "imports": [], "calls": [],
+            "globals": [], "fields": [("bar", "Foo", True)],
+        }
+        result = mcp_server._precompute_file_triples(
+            "models.py", extracted, ":commit/c1", {}, segment_index=None,
+        )
+        field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
+        module_ident = mcp_server._code_ident("module", "models.py")
+        class_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        _, _, triples = result["field_entries"][0]
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert f"[{class_ident} :contains {field_ident}]" in triples
+        assert f"[{field_ident} :class {class_ident}]" in triples
+        assert result["field_class_map"] == {field_ident: class_ident}
+
+    def test_field_with_no_extracted_owner_class_is_module_only(self):
+        import mcp_server
+        # owner "Ghost" is NOT in classes -> no :class, no class-contains edge.
+        extracted = {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "globals": [], "fields": [("attr", "Ghost", True)],
+        }
+        result = mcp_server._precompute_file_triples(
+            "x.py", extracted, ":commit/c1", {}, segment_index=None,
+        )
+        field_ident = mcp_server._code_ident("field", "x.py", "Ghost.attr")
+        module_ident = mcp_server._code_ident("module", "x.py")
+        class_ident = mcp_server._code_ident("class", "x.py", "Ghost")
+        _, _, triples = result["field_entries"][0]
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert all(":class " not in t for t in triples)
+        assert f"[{class_ident} :contains {field_ident}]" not in triples
+        assert result["field_class_map"] == {}
+
+    def test_elixir_module_attribute_falls_back_to_module_only(self):
+        import mcp_server
+        parser = self._parser("tree_sitter_elixir", "elixir")
+        extracted = mcp_server._extract_from_source(
+            b"defmodule Foo do\n  @attr 1\nend\n", parser, "foo.ex",
+        )
+        # Confirm the reproduction from issues.md: field extracted, no class.
+        assert extracted["fields"] == [("attr", "Foo", True)]
+        assert extracted["classes"] == []
+        result = mcp_server._precompute_file_triples(
+            "foo.ex", extracted, ":commit/c1", {}, segment_index=None,
+        )
+        field_ident = mcp_server._code_ident("field", "foo.ex", "Foo.attr")
+        module_ident = mcp_server._code_ident("module", "foo.ex")
+        class_ident = mcp_server._code_ident("class", "foo.ex", "Foo")
+        _, _, triples = result["field_entries"][0]
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert all(":class " not in t for t in triples)
+        assert f"[{class_ident} :contains {field_ident}]" not in triples
+        assert result["field_class_map"] == {}
+
+    def test_haskell_newtype_field_falls_back_to_module_only(self):
+        import mcp_server
+        parser = self._parser("tree_sitter_haskell", "haskell")
+        extracted = mcp_server._extract_from_source(
+            b"newtype Foo = Foo { unFoo :: Int }\n", parser, "foo.hs",
+        )
+        assert extracted["fields"] == [("unFoo", "Foo", False)]
+        assert extracted["classes"] == []
+        result = mcp_server._precompute_file_triples(
+            "foo.hs", extracted, ":commit/c1", {}, segment_index=None,
+        )
+        field_ident = mcp_server._code_ident("field", "foo.hs", "Foo.unFoo")
+        module_ident = mcp_server._code_ident("module", "foo.hs")
+        class_ident = mcp_server._code_ident("class", "foo.hs", "Foo")
+        _, _, triples = result["field_entries"][0]
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert all(":class " not in t for t in triples)
+        assert f"[{class_ident} :contains {field_ident}]" not in triples
+        assert result["field_class_map"] == {}
+
+    def test_build_code_triples_populates_field_class_ident(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": ["Foo"], "imports": [], "calls": [],
+            "globals": [], "fields": [("bar", "Foo", True)],
+        }
+        precomputed = mcp_server._precompute_file_triples("models.py", extracted, ":commit/c1", {})
+        field_class_ident = {}
+        mcp_server._build_code_triples(
+            "models.py", extracted, "2024-01-01T00:00:00Z", {}, {}, {}, ":commit/c1",
+            precomputed, field_class_ident,
+        )
+        field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
+        class_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        assert field_class_ident == {field_ident: class_ident}
+
+    def test_build_code_triples_omits_field_class_ident_for_dangling_owner(self):
+        import mcp_server
+        extracted = {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "globals": [], "fields": [("attr", "Ghost", True)],
+        }
+        precomputed = mcp_server._precompute_file_triples("x.py", extracted, ":commit/c1", {})
+        field_class_ident = {}
+        mcp_server._build_code_triples(
+            "x.py", extracted, "2024-01-01T00:00:00Z", {}, {}, {}, ":commit/c1",
+            precomputed, field_class_ident,
+        )
+        assert field_class_ident == {}
+
+    def test_close_triples_retracts_extra_class_contains_edge(self):
+        import mcp_server
+        field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
+        module_ident = mcp_server._code_ident("module", "models.py")
+        class_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        triples = mcp_server._build_close_triples(
+            field_ident, "Foo.bar", module_ident, class_ident,
+        )
+        assert f"[{module_ident} :contains {field_ident}]" in triples
+        assert f"[{class_ident} :contains {field_ident}]" in triples
+
+    def test_close_triples_ignores_none_extra_parent(self):
+        import mcp_server
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        triples = mcp_server._build_close_triples(fn_ident, "login", module_ident, None)
+        # Only the module-contains edge, no phantom extra :contains.
+        contains = [t for t in triples if ":contains" in t]
+        assert contains == [f"[{module_ident} :contains {fn_ident}]"]
+
+
+class TestBuildCodeTriplesGlobalsAndFields:
+    def test_new_global_writes_full_triples(self):
+        import mcp_server
+        extracted = {"functions": [], "classes": [], "imports": [], "calls": [],
+                     "globals": ["GLOBAL_X"], "fields": []}
+        precomputed = mcp_server._precompute_file_triples("config.py", extracted, ":commit/c1", {})
+        entity_valid_from, entity_descriptions, file_entities = {}, {}, {}
+        triples = mcp_server._build_code_triples(
+            "config.py", extracted, "2024-01-01T00:00:00Z", entity_valid_from,
+            entity_descriptions, file_entities, ":commit/c1", precomputed,
+        )
+        ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
+        assert any(f"{ident} :entity-type :type/variable" in t for t in triples)
+        assert ident in entity_valid_from
+
+    def test_preexisting_global_only_gets_modified_in(self):
+        import mcp_server
+        extracted = {"functions": [], "classes": [], "imports": [], "calls": [],
+                     "globals": ["GLOBAL_X"], "fields": []}
+        precomputed = mcp_server._precompute_file_triples("config.py", extracted, ":commit/c2", {})
+        ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
+        module_ident = mcp_server._code_ident("module", "config.py")
+        # Module must already be known too, otherwise _build_code_triples treats
+        # it as newly introduced and emits module_candidate_triples alongside
+        # the global's :modified-in line, breaking the strict equality below.
+        entity_valid_from = {
+            module_ident: "2024-01-01T00:00:00Z",
+            ident: "2024-01-01T00:00:00Z",
+        }
+        entity_descriptions = {module_ident: "config.py", ident: "GLOBAL_X"}
+        file_entities = {"config.py": [module_ident, ident]}
+        triples = mcp_server._build_code_triples(
+            "config.py", extracted, "2024-01-02T00:00:00Z", entity_valid_from,
+            entity_descriptions, file_entities, ":commit/c2", precomputed,
+        )
+        # Both the already-known module and the already-known global only get
+        # a :modified-in edge — none of the candidate (:entity-type, :ident, …)
+        # triples are re-asserted.
+        assert triples == [
+            f"[{module_ident} :modified-in :commit/c2]",
+            f"[{ident} :modified-in :commit/c2]",
+        ]
 
 
 class TestPreloadKnownDeps:
@@ -4486,6 +7081,140 @@ def git_repo_with_rename(tmp_path):
     return repo
 
 
+def _reused_path_repo(repo, variant):
+    """Build a 4-commit repo that reuses path a.py after it is closed.
+
+    commit1: add a.py with function f
+    commit2: rename a.py -> b.py  (variant="rename")  OR  delete a.py (variant="delete")
+    commit3: re-create a.py with a DIFFERENT function g (a "leave a shim" pattern)
+    commit4: edit the shim
+
+    Commit timestamps are pinned to distinct days so point-in-time queries can
+    target the window a.py's original function f was closed for.
+    """
+    env_base = dict(os.environ)
+
+    def _commit(msg, day):
+        env = dict(env_base)
+        ts = f"2020-01-0{day}T00:00:00Z"
+        env["GIT_AUTHOR_DATE"] = ts
+        env["GIT_COMMITTER_DATE"] = ts
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True, env=env)
+
+    repo.mkdir(parents=True, exist_ok=True)
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "a.py").write_text("def f():\n    return 1\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _commit("c1 add a.py f", 1)
+
+    if variant == "rename":
+        _subprocess.run(["git", "mv", "a.py", "b.py"], cwd=repo, check=True, capture_output=True)
+    else:
+        _subprocess.run(["git", "rm", "a.py"], cwd=repo, check=True, capture_output=True)
+    _commit("c2 close a.py", 2)
+
+    (repo / "a.py").write_text("def g():\n    return 2\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _commit("c3 re-add a.py g", 3)
+
+    (repo / "a.py").write_text("def g():\n    return 3\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _commit("c4 edit a.py g", 4)
+    return repo
+
+
+class TestClosedEntityLifecyclePurge:
+    """Real-backend regression tests for the closed-entity lifecycle purge.
+
+    Before the purge fix, close sites in _run_ingestion left the entity's ident
+    in the in-memory bookkeeping dicts (entity_valid_from / entity_descriptions /
+    field_class_ident / file_entities). Once closes became genuinely real (commit
+    1b2e262), reusing a closed path produced two corruptions:
+
+      * ghost entity: a NEW entity re-created at a previously-closed ident took
+        _build_code_triples' "already known" branch (its ident was still in
+        entity_valid_from) and never re-asserted :ident/:description/:path, so it
+        had no current :ident fact — invisible to nearly every query.
+      * phantom resurrection: a stale ident lingering in file_entities got closed
+        a SECOND time by a later removal diff, but with its ORIGINAL introduction
+        timestamp, widening its valid window across the span it was closed for.
+    """
+
+    def _make_progress(self):
+        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "",
+                "error": None, "prior_ingested": 0}
+
+    async def _ingest_and_open(self, repo, monkeypatch):
+        import mcp_server
+        graph = str(repo / "memory.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._db = None
+        mcp_server._graph_path = graph
+        mcp_server._ingest_progress = self._make_progress()
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._db = None  # release the lock so we can reopen for querying
+        from minigraf import MiniGrafDb
+        return MiniGrafDb.open(graph)
+
+    @staticmethod
+    def _results(db, datalog):
+        return json.loads(db.execute(datalog))["results"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
+    async def test_reused_path_new_entity_is_not_a_ghost(self, tmp_path, monkeypatch, variant):
+        """The module re-created at the reused path a.py must have a CURRENT
+        :ident fact (join target for nearly every query)."""
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        db = await self._ingest_and_open(repo, monkeypatch)
+
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "a.py")
+        g_ident = mcp_server._code_ident("function", "a.py", "g")
+
+        module_now = self._results(db, f'(query [:find ?i :where [{module_ident} :ident ?i]])')
+        assert module_now == [[module_ident]], \
+            f"[{variant}] re-created module at reused path has no current :ident (ghost): {module_now}"
+
+        # The re-created function g must also exist as a genuine current entity.
+        g_now = self._results(db, f'(query [:find ?i :where [{g_ident} :ident ?i]])')
+        assert g_now == [[g_ident]], f"[{variant}] re-created function g missing current :ident: {g_now}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
+    async def test_reused_path_no_phantom_resurrection_window(self, tmp_path, monkeypatch, variant):
+        """The original function f (closed at commit2) must NOT be visible at any
+        point-in-time between its close (commit2) and the final commit."""
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        db = await self._ingest_and_open(repo, monkeypatch)
+
+        import mcp_server
+        f_ident = mcp_server._code_ident("function", "a.py", "f")
+
+        # f was introduced at commit1 (2020-01-01) and closed at commit2 (2020-01-02).
+        # It must be visible strictly inside [c1, c2) and invisible at/after c2.
+        visible_before = self._results(
+            db, f'(query [:find ?i :valid-at "2020-01-01T12:00:00Z" :where [{f_ident} :ident ?i]])')
+        assert visible_before == [[f_ident]], \
+            f"[{variant}] f must remain visible within its true window [c1,c2): {visible_before}"
+
+        for label, when in [("c2", "2020-01-02T00:00:00Z"),
+                            ("between c2 and c4", "2020-01-03T00:00:00Z"),
+                            ("c4", "2020-01-04T00:00:00Z")]:
+            phantom = self._results(
+                db, f'(query [:find ?i :valid-at "{when}" :where [{f_ident} :ident ?i]])')
+            assert phantom == [], \
+                f"[{variant}] f (closed at c2) phantom-resurrected at {label} ({when}): {phantom}"
+
+        # And f must have no CURRENT :ident either.
+        assert self._results(db, f'(query [:find ?i :where [{f_ident} :ident ?i]])') == [], \
+            f"[{variant}] f (closed at c2) must not be visible at current time"
+
+
 class TestRunIngestionBitemporalClose:
     """Integration tests verifying bi-temporal correctness of entity lifecycle handling."""
 
@@ -4569,7 +7298,7 @@ class TestRunIngestionBitemporalClose:
             "login() still present in file must not be closed"
 
     @pytest.mark.asyncio
-    async def test_renamed_file_closes_old_entities_and_opens_new(
+    async def test_renamed_file_links_old_and_new_via_rename_edges(
         self, mock_minigraf_db, git_repo_with_rename, monkeypatch
     ):
         mock_class, db_instance = mock_minigraf_db
@@ -4587,14 +7316,484 @@ class TestRunIngestionBitemporalClose:
         await mcp_server._run_ingestion(str(git_repo_with_rename), "HEAD")
 
         old_module_ident = mcp_server._code_ident("module", "old_auth.py")
+        new_module_ident = mcp_server._code_ident("module", "new_auth.py")
         new_fn_ident = mcp_server._code_ident("function", "new_auth.py", "login")
 
         assert any(old_module_ident in t for t in close_triples_seen), \
-            "Old module entities must be closed when file is renamed"
+            "Old module entities must still be closed when file is renamed"
+        # :renamed-to is an open-ended fact (Fix 1): it must be transacted, NOT
+        # folded into the old module's closed valid window via _ingest_close.
+        assert not any(":renamed-to" in t for t in close_triples_seen), \
+            "Old module's close triples must NOT carry :renamed-to (it is open-ended)"
 
         transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
         assert new_fn_ident in transact_calls, \
-            "New module entities must be created after file is renamed"
+            "New module's entities must still be created after file is renamed"
+        assert f"{new_module_ident} :renamed-from {old_module_ident}" in transact_calls, \
+            "New module's open triples must include :renamed-from pointing at the old ident"
+        assert f"{old_module_ident} :renamed-to {new_module_ident}" in transact_calls, \
+            "Old module's :renamed-to must be transacted open-ended, not closed"
+
+    @pytest.mark.asyncio
+    async def test_in_file_function_rename_links_via_rename_edges(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def oldName(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def newName(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename fn"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        old_fn_ident = mcp_server._code_ident("function", "auth.py", "oldName")
+        new_fn_ident = mcp_server._code_ident("function", "auth.py", "newName")
+
+        # Fix 1: :renamed-to is transacted open-ended, not folded into a close.
+        assert not any(":renamed-to" in t for t in close_triples_seen)
+        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
+        assert f"{new_fn_ident} :renamed-from {old_fn_ident}" in transact_calls
+        assert f"{old_fn_ident} :renamed-to {new_fn_ident}" in transact_calls
+        # Fix 4: the old ident must be closed exactly ONCE (rename loop only), not
+        # also as a plain removal — count distinct close batches carrying its :ident.
+        old_ident_close_count = sum(
+            1 for t in close_triples_seen if f"{old_fn_ident} :ident" in t
+        )
+        assert old_ident_close_count == 1, \
+            f"same-file rename should close old ident once, got {old_ident_close_count}"
+
+    @pytest.mark.asyncio
+    async def test_global_rename_links_via_rename_edges_end_to_end(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        # Value padded to a 13-digit literal (not a bare "12345") so the
+        # assignment's normalized body clears _match_renamed_entities'
+        # _MIN_MATCH_BODY_LEN=20 floor (Task 8) -- see
+        # test_global_rename_produces_renamed_pair's identical note. A
+        # shorter literal is silently dropped as a "trivial stub" before
+        # matching, producing an empty renamed_pairs and no rename triples.
+        (repo / "config.py").write_text("GLOBAL_X = 1234567890123\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "config.py").write_text("GLOBAL_Y = 1234567890123\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename global"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        old_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
+        new_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_Y")
+
+        # Fix 1: :renamed-to open-ended via transact, not in the close window.
+        assert not any(":renamed-to" in t for t in close_triples_seen)
+        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
+        assert f"{new_ident} :renamed-from {old_ident}" in transact_calls
+        assert f"{old_ident} :renamed-to {new_ident}" in transact_calls
+        # Fix 4: the renamed old global is closed once (rename loop), not twice.
+        old_ident_close_count = sum(
+            1 for t in close_triples_seen if f"{old_ident} :ident" in t
+        )
+        assert old_ident_close_count == 1, \
+            f"same-file global rename should close old ident once, got {old_ident_close_count}"
+
+    @pytest.mark.asyncio
+    async def test_rename_to_unsupported_ext_closes_old_entities(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Forward -M regression, end-to-end through _run_ingestion: renaming a
+        tracked .py to an unsupported .txt must close the old module AND its
+        child function/global via the synthetic-delete path. Pre-fix the whole
+        "R" row was dropped in _extract_commit, so nothing was ever closed and
+        the old entities leaked open forever."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("AUTH_KEY = 1234567890123\n\ndef login(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "auth.py", "auth.txt"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename to txt"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        var_ident = mcp_server._code_ident("variable", "auth.py", "AUTH_KEY")
+
+        assert any(":ident" in t and module_ident in t for t in close_triples_seen), \
+            "Old module must be closed when renamed to an unsupported extension"
+        assert any(":ident" in t and fn_ident in t for t in close_triples_seen), \
+            "Old function must be closed when its file is renamed to an unsupported extension"
+        assert any(":ident" in t and var_ident in t for t in close_triples_seen), \
+            "Old global must be closed when its file is renamed to an unsupported extension"
+        # No .txt module should ever be opened.
+        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
+        txt_module_ident = mcp_server._code_ident("module", "auth.txt")
+        assert txt_module_ident not in transact_calls, \
+            "No module entity should be created for the unsupported .txt path"
+
+    @pytest.mark.asyncio
+    async def test_rename_from_unsupported_ext_creates_no_phantom_module(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Reverse -M regression, end-to-end: renaming an unsupported .txt into
+        a tracked .py must NOT close a phantom old module (the .txt ident was
+        never opened) and must NOT write a dangling :renamed-from edge. Pre-fix
+        _run_ingestion's R-branch unconditionally closed :module/notes-txt and
+        wrote a :renamed-from pointing at it."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "notes.txt").write_text("def login(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add txt"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "notes.txt", "notes.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename to py"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        old_module_ident = mcp_server._code_ident("module", "notes.txt")
+        new_module_ident = mcp_server._code_ident("module", "notes.py")
+        new_fn_ident = mcp_server._code_ident("function", "notes.py", "login")
+
+        # No phantom old module closed, no dangling rename edges either way.
+        assert not any(old_module_ident in t for t in close_triples_seen), \
+            "The never-opened .txt module must not be closed (no phantom)"
+        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
+        assert f"{new_module_ident} :renamed-from {old_module_ident}" not in transact_calls, \
+            "No :renamed-from edge should dangle at the never-opened .txt module"
+        assert old_module_ident not in transact_calls, \
+            "The .txt module ident must appear nowhere in transacted triples"
+        # The new .py path is still ingested normally.
+        assert new_fn_ident in transact_calls, \
+            "The new .py file's entities must still be created as a plain add"
+
+    @pytest.mark.asyncio
+    async def test_renamed_to_is_open_ended_against_real_graph(self, tmp_path):
+        """Fix 1, verified end-to-end against the REAL minigraf backend (no
+        MiniGrafDb mock, no _ingest_close monkeypatch) — this is the un-mocked
+        query test the review required to close the blind spot that let the
+        :renamed-to valid-window bug ship.
+
+        The essence of Fix 1 is the *valid-time window* of the emitted Datalog:
+        :renamed-to is a brand-new fact that becomes true at the rename commit
+        and must stay true forever after, so it must be transacted OPEN-ENDED
+        (`{:valid-from <rename-commit>}`, no :valid-to), NOT folded into the old
+        entity's closed window via _ingest_close (`retract` + re-transact with
+        `:valid-to`). We assert exactly that by capturing the real Datalog
+        commands executed against the live DB (a pass-through spy that still
+        forwards every call to the real backend and lets ingestion persist),
+        then also query the real graph to confirm both rename directions
+        resolve.
+
+        Point-in-time verification: we query the real graph with `:valid-at`
+        at a timestamp BEFORE the rename commit and confirm :renamed-to /
+        :renamed-from are NOT yet visible, then query at the rename commit
+        timestamp and confirm they ARE visible. This is now expressible because
+        the `transact` argument-order bug (options map was passed AFTER the
+        fact vector, so minigraf ignored `:valid-from`/`:valid-to` and stamped
+        every fact with wall-clock now) has been fixed — the options map now
+        correctly precedes the fact vector, matching the documented grammar
+        `(transact {:valid-from ...} [facts...])`. The earlier claim that the
+        historical window "was not honoured by this build" was a symptom of
+        that bug, not a real minigraf limitation.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_auth.py").write_text("def login(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_auth.py", "new_auth.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename auth"], cwd=repo, check=True, capture_output=True)
+
+        rename_commit_ts = mcp_server._git_commits(str(repo), None)[1][1]
+
+        # Real backend: real MiniGrafDb, real execute, real persistence.
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        real_execute = mcp_server._db_execute
+        executed_cmds = []
+
+        def spy(db, datalog):
+            executed_cmds.append(datalog)
+            return real_execute(db, datalog)
+
+        mcp_server._db_execute = spy
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._db_execute = real_execute
+
+        old_module = mcp_server._code_ident("module", "old_auth.py")
+        new_module = mcp_server._code_ident("module", "new_auth.py")
+        renamed_to_triple = f"{old_module} :renamed-to {new_module}"
+
+        cmds_with_renamed_to = [c for c in executed_cmds if renamed_to_triple in c]
+        assert cmds_with_renamed_to, ":renamed-to must be emitted against the real DB"
+        # It must NEVER be closed: no retract of it, and no transact carrying it
+        # may set a :valid-to (that would make it a bounded historical fact).
+        for c in cmds_with_renamed_to:
+            assert not c.strip().startswith("(retract"), \
+                ":renamed-to must not be retracted (it is open-ended, not closed)"
+            assert ":valid-to" not in c, \
+                ":renamed-to must be transacted open-ended, never with a :valid-to"
+        # At least one open-ended transact introduces it at the RENAME commit.
+        open_transacts = [
+            c for c in cmds_with_renamed_to
+            if c.strip().startswith("(transact") and f':valid-from "{rename_commit_ts}"' in c
+        ]
+        assert open_transacts, \
+            ":renamed-to must be transacted open-ended with :valid-from = rename commit ts"
+
+        # By contrast, the old module's own identity IS still closed (retract).
+        assert any(
+            c.strip().startswith("(retract") and f"{old_module} :ident" in c
+            for c in executed_cmds
+        ), "Old module's :ident must still be closed (retracted) on rename"
+
+        # Query the real graph: both rename directions resolve after ingestion.
+        db = mcp_server.get_db()
+        rt = json.loads(real_execute(db, f"(query [:find ?x :where [{old_module} :renamed-to ?x]])")).get("results", [])
+        rf = json.loads(real_execute(db, f"(query [:find ?x :where [{new_module} :renamed-from ?x]])")).get("results", [])
+        assert rt == [[new_module]], f"forward :renamed-to must resolve to new module, got {rt}"
+        assert rf == [[old_module]], f"reverse :renamed-from must resolve to old module, got {rf}"
+
+        # REAL point-in-time verification (the check the review originally asked
+        # for, now expressible after the transact argument-order fix): the rename
+        # edges become true AT the rename commit, so a :valid-at BEFORE that
+        # commit must NOT observe them, and a :valid-at at the rename commit must.
+        rt_before = json.loads(real_execute(
+            db, f'(query [:find ?x :valid-at "2000-01-01T00:00:00Z" :where [{old_module} :renamed-to ?x]])'
+        )).get("results", [])
+        rf_before = json.loads(real_execute(
+            db, f'(query [:find ?x :valid-at "2000-01-01T00:00:00Z" :where [{new_module} :renamed-from ?x]])'
+        )).get("results", [])
+        assert rt_before == [], f":renamed-to must NOT be visible before the rename commit, got {rt_before}"
+        assert rf_before == [], f":renamed-from must NOT be visible before the rename commit, got {rf_before}"
+
+        rt_at = json.loads(real_execute(
+            db, f'(query [:find ?x :valid-at "{rename_commit_ts}" :where [{old_module} :renamed-to ?x]])'
+        )).get("results", [])
+        rf_at = json.loads(real_execute(
+            db, f'(query [:find ?x :valid-at "{rename_commit_ts}" :where [{new_module} :renamed-from ?x]])'
+        )).get("results", [])
+        assert rt_at == [[new_module]], f":renamed-to must be visible at the rename commit, got {rt_at}"
+        assert rf_at == [[old_module]], f":renamed-from must be visible at the rename commit, got {rf_at}"
+
+        mcp_server._db = None  # release the real file lock for subsequent tests
+
+    @pytest.mark.asyncio
+    async def test_unchanged_global_and_field_survive_unrelated_edit(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Fix 2: an unchanged module global and class field must NOT be closed
+        when a later commit only edits an unrelated function body. Pre-fix,
+        current_extracted_idents omitted globals/fields, so every still-present
+        global/field looked 'removed' on any M commit and was wrongly closed."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "x.py").write_text(
+            "GLOBAL_CONF = 1234567890123\n\nclass C:\n    field_a = 1\n\ndef f():\n    return 1\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        # Second commit changes only f()'s body — global and field are untouched.
+        (repo / "x.py").write_text(
+            "GLOBAL_CONF = 1234567890123\n\nclass C:\n    field_a = 1\n\ndef f():\n    return 2\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "edit f body"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        gvar_ident = mcp_server._code_ident("variable", "x.py", "GLOBAL_CONF")
+        field_ident = mcp_server._code_ident("field", "x.py", "C.field_a")
+        assert not any(gvar_ident in t for t in close_triples_seen), \
+            "Unchanged global must NOT be closed on an unrelated function edit"
+        assert not any(field_ident in t for t in close_triples_seen), \
+            "Unchanged field must NOT be closed on an unrelated function edit"
+
+    @pytest.mark.asyncio
+    async def test_file_rename_closes_unmatched_child_and_dependency(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Fix 3: when a file is renamed, child entities the matcher could not
+        confirm a continuity edge for (e.g. short/ambiguous bodies) and the old
+        path's :depends-on edges must still be closed as plain removals under
+        the OLD path. Pre-fix only the old module was closed, leaking unmatched
+        children and dependency edges open forever alongside the new file's."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "dep.py").write_text("def helper():\n    return 1\n")
+        # go() has a body below _MIN_MATCH_BODY_LEN, so the matcher leaves it
+        # unmatched — the case Fix 3 must still close under the old path.
+        (repo / "main.py").write_text("import dep\n\ndef go():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "main.py", "app.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename main to app"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        old_go = mcp_server._code_ident("function", "main.py", "go")
+        old_module = mcp_server._code_ident("module", "main.py")
+        dep_module = mcp_server._code_ident("module", "dep.py")
+
+        # Unmatched old child closed as a PLAIN removal (no :renamed-to linkage).
+        assert any(f"{old_go} :ident" in t for t in close_triples_seen), \
+            "Unmatched old child function must be closed under the old path"
+        assert not any("renamed-to" in t and old_go in t for t in close_triples_seen), \
+            "Unmatched child has no continuity edge — must not get a :renamed-to"
+        # Old path's surviving dependency edge is closed too.
+        assert any(
+            f"{old_module} :depends-on {dep_module}" in t for t in close_triples_seen
+        ), "Old path's :depends-on edge must be closed on file rename"
+        # The new file is still ingested.
+        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
+        assert mcp_server._code_ident("module", "app.py") + " :entity-type" in transact_calls, \
+            "New renamed file's module must still be created"
+
+    @pytest.mark.asyncio
+    async def test_same_file_rename_closes_old_ident_exactly_once(
+        self, mock_minigraf_db, tmp_path, monkeypatch
+    ):
+        """Fix 4: an in-place rename must close the old ident exactly once (via
+        the renamed_pairs loop, with :renamed-to linkage) — not also a second
+        time as a plain removal from the M-status removal detector."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def oldName(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def newName(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename fn"], cwd=repo, check=True, capture_output=True)
+
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        close_triples_seen = []
+        monkeypatch.setattr(
+            mcp_server, "_ingest_close",
+            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        old_fn = mcp_server._code_ident("function", "auth.py", "oldName")
+        close_count = sum(1 for t in close_triples_seen if f"{old_fn} :ident" in t)
+        assert close_count == 1, \
+            f"same-file rename must close old ident exactly once, got {close_count}"
+        new_fn = mcp_server._code_ident("function", "auth.py", "newName")
+        assert any(f"{old_fn} :renamed-to {new_fn}" in t for t in
+                   [c for call in db_instance.execute.call_args_list for c in [str(call)]]), \
+            "the single close path must be the rename path (with :renamed-to linkage)"
 
 
 # ---------------------------------------------------------------------------
@@ -4638,6 +7837,60 @@ def git_repo_with_dep_removal(tmp_path):
     _subprocess.run(["git", "commit", "-m", "remove import"], cwd=repo, check=True, capture_output=True)
 
     return repo
+
+
+class TestTransactValidTimeArgumentOrder:
+    """Regression tests for the transact argument-order bug.
+
+    minigraf's documented grammar is `(transact {options} [facts...])` — the
+    valid-time options map MUST precede the fact vector. Every valid-time-bounded
+    transact in mcp_server.py historically emitted the reversed order
+    `(transact [facts...] {options})`, which minigraf silently ignored: the fact
+    was stamped with wall-clock now instead of the intended window. This meant a
+    "closed" (bounded) fact stayed visible in current-time queries forever, and
+    `:valid-at` point-in-time reads could never observe the intended window.
+
+    These tests run against a REAL temp minigraf .graph file (no MiniGrafDb mock)
+    and prove the fixed order behaves exactly as documented.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bounded_window_honoured_against_real_graph(self, tmp_path):
+        """Transact a fact with a bounded historical valid window and confirm:
+        (a) a default/current-time query does NOT see it,
+        (b) a :valid-at WITHIN the window DOES see it,
+        (c) a :valid-at BEFORE the window does NOT see it.
+        """
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(tmp_path / "vt.graph"))
+        db = mcp_server.get_db()
+
+        try:
+            # Bounded historical window: valid 2020-01-01 .. 2021-01-01 only.
+            mcp_server._db_execute(
+                db,
+                '(transact {:valid-from "2020-01-01T00:00:00Z" '
+                ':valid-to "2021-01-01T00:00:00Z"} [[:alice :employment/status :active]])',
+            )
+
+            def q(extra=""):
+                raw = mcp_server._db_execute(
+                    db, f"(query [:find ?s {extra} :where [:alice :employment/status ?s]])"
+                )
+                return json.loads(raw).get("results", [])
+
+            # (a) current time is AFTER the closed window -> not visible.
+            assert q() == [], "closed bounded fact must NOT appear in a current-time query"
+            # (b) point-in-time inside the window -> visible.
+            assert q(':valid-at "2020-06-01T00:00:00Z"') == [[":active"]], \
+                "fact must be visible at a :valid-at inside its window"
+            # (c) point-in-time before the window -> not visible.
+            assert q(':valid-at "2019-06-01T00:00:00Z"') == [], \
+                "fact must NOT be visible at a :valid-at before its window"
+        finally:
+            mcp_server._db = None  # release the real file lock for subsequent tests
 
 
 class TestRunIngestionBitemporalDeps:
@@ -5559,3 +8812,97 @@ class TestExtractImportName:
         assert "os" in result
         assert "github.com/user/pkg" in result
 
+
+def test_schema_has_renamed_from_and_to_on_code_entities():
+    import mcp_server
+    for entity_type in ("module", "function", "class", "variable", "field"):
+        optional = mcp_server.MINIGRAF_SCHEMA[entity_type]["optional"]
+        assert optional[":renamed-from"] is str
+        assert optional[":renamed-to"] is str
+
+
+def test_schema_has_variable_and_field_types():
+    import mcp_server
+    assert mcp_server.MINIGRAF_SCHEMA["variable"]["required"][":description"] is str
+    field_optional = mcp_server.MINIGRAF_SCHEMA["field"]["optional"]
+    assert field_optional[":static"] is bool
+    assert field_optional[":class"] is str
+
+
+class TestFieldClassContainmentE2E:
+    """Real-backend (non-mocked) end-to-end test: a class field is queryable via
+    the class's :contains edge in the live graph, and that edge is closed when
+    the field is removed (issues.md P2: "add a graph-level test asserting a
+    class's :contains set includes its fields" + close-logic verification)."""
+
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, msg):
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def _query(self, path, q):
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(path)
+        try:
+            return json.loads(db.execute(q)).get("results", [])
+        finally:
+            del db
+
+    def test_class_contains_field_is_queryable_and_closed_on_removal(self, tmp_path, monkeypatch):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+
+        # Commit 1: a class with a field.
+        (repo / "models.py").write_text("class Account:\n    balance = 0\n")
+        self._commit(repo, "add Account")
+
+        graph_path = str(tmp_path / "e2e.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph_path)
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+
+        asyncio.run(mcp_server._run_ingestion(str(repo), "HEAD"))
+        mcp_server._db = None
+
+        class_ident = mcp_server._code_ident("class", "models.py", "Account")
+        field_ident = mcp_server._code_ident("field", "models.py", "Account.balance")
+
+        # The class :contains set includes its field (structural graph traversal).
+        contains = self._query(
+            graph_path, f"(query [:find ?f :where [{class_ident} :contains ?f]])"
+        )
+        contained = {row[0] for row in contains}
+        assert field_ident in contained, f"expected {field_ident} in class :contains {contained}"
+
+        # Commit 2: remove the field (replace with a method) so it is a removal.
+        (repo / "models.py").write_text("class Account:\n    def deposit(self):\n        pass\n")
+        self._commit(repo, "drop balance field")
+
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+        asyncio.run(mcp_server._run_ingestion(str(repo), "HEAD"))
+        mcp_server._db = None
+
+        # The class-contains edge to the removed field is CLOSED at current time.
+        contains_after = self._query(
+            graph_path, f"(query [:find ?f :where [{class_ident} :contains ?f]])"
+        )
+        contained_after = {row[0] for row in contains_after}
+        assert field_ident not in contained_after, (
+            f"class-contains edge to removed field leaked open: {contained_after}"
+        )
+
+        # And the module-contains edge to the field is closed too (no half-close).
+        module_ident = mcp_server._code_ident("module", "models.py")
+        mod_contains_after = {
+            row[0] for row in self._query(
+                graph_path, f"(query [:find ?f :where [{module_ident} :contains ?f]])"
+            )
+        }
+        assert field_ident not in mod_contains_after

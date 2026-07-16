@@ -22,7 +22,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -689,12 +689,14 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
         else:
             name_node = node.child_by_field_name("name")
             if name_node:
-                results["functions"].append(name_node.text.decode("utf-8"))
+                name = name_node.text.decode("utf-8")
+                results["functions"].append(name)
 
     elif node.type in node_types.get("classes", set()):
         name_node = node.child_by_field_name("name")
         if name_node:
-            results["classes"].append(name_node.text.decode("utf-8"))
+            name = name_node.text.decode("utf-8")
+            results["classes"].append(name)
 
     elif node.type in node_types.get("imports", set()):
         names = _extract_import_name(node, lang_name)
@@ -709,20 +711,2006 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
         _walk_ast(child, results, lang_name)
 
 
+def _extract_globals_and_fields(root_node: Any, lang_name: str) -> Dict[str, Any]:
+    """Scope-aware extraction of module-level globals and class fields.
+
+    Deliberately NOT a _walk_ast-style full-tree recursion: an assignment-
+    like node is ubiquitous (appears inside every function body too), so a
+    naive table-driven walk would misclassify every local variable as a
+    global. Each per-language function in _GLOBAL_FIELD_EXTRACTORS is
+    responsible for only descending into module-level and class-body-level
+    statements, never into a function/method body (barring a narrow,
+    per-language, deliberate exception — see each language's own extractor).
+    """
+    empty: Dict[str, Any] = {
+        "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
+        "global_nodes": {}, "field_nodes": {},
+    }
+    extractor = _GLOBAL_FIELD_EXTRACTORS.get(lang_name)
+    if extractor is None or root_node is None:
+        return empty
+    return extractor(root_node)
+
+
+_GLOBAL_FIELD_EXTRACTORS: Dict[str, Callable[[Any], Dict[str, Any]]] = {}
+
+
+def _extract_python_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Python globals/fields extraction.
+
+    Only descends into: module-root direct children (globals), a
+    class_definition's body direct children (class-level/static fields),
+    and __init__'s own body direct children (self.x = ... instance
+    fields). Never recurses into any other function/method body, so a
+    known limitation is that fields first assigned outside __init__ (e.g.
+    dynamically added attributes) are not captured — deliberate, bounded
+    heuristic, not an oversight.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def plain_assignment_name(stmt_node: Any) -> Optional[Tuple[str, Any]]:
+        if stmt_node.type != "expression_statement" or stmt_node.child_count == 0:
+            return None
+        assign = stmt_node.children[0]
+        if assign.type != "assignment":
+            return None
+        left = assign.child_by_field_name("left")
+        if left is not None and left.type == "identifier":
+            return left.text.decode("utf-8"), assign
+        return None
+
+    def self_attr_assignment_name(stmt_node: Any) -> Optional[Tuple[str, Any]]:
+        if stmt_node.type != "expression_statement" or stmt_node.child_count == 0:
+            return None
+        assign = stmt_node.children[0]
+        if assign.type != "assignment":
+            return None
+        left = assign.child_by_field_name("left")
+        if left is None or left.type != "attribute":
+            return None
+        obj = left.child_by_field_name("object")
+        attr = left.child_by_field_name("attribute")
+        if obj is not None and obj.type == "identifier" and obj.text == b"self" and attr is not None:
+            return attr.text.decode("utf-8"), assign
+        return None
+
+    for stmt in root_node.children:
+        if stmt.type == "class_definition":
+            class_name_node = stmt.child_by_field_name("name")
+            class_name = class_name_node.text.decode("utf-8") if class_name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                match = plain_assignment_name(member)
+                if match:
+                    field_name, assign_node = match
+                    fields.append((field_name, class_name, True))
+                    field_info[field_name] = {
+                        "class": class_name, "static": True,
+                        "body": assign_node.text.decode("utf-8", "replace"),
+                    }
+                    field_nodes[f"{class_name}.{field_name}"] = assign_node
+                elif member.type == "function_definition":
+                    fn_name_node = member.child_by_field_name("name")
+                    if fn_name_node is not None and fn_name_node.text == b"__init__":
+                        fn_body = member.child_by_field_name("body")
+                        if fn_body is not None:
+                            for fn_stmt in fn_body.children:
+                                self_match = self_attr_assignment_name(fn_stmt)
+                                if self_match:
+                                    field_name, assign_node = self_match
+                                    fields.append((field_name, class_name, False))
+                                    field_info[field_name] = {
+                                        "class": class_name, "static": False,
+                                        "body": assign_node.text.decode("utf-8", "replace"),
+                                    }
+                                    field_nodes[f"{class_name}.{field_name}"] = assign_node
+        else:
+            match = plain_assignment_name(stmt)
+            if match:
+                name, assign_node = match
+                globals_.append(name)
+                global_bodies[name] = assign_node.text.decode("utf-8", "replace")
+                global_nodes[name] = assign_node
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["python"] = _extract_python_globals_and_fields
+
+
+def _extract_js_family_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware JavaScript/TypeScript globals/fields extraction.
+
+    Only descends into: program-root direct children (globals, from
+    lexical_declaration/variable_declaration's variable_declarator
+    children) and a class_declaration's class_body direct children
+    (field_definition for JS, public_field_definition for TS). A
+    program-root `export_statement` (covering `export const`/`export
+    let`/`export class`/`export default class`) is unwrapped via its
+    `declaration` field before the same type checks apply — this is the
+    one extra step permitted; it does not add any further recursion.
+    Never recurses into a function/method body, so a class field assigned
+    only inside a constructor (e.g. `this.x = 1` with no class-body field
+    declaration) is not captured — deliberate, bounded heuristic
+    consistent with the Python extractor's __init__-only scope.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    for raw_stmt in root_node.children:
+        stmt = raw_stmt
+        if stmt.type == "export_statement":
+            # `export const X = 5;`, `export class Foo {...}`, and
+            # `export default class Bar {...}` all wrap the actual
+            # declaration inside an export_statement node, exposed
+            # uniformly via the `declaration` field (verified against the
+            # real installed tree-sitter-javascript/typescript grammars,
+            # including the `export default class` variant). Unwrap it
+            # once here; no further recursion is added beyond this.
+            declaration = stmt.child_by_field_name("declaration")
+            if declaration is None:
+                continue
+            stmt = declaration
+        if stmt.type in ("lexical_declaration", "variable_declaration"):
+            for child in stmt.children:
+                if child.type == "variable_declarator":
+                    name_node = child.child_by_field_name("name")
+                    if name_node is not None and name_node.type == "identifier":
+                        name = name_node.text.decode("utf-8")
+                        globals_.append(name)
+                        # Use raw_stmt (not the unwrapped stmt) so an
+                        # exported global's body includes the `export`
+                        # keyword, matching its actual source text.
+                        global_bodies[name] = raw_stmt.text.decode("utf-8", "replace")
+                        global_nodes[name] = raw_stmt
+        elif stmt.type == "class_declaration":
+            class_name_node = stmt.child_by_field_name("name")
+            class_name = class_name_node.text.decode("utf-8") if class_name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                if member.type not in ("field_definition", "public_field_definition"):
+                    continue
+                name_node = member.child_by_field_name("property") or member.child_by_field_name("name")
+                if name_node is None or name_node.type not in ("property_identifier",):
+                    continue
+                field_name = name_node.text.decode("utf-8")
+                is_static = any(c.type == "static" for c in member.children)
+                fields.append((field_name, class_name, is_static))
+                field_info[field_name] = {
+                    "class": class_name, "static": is_static,
+                    "body": member.text.decode("utf-8", "replace"),
+                }
+                field_nodes[f"{class_name}.{field_name}"] = member
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["javascript"] = _extract_js_family_globals_and_fields
+_GLOBAL_FIELD_EXTRACTORS["typescript"] = _extract_js_family_globals_and_fields
+
+
+def _extract_rust_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Rust globals/fields extraction.
+
+    Only descends into: module-root direct children (`static_item`/
+    `const_item` globals, `struct_item` field lists) and, as the one
+    deliberate exception to "fields are always instance-only" in this
+    language, an `impl_item` block's direct `const_item` children --
+    treated as static fields of the impl'd type (the closest Rust analog
+    to a class-static constant). Never recurses into a function/method
+    body.
+
+    A leading `pub` visibility_modifier is a CHILD of static_item/
+    const_item/struct_item/field_declaration in the real installed
+    tree-sitter-rust grammar, not a wrapping node (unlike JS's `export`
+    wrapping the declaration in an export_statement) -- so no unwrapping
+    step is needed here; `child_by_field_name("name")` resolves correctly
+    regardless of `pub`. Verified empirically before writing this code.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    for stmt in root_node.children:
+        if stmt.type in ("static_item", "const_item"):
+            name_node = stmt.child_by_field_name("name")
+            if name_node is not None:
+                name = name_node.text.decode("utf-8")
+                globals_.append(name)
+                global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                global_nodes[name] = stmt
+        elif stmt.type == "struct_item":
+            struct_name_node = stmt.child_by_field_name("name")
+            struct_name = struct_name_node.text.decode("utf-8") if struct_name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is not None:
+                for member in body.children:
+                    if member.type == "field_declaration":
+                        fname_node = member.child_by_field_name("name")
+                        if fname_node is not None:
+                            fname = fname_node.text.decode("utf-8")
+                            fields.append((fname, struct_name, False))
+                            field_info[fname] = {
+                                "class": struct_name, "static": False,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+                            field_nodes[f"{struct_name}.{fname}"] = member
+        elif stmt.type == "impl_item":
+            type_node = stmt.child_by_field_name("type")
+            # For a generic impl (`impl<T> Foo<T> { ... }`), the `type` field
+            # is a `generic_type` node whose own `type` sub-field holds the
+            # bare `type_identifier` ("Foo"). Unwrap it so the owning-class
+            # name matches the clean name registered for the struct itself
+            # (struct_item's `name` field never includes generic params).
+            # Verified empirically against the installed tree-sitter-rust
+            # grammar for both `impl<T> Foo<T> { const CAP: ... }` (type
+            # field = generic_type -> type = type_identifier "Foo") and
+            # `impl Foo { const ASSOC: ... }` (type field = type_identifier
+            # "Foo" directly, unchanged by this unwrap).
+            if type_node is not None and type_node.type == "generic_type":
+                inner_type_node = type_node.child_by_field_name("type")
+                if inner_type_node is not None:
+                    type_node = inner_type_node
+            type_name = type_node.text.decode("utf-8") if type_node is not None else ""
+            body = stmt.child_by_field_name("body")
+            if body is not None:
+                for member in body.children:
+                    if member.type == "const_item":
+                        cname_node = member.child_by_field_name("name")
+                        if cname_node is not None:
+                            cname = cname_node.text.decode("utf-8")
+                            fields.append((cname, type_name, True))
+                            field_info[cname] = {
+                                "class": type_name, "static": True,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+                            field_nodes[f"{type_name}.{cname}"] = member
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["rust"] = _extract_rust_globals_and_fields
+
+
+def _extract_go_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Go globals/fields extraction.
+
+    Only descends into: file-root direct children (`var_declaration`/
+    `const_declaration` globals, via their `var_spec`/`const_spec`
+    children) and a `type_declaration > type_spec`'s `struct_type` body
+    direct children (fields). Never recurses into a function/method body.
+
+    Go has no export keyword -- exported identifiers are just capitalized
+    -- so there is no wrapping-node analog to JS's `export_statement` to
+    unwrap here; verified empirically that field:name resolves the same
+    way regardless of capitalization.
+
+    NOTE: `struct_type`'s `field_declaration_list` child is NOT exposed
+    via a `body` field in the real installed tree-sitter-go grammar (it's
+    a plain positional child, unlike Rust's struct_item/C's
+    struct_specifier which both do expose `field:body`) -- verified
+    empirically. It must be located by node type instead of
+    child_by_field_name("body").
+
+    NOTE: a grouped/parenthesized `var (\n A = 1\n B = 2\n)` -- an
+    idiomatic and common real-world Go pattern -- wraps its `var_spec`
+    children in an intermediate `var_spec_list` node, unlike a grouped
+    `const (...)` or `type (...)`, which do NOT wrap their specs (their
+    `const_spec`/`type_spec` children stay direct children of the
+    declaration node even when grouped) -- verified empirically against
+    the real installed tree-sitter-go grammar. `iter_specs` below
+    unwraps a `{spec_type}_list` if present so grouped var declarations
+    aren't silently dropped; it's a no-op for const/type, which never
+    produce that wrapper.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def iter_specs(stmt: Any, spec_type: str) -> Any:
+        list_type = f"{spec_type}_list"
+        for child in stmt.children:
+            if child.type == spec_type:
+                yield child
+            elif child.type == list_type:
+                for inner in child.children:
+                    if inner.type == spec_type:
+                        yield inner
+
+    for stmt in root_node.children:
+        if stmt.type in ("var_declaration", "const_declaration"):
+            spec_type = "var_spec" if stmt.type == "var_declaration" else "const_spec"
+            for spec in iter_specs(stmt, spec_type):
+                name_node = spec.child_by_field_name("name")
+                if name_node is not None:
+                    name = name_node.text.decode("utf-8")
+                    globals_.append(name)
+                    global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                    global_nodes[name] = stmt
+        elif stmt.type == "type_declaration":
+            for type_spec in stmt.children:
+                if type_spec.type != "type_spec":
+                    continue
+                type_name_node = type_spec.child_by_field_name("name")
+                type_name = type_name_node.text.decode("utf-8") if type_name_node else ""
+                struct_type = type_spec.child_by_field_name("type")
+                if struct_type is None or struct_type.type != "struct_type":
+                    continue
+                body = next(
+                    (c for c in struct_type.children if c.type == "field_declaration_list"),
+                    None,
+                )
+                if body is None:
+                    continue
+                for member in body.children:
+                    if member.type == "field_declaration":
+                        # `X, Y int` inside a struct puts more than one
+                        # node under the `name` field of one
+                        # field_declaration -- child_by_field_name
+                        # (singular) only returns the first, silently
+                        # dropping `Y`. Verified empirically; use the
+                        # plural children_by_field_name to capture all.
+                        for fname_node in member.children_by_field_name("name"):
+                            fname = fname_node.text.decode("utf-8")
+                            fields.append((fname, type_name, False))
+                            field_info[fname] = {
+                                "class": type_name, "static": False,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+                            field_nodes[f"{type_name}.{fname}"] = member
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["go"] = _extract_go_globals_and_fields
+
+
+def _extract_c_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware C globals/fields extraction.
+
+    Only descends into: translation-unit-root direct `declaration`
+    children (globals, whether a bare `identifier` declarator or an
+    `init_declarator` wrapping one) and a `struct_specifier`'s
+    `field_declaration_list` body direct children (fields, via each
+    `field_declaration`'s `field:declarator` = `field_identifier`).
+    Never recurses into a function body.
+
+    C has no export/visibility keyword; `static`/`extern` show up as a
+    `storage_class_specifier` sibling of the declarator inside
+    `declaration`, not a wrapper around it -- verified empirically that
+    field:declarator resolves the same way with or without them present.
+
+    NOTE: a multi-declarator statement (`int a, b = 2;` at file scope, or
+    `int a, b;` inside a struct) -- an ordinary, common C pattern -- puts
+    more than one node under the `declarator` field, so
+    `child_by_field_name("declarator")` (singular) only returns the
+    first one and silently drops the rest. Verified empirically against
+    the real installed tree-sitter-c grammar; `children_by_field_name`
+    (plural) is used instead to capture all of them.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def declarator_name(node: Any) -> Optional[str]:
+        if node.type == "identifier":
+            return node.text.decode("utf-8")
+        if node.type == "init_declarator":
+            inner = node.child_by_field_name("declarator")
+            return declarator_name(inner) if inner is not None else None
+        return None
+
+    for stmt in root_node.children:
+        if stmt.type == "declaration":
+            for declarator in stmt.children_by_field_name("declarator"):
+                name = declarator_name(declarator)
+                if name:
+                    globals_.append(name)
+                    global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                    global_nodes[name] = stmt
+        elif stmt.type == "struct_specifier":
+            struct_name_node = stmt.child_by_field_name("name")
+            struct_name = struct_name_node.text.decode("utf-8") if struct_name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is not None:
+                for member in body.children:
+                    if member.type == "field_declaration":
+                        for declarator in member.children_by_field_name("declarator"):
+                            if declarator.type == "field_identifier":
+                                fname = declarator.text.decode("utf-8")
+                                fields.append((fname, struct_name, False))
+                                field_info[fname] = {
+                                    "class": struct_name, "static": False,
+                                    "body": member.text.decode("utf-8", "replace"),
+                                }
+                                field_nodes[f"{struct_name}.{fname}"] = member
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["c"] = _extract_c_globals_and_fields
+
+
+def _extract_java_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Java globals/fields extraction.
+
+    Java has no true top-level globals -- all state lives inside a class
+    -- so this always returns "globals": []. Only descends into a
+    class_declaration's class_body direct children (field_declaration).
+    Never recurses into a method/constructor body.
+
+    `walk()` recurses into every node (not just direct children of the
+    root), unlike this plan's C/Go/Rust extractors' strictly-direct-
+    children approach -- this is still safe scope-wise because
+    class_declaration is itself a structural node (same non-ambiguity
+    argument as functions/classes in `_walk_ast`), and nested/inner
+    classes are a real, valid Java construct worth capturing fields from.
+    The recursion only ever *enters* a matched class's own member list
+    (walk_class only looks at class_node's body's direct children), never
+    a method body, so the "don't misclassify locals" invariant holds even
+    though walk() itself descends everywhere.
+
+    A field_declaration is optionally preceded by a `modifiers` wrapper
+    node (one node containing `static`/`public`/etc. as separate
+    children, e.g. "public static final") -- verified empirically against
+    the real installed tree-sitter-java grammar; static iff any child of
+    that `modifiers` node has type "static".
+
+    NOTE: `int a, b;` puts more than one node under the `declarator`
+    field of a single field_declaration -- child_by_field_name (singular)
+    only returns the first, silently dropping `b`. Verified empirically
+    (same lesson as Go's multi-name struct field and C's multi-declarator
+    statement); children_by_field_name (plural) is used instead.
+    """
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def walk_class(class_node: Any) -> None:
+        name_node = class_node.child_by_field_name("name")
+        class_name = name_node.text.decode("utf-8") if name_node else ""
+        body = class_node.child_by_field_name("body")
+        if body is None:
+            return
+        for member in body.children:
+            if member.type != "field_declaration":
+                continue
+            is_static = False
+            for child in member.children:
+                if child.type == "modifiers":
+                    is_static = any(mod.type == "static" for mod in child.children)
+            for declarator in member.children_by_field_name("declarator"):
+                if declarator.type != "variable_declarator":
+                    continue
+                fname_node = declarator.child_by_field_name("name")
+                if fname_node is not None:
+                    fname = fname_node.text.decode("utf-8")
+                    fields.append((fname, class_name, is_static))
+                    field_info[fname] = {
+                        "class": class_name, "static": is_static,
+                        "body": member.text.decode("utf-8", "replace"),
+                    }
+                    field_nodes[f"{class_name}.{fname}"] = member
+
+    def walk(node: Any) -> None:
+        if node.type == "class_declaration":
+            walk_class(node)
+        for child in node.children:
+            walk(child)
+
+    walk(root_node)
+    return {
+        "globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info,
+        "global_nodes": {}, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["java"] = _extract_java_globals_and_fields
+
+
+def _extract_csharp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware C# globals/fields extraction.
+
+    C# has no true top-level globals -- all state lives inside a class --
+    so this always returns "globals": []. Only descends into a
+    class_declaration's declaration_list body direct children
+    (field_declaration). Never recurses into a method/constructor body.
+
+    `walk()` recurses into every node, same rationale and same "never
+    enters a method body" invariant as the Java extractor above -- nested
+    classes are a real, valid C# construct.
+
+    Unlike Java, a field_declaration's modifiers are direct sibling
+    children of type "modifier" (not wrapped in an intermediate node) --
+    verified empirically against the real installed tree-sitter-c-sharp
+    grammar; static iff any child has type "modifier" and text b"static".
+
+    A field_declaration wraps a single variable_declaration child, itself
+    containing one or more variable_declarator children (via field:name
+    on the declarator, not on the variable_declaration step -- the
+    variable_declaration node has no field-name of its own per the
+    verified dump, so it's located by type). `int a, b;` puts multiple
+    variable_declarator nodes as plain positional children of that one
+    variable_declaration -- iterating them directly (no field lookup)
+    already captures all of them, verified empirically.
+    """
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def walk_class(class_node: Any) -> None:
+        name_node = class_node.child_by_field_name("name")
+        class_name = name_node.text.decode("utf-8") if name_node else ""
+        body = class_node.child_by_field_name("body")
+        if body is None:
+            return
+        for member in body.children:
+            if member.type != "field_declaration":
+                continue
+            is_static = any(c.type == "modifier" and c.text == b"static" for c in member.children)
+            var_decl = next((c for c in member.children if c.type == "variable_declaration"), None)
+            if var_decl is None:
+                continue
+            for declarator in var_decl.children:
+                if declarator.type == "variable_declarator":
+                    fname_node = declarator.child_by_field_name("name")
+                    if fname_node is not None:
+                        fname = fname_node.text.decode("utf-8")
+                        fields.append((fname, class_name, is_static))
+                        field_info[fname] = {
+                            "class": class_name, "static": is_static,
+                            "body": member.text.decode("utf-8", "replace"),
+                        }
+                        field_nodes[f"{class_name}.{fname}"] = member
+
+    def walk(node: Any) -> None:
+        if node.type == "class_declaration":
+            walk_class(node)
+        for child in node.children:
+            walk(child)
+
+    walk(root_node)
+    return {
+        "globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info,
+        "global_nodes": {}, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["c_sharp"] = _extract_csharp_globals_and_fields
+
+
+def _extract_cpp_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware C++ globals/fields extraction.
+
+    Top-level `int x = 5;` is a `declaration` directly under
+    `translation_unit`, same shape as C -- reuses C's declarator_name
+    helper (identifier, or init_declarator wrapping one).
+
+    `class Foo { ... };` / `struct Foo { ... };` are `class_specifier` /
+    `struct_specifier` nodes with `field:body` = `field_declaration_list`;
+    verified empirically against the real installed tree-sitter-cpp
+    grammar that both node types expose `name`/`body` fields identically,
+    so class and struct fields are handled by the same code path (structs
+    default to public, classes to private, but that doesn't affect the
+    AST shape used here). `access_specifier` nodes (public:/private:/
+    protected:) are just plain sibling children of field_declaration_list
+    -- multiple such sections in one class don't disrupt iteration since
+    non-field_declaration members are simply skipped.
+
+    Each member `field_declaration` optionally has a
+    `storage_class_specifier` child with text b"static"; a plain
+    (non-method) field's declarator is directly a `field_identifier`, not
+    wrapped in `init_declarator` (unlike C's free variable declarations,
+    verified empirically). A method declaration's declarator is a
+    `function_declarator` wrapping a `field_identifier` -- filtering on
+    `declarator.type == "field_identifier"` naturally excludes methods.
+
+    NOTE: `int a, b;` (at file scope, or as a field inside a class/struct)
+    puts more than one node under the `declarator` field of a single
+    declaration/field_declaration -- child_by_field_name (singular) only
+    returns the first one and silently drops the rest. Verified
+    empirically against the real installed tree-sitter-cpp grammar (same
+    lesson as Task 15's C extractor and Task 16's Java extractor);
+    children_by_field_name (plural) is used instead to capture all of
+    them, for both globals and fields.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def declarator_name(node: Any) -> Optional[str]:
+        if node.type == "identifier":
+            return node.text.decode("utf-8")
+        if node.type == "init_declarator":
+            inner = node.child_by_field_name("declarator")
+            return declarator_name(inner) if inner is not None else None
+        return None
+
+    for stmt in root_node.children:
+        if stmt.type == "declaration":
+            for declarator in stmt.children_by_field_name("declarator"):
+                name = declarator_name(declarator)
+                if name:
+                    globals_.append(name)
+                    global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                    global_nodes[name] = stmt
+        elif stmt.type in ("class_specifier", "struct_specifier"):
+            name_node = stmt.child_by_field_name("name")
+            class_name = name_node.text.decode("utf-8") if name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                if member.type != "field_declaration":
+                    continue
+                is_static = any(
+                    c.type == "storage_class_specifier" and c.text == b"static"
+                    for c in member.children
+                )
+                for declarator in member.children_by_field_name("declarator"):
+                    if declarator.type != "field_identifier":
+                        continue
+                    fname = declarator.text.decode("utf-8")
+                    fields.append((fname, class_name, is_static))
+                    field_info[fname] = {
+                        "class": class_name, "static": is_static,
+                        "body": member.text.decode("utf-8", "replace"),
+                    }
+                    field_nodes[f"{class_name}.{fname}"] = member
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["cpp"] = _extract_cpp_globals_and_fields
+
+
+def _extract_ruby_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Ruby globals/fields extraction.
+
+    Ruby's grammar distinguishes `$global`/`CONST`/`@@class_var`/
+    `@instance_var` via distinct node types (global_variable, constant,
+    class_variable, instance_variable), so -- unlike every other
+    language in this plan -- no heuristic modifier-inspection is needed;
+    classification is purely by field:left's node type.
+
+    Only descends into: program-root direct children (globals, from a
+    top-level `assignment` whose field:left is global_variable/constant),
+    a `class` node's field:body (body_statement) direct children
+    (class_variable assignment -> static field), and a `method` named
+    "initialize" that is itself a direct child of that same body_statement
+    (its own field:body's direct-child assignments with field:left of
+    type instance_variable -> instance field). Never recurses into any
+    other method body.
+
+    A `module Foo ... end` node has type "module", not "class" -- a
+    distinct node type in the real installed tree-sitter-ruby grammar
+    even though it exposes the same name/body fields -- so it is simply
+    not matched by the `stmt.type == "class"` check below; module-level
+    constants/class variables are out of scope for this extractor by
+    design. Verified empirically.
+
+    `attr_accessor`/`attr_reader`/`attr_writer` are ordinary method
+    calls (node type `call`), not assignments -- verified empirically --
+    so they are naturally excluded without any special-casing.
+
+    NOTE: Ruby's multi-assignment (`$a, $b = 1, 2` or, inside a class,
+    `@@a, @@b = 1, 2` / `@x, @y = 1, 2`) wraps the left side in a
+    `left_assignment_list` node instead of exposing a bare
+    global_variable/constant/class_variable/instance_variable directly
+    under field:left -- verified empirically against the real installed
+    tree-sitter-ruby grammar. Same lesson as the multi-declarator gaps
+    found in every other language in this plan (Go/C/Java/C++): iterate
+    `left_assignment_list`'s children too, or every name but the first
+    is silently dropped.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def left_targets(left_node: Any, target_types: Tuple[str, ...]) -> List[Any]:
+        if left_node.type in target_types:
+            return [left_node]
+        if left_node.type == "left_assignment_list":
+            return [c for c in left_node.children if c.type in target_types]
+        return []
+
+    for stmt in root_node.children:
+        if stmt.type == "assignment":
+            left = stmt.child_by_field_name("left")
+            if left is None:
+                continue
+            for target in left_targets(left, ("global_variable", "constant")):
+                name = target.text.decode("utf-8")
+                globals_.append(name)
+                global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                global_nodes[name] = stmt
+        elif stmt.type == "class":
+            name_node = stmt.child_by_field_name("name")
+            class_name = name_node.text.decode("utf-8") if name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                if member.type == "assignment":
+                    left = member.child_by_field_name("left")
+                    if left is None:
+                        continue
+                    for target in left_targets(left, ("class_variable",)):
+                        fname = target.text.decode("utf-8")
+                        fields.append((fname, class_name, True))
+                        field_info[fname] = {
+                            "class": class_name, "static": True,
+                            "body": member.text.decode("utf-8", "replace"),
+                        }
+                        field_nodes[f"{class_name}.{fname}"] = member
+                elif member.type == "method":
+                    method_name_node = member.child_by_field_name("name")
+                    if method_name_node is not None and method_name_node.text == b"initialize":
+                        method_body = member.child_by_field_name("body")
+                        if method_body is not None:
+                            for inner in method_body.children:
+                                if inner.type == "assignment":
+                                    left = inner.child_by_field_name("left")
+                                    if left is None:
+                                        continue
+                                    for target in left_targets(left, ("instance_variable",)):
+                                        fname = target.text.decode("utf-8")
+                                        fields.append((fname, class_name, False))
+                                        field_info[fname] = {
+                                            "class": class_name, "static": False,
+                                            "body": inner.text.decode("utf-8", "replace"),
+                                        }
+                                        field_nodes[f"{class_name}.{fname}"] = inner
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["ruby"] = _extract_ruby_globals_and_fields
+
+
+def _extract_php_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware PHP globals/fields extraction.
+
+    Top-level `$x = 5;` is `expression_statement > assignment_expression`
+    with field:left = variable_name -> global. `class Foo { ... }` is
+    class_declaration with field:body = declaration_list; each member is
+    a property_declaration containing an optional static_modifier child
+    and one or more property_element children (field:name =
+    variable_name) -> field.
+
+    Multi-property declarations (`public static $a = 1, $b = 2;`)
+    already work with plain iteration: verified empirically that a
+    single property_declaration node holds multiple property_element
+    children directly, unlike the multi-declarator gaps found in every
+    other C-family language in this plan (Go/Java/C++) -- no unwrapping
+    needed here.
+
+    Typed properties (`public int $x = 5;`, PHP 7.4+) add a
+    primitive_type/named_type child to property_declaration but keep the
+    same property_element shape -- verified empirically -- so no special
+    handling is required.
+
+    Namespaces have two forms, verified empirically against the real
+    installed tree-sitter-php grammar:
+      - Semicolon style (`namespace App; $x = 5;`) does NOT wrap
+        subsequent statements; they remain direct children of `program`,
+        so the plain top-level loop already sees them.
+      - Block style (`namespace App { $x = 5; }`) wraps its statements in
+        a compound_statement exposed via namespace_definition's
+        field:body. Without recursing into it, every global/class inside
+        a block-style namespace would be silently dropped -- the same
+        shape-changing-wrapper lesson as JS's export_statement. PHP
+        namespaces are extremely common in real-world code, so
+        namespace_definition nodes are unwrapped recursively (namespaces
+        can themselves be nested).
+
+    PHP 8+ constructor property promotion
+    (`public function __construct(public int $x) {}`) produces a
+    property_promotion_parameter node inside the constructor's
+    formal_parameters -- NOT a property_declaration under the class
+    body -- verified empirically, so it requires separate handling.
+    Promoted properties cannot carry a `static` modifier in real PHP
+    (verified: adding one produces a parse ERROR node), so they are
+    always recorded as instance (non-static) fields.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def handle_class(stmt: Any) -> None:
+        name_node = stmt.child_by_field_name("name")
+        class_name = name_node.text.decode("utf-8") if name_node else ""
+        body = stmt.child_by_field_name("body")
+        if body is None:
+            return
+        for member in body.children:
+            if member.type == "property_declaration":
+                is_static = any(c.type == "static_modifier" for c in member.children)
+                for elem in member.children:
+                    if elem.type == "property_element":
+                        elem_name_node = elem.child_by_field_name("name")
+                        if elem_name_node is not None:
+                            fname = elem_name_node.text.decode("utf-8")
+                            fields.append((fname, class_name, is_static))
+                            field_info[fname] = {
+                                "class": class_name, "static": is_static,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+                            field_nodes[f"{class_name}.{fname}"] = member
+            elif member.type == "method_declaration":
+                method_name_node = member.child_by_field_name("name")
+                if method_name_node is not None and method_name_node.text == b"__construct":
+                    params = member.child_by_field_name("parameters")
+                    if params is not None:
+                        for param in params.children:
+                            if param.type == "property_promotion_parameter":
+                                param_name_node = param.child_by_field_name("name")
+                                if param_name_node is not None:
+                                    fname = param_name_node.text.decode("utf-8")
+                                    fields.append((fname, class_name, False))
+                                    field_info[fname] = {
+                                        "class": class_name, "static": False,
+                                        "body": param.text.decode("utf-8", "replace"),
+                                    }
+                                    field_nodes[f"{class_name}.{fname}"] = param
+
+    def handle_stmts(stmts: Sequence[Any]) -> None:
+        for stmt in stmts:
+            if stmt.type == "expression_statement" and stmt.child_count > 0:
+                expr = stmt.children[0]
+                if expr.type == "assignment_expression":
+                    left = expr.child_by_field_name("left")
+                    if left is not None and left.type == "variable_name":
+                        name = left.text.decode("utf-8")
+                        globals_.append(name)
+                        global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                        global_nodes[name] = stmt
+            elif stmt.type == "class_declaration":
+                handle_class(stmt)
+            elif stmt.type == "namespace_definition":
+                ns_body = stmt.child_by_field_name("body")
+                if ns_body is not None:
+                    handle_stmts(ns_body.children)
+
+    handle_stmts(root_node.children)
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["php"] = _extract_php_globals_and_fields
+
+
+def _extract_kotlin_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Kotlin globals/fields extraction.
+
+    Top-level `val`/`var` is a property_declaration directly under
+    source_file, wrapping a variable_declaration (single name) or a
+    multi_variable_declaration (destructuring, e.g. `val (a, b) =
+    ...`) -- NEITHER exposes a named field for the identifier(s) in the
+    real installed tree-sitter-kotlin grammar, verified empirically, so
+    both are located purely by node type. `class Foo { ... }` is a
+    class_declaration whose `class_body` child is likewise not exposed
+    via a named field (only `name` is a named field on
+    class_declaration) -- verified empirically. A property_declaration
+    that is a direct child of class_body is an instance field; one
+    nested inside a companion_object's own class_body is Kotlin's
+    static-equivalent.
+
+    Multi-declarator/destructuring (`val (a, b) = Pair(1, 2)`) wraps
+    its names in multi_variable_declaration instead of a bare
+    variable_declaration -- verified empirically, same lesson as the
+    multi-declarator gaps found in every prior language in this plan
+    (Go/C/Java/C++/Ruby): every identifier inside it is extracted, not
+    just treated as absent.
+
+    Kotlin's primary-constructor property shorthand (`class Foo(val x:
+    Int)`) is an idiomatic and extremely common way to declare instance
+    fields (near-universal in `data class`), but it is structurally a
+    class_parameter inside primary_constructor's class_parameters list
+    -- NOT a property_declaration under class_body -- verified
+    empirically. class_parameter exposes no named fields either; its
+    optional `val`/`var` keyword child and its `identifier` name child
+    are both located by node type, taking only the direct-child
+    identifier so the nested one inside the parameter's type
+    annotation (e.g. `Int` in `val x: Int`) is never matched. A
+    class_parameter with neither a `val` nor `var` child is a plain
+    (non-property) constructor parameter and is excluded. These are
+    always instance fields: Kotlin has no syntax for a `val`/`var`
+    primary-constructor parameter inside a companion object (companion
+    objects are declared with `object`, which has no primary
+    constructor), so no static variant of this exists.
+
+    Never recurses into a nested class_declaration found inside a
+    class_body (fields two classes deep are out of scope, consistent
+    with every other language in this plan) or into any function/method
+    body.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def property_names(prop_node: Any) -> List[str]:
+        names: List[str] = []
+        for child in prop_node.children:
+            if child.type == "variable_declaration":
+                for inner in child.children:
+                    if inner.type == "identifier":
+                        names.append(inner.text.decode("utf-8"))
+                        break
+            elif child.type == "multi_variable_declaration":
+                for decl in child.children:
+                    if decl.type == "variable_declaration":
+                        for inner in decl.children:
+                            if inner.type == "identifier":
+                                names.append(inner.text.decode("utf-8"))
+                                break
+        return names
+
+    def record_constructor_param_fields(class_node: Any, class_name: str) -> None:
+        primary_ctor = next((c for c in class_node.children if c.type == "primary_constructor"), None)
+        if primary_ctor is None:
+            return
+        params = next((c for c in primary_ctor.children if c.type == "class_parameters"), None)
+        if params is None:
+            return
+        for param in params.children:
+            if param.type != "class_parameter":
+                continue
+            if not any(c.type in ("val", "var") for c in param.children):
+                continue
+            name_node = next((c for c in param.children if c.type == "identifier"), None)
+            if name_node is None:
+                continue
+            fname = name_node.text.decode("utf-8")
+            fields.append((fname, class_name, False))
+            field_info[fname] = {
+                "class": class_name, "static": False,
+                "body": param.text.decode("utf-8", "replace"),
+            }
+            field_nodes[f"{class_name}.{fname}"] = param
+
+    for stmt in root_node.children:
+        if stmt.type == "property_declaration":
+            for name in property_names(stmt):
+                globals_.append(name)
+                global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                global_nodes[name] = stmt
+        elif stmt.type == "class_declaration":
+            name_node = stmt.child_by_field_name("name")
+            class_name = name_node.text.decode("utf-8") if name_node else ""
+            record_constructor_param_fields(stmt, class_name)
+            class_body = next((c for c in stmt.children if c.type == "class_body"), None)
+            if class_body is None:
+                continue
+            for member in class_body.children:
+                if member.type == "property_declaration":
+                    for fname in property_names(member):
+                        fields.append((fname, class_name, False))
+                        field_info[fname] = {
+                            "class": class_name, "static": False,
+                            "body": member.text.decode("utf-8", "replace"),
+                        }
+                        field_nodes[f"{class_name}.{fname}"] = member
+                elif member.type == "companion_object":
+                    companion_body = next((c for c in member.children if c.type == "class_body"), None)
+                    if companion_body is None:
+                        continue
+                    for inner_member in companion_body.children:
+                        if inner_member.type == "property_declaration":
+                            for fname in property_names(inner_member):
+                                fields.append((fname, class_name, True))
+                                field_info[fname] = {
+                                    "class": class_name, "static": True,
+                                    "body": inner_member.text.decode("utf-8", "replace"),
+                                }
+                                field_nodes[f"{class_name}.{fname}"] = inner_member
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["kotlin"] = _extract_kotlin_globals_and_fields
+
+
+def _extract_swift_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Swift globals/fields extraction.
+
+    Top-level `let`/`var` is a property_declaration directly under
+    source_file. `class Foo { ... }`, `struct Foo { ... }`, `enum Foo
+    { ... }`, and `extension Foo { ... }` are ALL parsed as the same
+    class_declaration node type (distinguished only by a
+    `declaration_kind` field whose text is "class"/"struct"/"enum"/
+    "extension") -- verified empirically against the real installed
+    tree-sitter-swift grammar. Members are fetched via
+    `child_by_field_name("body")`, which works uniformly even though
+    the body node's *type* differs (class_body for class/struct/
+    extension, enum_class_body for enum), because it's identified by
+    field name, not type.
+
+    A property_declaration can bind MULTIPLE names in one statement
+    (`let a = 1, b = 2`), each its own `field:name` -> pattern ->
+    field:bound_identifier chain -- verified empirically. This is the
+    Swift analog of the multi-declarator gap found in every prior
+    language in this plan: `children_by_field_name("name")` is used
+    (not `child_by_field_name`, which would silently return only the
+    first binding) so every name in the statement is extracted.
+
+    Tuple destructuring (`let (x, y) = (1, 2)`) wraps names in a
+    pattern whose nested per-name patterns expose no bound_identifier
+    field -- verified empirically -- so it is safely skipped (no name
+    extracted), consistent with other out-of-scope destructuring forms
+    in this plan (e.g. Kotlin's multi_variable_declaration, which IS
+    in scope there because it exposes a different structural shape;
+    Swift's tuple pattern here does not surface identifiers via any
+    field, only by node type, so it is left alone).
+
+    Swift has no primary-constructor property shorthand analogous to
+    Kotlin's `class Foo(val x: Int)`: properties are always declared
+    inside the body via property_declaration regardless of how `init`
+    initializes them -- verified empirically (a class with only an
+    `init` and no property_declaration produces zero fields, and `init`
+    parameters/assignments are never treated as field declarations).
+
+    `extension Foo { ... }` is in scope as a side effect of sharing the
+    class_declaration node type with `class`/`struct`/`enum`: its
+    `field:name` is a user_type node wrapping Foo's type_identifier,
+    and `.text` on that node still resolves to the plain name "Foo" --
+    verified empirically -- so properties declared in an extension are
+    picked up and correctly attributed to class "Foo" rather than
+    silently dropped or misattributed. This is not explicitly
+    requested by the task brief but is a safe, useful side effect
+    rather than a misbehavior: it does not crash and does not merge
+    unrelated types.
+
+    Static iff the member's `modifiers` child has a `property_modifier`
+    child with text "static" (Swift's `class var` for overridable
+    static-like properties uses modifier text "class", not "static",
+    and is therefore treated as instance per the task brief's
+    definition).
+
+    Never recurses into a nested class_declaration found inside a
+    class/enum body (fields two types deep are out of scope, consistent
+    with every other language in this plan) or into any function/method
+    body.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def property_names(prop_node: Any) -> List[str]:
+        names: List[str] = []
+        for pattern in prop_node.children_by_field_name("name"):
+            bound = pattern.child_by_field_name("bound_identifier")
+            if bound is not None:
+                names.append(bound.text.decode("utf-8"))
+        return names
+
+    for stmt in root_node.children:
+        if stmt.type == "property_declaration":
+            for name in property_names(stmt):
+                globals_.append(name)
+                global_bodies[name] = stmt.text.decode("utf-8", "replace")
+                global_nodes[name] = stmt
+        elif stmt.type == "class_declaration":
+            name_node = stmt.child_by_field_name("name")
+            class_name = name_node.text.decode("utf-8") if name_node else ""
+            body = stmt.child_by_field_name("body")
+            if body is None:
+                continue
+            for member in body.children:
+                if member.type != "property_declaration":
+                    continue
+                is_static = False
+                for child in member.children:
+                    if child.type == "modifiers":
+                        is_static = any(
+                            m.type == "property_modifier" and m.text == b"static"
+                            for m in child.children
+                        )
+                for fname in property_names(member):
+                    fields.append((fname, class_name, is_static))
+                    field_info[fname] = {
+                        "class": class_name, "static": is_static,
+                        "body": member.text.decode("utf-8", "replace"),
+                    }
+                    field_nodes[f"{class_name}.{fname}"] = member
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["swift"] = _extract_swift_globals_and_fields
+
+
+def _extract_scala_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Scala globals/fields extraction.
+
+    Deliberate simplification (do not "fix" -- this is an intentional,
+    reasoned non-goal, not an oversight): Scala's closest analog to
+    "static" is a companion `object` sharing a class's name, but
+    matching an object_definition to its companion class_definition by
+    name -- and only then treating its members as that class's static
+    fields -- is real extra complexity for a niche pattern. Instead, a
+    top-level object_definition (direct child of compilation_unit, or
+    of a package block -- see below) is treated as a globals namespace,
+    not a fields-owner: its members are extracted as plain
+    module-level globals, no `:class` edge and no `:static` concept
+    invoked at all. Only genuine class_definition members become
+    instance fields, always `:static=False` (Scala classes have no
+    static-member concept). A nested object_definition found inside a
+    class's template_body is out of scope (it simply doesn't match the
+    val_definition/var_definition type filter used there, so it is
+    skipped without special-casing).
+
+    `class Foo { val instanceField = 2 }` is class_definition with
+    field:body = template_body, containing val_definition/
+    var_definition members whose field:pattern normally holds a plain
+    identifier -- verified empirically against the real installed
+    tree-sitter-scala grammar.
+
+    Multi-binding in one val/var statement is real in Scala and comes
+    in TWO distinct structural forms, both verified empirically (same
+    multi-declarator lesson as nearly every other language in this
+    plan):
+      - Tuple destructuring (`val (a, b) = (1, 2)`) puts a
+        tuple_pattern in field:pattern, whose children are `(`, `,`,
+        `)`, and nested identifier/tuple_pattern nodes (tuple patterns
+        can nest, e.g. `val (a, (b, c)) = ...`).
+      - Comma-separated multi-name binding (`val a, b = 5`, binding
+        both names to the same value) puts an "identifiers" node --
+        NOT a tuple_pattern -- in field:pattern, whose children are
+        `,`-separated identifier nodes.
+    Both shapes are handled by a single recursive pattern_names()
+    helper so no destructured/multi-bound name is silently dropped.
+
+    Scala's primary-constructor property shorthand (`class Foo(val x:
+    Int, var y: String)`) is idiomatic and extremely common (case
+    classes in particular), but it is structurally a class_parameter
+    inside class_definition's own field:class_parameters list -- NOT a
+    val_definition/var_definition under template_body -- verified
+    empirically, the same kind of justified, narrowly-scoped extension
+    Kotlin's task added for its analogous primary-constructor shorthand.
+    Unlike Kotlin's grammar, tree-sitter-scala DOES expose a `name`
+    field directly on class_parameter, so no by-type child search is
+    needed for the identifier; only the optional `val`/`var` keyword
+    child is found by type (it carries no field name). A
+    class_parameter with neither a `val` nor `var` child is a plain
+    (non-property) constructor parameter and is excluded -- this
+    deliberately also excludes case class parameters that lack an
+    explicit `val`/`var` keyword, even though Scala implicitly treats
+    unmarked case class parameters as public vals; recognizing that
+    implicit rule would require keying off the class_definition's
+    `case` child, a separate semantic inference beyond the structural,
+    by-keyword scope of this extension, so it is left out.
+
+    Scala's `package foo { ... }` block form wraps its contents in
+    package_clause's field:body (a template_body) -- verified
+    empirically -- the same shape-changing-wrapper hazard as JS's
+    export_statement and PHP's block-style namespace_definition
+    elsewhere in this plan. Without unwrapping it, every global/class
+    inside a braced package block would be silently dropped. The bare
+    `package foo` form (no braces) does NOT wrap subsequent statements
+    -- they remain direct siblings under compilation_unit, verified
+    empirically -- so no special handling is needed for that form.
+    package_clause blocks can nest, so they are unwrapped recursively.
+
+    Never recurses into a class_definition's or object_definition's
+    template_body looking for further nested class/object definitions,
+    nor into any function/method body.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def pattern_names(pattern: Any) -> List[str]:
+        if pattern is None:
+            return []
+        if pattern.type == "identifier":
+            return [pattern.text.decode("utf-8")]
+        if pattern.type in ("tuple_pattern", "identifiers"):
+            names: List[str] = []
+            for child in pattern.children:
+                names.extend(pattern_names(child))
+            return names
+        return []
+
+    def record_constructor_param_fields(class_node: Any, class_name: str) -> None:
+        params = class_node.child_by_field_name("class_parameters")
+        if params is None:
+            return
+        for param in params.children:
+            if param.type != "class_parameter":
+                continue
+            if not any(c.type in ("val", "var") for c in param.children):
+                continue
+            name_node = param.child_by_field_name("name")
+            if name_node is None:
+                continue
+            fname = name_node.text.decode("utf-8")
+            fields.append((fname, class_name, False))
+            field_info[fname] = {
+                "class": class_name, "static": False,
+                "body": param.text.decode("utf-8", "replace"),
+            }
+            field_nodes[f"{class_name}.{fname}"] = param
+
+    def handle_stmts(stmts: Sequence[Any]) -> None:
+        for stmt in stmts:
+            if stmt.type == "object_definition":
+                body = stmt.child_by_field_name("body")
+                if body is None:
+                    continue
+                for member in body.children:
+                    if member.type in ("val_definition", "var_definition"):
+                        for name in pattern_names(member.child_by_field_name("pattern")):
+                            globals_.append(name)
+                            global_bodies[name] = member.text.decode("utf-8", "replace")
+                            global_nodes[name] = member
+            elif stmt.type == "class_definition":
+                name_node = stmt.child_by_field_name("name")
+                class_name = name_node.text.decode("utf-8") if name_node else ""
+                record_constructor_param_fields(stmt, class_name)
+                body = stmt.child_by_field_name("body")
+                if body is None:
+                    continue
+                for member in body.children:
+                    if member.type in ("val_definition", "var_definition"):
+                        for name in pattern_names(member.child_by_field_name("pattern")):
+                            fields.append((name, class_name, False))
+                            field_info[name] = {
+                                "class": class_name, "static": False,
+                                "body": member.text.decode("utf-8", "replace"),
+                            }
+                            field_nodes[f"{class_name}.{name}"] = member
+            elif stmt.type == "package_clause":
+                pkg_body = stmt.child_by_field_name("body")
+                if pkg_body is not None:
+                    handle_stmts(pkg_body.children)
+
+    handle_stmts(root_node.children)
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["scala"] = _extract_scala_globals_and_fields
+
+
+def _extract_haskell_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Scope-aware Haskell top-level bindings/record-fields extraction.
+
+    Haskell is a genuinely different paradigm from every other language in
+    this plan -- no OOP, no static/instance concept, so extracted fields
+    are always `:static=False`.
+
+    A zero-argument top-level `bind` node (field:name = a `variable` node)
+    is the "global value" signal, cleanly distinguished by the grammar
+    itself from a parameterized `function` node (already targeted by
+    `_LANG_NODE_TYPES["haskell"]["functions"]`). A destructuring bind such
+    as `(a, b) = (1, 2)` puts a `tuple` node in field:pattern instead --
+    NOT field:name -- verified empirically; child_by_field_name("name")
+    correctly returns None for it, so it is silently excluded rather than
+    partially/incorrectly extracted. This is a deliberate simplification,
+    not a bug: recognizing destructured tuple binds as multiple globals
+    would require pattern-name recursion for comparatively rare top-level
+    syntax.
+
+    `module Foo where` produces a sibling `header` field on the root
+    node -- verified empirically -- it does NOT wrap the declarations the
+    way JS's export_statement or PHP's block-style namespace_definition
+    do elsewhere in this plan. field:declarations still holds top-level
+    declarations directly regardless of whether a module header is
+    present, so no unwrapping is needed.
+
+    `where`-clause local bindings (`f x = y where y = 1`) live nested
+    inside the enclosing function node's body (as a `local_binds` node),
+    NOT as direct children of field:declarations -- verified empirically
+    -- so they are correctly excluded without any special-casing, the
+    same as this extractor never recursing into function bodies elsewhere.
+
+    `data Foo = Foo { fieldA :: Int }` is `data_type` (field:name = the
+    type name) -> field:constructors -> `data_constructors` -> each
+    `data_constructor` (field:constructor) -> if that constructor is
+    specifically a `record` node -> field:fields -> `fields` -> each
+    `field` child (field:name) -> `field_name` -> `variable` (the actual
+    field name text). A `data` type with MULTIPLE constructors mixing
+    record and non-record shapes (e.g. `data Shape = Circle { radius ::
+    Double } | Rectangle { width :: Double } | Point`) works correctly
+    because each `data_constructor` within `data_constructors` gets its
+    own independent record-shape check in the loop -- verified
+    empirically; a non-record constructor (a `prefix` node, e.g. `Point`)
+    is simply skipped, not mistaken for a record.
+
+    `newtype Foo = Foo { unFoo :: Int }` -- a newtype's single record
+    field is a very common real Haskell pattern -- is a STRUCTURALLY
+    DIFFERENT top-level node from data_type: a `newtype` node (not
+    `data_type`) whose field:constructor holds a `newtype_constructor`
+    directly (no intermediate `data_constructor`/`data_constructors`
+    wrapper at all), and whose record child is reached via the
+    confusingly-named field:field (NOT field:record or field:fields) --
+    verified empirically. A braces-less newtype (`newtype Foo = Foo
+    Int`) puts a plain `field` node (not `record`) at that same
+    field:field, so the `.type != "record"` check correctly excludes it
+    without misreading its wrapped type name as a field.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def add_field_from_wrapper(field_wrapper: Any, type_name: str) -> None:
+        if field_wrapper.type != "field":
+            return
+        field_name_node = field_wrapper.child_by_field_name("name")
+        if field_name_node is None:
+            return
+        variable_node = next(
+            (c for c in field_name_node.children if c.type == "variable"), None
+        )
+        if variable_node is not None:
+            fname = variable_node.text.decode("utf-8")
+            fields.append((fname, type_name, False))
+            field_info[fname] = {
+                "class": type_name, "static": False,
+                "body": field_wrapper.text.decode("utf-8", "replace"),
+            }
+            field_nodes[f"{type_name}.{fname}"] = field_wrapper
+
+    def record_fields(record_node: Any, type_name: str) -> None:
+        # A record with multiple comma-separated fields (the shape
+        # data_type constructors use) wraps them in a "fields" node at
+        # field:fields. A newtype's record -- restricted by the
+        # language to exactly one field -- instead exposes that single
+        # field node directly at field:field (no wrapper) -- verified
+        # empirically. Both shapes are handled here.
+        fields_node = record_node.child_by_field_name("fields")
+        if fields_node is not None:
+            for field_wrapper in fields_node.children:
+                add_field_from_wrapper(field_wrapper, type_name)
+            return
+        single_field = record_node.child_by_field_name("field")
+        if single_field is not None:
+            add_field_from_wrapper(single_field, type_name)
+
+    declarations = root_node.child_by_field_name("declarations")
+    if declarations is None:
+        return {
+            "globals": [], "global_bodies": {}, "fields": [], "field_info": {},
+            "global_nodes": {}, "field_nodes": {},
+        }
+
+    for decl in declarations.children:
+        if decl.type == "bind":
+            name_node = decl.child_by_field_name("name")
+            if name_node is not None:
+                name = name_node.text.decode("utf-8")
+                globals_.append(name)
+                global_bodies[name] = decl.text.decode("utf-8", "replace")
+                global_nodes[name] = decl
+        elif decl.type == "data_type":
+            type_name_node = decl.child_by_field_name("name")
+            type_name = type_name_node.text.decode("utf-8") if type_name_node else ""
+            constructors = decl.child_by_field_name("constructors")
+            if constructors is None:
+                continue
+            for ctor_wrapper in constructors.children:
+                if ctor_wrapper.type != "data_constructor":
+                    continue
+                ctor = ctor_wrapper.child_by_field_name("constructor")
+                if ctor is None or ctor.type != "record":
+                    continue
+                record_fields(ctor, type_name)
+        elif decl.type == "newtype":
+            type_name_node = decl.child_by_field_name("name")
+            type_name = type_name_node.text.decode("utf-8") if type_name_node else ""
+            newtype_ctor = decl.child_by_field_name("constructor")
+            if newtype_ctor is None:
+                continue
+            record = newtype_ctor.child_by_field_name("field")
+            if record is None or record.type != "record":
+                continue
+            record_fields(record, type_name)
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies,
+        "fields": fields, "field_info": field_info,
+        "global_nodes": global_nodes, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["haskell"] = _extract_haskell_globals_and_fields
+
+
+def _extract_lua_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Extract true top-level global variable assignments in Lua.
+
+    `_LANG_NODE_TYPES["lua"]["classes"]` is already `set()` -- Lua has no
+    class node type at all (table-based OOP is a library convention, not a
+    grammar construct) -- so fields are always empty here, consistent with
+    that existing precedent. Table-field writes (`Foo.staticField = 1`) are
+    deliberately excluded: there is no class entity for such a field to
+    attach a `:class` edge to.
+
+    A true global is an `assignment_statement` that is a *direct* child of
+    `chunk` whose `variable_list` holds one or more plain `identifier`
+    nodes (not `dot_index_expression`, the table-field-write shape) -- and
+    which is not wrapped in a `variable_declaration` (the wrapper node
+    `local` produces). Because this loop only matches `assignment_statement`
+    nodes directly under `chunk`, a `local`-wrapped assignment is
+    automatically excluded: its actual `assignment_statement` is one level
+    deeper, inside the `variable_declaration` wrapper -- verified
+    empirically.
+
+    `local function foo() ... end` and top-level `function foo() ... end`
+    both parse as `function_declaration` nodes, never `assignment_statement`
+    -- verified empirically -- so they cannot be misidentified as global
+    variable assignments here; functions are handled separately by
+    `_LANG_NODE_TYPES["lua"]["functions"]`.
+
+    Lua supports multiple assignment in one statement (`a, b = 1, 2`): the
+    `variable_list` node exposes each name via a repeated `field:name` --
+    verified empirically -- so `children_by_field_name` (plural) is used
+    instead of `child_by_field_name`, which would silently return only the
+    first name. This is the Lua analog of the multi-assignment gap found in
+    every prior language in this plan (Ruby, Kotlin, Swift, Scala). A
+    variable_list can also mix plain identifiers with dot_index_expressions
+    in the same statement (`a, Foo.x = 1, 2`) -- verified empirically --
+    each name node is checked individually so only the plain identifiers
+    are captured.
+    """
+    globals_: List[str] = []
+    global_bodies: Dict[str, str] = {}
+    global_nodes: Dict[str, Any] = {}
+
+    for stmt in root_node.children:
+        if stmt.type != "assignment_statement":
+            continue
+        var_list = next((c for c in stmt.children if c.type == "variable_list"), None)
+        if var_list is None:
+            continue
+        stmt_text = stmt.text.decode("utf-8", "replace")
+        for name_node in var_list.children_by_field_name("name"):
+            if name_node.type == "identifier":
+                name = name_node.text.decode("utf-8")
+                globals_.append(name)
+                global_bodies[name] = stmt_text
+                global_nodes[name] = stmt
+
+    return {
+        "globals": globals_, "global_bodies": global_bodies, "fields": [], "field_info": {},
+        "global_nodes": global_nodes, "field_nodes": {},
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["lua"] = _extract_lua_globals_and_fields
+
+
+def _extract_elixir_globals_and_fields(root_node: Any) -> Dict[str, Any]:
+    """Extract Elixir module attributes as static fields of their module.
+
+    Elixir has no top-level mutable globals outside module attributes --
+    verified empirically there is no syntactic construct (destructuring or
+    otherwise) that produces one -- so `"globals"` is always empty here.
+
+    A module is a `call` node whose `field:target` is an `identifier` with
+    text `"defmodule"`, whose module-name argument is an `alias` node inside
+    an `arguments` child, and which has a `do_block` child holding the
+    module's body. A module attribute (`@module_attr 5`) is a
+    `unary_operator` with `field:operator` text `"@"` and `field:operand` a
+    `call` node whose `field:target` is the attribute's name; it is treated
+    as a `:static=True` field of the enclosing module -- the closest Elixir
+    analog to compile-time class-scoped state.
+
+    Verified empirically: unlike `field:target`/`field:operator`/
+    `field:operand` (which do resolve via `child_by_field_name`), the
+    `arguments` child of a `defmodule` call is *not* exposed under a field
+    name here -- `child_by_field_name("arguments")` returns None even though
+    an `arguments` node is present as a plain (unnamed-field) child. It must
+    be located by scanning `node.children` for `type == "arguments"`
+    instead, matching the existing precedent in `_elixir_module_name` above.
+
+    Nested modules (`defmodule Foo do defmodule Bar do ... end end`) are
+    handled correctly by this recursive walk: each `defmodule` call's own
+    `do_block` is scanned only for its *direct* children when processing
+    that module, and a nested `defmodule` call is itself just another node
+    the walk recurses into separately, so its attributes are attributed to
+    its own (inner) module name -- verified empirically. A dotted single
+    declaration (`defmodule Foo.Bar do ... end`) is one `call` node whose
+    `alias` node's text is already the full dotted name "Foo.Bar", not two
+    levels of AST nesting -- verified empirically.
+
+    A bare attribute reference with no value (`@attr`, reading a
+    previously-defined attribute rather than defining one) parses with
+    `operand.type == "identifier"`, not `"call"` -- verified empirically --
+    so it is naturally excluded by the `operand.type == "call"` check below
+    and never mistaken for a field definition.
+
+    `@moduledoc`/`@doc`/`@spec`/`@type` (Elixir's built-in documentation/
+    typespec attributes) parse identically to any other module attribute --
+    verified empirically, same `unary_operator` -> `call` shape -- and are
+    deliberately *not* excluded as noise here: no other language task in
+    this plan special-cases built-in annotations/decorators, and inventing
+    a bespoke exclusion list was not requested by this task's spec.
+    """
+    fields: List[Tuple[str, str, bool]] = []
+    field_info: Dict[str, Dict[str, Any]] = {}
+    field_nodes: Dict[str, Any] = {}
+
+    def walk(node: Any) -> None:
+        if node.type == "call":
+            target = node.child_by_field_name("target")
+            if target is not None and target.type == "identifier" and target.text == b"defmodule":
+                arguments = next((c for c in node.children if c.type == "arguments"), None)
+                module_name = ""
+                if arguments is not None:
+                    alias_node = next((c for c in arguments.children if c.type == "alias"), None)
+                    if alias_node is not None:
+                        module_name = alias_node.text.decode("utf-8")
+                do_block = next((c for c in node.children if c.type == "do_block"), None)
+                if do_block is not None:
+                    for member in do_block.children:
+                        if member.type == "unary_operator":
+                            op = member.child_by_field_name("operator")
+                            operand = member.child_by_field_name("operand")
+                            if op is not None and op.text == b"@" and operand is not None and operand.type == "call":
+                                attr_target = operand.child_by_field_name("target")
+                                if attr_target is not None:
+                                    fname = attr_target.text.decode("utf-8")
+                                    fields.append((fname, module_name, True))
+                                    field_info[fname] = {
+                                        "class": module_name, "static": True,
+                                        "body": member.text.decode("utf-8", "replace"),
+                                    }
+                                    field_nodes[f"{module_name}.{fname}"] = member
+        for child in node.children:
+            walk(child)
+
+    walk(root_node)
+    return {
+        "globals": [], "global_bodies": {}, "fields": fields, "field_info": field_info,
+        "global_nodes": {}, "field_nodes": field_nodes,
+    }
+
+
+_GLOBAL_FIELD_EXTRACTORS["elixir"] = _extract_elixir_globals_and_fields
+
+
 def _extract_from_source(
     source: bytes, parser: Any, file_path: str
-) -> Dict[str, List[str]]:
-    """Parse source bytes and extract functions, classes, imports, calls."""
-    results: Dict[str, List[str]] = {
-        "functions": [], "classes": [], "imports": [], "calls": []
+) -> Dict[str, Any]:
+    """Parse source bytes and extract functions, classes, imports, calls,
+    module-level globals, and class fields — the plain-data structural summary
+    of a file.
+
+    This dict crosses the ProcessPoolExecutor boundary (see #116) as part of
+    _extract_commit's return value, so it deliberately carries ONLY the
+    lightweight name/structure lists the downstream pipeline actually consumes.
+    It does NOT carry entity body text: the rename matcher
+    (_match_renamed_entities) operates on live, re-parsed tree_sitter nodes
+    collected inside the worker process (_collect_entity_nodes /
+    _extract_globals_and_fields' *_nodes keys, via _extract_commit), never on
+    decoded body text — so shipping full function/class/global bodies and
+    per-field metadata across the process boundary would be pure serialization
+    cost for no consumer.
+    """
+    results: Dict[str, Any] = {
+        "functions": [], "classes": [], "imports": [], "calls": [],
+        "globals": [], "fields": [],
     }
     try:
         tree = parser.parse(source)
         lang_name = _EXT_TO_LANG.get(Path(file_path).suffix.lower(), "")
         _walk_ast(tree.root_node, results, lang_name)
+        gf = _extract_globals_and_fields(tree.root_node, "typescript" if lang_name == "tsx" else lang_name)
+        results["globals"] = gf["globals"]
+        results["fields"] = gf["fields"]
     except Exception:
         pass  # best-effort; parse failures are non-fatal
     return results
+
+
+def _match_candidate_pair(
+    old_node: Any,
+    new_node: Any,
+    tracked_names: Dict[str, Optional[str]],
+    tracked_reserved: Optional[Dict[str, int]] = None,
+    exclude_names: Tuple[str, ...] = (),
+    exclude_reserved: Tuple[str, ...] = (),
+) -> Optional[Dict[str, str]]:
+    """Lockstep-walk two tree-sitter nodes, allowing local (untracked)
+    identifiers to differ under a one-to-one bijective mapping.
+
+    tracked_names maps every entity name known in this commit's context to
+    either None (must appear unchanged) or a confirmed new name (must appear
+    renamed to exactly that). Any identifier NOT a key in tracked_names is
+    treated as local/unresolved and is free to differ, as long as the
+    mapping stays consistent (same old token always maps to the same new
+    token) and injective (no two distinct old tokens collapse onto one new
+    token) for THIS candidate pair only — the mapping is never reused across
+    other pairs or persisted as an entity.
+
+    Returns the discovered bijection dict on a full match (empty dict if no
+    local identifiers were involved — plain exact match is the case where
+    the bijection happens to be the identity mapping), or None if the nodes
+    don't match structurally or a tracked/bijection constraint is violated.
+
+    Internally, `mapping`/`local_reverse` record EVERY local identifier
+    correspondence seen (including identity ones, e.g. an untouched
+    parameter name) so consistency and injectivity can be enforced across
+    the whole pair. Injectivity against *tracked* entities is enforced
+    separately via `tracked_reserved`, a multiset {new-side-token: count}
+    covering every tracked entity's new-side text (its confirmed rename
+    target, or its own unchanged name when tracked_names[name] is None) —
+    otherwise a local/untracked identifier could silently claim the exact
+    new text already reserved for a different, tracked entity, which is a
+    real injectivity violation (two distinct old tokens collapsing onto one
+    new token) that the tracked-name equality check alone doesn't catch
+    since it lives in a disjoint namespace from `mapping`.
+
+    Performance (see the O(n^3) matcher fix): tracked_names/tracked_reserved
+    are built ONCE per matching round by _match_renamed_entities and passed
+    in read-only, rather than reconstructed per candidate pair. The pair's
+    own two names are excluded cheaply via exclude_names (skip the tracked
+    equality constraint — they are exactly what's under test) and
+    exclude_reserved (their reserved new-side tokens, decremented from the
+    multiset so the pair may legitimately map onto them). Both are tiny
+    (<=2 entries), so exclusion is O(1) per identifier instead of an
+    O(all_names) dict rebuild per pair. When tracked_reserved is None it is
+    derived from tracked_names (the standalone/test call path); production
+    callers pass it precomputed.
+    """
+    if tracked_reserved is None:
+        tracked_reserved = {}
+        for name, target in tracked_names.items():
+            tok = target if target is not None else name
+            tracked_reserved[tok] = tracked_reserved.get(tok, 0) + 1
+
+    mapping: Dict[str, str] = {}
+    local_reverse: Dict[str, str] = {}
+
+    def walk(a: Any, b: Any) -> bool:
+        if a.type != b.type:
+            return False
+        if a.child_count == 0 and b.child_count == 0:
+            a_text = a.text.decode("utf-8", "replace")
+            b_text = b.text.decode("utf-8", "replace")
+            if a.type == "identifier" or a.type.endswith("_identifier"):
+                if a_text in tracked_names and a_text not in exclude_names:
+                    expected = tracked_names[a_text]
+                    return b_text == (expected if expected is not None else a_text)
+                if a_text in mapping:
+                    return mapping[a_text] == b_text
+                if b_text in local_reverse:
+                    return False
+                # Injectivity vs tracked entities: b_text may not claim a
+                # new-side token already reserved by a tracked name, EXCEPT
+                # the (<=2) reserved tokens belonging to this pair's own
+                # excluded names.
+                reserved = tracked_reserved.get(b_text, 0) - exclude_reserved.count(b_text)
+                if reserved > 0:
+                    return False
+                mapping[a_text] = b_text
+                local_reverse[b_text] = a_text
+                return True
+            return a_text == b_text
+        if a.child_count != b.child_count:
+            return False
+        return all(walk(ac, bc) for ac, bc in zip(a.children, b.children))
+
+    return {k: v for k, v in mapping.items() if k != v} if walk(old_node, new_node) else None
+
+
+_MAX_MATCH_ROUNDS = 10
+_MIN_MATCH_BODY_LEN = 20  # normalized chars; avoids matching trivial boilerplate stubs
+# Above this total pool size (removed + added entries across all categories)
+# the matcher skips a commit entirely, mirroring git's own `-M` rename-limit
+# degradation: a missed rename is the accepted fallback, never an unbounded
+# (~cubic) stall on a 20k+-file vendored-dependency commit. Overridable via
+# MINIGRAF_MATCH_MAX_POOL, following the env-var pattern used elsewhere here.
+_MAX_MATCH_POOL_SIZE = int(os.environ.get("MINIGRAF_MATCH_MAX_POOL", "3000"))
+
+
+def _normalize_body_for_matching(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _match_body_name(category: str, name: str) -> str:
+    """Map an entity's pool key to the bare identifier that actually appears in
+    its body text, for the matcher's internal name bookkeeping.
+
+    Fields are pooled under QUALIFIED keys ("Class.leaf", per Task 11) so that
+    same-named fields in different classes get distinct, collision-free
+    :type/field idents downstream — that qualification MUST stay on the pool
+    keys and on _match_renamed_entities' returned pairs (both the ident
+    construction in Task 11/27 and renamed_pairs depend on it). But a field's
+    body text only ever contains its BARE leaf identifier: the declaration
+    `Config = 1` contains the token `Config`, never `A.Config`.
+
+    _match_candidate_pair matches body-text tokens, so _match_renamed_entities'
+    tracked-name set, confirmed-rename map, and per-pair self-exclusion must all
+    key on that bare leaf, not the qualified pool key. Otherwise a field's own
+    leaf token is never excluded from its own candidate test and can be captured
+    by an UNRELATED already-confirmed rename that happens to share the bare name
+    (e.g. a function `Config`->`ConfigFn` confirmed in an earlier round), which
+    forces the field's body token to a specific new spelling and produces a
+    WRONG confirmed match. Non-field categories are already unqualified (pool
+    key == body identifier), so they pass through unchanged.
+    """
+    if category == "field":
+        return name.rsplit(".", 1)[-1]
+    return name
+
+
+def _match_renamed_entities(
+    removed: Dict[str, List[Tuple[str, Any]]],
+    added: Dict[str, List[Tuple[str, Any]]],
+    unchanged_names: Optional[Set[str]] = None,
+) -> List[Tuple[str, str, Any, str, Any]]:
+    """Round-based rename matching across entity categories, scoped to a
+    single commit's touched files (callers build removed/added from just
+    that commit — see _extract_commit's use in Task 9).
+
+    A rename confirmed in one category (e.g. a function) becomes available
+    as a "tracked, confirmed-renamed" name for other not-yet-matched pairs
+    (in the same or a different category) evaluated in a later round — this
+    resolves cascading/mutual renames within one commit regardless of
+    dependency order. Capped at _MAX_MATCH_ROUNDS as a defensive bound.
+
+    unchanged_names is the set of BARE body-text identifiers (see
+    _match_body_name) that are present, with the SAME name, on BOTH the old
+    and new side of a touched file this commit — i.e. tracked entities that
+    survived unrenamed. The design requires a reference to such an entity to
+    "match exactly" rather than be treated as a free local eligible for
+    bijective substitution. These names never appear in the removed/added
+    pools (an unchanged same-path entity is excluded from both by the "M"
+    diff), so without seeding them here the matcher would treat a reference
+    to a surviving helper as a free local and could confirm a FALSE rename
+    between two entities that merely call two different, still-present
+    helpers. They are seeded into tracked_names with target None (must appear
+    identically); a name that is ALSO confirmed renamed this round takes the
+    confirmed target instead (confirmed wins, so a genuine rename still
+    resolves). The pair under test always excludes its own name from the
+    constraint (see the self-exclusion below), so a real rename whose old and
+    new bodies share an unchanged helper still matches.
+
+    Mutates removed/added in place, removing matched entries.
+
+    Returns (category, old_name, old_node, new_name, new_node) 5-tuples —
+    the matched node objects are included (not just their names) because
+    this function is file-path-agnostic by design (reused as-is for Task
+    26's globals/fields), yet callers like _extract_commit need to recover
+    which file each side came from. Two different removed entities in two
+    different deleted files can coincidentally share a name, so the name
+    alone isn't a safe lookup key back to a file — the node identity is.
+    (Retrofitted here, while wiring this into _extract_commit in Task 9,
+    from the original 3-tuple (category, old_name, new_name) shape.)
+    """
+    matches: List[Tuple[str, str, Any, str, Any]] = []
+    # Keyed by BARE body-text identifier (see _match_body_name), not the pool
+    # key, because a field's qualified pool key ("Class.leaf") never appears as
+    # a token in any body text — only its bare leaf does.
+    confirmed: Dict[str, str] = {}  # bare old_name -> bare new_name, shared across all categories
+
+    # Pool-size guard: above _MAX_MATCH_POOL_SIZE total entries the pairwise
+    # scan (inherently O(removed x added) per category per round) is skipped
+    # outright, mirroring git's -M rename-limit degradation. A missed rename
+    # is the accepted fallback; the entity is simply treated as removed+added.
+    total_pool = sum(len(v) for v in removed.values()) + sum(len(v) for v in added.values())
+    if total_pool > _MAX_MATCH_POOL_SIZE:
+        return matches
+
+    all_names: set = set(unchanged_names or ())
+    for pool in (removed, added):
+        for category, entries in pool.items():
+            all_names.update(_match_body_name(category, name) for name, _node in entries)
+
+    for _round in range(_MAX_MATCH_ROUNDS):
+        changed = False
+        # Seed every known name to its confirmed rename target if it has one,
+        # else None ("must match exactly"). Unchanged-tracked names (folded
+        # into all_names above) therefore default to None unless a genuine
+        # rename was confirmed for them this round, in which case confirmed
+        # wins. Both tracked_names and its derived new-side reserved-token
+        # multiset are built ONCE per round and passed read-only into every
+        # _match_candidate_pair call — the pair's own two names are excluded
+        # cheaply per-pair (see below) instead of rebuilding an O(all_names)
+        # dict per candidate, which was the cubic term in the old code.
+        tracked_names: Dict[str, Optional[str]] = {
+            name: confirmed.get(name) for name in all_names
+        }
+        tracked_reserved: Dict[str, int] = {}
+        for name, target in tracked_names.items():
+            tok = target if target is not None else name
+            tracked_reserved[tok] = tracked_reserved.get(tok, 0) + 1
+        for category in list(removed.keys()):
+            r_list = removed.get(category, [])
+            a_list = added.get(category, [])
+            for r_name, r_node in list(r_list):
+                r_text = _normalize_body_for_matching(r_node.text.decode("utf-8", "replace"))
+                if len(r_text) < _MIN_MATCH_BODY_LEN:
+                    continue
+                # The bare identifier the pair-under-test actually spells in its
+                # body (equal to the pool key for non-field categories). Used
+                # for self-exclusion below so the walker treats the pair's own
+                # name as free/under-test, never as an inherited constraint.
+                # Its reserved new-side token (own confirmed target, else the
+                # name itself) is excluded from the injectivity multiset for
+                # the same reason.
+                r_match_name = _match_body_name(category, r_name)
+                r_reserved_token = confirmed.get(r_match_name, r_match_name)
+                candidates = []
+                for a_name, a_node in a_list:
+                    a_match_name = _match_body_name(category, a_name)
+                    a_reserved_token = confirmed.get(a_match_name, a_match_name)
+                    # Exclude this specific pair's own old/new names from the
+                    # tracked-equality constraint and their reserved tokens
+                    # from the injectivity multiset: they are exactly what's
+                    # under test here (is r_name renamed to a_name?), not an
+                    # already-known constraint. Without this, an unconfirmed
+                    # entity's own name would be treated as "must stay
+                    # unchanged" and no rename could ever be confirmed for it.
+                    # Excluding by BARE name (not the qualified pool key) is
+                    # essential for fields: the body token is the bare leaf, so
+                    # excluding "A.Config" would leave the field's own "Config"
+                    # token still bound to an unrelated confirmed
+                    # "Config"->... rename (the false positive this closes).
+                    try:
+                        matched = _match_candidate_pair(
+                            r_node,
+                            a_node,
+                            tracked_names,
+                            tracked_reserved=tracked_reserved,
+                            exclude_names=(r_match_name, a_match_name),
+                            exclude_reserved=(r_reserved_token, a_reserved_token),
+                        )
+                    except RecursionError:
+                        # A single pathological pair — an AST deep enough to
+                        # survive _collect_entity_nodes but blow the recursion
+                        # limit inside the pair walk (which uses more stack per
+                        # level) — must degrade to no-match for THIS pair only,
+                        # not abort the whole commit's matching (and, via
+                        # _extract_commit's outer propagation, the entire
+                        # ingestion run). Skip it and keep testing the rest.
+                        continue
+                    if matched is not None:
+                        candidates.append((a_name, a_node))
+                        # Ambiguity is already certain at 2 candidates: the
+                        # match is only kept when exactly one survives, so
+                        # walking the 3rd, 4th, ... against this same removed
+                        # entry is pure wasted work. Bail the inner scan (never
+                        # the outer removed-entries loop).
+                        if len(candidates) >= 2:
+                            break
+                if len(candidates) == 1:
+                    a_name, a_node = candidates[0]
+                    # Returned pair keeps the QUALIFIED pool keys (r_name/a_name)
+                    # for downstream ident construction; only the shared
+                    # confirmed map records the bare body names.
+                    matches.append((category, r_name, r_node, a_name, a_node))
+                    confirmed[r_match_name] = _match_body_name(category, a_name)
+                    r_list.remove((r_name, r_node))
+                    a_list.remove((a_name, a_node))
+                    changed = True
+        if not changed:
+            break
+    return matches
+
+
+def _collect_entity_nodes(root_node: Any, lang_name: str) -> Dict[str, Dict[str, Any]]:
+    """Like _walk_ast, but returns live nodes keyed by name instead of text —
+    for use only inside a single worker-process call (_extract_commit), never
+    returned across the ProcessPoolExecutor boundary. Only functions/classes
+    are collected here; Task 26 extends this for globals/fields once those
+    categories exist.
+    """
+    node_types = _LANG_NODE_TYPES.get("typescript" if lang_name == "tsx" else lang_name)
+    result: Dict[str, Dict[str, Any]] = {"function": {}, "class": {}}
+    if node_types is None:
+        return result
+
+    def walk(node: Any) -> None:
+        if node.type in node_types.get("functions", set()):
+            if lang_name in ("c", "cpp"):
+                name = _c_family_function_name(node)
+                if name:
+                    result["function"][name] = node
+            else:
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    result["function"][name_node.text.decode("utf-8")] = node
+        elif node.type in node_types.get("classes", set()):
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                result["class"][name_node.text.decode("utf-8")] = node
+        for child in node.children:
+            walk(child)
+
+    walk(root_node)
+    return result
+
 
 # ---------------------------------------------------------------------------
 # DB lifecycle
@@ -1075,7 +3063,7 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     _refresh_if_stale()
     db = get_db()
     try:
-        raw = _db_execute(db, f'(transact {facts} {{:valid-from "{_now_utc_ms()}"}})')
+        raw = _db_execute(db, f'(transact {{:valid-from "{_now_utc_ms()}"}} {facts})')
         _db_checkpoint(db)
         _update_mtime()
         result = _parse_tx_result(raw)
@@ -1487,29 +3475,50 @@ def _git_commits(
 
 
 def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
-    """Return (status_char, old_mode, new_mode, old_sha, new_sha, path) for
-    every changed path in a commit, via a single `git diff-tree --raw` call.
+    """Return (status_char, old_mode, new_mode, old_sha, new_sha, path, old_path,
+    similarity) for every changed path in a commit, via a single
+    `git diff-tree --raw` call.
+
+    -M enables git's own content-similarity rename detection (default 50%
+    threshold, unchanged — see the 2026-07-14 rename-tracking design doc's
+    "Component 1" for why no additional threshold filtering is applied on
+    top of git's own judgment). Deliberately no -C (copy detection) — a copy
+    leaves the original in place *and* creates a new, independent entity;
+    treating it as a rename would misrepresent history.
+
+    A rename/copy raw line has TWO tab-separated paths (old, then new), not
+    one, e.g. ":100644 100644 <sha> <sha> R100\told.py\tnew.py" — naively
+    keeping the old single-partition parse would fold both paths into one
+    bogus string. old_path is "" for every non-rename status. similarity is
+    the numeric suffix of the status (e.g. 100 for "R100", 57 for "R057"),
+    None for non-rename statuses.
 
     Supersedes running diff-tree a second time just to detect gitlinks:
     --raw already carries file mode (needed to spot submodule paths, mode
     160000) in the same subprocess invocation _extract_commit already makes.
     """
     result = _subprocess.run(
-        ["git", "diff-tree", "--no-commit-id", "-r", "--raw", "--root", commit_hash],
+        ["git", "diff-tree", "--no-commit-id", "-r", "-M", "--raw", "--root", commit_hash],
         cwd=repo_path, capture_output=True, text=True, check=True,
     )
     entries = []
     for line in result.stdout.strip().splitlines():
         if not line.startswith(":"):
             continue
-        meta, sep, path = line.partition("\t")
+        meta, sep, rest = line.partition("\t")
         if not sep:
             continue
         fields = meta[1:].split(" ")
         if len(fields) < 5:
             continue
-        old_mode, new_mode, old_sha, new_sha, status = fields[0], fields[1], fields[2], fields[3], fields[4]
-        entries.append((status[0], old_mode, new_mode, old_sha, new_sha, path))
+        old_mode, new_mode, old_sha, new_sha, status_field = fields[0], fields[1], fields[2], fields[3], fields[4]
+        status = status_field[0]
+        similarity = int(status_field[1:]) if len(status_field) > 1 and status_field[1:].isdigit() else None
+        if status in ("R", "C"):
+            old_path, _, path = rest.partition("\t")
+        else:
+            old_path, path = "", rest
+        entries.append((status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity))
     return entries
 
 
@@ -1534,7 +3543,7 @@ def _gitlink_changes(raw_entries: List[tuple]) -> List[tuple]:
     commit for "remove" (needed by the caller to close the right fact).
     """
     changes = []
-    for status, old_mode, new_mode, old_sha, new_sha, path in raw_entries:
+    for status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity in raw_entries:
         old_is_link = old_mode == _GITLINK_MODE
         new_is_link = new_mode == _GITLINK_MODE
         if not old_is_link and not new_is_link:
@@ -1578,6 +3587,22 @@ def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes
     """Return raw bytes of a file at the given commit."""
     result = _subprocess.run(
         ["git", "show", f"{commit_hash}:{file_path}"],
+        cwd=repo_path, capture_output=True, check=True,
+    )
+    return result.stdout
+
+
+def _git_blob_content(repo_path: str, blob_sha: str) -> bytes:
+    """Return raw bytes of a blob by its own SHA, independent of any commit/path.
+
+    Used to fetch a file's *old* content directly from _git_diff_tree_raw's
+    old_sha field (a plain blob SHA) when comparing pre/post rename or
+    modification content — cheaper than resolving a parent commit hash and
+    re-deriving the old path, and correct even when the old path no longer
+    exists at any reachable commit-ish (e.g. mid-history rewrites).
+    """
+    result = _subprocess.run(
+        ["git", "cat-file", "blob", blob_sha],
         cwd=repo_path, capture_output=True, check=True,
     )
     return result.stdout
@@ -1765,12 +3790,21 @@ def _build_close_triples(
     ident: str,
     description: str,
     module_ident: str,
+    extra_contains_parent: Optional[str] = None,
 ) -> List[str]:
     """Return triple strings needed to bi-temporally close an entity.
 
     Closes :ident (canonical existence fact), :description (with real value),
     and the parent module's :contains edge.  The module's own :contains triple
     is omitted when ident == module_ident (modules have no parent module here).
+
+    extra_contains_parent closes a SECOND :contains edge alongside the module's
+    one.  Fields with a real (extracted) owning class carry two containment
+    parents — [module :contains field] AND [class :contains field] (see
+    _precompute_file_triples) — so both must be retracted when the field closes,
+    or the class-contains edge leaks open forever.  Callers pass the field's
+    class ident here (from field_class_ident); it is ignored when None or equal
+    to ident/module_ident so non-field close sites are unaffected.
     """
     triples = [
         f'[{ident} :ident "{_edn_escape(ident)}"]',
@@ -1778,7 +3812,64 @@ def _build_close_triples(
     ]
     if ident != module_ident:
         triples.append(f"[{module_ident} :contains {ident}]")
+    if (
+        extra_contains_parent is not None
+        and extra_contains_parent != ident
+        and extra_contains_parent != module_ident
+    ):
+        triples.append(f"[{extra_contains_parent} :contains {ident}]")
     return triples
+
+
+def _forget_closed_entity(
+    ident: str,
+    file_path: Optional[str],
+    entity_valid_from: Dict[str, str],
+    entity_descriptions: Dict[str, str],
+    field_class_ident: Dict[str, str],
+    file_entities: Dict[str, List[str]],
+) -> None:
+    """Purge a just-closed ident from all in-memory lifecycle bookkeeping.
+
+    Once an entity's bi-temporal window is genuinely closed (i.e. the fact is
+    invisible at current time — true only since the transact-ordering fix in
+    1b2e262), its stale entries in these serially-threaded dicts must be
+    dropped so a later commit is not misled by them:
+
+    - entity_valid_from: _build_code_triples keys "is this genuinely new?" on
+      absence here. Leaving a stale entry makes a re-introduction at the same
+      ident take the "already known, only :modified-in" branch, so its
+      :ident/:description/:path/:introduced-by never get re-asserted — a ghost
+      entity with no current :ident fact.
+    - file_entities[file_path]: a stale ident lingering here is re-discovered by
+      a later commit's removal-detection diff (previous_idents - current) if the
+      path is reused, and closed a SECOND time; because entity_valid_from still
+      held its ORIGINAL introduction timestamp, that second close would span the
+      whole gap and silently resurrect the entity across its closed window.
+    - entity_descriptions / field_class_ident: purged for consistency so no
+      stale description or class-containment parent is read for a future
+      re-introduction of the same ident.
+
+    Call this at EVERY entity close site, AFTER that site has read whatever it
+    needs (description, orig_ts, class ident) to build its close triples — never
+    before. Each ident is closed at exactly one site per commit, so purging one
+    ident never removes state another site in the same commit still needs.
+
+    file_path is the owning file's path (the module the ident lives under); pass
+    None to skip the file_entities removal (e.g. idents not tracked per-file).
+    Callers that iterate a file_entities list while calling this MUST iterate a
+    copy, since this mutates file_entities[file_path] in place.
+    """
+    entity_valid_from.pop(ident, None)
+    entity_descriptions.pop(ident, None)
+    field_class_ident.pop(ident, None)
+    if file_path is not None:
+        idents = file_entities.get(file_path)
+        if idents is not None:
+            try:
+                idents.remove(ident)
+            except ValueError:
+                pass
 
 
 def _ingest_transact(
@@ -1791,7 +3882,7 @@ def _ingest_transact(
     if not triples:
         return
     facts_str = "[" + " ".join(triples) + "]"
-    _db_execute(db, f'(transact {facts_str} {{:valid-from "{commit_ts_iso}"}})')
+    _db_execute(db, f'(transact {{:valid-from "{commit_ts_iso}"}} {facts_str})')
 
 
 def _ingest_close(
@@ -1824,7 +3915,7 @@ def _ingest_close(
     facts_str = "[" + " ".join(triples) + "]"
     _db_execute(
         db,
-        f'(transact {facts_str} {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}})',
+        f'(transact {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}} {facts_str})',
     )
 
 
@@ -1866,11 +3957,11 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
         _db_execute(db, f'(retract [[:ingestion/watermark :hash "{existing}"]])')
     _db_execute(
         db,
-        f'(transact [[:ingestion/watermark :entity-type :type/ingestion] '
+        f'(transact {{:valid-from "{commit_ts_iso}"}} '
+        f'[[:ingestion/watermark :entity-type :type/ingestion] '
         f'[:ingestion/watermark :ident ":ingestion/watermark"] '
         f'[:ingestion/watermark :description "git ingestion watermark"] '
-        f'[:ingestion/watermark :hash "{commit_hash}"]] '
-        f'{{:valid-from "{commit_ts_iso}"}})',
+        f'[:ingestion/watermark :hash "{commit_hash}"]])',
     )
 
 
@@ -1916,6 +4007,8 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
             ":contains": str, ":depends-on": str, ":calls": str,
             # commit cross-references
             ":introduced-by": str, ":modified-in": str,
+            # rename/move continuity (see 2026-07-14 rename-tracking design doc)
+            ":renamed-from": str, ":renamed-to": str,
         },
     },
     "function": {
@@ -1923,6 +4016,7 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
         "optional": {
             ":file": str, ":alias": str,
             ":introduced-by": str, ":modified-in": str,
+            ":renamed-from": str, ":renamed-to": str,
         },
     },
     "class": {
@@ -1930,6 +4024,23 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
         "optional": {
             ":file": str, ":alias": str,
             ":introduced-by": str, ":modified-in": str,
+            ":renamed-from": str, ":renamed-to": str,
+        },
+    },
+    "variable": {
+        "required": {":description": str},
+        "optional": {
+            ":file": str, ":alias": str,
+            ":introduced-by": str, ":modified-in": str,
+            ":renamed-from": str, ":renamed-to": str,
+        },
+    },
+    "field": {
+        "required": {":description": str},
+        "optional": {
+            ":file": str, ":alias": str, ":class": str, ":static": bool,
+            ":introduced-by": str, ":modified-in": str,
+            ":renamed-from": str, ":renamed-to": str,
         },
     },
     "ingestion": {
@@ -2298,7 +4409,7 @@ def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
     for entity in entities:
         try:
             raw = _db_execute(
-                db, f'(query [:find ?a ?v {temporal_clauses} :where [?e ?a ?v] (contains? ?v "{entity}")])'
+                db, f'(query [:find ?a ?v {temporal_clauses} :where [?e ?a ?v] [(contains? ?v "{entity}")]])'
             )
             data = json.loads(raw)
             for row in data.get("results", []):
@@ -2448,7 +4559,7 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
                 )
             else:
                 triples = f'[{entity} {attribute} "{value}"]'
-            _db_execute(db, f'(transact [{triples}] {{:valid-from "{now_z}"}})')
+            _db_execute(db, f'(transact {{:valid-from "{now_z}"}} [{triples}])')
             stored += 1
         except MiniGrafError:
             continue
@@ -2690,7 +4801,7 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
             return {"ok": True, "stored_count": 0, "strategy": "agent"}
         _refresh_if_stale()
         db = get_db()
-        _db_execute(db, f'(transact {datalog} {{:valid-from "{valid_at}"}})')
+        _db_execute(db, f'(transact {{:valid-from "{valid_at}"}} {datalog})')
         _db_checkpoint(db)
         _update_mtime()
         # Approximate: count "[:" occurrences as a proxy for triple count.
@@ -2804,6 +4915,51 @@ def _precompute_file_triples(
             f"[{cls_ident} :introduced-by {commit_ident}]",
         ]))
 
+    global_entries: List[Tuple[str, str, List[str]]] = []
+    for gvar_name in extracted.get("globals", []):
+        gvar_ident = _code_ident("variable", file_path, gvar_name)
+        global_entries.append((gvar_ident, gvar_name, [
+            f"[{gvar_ident} :entity-type :type/variable]",
+            f'[{gvar_ident} :ident "{gvar_ident}"]',
+            f'[{gvar_ident} :description "{_edn_escape(gvar_name)}"]',
+            f'[{gvar_ident} :file "{_edn_escape(file_path)}"]',
+            f"[{module_ident} :contains {gvar_ident}]",
+            f"[{gvar_ident} :introduced-by {commit_ident}]",
+        ]))
+
+    field_entries: List[Tuple[str, str, List[str]]] = []
+    # field_ident -> owning class_ident, but ONLY for fields whose owning class
+    # is genuinely extracted as a :type/class entity in this same file. Threaded
+    # to close sites via field_class_ident so the class-contains edge is retracted
+    # when the field closes.
+    field_class_map: Dict[str, str] = {}
+    extracted_class_names = set(extracted.get("classes", []))
+    for field_name, owning_class, is_static in extracted.get("fields", []):
+        qualified_name = f"{owning_class}.{field_name}"
+        field_ident = _code_ident("field", file_path, qualified_name)
+        static_literal = "true" if is_static else "false"
+        candidate_triples = [
+            f"[{field_ident} :entity-type :type/field]",
+            f'[{field_ident} :ident "{field_ident}"]',
+            f'[{field_ident} :description "{_edn_escape(qualified_name)}"]',
+            f'[{field_ident} :file "{_edn_escape(file_path)}"]',
+            f"[{field_ident} :static {static_literal}]",
+            f"[{module_ident} :contains {field_ident}]",
+            f"[{field_ident} :introduced-by {commit_ident}]",
+        ]
+        # Only emit class-level linkage (:class edge + class :contains edge) when
+        # the owning class is a real extracted :type/class entity. Otherwise the
+        # owner name (e.g. an Elixir defmodule attribute or a Haskell newtype) is
+        # never opened as a class, so a :class edge would dangle and a class
+        # :contains edge would point at a nonexistent parent. Module containment
+        # alone is kept in that case (see issues.md P2 findings).
+        if owning_class in extracted_class_names:
+            class_ident = _code_ident("class", file_path, owning_class)
+            candidate_triples.append(f"[{field_ident} :class {class_ident}]")
+            candidate_triples.append(f"[{class_ident} :contains {field_ident}]")
+            field_class_map[field_ident] = class_ident
+        field_entries.append((field_ident, qualified_name, candidate_triples))
+
     resolved_imports: List[Tuple[str, str, bool]] = []
     for import_name in set(extracted.get("imports", [])):
         dep_ident, is_resolved = _resolve_module_import(
@@ -2816,6 +4972,9 @@ def _precompute_file_triples(
         "module_candidate_triples": module_candidate_triples,
         "function_entries": function_entries,
         "class_entries": class_entries,
+        "global_entries": global_entries,
+        "field_entries": field_entries,
+        "field_class_map": field_class_map,
         "resolved_imports": resolved_imports,
     }
 
@@ -2829,6 +4988,7 @@ def _build_code_triples(
     file_entities: Dict[str, List[str]],
     commit_ident: str,
     precomputed: Dict[str, Any],
+    field_class_ident: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Return Datalog triple strings for a file's extracted code entities.
 
@@ -2851,6 +5011,7 @@ def _build_code_triples(
     """
     triples: List[str] = []
     module_ident = precomputed["module_ident"]
+    field_class_map = precomputed.get("field_class_map", {})
 
     is_new_module = module_ident not in entity_valid_from
     # Track all idents for this file (for deletion cleanup)
@@ -2887,6 +5048,31 @@ def _build_code_triples(
         else:
             # Pre-existing class: record that this commit modified it
             triples.append(f"[{cls_ident} :modified-in {commit_ident}]")
+
+    for gvar_ident, gvar_name, candidate_triples in precomputed["global_entries"]:
+        if gvar_ident not in entity_valid_from:
+            triples += candidate_triples
+            if gvar_ident not in idents_for_file:
+                idents_for_file.append(gvar_ident)
+            entity_valid_from[gvar_ident] = commit_ts_iso
+            entity_descriptions[gvar_ident] = gvar_name
+        else:
+            triples.append(f"[{gvar_ident} :modified-in {commit_ident}]")
+
+    for field_ident, field_name, candidate_triples in precomputed["field_entries"]:
+        if field_ident not in entity_valid_from:
+            triples += candidate_triples
+            if field_ident not in idents_for_file:
+                idents_for_file.append(field_ident)
+            entity_valid_from[field_ident] = commit_ts_iso
+            entity_descriptions[field_ident] = field_name
+            # Record the field's real owning-class parent so every close path
+            # can retract the [class :contains field] edge alongside the module
+            # one. Only fields with an extracted owning class appear in the map.
+            if field_class_ident is not None and field_ident in field_class_map:
+                field_class_ident[field_ident] = field_class_map[field_ident]
+        else:
+            triples.append(f"[{field_ident} :modified-in {commit_ident}]")
 
     return triples
 
@@ -2928,7 +5114,7 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     except Exception:
         pass
 
-    for entity_type in ("module", "function", "class", "external-dependency"):
+    for entity_type in ("module", "function", "class", "variable", "field", "external-dependency"):
         path_attr = "path" if entity_type in ("module", "external-dependency") else "file"
         try:
             raw = _db_execute(
@@ -2952,6 +5138,35 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
             pass
 
     return entity_valid_from, entity_descriptions, file_entities
+
+
+def _preload_field_class_idents(db: Any) -> Dict[str, str]:
+    """Reload field_ident -> owning class_ident for every field with a live :class edge.
+
+    A field only carries a :class edge when its owning class was genuinely
+    extracted as a :type/class entity (see _precompute_file_triples). Without
+    this reload, field_class_ident starts empty on every restart, so a field
+    introduced in an earlier run would have its [class :contains field] edge
+    silently leaked open when a later run closes the field (its module-contains
+    edge would still close, but not the class one). Current-time query semantics
+    naturally exclude already-closed fields' edges.
+    """
+    field_class_ident: Dict[str, str] = {}
+    try:
+        # Bind the field's :ident object (the canonical ":field/…" string), not
+        # the subject variable — minigraf returns an internal UUID for a subject
+        # in find position, whereas close sites key field_class_ident by the same
+        # ident string _code_ident produces. This mirrors _preload_known_entities.
+        raw = _db_execute(
+            db,
+            "(query [:find ?fi ?c :where "
+            "[?f :entity-type :type/field] [?f :ident ?fi] [?f :class ?c]])",
+        )
+        for field_ident, class_ident in json.loads(raw).get("results", []):
+            field_class_ident[field_ident] = class_ident
+    except Exception:
+        pass
+    return field_class_ident
 
 
 _VALID_TIME_FOREVER_MS = (1 << 63) - 1  # minigraf's i64::MAX "still open" :valid-to sentinel
@@ -3075,9 +5290,11 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     entity_valid_from, entity_descriptions, file_entities = _preload_known_entities(db, repo_path)
     file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
     pinned_commit_state = _preload_pinned_commits(db)
+    field_class_ident = _preload_field_class_idents(db)
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
         file_entities, file_deps, dep_valid_from, pinned_commit_state,
+        field_class_ident,
     )
 
 
@@ -3107,14 +5324,14 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
             ]
             if date_raw:
                 triples.append(f'[{tag_ident} :date "{_edn_escape(date_raw)}"]')
-            _db_execute(db, f'(transact [{" ".join(triples)}] {{:valid-from "{run_ts_iso}"}})')
+            _db_execute(db, f'(transact {{:valid-from "{run_ts_iso}"}} [{" ".join(triples)}])')
         except Exception:
             pass  # non-fatal per tag
 
 
 def _extract_commit(
     repo_path: str, commit_hash: str, ignore_patterns: Sequence[str] = ()
-) -> Tuple[List[tuple], List[tuple], Dict[str, Dict[str, str]]]:
+) -> Tuple[List[tuple], List[tuple], Dict[str, Dict[str, str]], List[Tuple[str, str, str, str, str]]]:
     """Read-only, stateless per-commit extraction: diff-tree + git-show + tree-sitter parse,
     plus import resolution and "if this turns out to be new" triple precomputation —
     both pure functions of this commit alone (see _known_files_at_commit and
@@ -3130,19 +5347,29 @@ def _extract_commit(
     a thread pool here let tree-sitter's GIL-holding C parse starve the event
     loop). Touches no shared mutable state and no DB — a hard requirement now
     that this crosses a process boundary, not just a nice property. Returns
-    (file_results, gitlink_changes, gitmodules_map):
+    (file_results, gitlink_changes, gitmodules_map, renamed_pairs):
 
       file_results: one entry per changed file that has a supported parser, as
-        (status, file_path, extracted, precomputed). A/M files whose content fetch
-        fails are omitted entirely, mirroring the previous inline `continue` — same
-        as before this pipeline existed. For a "D" (deleted) file, extracted and
-        precomputed are both None — the main thread only needs file_path to know
-        what to close.
+        (status, file_path, extracted, precomputed, old_path). A/M files whose
+        content fetch fails are omitted entirely, mirroring the previous inline
+        `continue` — same as before this pipeline existed. For a "D" (deleted)
+        file, extracted and precomputed are both None — the main thread only
+        needs file_path to know what to close. old_path is the pre-rename path
+        for "R" entries and "" for every other status (A/M/D) — kept as a fixed
+        5th tuple element rather than variable arity so downstream consumers
+        (_run_ingestion) can unpack uniformly.
       gitlink_changes: _gitlink_changes' output — gitlink-involving rows, never fed
         through the tree-sitter parser (gitlink paths never have a resolvable extension).
       gitmodules_map: path -> {"name", "url"}, populated only when this commit has at
         least one gitlink "add" — avoids a wasted git-show call on the (overwhelmingly
         common) case of a commit that touches no submodules at all.
+      renamed_pairs: (category, old_file_path, old_name, new_file_path, new_name)
+        plain-string 5-tuples — one per function/class the AST-lockstep matcher
+        (_match_renamed_entities, Task 8) confirmed renamed and/or moved within
+        this commit. Deliberately plain strings, not the tree_sitter Node
+        objects _match_renamed_entities itself works with — those live only
+        for the duration of this call and cannot cross the ProcessPoolExecutor
+        boundary back to the main process (see #116).
 
     Sources both file_results and gitlink_changes from a single
     `git diff-tree --raw` call (via _git_diff_tree_raw) rather than a --name-status
@@ -3161,15 +5388,118 @@ def _extract_commit(
     known_files: Optional[Dict[str, List[str]]] = None
     segment_index: Optional[_SegmentSuffixIndex] = None
 
-    for status, old_mode, new_mode, old_sha, new_sha, file_path in raw_entries:
-        if _is_ignored_path(file_path, ignore_patterns):
+    # removed/added pools for _match_renamed_entities, scoped to this commit.
+    # Populated alongside the per-file loop below; matched entirely inside
+    # this worker process — tree_sitter Node objects never cross the process
+    # boundary (#116), only the plain-string renamed_pairs derived from
+    # matches does.
+    removed_pool: Dict[str, List[Tuple[str, Any]]] = {
+        "function": [], "class": [], "variable": [], "field": [],
+    }
+    added_pool: Dict[str, List[Tuple[str, Any]]] = {
+        "function": [], "class": [], "variable": [], "field": [],
+    }
+    # (category, old_file_path, old_name, new_file_path, new_name) is only
+    # knowable once we know which FILE each pooled node came from — track
+    # that alongside the pool itself, keyed by node identity (id()), since
+    # two different removed entities in two different deleted files could
+    # coincidentally share a name.
+    node_origin: Dict[int, str] = {}  # id(node) -> file_path
+    # Bare body-text names (see _match_body_name) present, with the SAME name,
+    # on BOTH the old and new side of some touched file this commit — tracked
+    # entities that survived unrenamed. Passed to _match_renamed_entities so a
+    # reference to one of them must match exactly rather than be treated as a
+    # free local (see the P1 false-continuity fix). Unchanged same-path
+    # entities never enter removed_pool/added_pool (the "M" diff excludes
+    # them), so they must be threaded separately to constrain OTHER entities'
+    # candidate walks.
+    unchanged_names: Set[str] = set()
+
+    def collect_all_nodes(root: Any, lang: str) -> Dict[str, Dict[str, Any]]:
+        # Widens _collect_entity_nodes's function/class-only result with the
+        # variable/field categories from Component 3 (Tasks 13-25), reusing
+        # _extract_globals_and_fields directly (not through
+        # _extract_from_source) so its live-node keys — never exposed across
+        # the ProcessPoolExecutor boundary — are available here, entirely
+        # inside this worker process (Task 26).
+        base = _collect_entity_nodes(root, lang)
+        gf = _extract_globals_and_fields(root, "typescript" if lang == "tsx" else lang)
+        base["variable"] = dict(gf.get("global_nodes", {}))
+        base["field"] = dict(gf.get("field_nodes", {}))
+        return base
+
+    for status, old_mode, new_mode, old_sha, new_sha, file_path, old_path, similarity in raw_entries:
+        # Trackable == not ignored AND has a supported parser. Short-circuits
+        # so an ignored path never pays for a parser build (see the docstring's
+        # "ignored file costs zero parse time" contract).
+        new_trackable = (
+            not _is_ignored_path(file_path, ignore_patterns)
+            and _thread_parser(file_path) is not None
+        )
+        if status == "R":
+            # -M folds a rename's old+new sides into ONE "R" row, but each side
+            # can have a different trackability (cross-extension rename, or a
+            # move into/out of an ignored directory). Keying the skip on the
+            # NEW path alone (as A/M/D do) silently drops the whole row when the
+            # new side is untrackable — leaking the old module/children/deps
+            # open forever — and, in reverse, closes a phantom old module that
+            # was never opened. So resolve the OLD side independently, with its
+            # own ignore/parser lookup keyed on old_path's extension.
+            old_trackable = (
+                not _is_ignored_path(old_path, ignore_patterns)
+                and _thread_parser(old_path) is not None
+            )
+            if old_trackable and not new_trackable:
+                # Forward (tracked -> unsupported/ignored): rewrite the row as a
+                # synthetic delete of the OLD path so the existing "D" handling
+                # below closes the old module, its children, and its deps.
+                status, file_path, old_path = "D", old_path, ""
+            elif new_trackable and not old_trackable:
+                # Reverse (unsupported/ignored -> tracked): the new path is a
+                # brand-new entity and the old ident was never opened. Treat as
+                # a plain add — no rename linkage, no old-module close.
+                status, old_path = "A", ""
+            elif not new_trackable:  # neither side trackable — nothing to do
+                continue
+            # else: both sides trackable — unchanged "R" handling below.
+        elif not new_trackable:
             continue
+
         parser = _thread_parser(file_path)
         if parser is None:
             continue
+
+        old_lang_path = old_path if status == "R" else file_path
+        old_entity_nodes: Dict[str, Dict[str, Any]] = {
+            "function": {}, "class": {}, "variable": {}, "field": {},
+        }
+        if status in ("D", "M", "R") and old_sha and old_sha != "0" * len(old_sha):
+            try:
+                old_content = _git_blob_content(repo_path, old_sha)
+                # For "R" (rename), old_lang_path is the PRE-rename path,
+                # which can map to a different language than file_path (the
+                # NEW path) on a cross-extension rename — reuse `parser`
+                # (already selected for file_path) would silently walk the
+                # old blob with the wrong grammar. _thread_parser(old_lang_path)
+                # selects the grammar matching the blob's own language. For
+                # "M"/"D", old_lang_path == file_path already (no rename), so
+                # this is the same parser instance as `parser` (thread-local
+                # cache hit) — no behavior change there.
+                old_parser = _thread_parser(old_lang_path) if status == "R" else parser
+                old_tree = old_parser.parse(old_content)
+                old_lang = _EXT_TO_LANG.get(Path(old_lang_path).suffix.lower(), "")
+                old_entity_nodes = collect_all_nodes(old_tree.root_node, old_lang)
+            except Exception:
+                pass  # best-effort: matching degrades to no-match, not a hard failure
+
         if status == "D":
-            results.append((status, file_path, None, None))
+            for category in ("function", "class", "variable", "field"):
+                for name, node in old_entity_nodes[category].items():
+                    removed_pool[category].append((name, node))
+                    node_origin[id(node)] = old_lang_path
+            results.append((status, file_path, None, None, ""))
             continue
+
         try:
             content = _git_file_content(repo_path, commit_hash, file_path)
         except Exception:
@@ -3181,14 +5511,95 @@ def _extract_commit(
         precomputed = _precompute_file_triples(
             file_path, extracted, commit_ident, known_files, segment_index=segment_index,
         )
-        results.append((status, file_path, extracted, precomputed))
+        results.append((status, file_path, extracted, precomputed, old_path if status == "R" else ""))
+
+        # Build this file's contribution to the removed/added pools. Live
+        # nodes for the NEW side come from re-parsing (extracted only carries
+        # text, per Task 6) — cheap, since this is the same content already
+        # fetched above; a second parse of the same bytes is a deliberate
+        # simplicity/cost tradeoff over threading Node references through
+        # _extract_from_source's return value, which must stay plain-data-only
+        # for other callers.
+        #
+        # Wrapped best-effort, same as the old-side call above: a
+        # pathologically nested file parses fine under tree-sitter but can
+        # blow the Python recursion limit inside _collect_entity_nodes's
+        # own recursive walk() (RecursionError). Left unguarded, that
+        # exception would propagate out of _extract_commit and (in the real
+        # ProcessPoolExecutor pipeline) abort the entire ingestion run
+        # rather than just this one commit — contradicting this function's
+        # own contract that ordinary exceptions fail only the one commit.
+        new_lang = _EXT_TO_LANG.get(Path(file_path).suffix.lower(), "")
+        try:
+            new_tree = parser.parse(content)
+            new_entity_nodes = collect_all_nodes(new_tree.root_node, new_lang)
+        except Exception:
+            new_entity_nodes = {
+                "function": {}, "class": {}, "variable": {}, "field": {},
+            }  # best-effort: matching degrades to no-match
+
+        # Record every entity whose name is present, unchanged, on BOTH sides
+        # of this file — these survive the commit unrenamed and so must be
+        # matched exactly (not treated as free locals) when they appear inside
+        # some OTHER entity's candidate body. Uses the bare body-text name
+        # (via _match_body_name) to match how the matcher keys tracked names.
+        # For "A" the old side is empty and for "D" we already `continue`d, so
+        # only "M"/"R" (both-sides) files contribute here.
+        for category in ("function", "class", "variable", "field"):
+            common = set(old_entity_nodes[category].keys()) & set(new_entity_nodes[category].keys())
+            for name in common:
+                unchanged_names.add(_match_body_name(category, name))
+
+        if status == "A":
+            for category in ("function", "class", "variable", "field"):
+                for name, node in new_entity_nodes[category].items():
+                    added_pool[category].append((name, node))
+                    node_origin[id(node)] = file_path
+        elif status == "R":
+            # Ident changes for every entity in a renamed file, even ones
+            # whose text is byte-identical — pool everything on both sides,
+            # not just the local diff (unlike "M" below).
+            for category in ("function", "class", "variable", "field"):
+                for name, node in old_entity_nodes[category].items():
+                    removed_pool[category].append((name, node))
+                    node_origin[id(node)] = old_lang_path
+                for name, node in new_entity_nodes[category].items():
+                    added_pool[category].append((name, node))
+                    node_origin[id(node)] = file_path
+        else:  # "M" — same path, only the local diff needs matching
+            for category in ("function", "class", "variable", "field"):
+                old_names = set(old_entity_nodes[category].keys())
+                new_names = set(new_entity_nodes[category].keys())
+                for name in old_names - new_names:
+                    node = old_entity_nodes[category][name]
+                    removed_pool[category].append((name, node))
+                    node_origin[id(node)] = old_lang_path
+                for name in new_names - old_names:
+                    node = new_entity_nodes[category][name]
+                    added_pool[category].append((name, node))
+                    node_origin[id(node)] = file_path
+
+    raw_matches = _match_renamed_entities(removed_pool, added_pool, unchanged_names)
+    # raw_matches carries the matched node objects themselves (see Task 8's
+    # _match_renamed_entities retrofit), so file paths can be recovered
+    # directly via node_origin — no second pass or pre-mutation snapshot
+    # needed. (The brief's original sketch tried to translate from bare
+    # (category, old_name, new_name) 3-tuples, which loses the file path
+    # whenever a name collides across two different files touched in the
+    # same commit; that gap is why _match_renamed_entities' return type was
+    # widened to include the nodes.)
+    renamed_pairs: List[Tuple[str, str, str, str, str]] = []
+    for category, old_name, old_node, new_name, new_node in raw_matches:
+        renamed_pairs.append((
+            category, node_origin[id(old_node)], old_name, node_origin[id(new_node)], new_name,
+        ))
 
     gitlink_changes = _gitlink_changes(raw_entries)
     gitmodules_map: Dict[str, Dict[str, str]] = {}
     if any(kind == "add" for kind, _, _ in gitlink_changes):
         gitmodules_map = _git_gitmodules_at(repo_path, commit_hash)
 
-    return results, gitlink_changes, gitmodules_map
+    return results, gitlink_changes, gitmodules_map, renamed_pairs
 
 
 async def _run_ingestion(repo_path: str, branch: str) -> None:
@@ -3229,6 +5640,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             (
                 watermark, prior_ingested, entity_valid_from, entity_descriptions,
                 file_entities, file_deps, dep_valid_from, pinned_commit_state,
+                field_class_ident,
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`
@@ -3325,7 +5737,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         break
 
                     (commit_hash, commit_ts_iso, author, subject), fut = pending.popleft()
-                    extracted_files, gitlink_changes, gitmodules_map = await fut
+                    # renamed_pairs (Task 9's 4th _extract_commit return element) is
+                    # unpacked here but not yet consumed — Task 10 wires it into
+                    # :renamed-from/:renamed-to triple emission for functions/classes.
+                    # Widening this unpack now (rather than leaving it a 3-tuple) is
+                    # required as soon as _extract_commit returns 4 elements: every
+                    # ingestion run — including the many existing tests that drive
+                    # _run_ingestion through a real ProcessPoolExecutor worker — would
+                    # otherwise fail with "too many values to unpack".
+                    extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
                     submit_next()
 
                     last_hash = commit_hash
@@ -3349,18 +5769,34 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         ]
                         close_items: List[tuple] = []  # (triples, original_ts_iso)
                         dep_add_triples: List[str] = []  # :depends-on triples to transact individually
+                        # Old paths of files renamed this commit (R status). Their
+                        # unmatched child entities / dependency edges are closed in a
+                        # final pass after renamed_pairs is consumed (see below).
+                        renamed_old_paths: set = set()
 
-                        for status, file_path, extracted, precomputed in extracted_files:
+                        for status, file_path, extracted, precomputed, old_path in extracted_files:
                             if status == "D":
-                                # Close module and all known child entities for this file
-                                idents = file_entities.get(file_path, [_code_ident("module", file_path)])
+                                # Close module and all known child entities for this file.
+                                # Iterate a copy: _forget_closed_entity mutates
+                                # file_entities[file_path] in place as it purges.
+                                idents = list(file_entities.get(file_path, [_code_ident("module", file_path)]))
                                 module_ident = _code_ident("module", file_path)
                                 for ident in idents:
                                     orig_ts = entity_valid_from.get(ident, commit_ts_iso)
                                     desc = entity_descriptions.get(ident, "")
                                     close_items.append(
-                                        (_build_close_triples(ident, desc, module_ident), orig_ts)
+                                        (_build_close_triples(
+                                            ident, desc, module_ident,
+                                            field_class_ident.get(ident),
+                                        ), orig_ts)
                                     )
+                                    _forget_closed_entity(
+                                        ident, file_path, entity_valid_from,
+                                        entity_descriptions, field_class_ident, file_entities,
+                                    )
+                                # Whole file is gone: drop its (now-empty) file_entities key
+                                # so nothing stale lingers under this path (matches file_deps).
+                                file_entities.pop(file_path, None)
                                 # Close all :depends-on edges for the deleted module
                                 for dep_ident in file_deps.get(file_path, set()):
                                     orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
@@ -3368,11 +5804,39 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
                                     )
                                 file_deps.pop(file_path, None)
-                            else:  # A or M
+                            else:  # A or M or R
+                                if status == "R" and old_path:
+                                    renamed_old_paths.add(old_path)
+                                    old_module_ident = _code_ident("module", old_path)
+                                    new_module_ident = _code_ident("module", file_path)
+                                    add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
+                                    # :renamed-to is a brand-new fact that becomes
+                                    # true at the rename commit and stays true forever
+                                    # after — it must be transacted open-ended (like
+                                    # :renamed-from), NOT closed with the old entity's
+                                    # historical valid window via _ingest_close.
+                                    add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
+                                    old_desc = entity_descriptions.get(old_module_ident, old_path)
+                                    orig_ts = entity_valid_from.get(old_module_ident, commit_ts_iso)
+                                    close_items.append((
+                                        _build_close_triples(old_module_ident, old_desc, old_module_ident),
+                                        orig_ts,
+                                    ))
+                                    # Purge the closed old module. Its remaining child
+                                    # entities under old_path are closed+purged by the
+                                    # renamed_old_paths pass below, which also pops the
+                                    # whole file_entities[old_path] key — so only the
+                                    # scalar dicts and the module's own list slot need
+                                    # dropping here.
+                                    _forget_closed_entity(
+                                        old_module_ident, old_path, entity_valid_from,
+                                        entity_descriptions, field_class_ident, file_entities,
+                                    )
                                 previous_idents = set(file_entities.get(file_path, []))
                                 triples = _build_code_triples(
                                     file_path, extracted, commit_ts_iso, entity_valid_from,
                                     entity_descriptions, file_entities, commit_ident, precomputed,
+                                    field_class_ident,
                                 )
                                 add_triples.extend(triples)
                                 # Detect entities removed from a modified file.
@@ -3386,12 +5850,39 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         current_extracted_idents.add(fn_ident)
                                     for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
                                         current_extracted_idents.add(cls_ident)
+                                    # Globals and fields are tracked in file_entities too
+                                    # (see _build_code_triples): omitting them here would
+                                    # make every still-present global/field look "removed"
+                                    # on any later edit and wrongly close it (#113).
+                                    for gvar_ident, _gvar_name, _gvar_triples in precomputed["global_entries"]:
+                                        current_extracted_idents.add(gvar_ident)
+                                    for field_ident, _field_name, _field_triples in precomputed["field_entries"]:
+                                        current_extracted_idents.add(field_ident)
                                     removed_idents = previous_idents - current_extracted_idents
+                                    # An in-place rename (old->new in the same file) is
+                                    # closed with :renamed-to linkage by the renamed_pairs
+                                    # loop below; exclude those old idents here so they are
+                                    # not ALSO closed as a plain removal (double close).
+                                    same_file_renamed_old_idents = {
+                                        _code_ident(cat, o_file, o_name)
+                                        for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+                                        if o_file == file_path
+                                    }
+                                    removed_idents -= same_file_renamed_old_idents
                                     for ident in removed_idents:
                                         orig_ts = entity_valid_from.get(ident, commit_ts_iso)
                                         desc = entity_descriptions.get(ident, "")
                                         close_items.append(
-                                            (_build_close_triples(ident, desc, module_ident), orig_ts)
+                                            (_build_close_triples(
+                                                ident, desc, module_ident,
+                                                field_class_ident.get(ident),
+                                            ), orig_ts)
+                                        )
+                                        # File survives (M), only this child was removed:
+                                        # purge just this ident from the file's list.
+                                        _forget_closed_entity(
+                                            ident, file_path, entity_valid_from,
+                                            entity_descriptions, field_class_ident, file_entities,
                                         )
                                 # Compute dep edges for this file and diff against previous.
                                 # Resolution itself already happened in _extract_commit
@@ -3422,6 +5913,78 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                             ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
                                         )
                                 file_deps[file_path] = current_deps
+
+                        # Function/class rename linkage (Task 9's renamed_pairs).
+                        # Module-level linkage is handled separately per-file
+                        # above (Task 5) since it comes from git's own -M
+                        # detection, not this commit-wide matcher.
+                        for category, old_file, old_name, new_file, new_name in renamed_pairs:
+                            old_ident = _code_ident(category, old_file, old_name)
+                            new_ident = _code_ident(category, new_file, new_name)
+                            add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
+                            # :renamed-to becomes true at the rename commit and stays
+                            # open-ended thereafter — transact it via the add path, do
+                            # NOT fold it into the old entity's _ingest_close window.
+                            add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
+                            old_desc = entity_descriptions.get(old_ident, old_name)
+                            old_module_ident = _code_ident("module", old_file)
+                            orig_ts = entity_valid_from.get(old_ident, commit_ts_iso)
+                            close_items.append((
+                                _build_close_triples(
+                                    old_ident, old_desc, old_module_ident,
+                                    field_class_ident.get(old_ident),
+                                ),
+                                orig_ts,
+                            ))
+                            _forget_closed_entity(
+                                old_ident, old_file, entity_valid_from,
+                                entity_descriptions, field_class_ident, file_entities,
+                            )
+
+                        # A file rename (R status) only closes the old MODULE above.
+                        # Child entities and dependency edges under the old path are
+                        # closed here as plain removals UNLESS the matcher established
+                        # a rename continuity edge for them (handled with :renamed-to
+                        # by the loop above). This runs after renamed_pairs is fully
+                        # consumed so those confirmed renames can be excluded; without
+                        # it, unmatched old children/deps leak open forever under the
+                        # old path while new ones open under the new path.
+                        if renamed_old_paths:
+                            renamed_covered_idents = {
+                                _code_ident(cat, o_file, o_name)
+                                for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+                            }
+                            for r_old_path in renamed_old_paths:
+                                r_old_module_ident = _code_ident("module", r_old_path)
+                                # Iterate a copy: _forget_closed_entity mutates
+                                # file_entities[r_old_path] in place as it purges.
+                                for ident in list(file_entities.get(r_old_path, [])):
+                                    if ident == r_old_module_ident:
+                                        continue  # already closed+purged by the R block above
+                                    if ident in renamed_covered_idents:
+                                        continue  # already closed+purged with :renamed-to linkage
+                                    orig_ts = entity_valid_from.get(ident, commit_ts_iso)
+                                    desc = entity_descriptions.get(ident, "")
+                                    close_items.append(
+                                        (_build_close_triples(
+                                            ident, desc, r_old_module_ident,
+                                            field_class_ident.get(ident),
+                                        ), orig_ts)
+                                    )
+                                    _forget_closed_entity(
+                                        ident, r_old_path, entity_valid_from,
+                                        entity_descriptions, field_class_ident, file_entities,
+                                    )
+                                # Whole old path is gone (renamed away): drop the key so
+                                # no stale ident lingers to be re-discovered by a later
+                                # commit that reuses this path (e.g. a shim at old_path).
+                                file_entities.pop(r_old_path, None)
+                                for dep_ident in file_deps.get(r_old_path, set()):
+                                    orig_ts = dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)
+                                    close_items.append(
+                                        ([f"[{r_old_module_ident} :depends-on {dep_ident}]"], orig_ts)
+                                    )
+                                file_deps.pop(r_old_path, None)
 
                         # Process gitlink changes (submodule add/bump/remove).
                         # The "remove" case's interaction with the ordinary per-file module-open
@@ -3467,6 +6030,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 close_items.append(
                                     (_build_close_triples(ext_ident, desc, ext_ident), orig_ts)
                                 )
+                                # Submodule removed: purge lifecycle state so a later
+                                # re-add at the same path is treated as genuinely new.
+                                # (Submodule paths aren't tracked in file_entities, so the
+                                # path arg is a no-op there, but pass it for consistency.)
+                                _forget_closed_entity(
+                                    ext_ident, path, entity_valid_from,
+                                    entity_descriptions, field_class_ident, file_entities,
+                                )
                                 old_sha, pin_orig_ts = pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
                                 if old_sha is not None:
                                     close_items.append(
@@ -3507,8 +6078,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     write_executor,
                                     _db_execute,
                                     db,
-                                    f'(transact [[{commit_ident} :parent {parent_ident}]] '
-                                    f'{{:valid-from "{commit_ts_iso}"}})',
+                                    f'(transact {{:valid-from "{commit_ts_iso}"}} '
+                                    f'[[{commit_ident} :parent {parent_ident}]])',
                                 )
                         except Exception:
                             pass  # non-fatal; parent edges are best-effort
