@@ -772,9 +772,8 @@ class TestMinigrafRetract:
 
 
 class TestMinigrafReportIssue:
-    def test_delegates_to_report_issue(self, mock_minigraf_db, tmp_path):
+    def test_delegates_to_report_issue(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mock_module = MagicMock()
         mock_module.report_issue.return_value = {
             "ok": True, "method": "gh", "repo": "org/repo", "result": "https://github.com/org/repo/issues/1"
@@ -788,18 +787,16 @@ class TestMinigrafReportIssue:
             "bug", "something broke", datalog=None, error=None
         )
 
-    def test_propagates_failure_from_report_issue(self, mock_minigraf_db, tmp_path):
+    def test_propagates_failure_from_report_issue(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mock_module = MagicMock()
         mock_module.report_issue.return_value = {"ok": False, "error": "gh command failed"}
         with patch.dict("sys.modules", {"report_issue": mock_module}):
             result = mcp_server.handle_minigraf_report_issue("bug", "something broke")
         assert result == {"ok": False, "error": "gh command failed"}
 
-    def test_returns_error_on_import_failure(self, mock_minigraf_db, tmp_path):
+    def test_returns_error_on_import_failure(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         with patch.dict("sys.modules", {"report_issue": None}):
             result = mcp_server.handle_minigraf_report_issue("bug", "something broke")
         assert result["ok"] is False
@@ -1179,10 +1176,9 @@ class TestAgentStrategy:
 
 
 class TestMcpToolWiring:
-    def test_list_tools_returns_ten_tools(self, mock_minigraf_db, tmp_path):
+    def test_list_tools_returns_ten_tools(self, real_db):
         import asyncio
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         tools = asyncio.run(mcp_server.list_tools())
 
@@ -1194,16 +1190,13 @@ class TestMcpToolWiring:
             "minigraf_audit", "minigraf_ingest_git", "minigraf_ingest_status",
         }
 
-    def test_call_tool_minigraf_query(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_minigraf_query(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": [["FastAPI"]]})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        real_db.execute('(transact {} [[:e1 :name "FastAPI"]])')
 
         result = asyncio.run(mcp_server.call_tool(
-            "minigraf_query", {"datalog": "[:find ?n :where [?e :name ?n]]"}
+            "minigraf_query", {"datalog": "[:find ?n :where [:e1 :name ?n]]"}
         ))
 
         assert len(result) == 1
@@ -1211,13 +1204,9 @@ class TestMcpToolWiring:
         assert data["ok"] is True
         assert data["results"] == [["FastAPI"]]
 
-    def test_call_tool_minigraf_transact(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_minigraf_transact(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "10"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         result = asyncio.run(mcp_server.call_tool(
             "minigraf_transact",
@@ -1227,13 +1216,14 @@ class TestMcpToolWiring:
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/cache :description ?d]])'
+        ))
+        assert queried["results"] == [["Redis"]]
 
-    def test_call_tool_memory_prepare_turn(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_memory_prepare_turn(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         result = asyncio.run(mcp_server.call_tool(
             "memory_prepare_turn", {"user_message": "what database are we using?"}
@@ -1242,28 +1232,27 @@ class TestMcpToolWiring:
         assert len(result) == 1
         assert isinstance(result[0].text, str)
 
-    def test_call_tool_memory_finalize_turn(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_memory_finalize_turn(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "11"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         result = asyncio.run(mcp_server.call_tool(
-            "memory_finalize_turn", {"conversation_delta": "The sky is blue."}
+            "memory_finalize_turn", {"conversation_delta": "We'll use Redis for caching."}
         ))
 
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["ok"] is True
+        assert data["stored_count"] >= 1
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] != []
 
-    def test_call_tool_minigraf_retract(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_minigraf_retract(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "12"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        real_db.execute('(transact {} [[:decision/cache :description "Redis"]])')
 
         result = asyncio.run(mcp_server.call_tool(
             "minigraf_retract",
@@ -1273,13 +1262,14 @@ class TestMcpToolWiring:
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/cache :description ?d]])'
+        ))
+        assert queried["results"] == []
 
-    def test_db_released_after_call_tool(self, mock_minigraf_db, tmp_path):
+    def test_db_released_after_call_tool(self, real_db):
         import asyncio
         import mcp_server
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         asyncio.run(mcp_server.call_tool(
             "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
@@ -1287,41 +1277,44 @@ class TestMcpToolWiring:
 
         assert mcp_server._db is None, "lock must be released after call_tool so prepare_hook can open the DB"
 
-    def test_call_tool_unknown_raises(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_unknown_raises(self, real_db):
         import asyncio
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with pytest.raises(Exception, match="Unknown tool"):
             asyncio.run(mcp_server.call_tool("nonexistent_tool", {}))
 
-    def test_call_tool_lock_retry_does_not_block_event_loop(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_call_tool_lock_retry_does_not_block_event_loop(self, tmp_path, monkeypatch):
         """Regression test for #99: lock-retry backoff hit while opening the DB
         for a tool call must not use a blocking time.sleep(), since call_tool
         runs on the single-threaded asyncio event loop — a blocking sleep there
         would freeze the very coroutine (e.g. ingestion) that's about to
-        release the lock we're waiting on."""
+        release the lock we're waiting on.
+
+        Uses a real subprocess (_hold_lock_subprocess, see TestGetDbLockRetry)
+        to manufacture genuine cross-process lock contention rather than
+        mocking MiniGrafDb.open, since this test specifically exercises the
+        real lock-retry backoff path (_ensure_db_async), not general dispatch."""
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         import mcp_server
+        graph_path = str(tmp_path / "t.graph")
         mcp_server._db = None
-        mcp_server._graph_path = str(tmp_path / "t.graph")
-        lock_err = MiniGrafError(
-            "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
-        )
-        mock_class.open.side_effect = [lock_err, db_instance]
+        mcp_server._graph_path = graph_path
 
         def fail_if_called(_delay):
             raise AssertionError("time.sleep() must not be called on the event-loop retry path (see #99)")
         monkeypatch.setattr(mcp_server.time, "sleep", fail_if_called)
 
-        result = asyncio.run(mcp_server.call_tool(
-            "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
-        ))
+        # Real backoff (not mocked) — the subprocess needs genuine wall-clock
+        # time to hold the lock and then exit before a later retry attempt
+        # observes it free again.
+        with _hold_lock_subprocess(graph_path, hold_seconds=0.1):
+            result = asyncio.run(mcp_server.call_tool(
+                "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
+            ))
 
         data = json.loads(result[0].text)
         assert data["ok"] is True
-        assert mock_class.open.call_count == 2
 
 
 class TestParseValidAtHint:
