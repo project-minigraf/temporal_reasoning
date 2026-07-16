@@ -321,7 +321,7 @@ potentially stale watermark.
 
 ### Git-Ingested Data Schema
 
-`minigraf_ingest_git` writes the following entity types. All relationship attributes (`:parent`, `:introduced-by`, `:modified-in`, `:contains`, `:depends-on`, `:tagged-commit`) are stored as keyword entity references — they bypass string-value schema validation by design and are directly traversable in queries.
+`minigraf_ingest_git` writes the following entity types. All relationship attributes (`:parent`, `:introduced-by`, `:modified-in`, `:contains`, `:depends-on`, `:tagged-commit`, `:resolves-to`) are stored as keyword entity references — they bypass string-value schema validation by design and are directly traversable in queries.
 
 **Ident slugging:** non-alphanumeric characters in paths and names are replaced with hyphens and consecutive hyphens collapsed. Examples: `src/auth.py` → `:module/src-auth-py`; function `login` in `src/auth.py` → `:function/src-auth-py-login`.
 
@@ -418,6 +418,7 @@ Ident: `:module/<slugified-path-or-import-name>` (shares the module ident namesp
 | `:submodule-name` / `:submodule-url` | from `.gitmodules`, when parseable (submodules only) |
 | `:introduced-by` (keyword ref) | commit that first introduced this dependency |
 | `:modified-in` (keyword ref) | one edge per commit that bumped a submodule's pinned commit |
+| `:resolves-to` (keyword ref, unresolved-import placeholders only) | points to the real submodule entity when this placeholder's import path falls under a known `.gitmodules`/gitlink path — bridges the two ident schemes (`_canonical_ident` from the raw import specifier vs. `_code_ident` from the submodule's declared path), which otherwise never produce the same ident string even once both entities exist. Set regardless of which one was ingested first. |
 
 Vendored-in-tree code checked in as regular files (not a git submodule) is parsed as ordinary `:type/module`/`:function`/`:class` entities like any first-party code — only real gitlinks (mode `160000`) and genuinely-unresolved imports get the external marker.
 
