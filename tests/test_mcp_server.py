@@ -6357,13 +6357,28 @@ class TestRunIngestion:
 
 class TestRunIngestionConcurrency:
     @pytest.mark.asyncio
-    async def test_concurrent_run_matches_sequential_facts(self, mock_minigraf_db, git_repo_with_deps, monkeypatch):
+    async def test_concurrent_run_matches_sequential_facts(
+        self, tmp_path, git_repo_with_deps, monkeypatch
+    ):
         """A run using the thread-pool pipeline must produce the exact same
-        set of transacted triples, in the same commit order, as today's
-        sequential loop — this is the core correctness guarantee for the
-        producer/consumer split."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        set of transacted triples, in the same commit order, AND the exact
+        same set of durably persisted facts, as today's sequential loop —
+        this is the core correctness guarantee for the producer/consumer
+        split.
+
+        Uses a real, file-backed MiniGrafDb per run (not the `real_db`
+        in-memory fixture): `_run_ingestion` releases and reacquires its DB
+        handle between every commit and again after the run completes, and
+        `MiniGrafDb.open_in_memory()` hands back a brand-new, isolated store
+        on every call. Under the in-memory fixture, those reopens would
+        silently wipe state at each boundary, so querying "the graph" after
+        the run would only ever reflect the last write in isolation — the
+        comparison below would be vacuous. A real on-disk graph (same
+        pattern as TestRunIngestionBitemporalClose's
+        test_renamed_to_is_open_ended_against_real_graph) genuinely persists
+        across those reopens, so the facts queried back after each run
+        reflect that run's true cumulative state.
+        """
         import mcp_server
 
         # Capture the true, unpatched transact function once — each run below
@@ -6371,16 +6386,24 @@ class TestRunIngestionConcurrency:
         # pick up the previous run's capture wrapper instead of the original.
         real_ingest_transact = mcp_server._ingest_transact
 
-        async def run_and_capture(worker_count):
+        async def run_and_capture(worker_count, graph_path):
             if worker_count is None:
                 monkeypatch.delenv("MINIGRAF_INGEST_WORKERS", raising=False)
             else:
                 monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", str(worker_count))
 
-            # Reset module-level state so the second run starts exactly as
-            # clean as the first (same watermark, same progress, no leftover
-            # shutdown signal).
-            mcp_server.open_db(str(git_repo_with_deps / "memory.graph"))
+            # Fresh, dedicated on-disk graph per run so each run starts from
+            # a genuinely empty store — no leftover watermark, progress, or
+            # shutdown signal from the previous run.
+            mcp_server._db = None
+            mcp_server._graph_path = None
+            mcp_server.open_db(str(graph_path))
+            # Prevent IndexCache's background rebuild thread (spawned on
+            # ingestion completion) from racing this test's own DB
+            # open/close cycles across the two runs below — see the
+            # established precedent for this same monkeypatch on other
+            # real-backend _run_ingestion tests in this file.
+            monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
             mcp_server._ingest_progress = {
                 "status": "idle", "processed": 0, "total": 0,
                 "current_commit": "", "error": None,
@@ -6397,28 +6420,47 @@ class TestRunIngestionConcurrency:
             await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
             assert mcp_server._ingest_progress["status"] == "complete"
             assert mcp_server._ingest_progress["processed"] == 1
-            return transacted
 
-        sequential_triples = await run_and_capture(1)
-        concurrent_triples = await run_and_capture(4)
+            # Query the real, persisted graph for every currently-valid fact.
+            # The :last-run-at value is excluded: it legitimately carries a
+            # wall-clock timestamp (see _last_run_write), so it differs
+            # between the two runs below without indicating any divergence
+            # in the actual ingested content. Everything else — including
+            # that same entity's :ident/:last-commit/:total-ingested — is
+            # deterministic given the same repo content and is compared.
+            db = mcp_server.get_db()
+            raw = mcp_server._db_execute(db, "(query [:find ?e ?a ?v :where [?e ?a ?v]])")
+            rows = json.loads(raw)["results"]
+            facts = {
+                (e, a, v) for e, a, v in rows
+                if a != ":last-run-at"
+            }
+            mcp_server._db = None  # release the file lock for the next run
+            return transacted, facts
+
+        sequential_triples, sequential_facts = await run_and_capture(1, tmp_path / "sequential.graph")
+        concurrent_triples, concurrent_facts = await run_and_capture(4, tmp_path / "concurrent.graph")
 
         mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
         mod_b_ident = mcp_server._code_ident("module", "mod_b.py")
         all_triples = [t for batch in sequential_triples for t in batch]
         assert any(mod_a_ident in t for t in all_triples)
         assert any(mod_b_ident in t for t in all_triples)
+        assert any(a == ":ident" and v == mod_a_ident for e, a, v in sequential_facts)
+        assert any(a == ":ident" and v == mod_b_ident for e, a, v in sequential_facts)
 
-        # The core equivalence guarantee: identical triples, identical
-        # per-commit batching, identical order — regardless of how many
-        # worker threads did the extraction.
+        # The core equivalence guarantee: identical triples emitted in
+        # identical per-commit batches and identical order, AND identical
+        # facts genuinely persisted to (and read back from) the graph —
+        # regardless of how many worker threads did the extraction.
         assert concurrent_triples == sequential_triples
+        assert concurrent_facts == sequential_facts
 
     @pytest.mark.asyncio
-    async def test_worker_count_env_var_is_respected(self, mock_minigraf_db, git_repo, monkeypatch):
+    async def test_worker_count_env_var_is_respected(self, real_db, git_repo, monkeypatch):
         monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", "1")
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6430,7 +6472,7 @@ class TestRunIngestionConcurrency:
 
     @pytest.mark.asyncio
     async def test_one_commits_file_failure_does_not_affect_other_commits(
-        self, mock_minigraf_db, git_repo
+        self, real_db, git_repo, monkeypatch
     ):
         """A file-content fetch failure must be induced for real, not via
         monkeypatch: _extract_commit runs in a spawned worker process
@@ -6439,9 +6481,8 @@ class TestRunIngestionConcurrency:
         actual loose git blob object for auth.py makes `git show
         <hash>:auth.py` genuinely fail inside the worker, exercising the
         same try/except continue path the old monkeypatch used to reach."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6471,7 +6512,7 @@ class TestRunIngestionConcurrency:
 class TestRunIngestionEventLoopResponsiveness:
     @pytest.mark.asyncio
     async def test_event_loop_stays_responsive_during_heavy_extraction(
-        self, mock_minigraf_db, tmp_path
+        self, real_db, tmp_path, monkeypatch
     ):
         """#116: tree-sitter's C parse holds the GIL for its whole duration
         (confirmed empirically — a single hammering thread stalls a
@@ -6491,9 +6532,6 @@ class TestRunIngestionEventLoopResponsiveness:
         full ~500ms parse; a process pool's residual cost is bounded by
         the tiny output, not the parse time.
         """
-        db_instance = mock_minigraf_db[1]
-        db_instance.execute.return_value = json.dumps({"results": []})
-
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -6507,6 +6545,7 @@ class TestRunIngestionEventLoopResponsiveness:
         _subprocess.run(["git", "commit", "-m", "add big file"], cwd=repo, check=True, capture_output=True)
 
         import mcp_server
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6541,13 +6580,11 @@ class TestRunIngestionEventLoopResponsiveness:
 
 class TestRunIngestionShutdown:
     @pytest.mark.asyncio
-    async def test_shutdown_mid_run_stops_at_commit_boundary(self, mock_minigraf_db, git_repo, monkeypatch):
+    async def test_shutdown_mid_run_stops_at_commit_boundary(self, real_db, git_repo, monkeypatch):
         """git_repo has 2 commits. Request shutdown right after the first
         commit's extraction is consumed but before the second is processed;
         the loop must stop cleanly with status 'stopped' and only 1 commit
         durably processed."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
@@ -6570,32 +6607,26 @@ class TestRunIngestionShutdown:
         assert mcp_server._ingest_progress["processed"] == 1
 
     @pytest.mark.asyncio
-    async def test_resumes_from_watermark_after_shutdown(self, mock_minigraf_db, git_repo, monkeypatch):
+    async def test_resumes_from_watermark_after_shutdown(self, git_repo, monkeypatch):
         """After a simulated shutdown mid-run, a second _run_ingestion call
-        against the same (mocked) DB state must pick up the watermark that
-        was written for the last fully-completed commit and finish the
-        remaining commit(s), without re-processing or skipping any."""
-        mock_class, db_instance = mock_minigraf_db
+        against the same DB must pick up the watermark that was written for
+        the last fully-completed commit and finish the remaining commit(s),
+        without re-processing or skipping any.
+
+        Uses a real, file-backed MiniGrafDb (not the `real_db` in-memory
+        fixture, and not a MagicMock): the watermark written by run 1 must
+        genuinely be visible to run 2's preload read, across the DB
+        open/close cycles _run_ingestion performs both between commits and
+        between the two separate _run_ingestion calls below. Neither a
+        canned-response mock nor `MiniGrafDb.open_in_memory()` (which hands
+        back a brand-new, isolated store on every open) can model that —
+        only a real on-disk graph, reopened at the same path both times,
+        actually persists the watermark for run 2 to read.
+        """
         import mcp_server
-
-        # In-memory fake DB standing in for minigraf so the watermark
-        # written by run 1 is genuinely visible to run 2 (the default mock
-        # always returns the same canned response and can't model this).
-        state = {"watermark": None}
-
-        def execute(cmd, *a, **k):
-            if "(query" in cmd and ":ingestion/watermark" in cmd and ":hash" in cmd:
-                if state["watermark"]:
-                    return json.dumps({"results": [[state["watermark"]]]})
-                return json.dumps({"results": []})
-            if "(transact" in cmd and ":ingestion/watermark" in cmd:
-                import re
-                m = re.search(r':hash "([0-9a-f]+)"', cmd)
-                if m:
-                    state["watermark"] = m.group(1)
-            return json.dumps({"results": []})
-
-        db_instance.execute.side_effect = execute
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6617,6 +6648,14 @@ class TestRunIngestionShutdown:
         first_run_processed = mcp_server._ingest_progress["processed"]
         assert first_run_processed == 1
 
+        # Prove the watermark and the first commit's entity were genuinely
+        # persisted to disk before run 2 starts (not just left in the
+        # in-process _ingest_progress counter).
+        db = mcp_server.get_db()
+        watermark = mcp_server._watermark_query(db)
+        assert watermark, "run 1's watermark must be durably persisted for run 2 to resume from"
+        assert mcp_server._count_commit_entities(db) == 1
+
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -6624,10 +6663,16 @@ class TestRunIngestionShutdown:
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         assert mcp_server._ingest_progress["status"] == "complete"
-        # Second run only had the 1 remaining commit to do, and
-        # _count_commit_entities (mocked to [] here) seeds prior_ingested=0,
-        # so processed reflects just that run's own work.
-        assert mcp_server._ingest_progress["processed"] == 1
+        # Second run's preload now sees the 1 :type/commit entity genuinely
+        # persisted by run 1 (a real DB, not a canned mock response), so
+        # prior_ingested correctly seeds at 1; processed = prior_ingested (1)
+        # + the 1 remaining commit this run itself completes = 2. This is
+        # also proof the watermark actually gated re-processing: git_repo
+        # has 2 commits total, and only 1 was processed in each run.
+        assert mcp_server._ingest_progress["processed"] == 2
+        assert mcp_server._count_commit_entities(mcp_server.get_db()) == 2
+
+        mcp_server._db = None  # release the real file lock for subsequent tests
 
 
 class TestMainShutdown:
