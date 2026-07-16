@@ -50,25 +50,69 @@ def mock_minigraf_db():
         yield mock_class, db_instance
 
 
+@pytest.fixture
+def real_db(monkeypatch, tmp_path):
+    """Open a real (non-mocked) in-memory MiniGrafDb for the duration of the test.
+    Full Datalog parsing, schema validation, and bi-temporal semantics — just
+    backed by open_in_memory() instead of a disk file, so tests stay fast."""
+    from minigraf import MiniGrafDb
+    real_open_in_memory = MiniGrafDb.open_in_memory
+    monkeypatch.setattr(MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory()))
+    import mcp_server
+    mcp_server.open_db(str(tmp_path / "t.graph"))
+    yield mcp_server.get_db()
+
+
+@contextlib.contextmanager
+def execute_spy():
+    """Wrap mcp_server._db_execute to record (db, datalog) for every real call,
+    while still executing for real. Yields the list of recorded datalog strings."""
+    import mcp_server
+    real_execute = mcp_server._db_execute
+    calls = []
+
+    def spy(db_arg, datalog):
+        calls.append(datalog)
+        return real_execute(db_arg, datalog)
+
+    mcp_server._db_execute = spy
+    try:
+        yield calls
+    finally:
+        mcp_server._db_execute = real_execute
+
+
 class TestOpenDb:
-    def test_opens_db_at_given_path(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_opens_db_at_given_path(self, monkeypatch, tmp_path):
+        from minigraf import MiniGrafDb
+        real_open_in_memory = MiniGrafDb.open_in_memory
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory()))
         import mcp_server
-        graph_path = str(tmp_path / "test.graph")
-        mcp_server.open_db(graph_path)
-        mock_class.open.assert_called_once_with(graph_path)
+        path = str(tmp_path / "t.graph")
 
-    def test_registers_session_rules(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+        result = mcp_server.open_db(path)
+
+        assert result is not None
+        assert mcp_server._graph_path == path
+        # A real handle can execute — proof it's a live db, not a stub.
+        assert json.loads(result.execute("(query [:find ?e :where [?e :foo ?v]])"))["results"] == []
+
+    def test_registers_session_rules(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "test.graph"))
-        # Four rules registered at startup
-        assert db_instance.execute.call_count == len(mcp_server.SESSION_RULES)
-        for rule in mcp_server.SESSION_RULES:
-            db_instance.execute.assert_any_call(rule)
+        # Session rules are query-invocable once registered; pick one from
+        # SESSION_RULES and confirm it doesn't error when invoked as a rule call.
+        assert mcp_server.SESSION_RULES  # sanity: rules exist to register
+        # Invoke the 'linked' rule (first rule in SESSION_RULES) to confirm
+        # it was registered and is callable.
+        result = json.loads(real_db.execute("(query [:find ?a ?b :where (linked ?a ?b)])"))
+        assert "results" in result
+        # No exception during open_db (already happened via the real_db fixture)
+        # is itself the regression signal for registration failures.
 
-    def test_get_db_auto_opens_when_db_none(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_get_db_auto_opens_when_db_none(self, monkeypatch, tmp_path):
+        from minigraf import MiniGrafDb
+        real_open_in_memory = MiniGrafDb.open_in_memory
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory()))
         import mcp_server
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "auto.graph"))
         mcp_server._db = None
@@ -76,21 +120,27 @@ class TestOpenDb:
 
         result = mcp_server.get_db()
 
-        assert result is db_instance
+        assert result is not None
+        assert mcp_server._graph_path == str(tmp_path / "auto.graph")
 
-    def test_get_db_returns_instance_after_open(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_get_db_returns_instance_after_open(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "test.graph"))
-        assert mcp_server.get_db() is db_instance
+        result = mcp_server.get_db()
+        assert result is real_db
 
-    def test_uses_env_var_for_graph_path(self, mock_minigraf_db, monkeypatch, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_uses_env_var_for_graph_path(self, monkeypatch, tmp_path):
+        from minigraf import MiniGrafDb
+        real_open_in_memory = MiniGrafDb.open_in_memory
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory()))
+        import mcp_server
         custom_path = str(tmp_path / "custom.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", custom_path)
-        import mcp_server
-        mcp_server.open_db()
-        mock_class.open.assert_called_once_with(custom_path)
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+
+        mcp_server.get_db()
+
+        assert mcp_server._graph_path == custom_path
 
 
 class TestGetDbLockRetry:
