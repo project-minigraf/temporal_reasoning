@@ -803,105 +803,92 @@ class TestMinigrafReportIssue:
 
 
 class TestMemoryPrepareTurn:
-    def test_returns_empty_string_when_graph_empty(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    def test_returns_empty_string_when_graph_empty(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         result = mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
 
-        assert isinstance(result, str)
+        assert result == ""
 
-    def test_includes_matching_facts_in_output(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_includes_matching_facts_in_output(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute(
+            '(transact {} [[:decision/postgres :entity-type :type/decision] '
+            '[:decision/postgres :ident ":decision/postgres"] '
+            '[:decision/postgres :description "we use postgresql for storage"]])'
+        )
 
-        def execute_side_effect(cmd):
-            if "contains?" in cmd and "postgres" in cmd.lower():
-                return json.dumps({"results": [[":name", "PostgreSQL 15"]]})
-            return json.dumps({"results": []})
-
-        db_instance.execute.side_effect = execute_side_effect
         result = mcp_server._handle_memory_prepare_turn_heuristic("what did we decide about postgres?")
 
-        assert "PostgreSQL" in result or "postgres" in result.lower() or result == ""
+        assert "postgresql" in result.lower()
 
-    def test_falls_back_to_broad_scan_when_no_targeted_results(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_falls_back_to_broad_scan_when_no_targeted_results(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        # Seeded fact shares no substring with the message's candidate entities
+        # ("tell", "framework") — the targeted contains? query must come back
+        # empty, forcing the unfiltered broad-scan fallback to surface it.
+        real_db.execute(
+            '(transact {} [[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            '[:decision/redis :description "use Redis for caching"]])'
+        )
 
-        call_count = [0]
-
-        def execute_side_effect(cmd):
-            call_count[0] += 1
-            # Targeted queries return nothing; broad scan returns something
-            if "contains?" in cmd:
-                return json.dumps({"results": []})
-            return json.dumps({"results": [[":e", ":name", "FastAPI"]]})
-
-        db_instance.execute.side_effect = execute_side_effect
         result = mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
 
-        # Broad scan should have been called
-        assert call_count[0] > 0
+        assert "Redis" in result
 
-    def test_respects_scan_limit_env_var(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_respects_scan_limit_env_var(self, real_db, monkeypatch):
+        import mcp_server
         monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "10")
-        db_instance.execute.return_value = json.dumps({"results": []})
+        # None of these facts share a substring with the message's candidate
+        # entities, so the targeted query stays empty and every one of these
+        # triples is eligible for the broad-scan fallback — the scan_limit is
+        # only meaningfully tested if the graph holds more rows than the limit.
+        triples = []
+        for i in range(30):
+            ident = f":decision/item-{i}"
+            triples.append(f'[{ident} :entity-type :type/decision]')
+            triples.append(f'[{ident} :ident "{ident}"]')
+            triples.append(f'[{ident} :description "unrelated fact {i}"]')
+        real_db.execute(f'(transact {{}} [{" ".join(triples)}])')
+
+        result = mcp_server._handle_memory_prepare_turn_heuristic("xyzzy plugh quux")
+
+        lines = result.split("\n")
+        assert lines[0] == "Relevant memory context:"
+        assert len(lines) - 1 == 10
+
+    def test_uses_valid_at_for_message_with_explicit_iso_date(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        mcp_server._handle_memory_prepare_turn_heuristic("hello")
-        # Should not raise; limit is respected internally
+        with execute_spy() as calls:
+            mcp_server._handle_memory_prepare_turn_heuristic("what did we decide before 2026-01-15?")
 
-    def test_uses_valid_at_for_message_with_explicit_iso_date(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
-        import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
-
-        mcp_server._handle_memory_prepare_turn_heuristic("what did we decide before 2026-01-15?")
-
-        calls = [str(c) for c in db_instance.execute.call_args_list]
         assert any(':valid-at "2026-01-15"' in c for c in calls)
 
-    def test_caps_number_of_entities_scanned(self, mock_minigraf_db, tmp_path):
+    def test_caps_number_of_entities_scanned(self, real_db):
         """A long message must not issue one full-graph contains? scan per token.
 
         Each contains? query is an unindexed O(graph-size) linear scan (see
         issue #96); an unbounded entity count turns a single hook invocation
         into an unbounded number of full scans as the user's message grows.
         """
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         long_message = " ".join(f"distinctentityword{i}" for i in range(200))
-        mcp_server._handle_memory_prepare_turn_heuristic(long_message)
+        with execute_spy() as calls:
+            mcp_server._handle_memory_prepare_turn_heuristic(long_message)
 
-        contains_calls = [
-            c for c in db_instance.execute.call_args_list if "contains?" in str(c)
-        ]
+        contains_calls = [c for c in calls if "contains?" in c]
         assert len(contains_calls) <= mcp_server._MAX_HEURISTIC_ENTITIES
 
-    def test_uses_current_utc_timestamp_for_current_state_queries(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
-        import mcp_server, re
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+    def test_uses_current_utc_timestamp_for_current_state_queries(self, real_db):
+        import mcp_server
+        import re
 
-        mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
+        with execute_spy() as calls:
+            mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
 
-        calls = [str(c) for c in db_instance.execute.call_args_list]
         # Should contain a UTC timestamp like 2026-05-02T15:44:52.184Z
         assert any(re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z', c) for c in calls)
 
@@ -988,29 +975,26 @@ class TestHeuristicExtraction:
 
 
 class TestMemoryFinalizeTurnHeuristic:
-    def test_transacts_extracted_facts(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_transacts_extracted_facts(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
-        db_instance.execute.return_value = json.dumps({"tx": "5"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         result = asyncio.run(mcp_server.handle_memory_finalize_turn(
             "User: We'll use Redis.\nAgent: Stored."
         ))
 
         assert result["ok"] is True
-        assert isinstance(result["stored_count"], int)
+        assert result["stored_count"] == 1
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == [["Redis"]]
 
-    def test_returns_zero_stored_when_no_signals(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_returns_zero_stored_when_no_signals(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         result = asyncio.run(mcp_server.handle_memory_finalize_turn("The weather is fine."))
 
@@ -1079,12 +1063,10 @@ class TestCallLlm:
 
 
 class TestLlmStrategyOpenAI:
-    def test_calls_openai_api(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_calls_openai_api(self, real_db, monkeypatch):
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
         monkeypatch.setenv("MINIGRAF_LLM_MODEL", "gpt-4o-mini")
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        db_instance.execute.return_value = json.dumps({"tx": "6"})
         import mcp_server
 
         fake_response_text = '[[:decision/redis :description "Redis"]]\n'
@@ -1094,7 +1076,6 @@ class TestLlmStrategyOpenAI:
         )
 
         with patch("mcp_server._get_openai_client", return_value=mock_openai_client):
-            mcp_server.open_db(str(tmp_path / "t.graph"))
             result = mcp_server._llm_extract_and_transact(
                 "User: We'll use Redis.\nAgent: Stored."
             )
@@ -1102,29 +1083,32 @@ class TestLlmStrategyOpenAI:
         assert result["ok"] is True
         assert result["stored_count"] > 0
         mock_openai_client.chat.completions.create.assert_called_once()
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == [["Redis"]]
 
-    def test_falls_back_to_heuristic_on_openai_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_falls_back_to_heuristic_on_openai_failure(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
         monkeypatch.setenv("MINIGRAF_LLM_MODEL", "gpt-4o-mini")
-        db_instance.execute.return_value = json.dumps({"tx": "7"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with patch("mcp_server._get_openai_client", side_effect=Exception("no key")):
             result = asyncio.run(mcp_server.handle_memory_finalize_turn("We'll use Kafka."))
 
         assert result["ok"] is True
         assert "heuristic" in result["strategy"]
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/kafka :description ?d]])'
+        ))
+        assert queried["results"] == [["Kafka"]]
 
 
 class TestLlmStrategy:
-    def test_calls_anthropic_api(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_calls_anthropic_api(self, real_db, monkeypatch):
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        db_instance.execute.return_value = json.dumps({"tx": "6"})
         import mcp_server
 
         fake_response_text = '[[:decision/redis :description "Redis"]]\n'
@@ -1134,21 +1118,21 @@ class TestLlmStrategy:
         mock_anthropic_client.messages.create.return_value = mock_message
 
         with patch("mcp_server._get_anthropic_client", return_value=mock_anthropic_client):
-            mcp_server.open_db(str(tmp_path / "t.graph"))
             result = mcp_server._llm_extract_and_transact(
                 "User: We'll use Redis.\nAgent: Stored."
             )
 
         assert result["ok"] is True
         mock_anthropic_client.messages.create.assert_called_once()
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == [["Redis"]]
 
-    def test_falls_back_to_heuristic_on_api_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_falls_back_to_heuristic_on_api_failure(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
-        db_instance.execute.return_value = json.dumps({"tx": "7"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with patch("mcp_server._get_anthropic_client", side_effect=Exception("no key")):
             result = asyncio.run(mcp_server.handle_memory_finalize_turn("We'll use Kafka."))
@@ -1156,16 +1140,17 @@ class TestLlmStrategy:
         assert result["ok"] is True
         assert "heuristic" in result["strategy"]
         assert "warning" in result
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/kafka :description ?d]])'
+        ))
+        assert queried["results"] == [["Kafka"]]
 
 
 class TestAgentStrategy:
-    def test_returns_ok_result(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_returns_ok_result(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "agent")
-        db_instance.execute.return_value = json.dumps({"tx": "8"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with patch("mcp_server._request_agent_memory_block_async",
                    new_callable=AsyncMock,
@@ -1173,6 +1158,10 @@ class TestAgentStrategy:
             result = asyncio.run(mcp_server._agent_extract_and_transact("We chose Kafka."))
 
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/kafka :description ?d]])'
+        ))
+        assert queried["results"] == [["Kafka"]]
 
 
 class TestMcpToolWiring:
