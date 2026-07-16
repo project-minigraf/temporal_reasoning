@@ -3793,6 +3793,7 @@ def _build_close_triples(
     extra_contains_parent: Optional[str] = None,
     *,
     close_entity_type: bool = False,
+    entity_type_kw: Optional[str] = None,
     file_value: Optional[str] = None,
     is_static: Optional[bool] = None,
 ) -> List[str]:
@@ -3822,7 +3823,14 @@ def _build_close_triples(
     (submodule) idents that reuse the "module" ident prefix but were never
     actually asserted as :type/module — deriving :entity-type from the ident
     prefix there would transact a false fact, so only call sites that KNOW
-    they're closing a real module/function/class/variable/field pass these.
+    they're closing a real module/function/class/variable/field pass
+    close_entity_type=True.
+
+    entity_type_kw is the escape hatch for exactly that submodule case (#137):
+    an explicit ":type/xxx" keyword to close instead of deriving one from the
+    ident prefix, for callers whose ident prefix does NOT match their real
+    :entity-type. Takes precedence over close_entity_type when both are given
+    (they shouldn't be — pass one or the other).
     """
     triples = [
         f'[{ident} :ident "{_edn_escape(ident)}"]',
@@ -3837,7 +3845,9 @@ def _build_close_triples(
     ):
         triples.append(f"[{extra_contains_parent} :contains {ident}]")
         triples.append(f"[{ident} :class {extra_contains_parent}]")
-    if close_entity_type:
+    if entity_type_kw is not None:
+        triples.append(f"[{ident} :entity-type {entity_type_kw}]")
+    elif close_entity_type:
         entity_type = ident.split("/", 1)[0].lstrip(":")
         triples.append(f"[{ident} :entity-type :type/{entity_type}]")
     if file_value is not None:
@@ -6108,7 +6118,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 orig_ts = entity_valid_from.get(ext_ident, commit_ts_iso)
                                 desc = entity_descriptions.get(ext_ident, "")
                                 close_items.append(
-                                    (_build_close_triples(ext_ident, desc, ext_ident), orig_ts)
+                                    (_build_close_triples(
+                                        ext_ident, desc, ext_ident,
+                                        entity_type_kw=":type/external-dependency",
+                                        file_value=path,
+                                    ), orig_ts)
                                 )
                                 # Submodule removed: purge lifecycle state so a later
                                 # re-add at the same path is treated as genuinely new.
