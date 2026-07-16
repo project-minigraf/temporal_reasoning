@@ -8569,6 +8569,54 @@ class TestRunIngestionGitlinks:
         ident = mcp_server._code_ident("module", "vendor/lib")
         assert any(f'[{ident} :ident "{ident}"]' in t for t in close_triples_seen)
 
+    @pytest.mark.asyncio
+    async def test_submodule_removal_closes_entity_type_and_path_against_real_graph(self, tmp_path):
+        """Issue #137: a removed submodule's :entity-type/:path must be closed
+        too, not just :ident/:description (the pre-existing behavior verified
+        by test_submodule_removal_closes_entity above via a mock). Pre-fix,
+        [?e :entity-type :type/external-dependency] and [?e :path ?p] queries
+        without an :ident join still returned the removed submodule forever,
+        the same class of bug as #134 (see PR #136) but for the gitlink
+        "remove" close site, which #136 deliberately left unfixed since
+        deriving :entity-type from the ident's "module" prefix there would
+        have transacted a false :type/module fact.
+
+        Verified against the REAL minigraf backend, counting rows before/after
+        removal (no mock — this is exactly the un-mocked query check #134's
+        fix required).
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        self._add_submodule_commit(repo)
+        _subprocess.run(["git", "rm", "-f", "vendor/lib"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "remove submodule"], cwd=repo, check=True, capture_output=True)
+
+        # Real backend: real MiniGrafDb, real execute, real persistence.
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        real_execute = mcp_server._db_execute
+
+        def count(attr, value):
+            raw = real_execute(db, f"(query [:find ?e :where [?e {attr} {value}]])")
+            return len(json.loads(raw).get("results", []))
+
+        assert count(":entity-type", ":type/external-dependency") == 0, \
+            "removed submodule's :entity-type must be closed (issue #137)"
+        assert count(":path", '"vendor/lib"') == 0, \
+            "removed submodule's :path must be closed (issue #137)"
+
+        mcp_server._db = None  # release the real file lock for subsequent tests
+
 
 # ---------------------------------------------------------------------------
 # Helpers for TestExtractImportName
