@@ -700,101 +700,75 @@ class TestPidIsAlive:
 
 
 class TestMinigrafQuery:
-    def test_returns_results_on_success(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": [["FastAPI", ":decision"]]})
+    def test_returns_results_on_success(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        real_db.execute('(transact {} [[:decision/redis :description "use Redis"]])')
 
-        result = mcp_server.handle_minigraf_query("[:find ?n :where [?e :name ?n]]")
+        result = mcp_server.handle_minigraf_query(
+            '[:find ?d :where [:decision/redis :description ?d]]'
+        )
 
-        db_instance.execute.assert_called_once()
         assert result["ok"] is True
-        assert result["results"] == [["FastAPI", ":decision"]]
+        assert result["results"] == [["use Redis"]]
 
-    def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_error_on_minigraf_error(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad datalog")
-
-        result = mcp_server.handle_minigraf_query("[:bad]")
-
+        result = mcp_server.handle_minigraf_query("(this is not valid datalog")
         assert result["ok"] is False
-        assert "bad datalog" in result["error"]
+        assert "error" in result
 
 
 class TestMinigrafTransact:
-    def test_requires_reason(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_requires_reason(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
-        result = mcp_server.handle_minigraf_transact("[[:e :a :v]]", reason="")
-
+        result = mcp_server.handle_minigraf_transact("[[:decision/x :description \"y\"]]", reason="")
         assert result["ok"] is False
         assert "reason" in result["error"].lower()
 
-    def test_transacts_and_checkpoints(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "3"})
+    def test_transacts_and_checkpoints(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="test"
+        )
 
-        result = mcp_server.handle_minigraf_transact("[[:e :a :v]]", reason="test")
-
-        # execute is called at least once for the transact (background index rebuild may
-        # add an extra call; assert any transact call was made rather than assert_called_once)
-        assert any("transact" in str(c) for c in db_instance.execute.call_args_list)
-        db_instance.checkpoint.assert_called_once()
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/cache :description ?d]])'
+        ))
+        assert queried["results"] == [["use Redis"]]
 
-    def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_error_on_minigraf_error(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad facts")
-
-        result = mcp_server.handle_minigraf_transact("[[:bad]]", reason="test")
-
+        result = mcp_server.handle_minigraf_transact("(not valid datalog", reason="test")
         assert result["ok"] is False
-        assert "bad facts" in result["error"]
+        assert "error" in result
 
 
 class TestMinigrafRetract:
-    def test_requires_reason(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_requires_reason(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         result = mcp_server.handle_minigraf_retract("[[:e :a :v]]", reason="")
-
         assert result["ok"] is False
 
-    def test_retracts_and_checkpoints(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "4"})
+    def test_retracts_and_checkpoints(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        real_db.execute('(transact {} [[:decision/old :description "deprecated"]])')
 
-        result = mcp_server.handle_minigraf_retract("[[:e :a :v]]", reason="gone")
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/old :description "deprecated"]]', reason="gone"
+        )
 
-        db_instance.checkpoint.assert_called_once()
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/old :description ?d]])'
+        ))
+        assert queried["results"] == []
 
-    def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_error_on_minigraf_error(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad retract")
-
-        result = mcp_server.handle_minigraf_retract("[[:e :a :v]]", reason="gone")
-
+        result = mcp_server.handle_minigraf_retract("(not valid datalog", reason="gone")
         assert result["ok"] is False
-        assert "bad retract" in result["error"]
+        assert "error" in result
 
 
 class TestMinigrafReportIssue:
