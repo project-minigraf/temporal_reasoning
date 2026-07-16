@@ -7014,13 +7014,9 @@ class TestIndexCache:
         cache = IndexCache()
         assert cache.get() is None
 
-    def test_rebuild_populates_index(self, mock_minigraf_db, tmp_path):
+    def test_rebuild_populates_index(self, real_db):
         import mcp_server
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":decision/use-redis", ":description", "use redis"]]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute('(transact {} [[:decision/use-redis :description "use redis"]])')
         cache = mcp_server.IndexCache()
         cache._rebuild()
         assert cache.get() is not None
@@ -7084,57 +7080,64 @@ class TestIndexCache:
 
 @requires_bm25
 class TestMemoryPrepareTurnBM25:
-    def test_returns_empty_when_no_index(self, mock_minigraf_db, tmp_path):
+    def test_returns_empty_when_no_index(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         fresh_cache = mcp_server.IndexCache()  # no index built yet
         with patch.object(mcp_server, "_index_cache", fresh_cache), \
              patch.object(mcp_server, "_BM25_AVAILABLE", True):
             result = mcp_server.handle_memory_prepare_turn("redis caching")
         assert result == ""
 
-    def test_returns_empty_for_unmatched_query(self, mock_minigraf_db, tmp_path):
+    def test_returns_empty_for_unmatched_query(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":decision/use-redis", ":description", "use redis"]]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute('(transact {} [[:decision/use-redis :description "use redis"]])')
         cache = mcp_server.IndexCache()
         cache._rebuild()
         with patch.object(mcp_server, "_index_cache", cache):
             result = mcp_server.handle_memory_prepare_turn("elephants trombone")
         assert result == ""
 
-    def test_memory_facts_rank_above_git_facts(self, mock_minigraf_db, tmp_path):
+    def test_memory_facts_rank_above_git_facts(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [
-                [":decision/use-redis", ":description", "use redis for caching"],
-                [":commit/abc123def456", ":subject", "feat use redis caching layer"],
-                [":function/unrelated", ":name", "some other thing entirely"],
-            ]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        # NOTE: against a real backend, minigraf resolves every entity ident
+        # (e.g. ":decision/use-redis") to an internal UUID — an unbound [?e
+        # ?a ?v] query never returns the keyword literal in the ?e position
+        # (see _query_canonical_entities' docstring a few hundred lines up,
+        # which documents this exact UUID-vs-ident distinction). That means
+        # FactIndex._is_memory — which keys off row[0], i.e. ?e — never
+        # matches a real fact, so the memory-fact BM25 boost this test's name
+        # references never actually fires in production either; verified by
+        # calling IndexCache._rebuild() against a real db with a
+        # ":decision/..."-prefixed + explicit :ident fact and observing
+        # _is_memory == [False, False]. This assertion therefore exercises
+        # natural BM25 relevance ranking (decision text scores higher than
+        # commit text for this query on doc-length/term-frequency grounds
+        # alone), not the boost path — see task-12-report.md for the full
+        # writeup of this pre-existing bug.
+        real_db.execute(
+            '(transact {} ['
+            '[:decision/use-redis :description "use redis for caching"] '
+            '[:commit/abc123def456 :subject "feat use redis caching layer"] '
+            '[:function/unrelated :name "some other thing entirely"]'
+            '])'
+        )
         cache = mcp_server.IndexCache()
         cache._rebuild()
         with patch.object(mcp_server, "_index_cache", cache):
             result = mcp_server.handle_memory_prepare_turn("redis caching")
         assert "Relevant memory context:" in result
-        assert result.index(":decision/use-redis") < result.index(":commit/abc123def456")
+        assert result.index("use redis for caching") < result.index("feat use redis caching layer")
 
-    def test_respects_scan_limit(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_respects_scan_limit(self, real_db, monkeypatch):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[f":decision/item-{i}", ":description", f"redis item {i}"] for i in range(20)]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        triples = " ".join(
+            f'[:decision/item-{i} :description "redis item {i}"]' for i in range(20)
+        )
+        real_db.execute(f'(transact {{}} [{triples}])')
         monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "3")
         cache = mcp_server.IndexCache()
         cache._rebuild()
@@ -7145,62 +7148,42 @@ class TestMemoryPrepareTurnBM25:
 
 
 class TestIndexCacheInvalidation:
-    def test_successful_transact_triggers_invalidation(self, mock_minigraf_db, tmp_path):
+    def test_successful_transact_triggers_invalidation(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx_id": 1, "count": 1})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
             mcp_server.handle_minigraf_transact(
                 '[[:decision/test :description "test"]]', reason="test"
             )
             mock_inv.assert_called_once()
 
-    def test_failed_transact_does_not_trigger_invalidation(self, mock_minigraf_db, tmp_path):
+    def test_failed_transact_does_not_trigger_invalidation(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        from minigraf import MiniGrafError
-        mock_class, db_instance = mock_minigraf_db
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad tx")
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_minigraf_transact(
-                '[[:decision/test :description "test"]]', reason="test"
-            )
+            mcp_server.handle_minigraf_transact("(not valid datalog", reason="test")
             mock_inv.assert_not_called()
 
-    def test_successful_retract_triggers_invalidation(self, mock_minigraf_db, tmp_path):
+    def test_successful_retract_triggers_invalidation(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx_id": 2, "count": 1})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute('(transact {} [[:decision/test :description "test"]])')
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
             mcp_server.handle_minigraf_retract(
                 '[[:decision/test :description "test"]]', reason="cleanup"
             )
             mock_inv.assert_called_once()
 
-    def test_failed_retract_does_not_trigger_invalidation(self, mock_minigraf_db, tmp_path):
+    def test_failed_retract_does_not_trigger_invalidation(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        from minigraf import MiniGrafError
-        mock_class, db_instance = mock_minigraf_db
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad retract")
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_minigraf_retract(
-                '[[:decision/test :description "test"]]', reason="cleanup"
-            )
+            mcp_server.handle_minigraf_retract("(not valid datalog", reason="cleanup")
             mock_inv.assert_not_called()
 
-    def test_run_ingestion_triggers_invalidation_on_completion(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_run_ingestion_triggers_invalidation_on_completion(self, real_db, tmp_path, monkeypatch):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         monkeypatch.setattr(mcp_server, "_git_commits", lambda *a, **k: [])
         monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
         monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}, {}, {}))
@@ -7213,44 +7196,21 @@ class TestIndexCacheInvalidation:
 
 
 class TestBM25GracefulDegradation:
-    def test_falls_back_to_heuristic_when_bm25_unavailable(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_falls_back_to_heuristic_when_bm25_unavailable(self, real_db, monkeypatch):
         import mcp_server
-        from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
         # The heuristic extracts entities from "decided to use redis":
         #   "decided" (7 chars) and "redis" (5 chars) pass the _MIN_ENTITY_LEN=4 filter.
-        # For each entity it calls db.execute() with a contains? query.
-        # Using side_effect so the first entity query returns a match and the
-        # second returns empty (deduplication handles any overlap).
-        session_rule_count = len(mcp_server.SESSION_RULES)
-        call_count = 0
-
-        def side_effect(query_str):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= session_rule_count:
-                # SESSION_RULES registrations during open_db
-                return json.dumps({"ok": True})
-            # First entity query ("decided") — return a matching fact
-            if call_count == session_rule_count + 1:
-                return json.dumps({"results": [["use", "decided to use redis"]]})
-            # Subsequent entity queries — return empty
-            return json.dumps({"results": []})
-
-        db_instance.execute.side_effect = side_effect
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        # A fact whose value contains both substrings satisfies the heuristic's
+        # (contains? ?v "<entity>") query for either extracted entity.
+        real_db.execute('(transact {} [[:decision/use-redis :description "decided to use redis"]])')
         monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
         result = mcp_server.handle_memory_prepare_turn("decided to use redis")
         # Heuristic path produces "Relevant memory context:" when facts are found
         assert "Relevant memory context:" in result
 
-    def test_index_cache_rebuild_noop_when_bm25_unavailable(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_index_cache_rebuild_noop_when_bm25_unavailable(self, real_db, monkeypatch):
         import mcp_server
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":decision/use-redis", ":description", "use redis"]]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute('(transact {} [[:decision/use-redis :description "use redis"]])')
         monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
         monkeypatch.setattr(mcp_server, "_BM25Okapi", None)
         cache = mcp_server.IndexCache()
