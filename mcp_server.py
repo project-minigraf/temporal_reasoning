@@ -4082,6 +4082,7 @@ def _ingest_close(
     original_ts_iso: str,
     commit_ts_iso: str,
     reason: str,
+    index_con: Optional[Any] = None,
 ) -> None:
     """Close a fact's valid window at the deletion commit timestamp.
 
@@ -4089,8 +4090,10 @@ def _ingest_close(
     1. Retract each original open-ended fact so it vanishes from current-time
        queries (retract has no temporal options, so this removes the unbounded
        assertion from the live view while keeping it in transaction history).
+       This is also the step that removes the fact from the live index.
     2. Re-transact the same facts with explicit :valid-from + :valid-to so the
-       historical valid window is preserved for point-in-time queries.
+       historical valid window is preserved for point-in-time queries. Bounded
+       (valid_to is not None), so _transact does not index this half.
 
     Triples are retracted one-by-one to avoid EAVT collision on :contains edges
     (Minigraf's pending index omits value bytes, so batching multiple
@@ -4100,13 +4103,12 @@ def _ingest_close(
         return
     for triple in triples:
         try:
-            _db_execute(db, f"(retract [{triple}])")
+            _retract(db, f"[{triple}]", index_con=index_con)
         except Exception:
             pass  # best-effort: original may not exist if preload was incomplete
     facts_str = "[" + " ".join(triples) + "]"
-    _db_execute(
-        db,
-        f'(transact {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}} {facts_str})',
+    _transact(
+        db, facts_str, original_ts_iso, valid_to=commit_ts_iso, index_con=index_con,
     )
 
 

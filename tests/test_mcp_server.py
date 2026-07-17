@@ -5635,6 +5635,145 @@ class TestIngestionWrites:
         assert last_run_calls[0][2] == 0  # no commits processed this run, prior was 0
 
 
+class TestIngestCloseFactIndex:
+    """_ingest_close makes two separate writes -- a retract-loop (the actual
+    live-index removal mechanism) and a bounded re-transact (historical,
+    must NOT be indexed). Both must route through the _transact/_retract
+    choke point for a closed entity to actually disappear from the index.
+    This is the exact gap the design-review process for #118 caught: an
+    earlier draft of the design doc mislabeled which half does the real
+    removal.
+
+    Seeding below uses mcp_server._transact directly, NOT _ingest_transact.
+    _ingest_transact is migrated separately in Task 8 and, as of this task,
+    is still a raw _db_execute call -- it never touches the fact index.
+    Seeding through it would make every index-state assertion below
+    vacuously true (the fact would never have been indexed to begin with,
+    so "absent from the index after close" would hold no matter what
+    _ingest_close does). Each index-state test below also asserts the seed
+    itself landed in the index, so a future regression to a non-indexing
+    seed would fail loudly here instead of silently validating nothing.
+    """
+
+    def test_close_removes_open_assertion_from_index(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server._transact(
+            real_db, '[[:module/foo :description "the foo module"]]',
+            "2026-01-01T00:00:00.000Z",
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        # Sanity: the seed genuinely indexed the fact. If this fails, the
+        # assertion below would be vacuous (nothing there to remove).
+        seeded = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0)
+        assert any(r[0] == ":module/foo" for r in seeded)
+
+        mcp_server._ingest_close(
+            real_db, ['[:module/foo :description "the foo module"]'],
+            "2026-01-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z", "test",
+        )
+
+        results = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0)
+        assert results == []
+
+    def test_close_bounded_retransact_not_indexed(self, real_db):
+        """The historical (valid_to-bounded) half of a close must never
+        appear in the live index -- this is the exact case an earlier draft
+        of the design doc got wrong by only naming the visible half of
+        _ingest_close. Directly asserts nothing at all references
+        :module/foo post-close, not just that this exact text is unmatched
+        -- this also catches a buggy migration that ends up re-indexing the
+        bounded half (a stray row would still surface here even if it used
+        different wording than the original)."""
+        import mcp_server
+        import fact_index
+        mcp_server._transact(
+            real_db, '[[:module/foo :description "the foo module"]]',
+            "2026-01-01T00:00:00.000Z",
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        con = fact_index.open_reader(index_path)
+        try:
+            seeded_rows = con.execute(
+                "SELECT * FROM facts_fts WHERE entity = ?", (":module/foo",)
+            ).fetchall()
+        finally:
+            con.close()
+        assert seeded_rows != [], "seed must genuinely index the fact, or this test is vacuous"
+
+        mcp_server._ingest_close(
+            real_db, ['[:module/foo :description "the foo module"]'],
+            "2026-01-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z", "test",
+        )
+
+        con = fact_index.open_reader(index_path)
+        try:
+            rows = con.execute(
+                "SELECT * FROM facts_fts WHERE entity = ?", (":module/foo",)
+            ).fetchall()
+        finally:
+            con.close()
+        assert rows == []
+
+    def test_close_routes_both_writes_through_choke_point(self, real_db, monkeypatch):
+        """Structural proof that both halves of _ingest_close call the
+        _retract/_transact choke-point functions -- not just that the
+        resulting index state looks right.
+
+        This matters specifically for the bounded re-transact half: a
+        bounded write (valid_to != None) is NEVER indexed whether or not it
+        goes through _transact, since _transact's own indexing guard skips
+        anything with valid_to set. That means an index-state-only test
+        (like the two above) cannot structurally distinguish "correctly
+        migrated to call _transact" from "still calling raw _db_execute,
+        never migrated at all" for that half -- both produce an identical,
+        empty index outcome. This test can, because it inspects the calls
+        themselves rather than their downstream effect on the index.
+        """
+        import mcp_server
+        # Seed the graph directly (not via _transact/_ingest_transact) so the
+        # retract-loop has a real fact to retract, without itself invoking
+        # either spied choke-point function.
+        real_db.execute(
+            '(transact {:valid-from "2026-01-01T00:00:00.000Z"} '
+            '[[:module/foo :description "the foo module"]])'
+        )
+
+        retract_calls = []
+        transact_calls = []
+        real_retract = mcp_server._retract
+        real_transact = mcp_server._transact
+
+        def spy_retract(db, datalog_facts, **kwargs):
+            retract_calls.append(datalog_facts)
+            return real_retract(db, datalog_facts, **kwargs)
+
+        def spy_transact(db, datalog_facts, valid_from, valid_to=None, **kwargs):
+            transact_calls.append((datalog_facts, valid_from, valid_to))
+            return real_transact(db, datalog_facts, valid_from, valid_to=valid_to, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_retract", spy_retract)
+        monkeypatch.setattr(mcp_server, "_transact", spy_transact)
+
+        mcp_server._ingest_close(
+            real_db, ['[:module/foo :description "the foo module"]'],
+            "2026-01-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z", "test",
+        )
+
+        assert len(retract_calls) == 1, (
+            "retract-loop must call the _retract choke point once per triple"
+        )
+        assert ':module/foo :description "the foo module"' in retract_calls[0]
+        assert len(transact_calls) == 1, (
+            "bounded re-transact must call the _transact choke point"
+        )
+        _, _, valid_to = transact_calls[0]
+        assert valid_to == "2026-02-01T00:00:00.000Z", (
+            "bounded re-transact must pass valid_to so _transact's own "
+            "indexing guard skips it"
+        )
+
+
 class TestPrecomputeFileTriples:
     def test_module_candidate_triples_include_introduced_by(self):
         import mcp_server
