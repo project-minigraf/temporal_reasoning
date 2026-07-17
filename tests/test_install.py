@@ -64,22 +64,22 @@ class TestCheckMcpServerImportable:
 
 
 class TestSetupMcpJson:
-    def test_uses_git_ingestion_and_bm25_extras(self, tmp_path):
+    def test_uses_git_ingestion_extra(self, tmp_path):
         install.setup_mcp_json(str(tmp_path))
         with open(tmp_path / ".mcp.json") as f:
             config = json.load(f)
         args = config["mcpServers"]["temporal-reasoning"]["args"]
-        assert args == ["temporal-reasoning[git-ingestion,bm25]"]
+        assert args == ["temporal-reasoning[git-ingestion]"]
 
 
 class TestBuildPluginStub:
-    def test_stub_mcp_json_uses_git_ingestion_and_bm25_extras(self, tmp_path, monkeypatch):
+    def test_stub_mcp_json_uses_git_ingestion_extra(self, tmp_path, monkeypatch):
         monkeypatch.setattr(install.os.path, "expanduser", lambda p: str(tmp_path))
         stub_dir = install._build_plugin_stub()
         with open(install.os.path.join(stub_dir, ".mcp.json")) as f:
             config = json.load(f)
         args = config["mcpServers"]["temporal-reasoning"]["args"]
-        assert args == ["temporal-reasoning[git-ingestion,bm25]"]
+        assert args == ["temporal-reasoning[git-ingestion]"]
 
 
 class TestSyncLists:

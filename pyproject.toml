@@ -26,13 +26,13 @@ classifiers = [
 dependencies = [
     "minigraf>=1.2.1",
     "mcp>=1.27.0",
+    "rank-bm25",
 ]
 
 [project.scripts]
 temporal-reasoning = "mcp_server:run"
 
 [project.optional-dependencies]
-bm25 = ["rank-bm25"]
 git-ingestion = [
     "tree-sitter>=0.22.0",
     "tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript",
@@ -48,7 +48,6 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "black>=25.11.0",
     "ruff>=0.15.12",
-    "rank-bm25",
 ]
 
 [tool.setuptools]

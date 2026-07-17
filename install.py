@@ -313,15 +313,15 @@ def setup_mcp_json(target_dir: str) -> bool:
     - Creates the file if absent.
     - Merges into existing content if present (other servers are preserved).
     - Always updates MINIGRAF_GRAPH_PATH to reflect the target project path.
-    - Uses `uvx temporal-reasoning[git-ingestion,bm25]` so the published PyPI
+    - Uses `uvx temporal-reasoning[git-ingestion]` so the published PyPI
       package is invoked directly — no local venv path baked in. `[git-ingestion]`
       is required so uvx's ephemeral venv actually has the tree-sitter
       packages code-structure extraction depends on (see issue #93 — a bare
       `uvx temporal-reasoning` resolves none of them, silently disabling
-      code-structure extraction). `[bm25]` is required so rank-bm25 is present
-      and handle_memory_prepare_turn can use the cached, indexed BM25 path
-      instead of permanently falling back to the unindexed, O(graph-size)
-      heuristic scan on every turn (see issue #96).
+      code-structure extraction). rank-bm25 is a core (non-optional) dependency
+      so handle_memory_prepare_turn always has the cached, indexed BM25 path
+      available instead of falling back to the unindexed, O(graph-size)
+      heuristic scan on every turn (see issues #96, #117).
     - Only MINIGRAF_GRAPH_PATH is set here; ANTHROPIC_API_KEY and
       MINIGRAF_EXTRACTION_STRATEGY belong in .claude/settings.local.json so
       they are available to hook subprocesses as well as the MCP server.
@@ -343,7 +343,7 @@ def setup_mcp_json(target_dir: str) -> bool:
     existing.setdefault("mcpServers", {})["temporal-reasoning"] = {
         "type": "stdio",
         "command": "uvx",
-        "args": ["temporal-reasoning[git-ingestion,bm25]"],
+        "args": ["temporal-reasoning[git-ingestion]"],
         "env": {
             "MINIGRAF_GRAPH_PATH": graph_path,
         },
@@ -359,7 +359,7 @@ def setup_mcp_json(target_dir: str) -> bool:
 
     verb = "Updated" if file_existed else "Created"
     print(f"✓ {verb} {mcp_json_path}")
-    print(f"    command = uvx temporal-reasoning[git-ingestion,bm25]")
+    print(f"    command = uvx temporal-reasoning[git-ingestion]")
     print(f"    MINIGRAF_GRAPH_PATH = {graph_path}")
     return True
 
@@ -569,7 +569,7 @@ def _build_plugin_stub() -> str:
                 "temporal-reasoning": {
                     "type": "stdio",
                     "command": "uvx",
-                    "args": ["temporal-reasoning[git-ingestion,bm25]"],
+                    "args": ["temporal-reasoning[git-ingestion]"],
                 },
             },
         }, f, indent=2)
