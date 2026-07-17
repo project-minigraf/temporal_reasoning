@@ -10,10 +10,11 @@ __pycache__/
 build/
 *.egg-info/
 
-# OpenCode
+# Harness-local synced skill copies (OpenCode, Codex CLI)
 .opencode/
 .codex
 .codex/
+.agents/
 *.graph
 *.graph.lock
 .mcp.json

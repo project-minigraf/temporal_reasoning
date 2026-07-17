@@ -42,10 +42,22 @@ PLUGIN_VERSION = _plugin_version()
 FILES_TO_SYNC = ["SKILL.md", "mcp_server.py", "skill.json"]
 DIRS_TO_SYNC = ["tools", "hooks"]
 SUPPORTED_HARNESSES = ("claude-code", "opencode", "codex")
+# Per-harness project-local skill directory. Verified against each harness's own
+# docs (2026-07-17), not assumed from prior code:
+#   - claude-code: Claude Code discovers project skills under .claude/skills/
+#     (https://opencode.ai/docs/skills/ independently documents this as the
+#     "Project Claude-compatible" path, corroborating Claude Code's own docs).
+#   - opencode:    .opencode/skills/ is OpenCode's documented project scope
+#     (https://opencode.ai/docs/skills/).
+#   - codex:       Codex CLI scans .agents/skills/ from cwd up to the repo root
+#     — NOT .codex/skills/, which was an unverified assumption in earlier code
+#     (https://developers.openai.com/codex/skills, confirmed 2026-07-17: "Codex
+#     scans .agents/skills in every directory from your current working
+#     directory up to the repository root").
 HARNESS_SKILL_DIRS = {
-    "codex": os.path.join(".codex", "skills", "temporal-reasoning"),
+    "codex": os.path.join(".agents", "skills", "temporal-reasoning"),
     "opencode": os.path.join(".opencode", "skills", "temporal-reasoning"),
-    "claude-code": os.path.join("skills", "temporal-reasoning"),
+    "claude-code": os.path.join(".claude", "skills", "temporal-reasoning"),
 }
 _MANUAL_CONFIG_TEMPLATE = {
     "opencode": os.path.join("hooks", "opencode.json"),
