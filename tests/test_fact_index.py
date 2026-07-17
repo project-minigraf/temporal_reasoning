@@ -102,3 +102,67 @@ def test_open_reader_missing_file_raises():
     import pytest
     with pytest.raises(sqlite3.OperationalError):
         fact_index.open_reader("/nonexistent/path/does-not-exist.sqlite3")
+
+
+def test_query_facts_ranks_by_relevance(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [
+        (":decision/use-redis", ":description", "use redis for caching layer"),
+        (":function/unrelated", ":name", "some other thing entirely"),
+    ])
+    fact_index.close_writer(con)
+    results = fact_index.query_facts(path, "redis caching", top_n=10, boost=2.0)
+    assert results
+    assert results[0][0] == ":decision/use-redis"
+
+
+def test_query_facts_excludes_non_matching_rows(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [(":function/unrelated", ":name", "some other thing entirely")])
+    fact_index.close_writer(con)
+    results = fact_index.query_facts(path, "redis caching", top_n=10, boost=2.0)
+    assert results == []
+
+
+def test_query_facts_respects_top_n(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [
+        (f":decision/x{i}", ":description", "redis caching option") for i in range(5)
+    ])
+    fact_index.close_writer(con)
+    results = fact_index.query_facts(path, "redis caching", top_n=2, boost=2.0)
+    assert len(results) == 2
+
+
+def test_query_facts_boosts_memory_prefixed_entities():
+    """#141 regression test: a :decision/-prefixed fact must rank above a
+    non-memory fact with otherwise identical text. This is the boost that
+    never fired against real data in the old FactIndex._is_memory (it
+    checked minigraf's internal UUID, never the keyword ident) -- here the
+    entity column is always the real ident, since callers supply it
+    directly rather than re-deriving it from a Datalog rescan."""
+    import tempfile
+    import os as _os
+    fd, path = tempfile.mkstemp(suffix=".fts.sqlite3")
+    _os.close(fd)
+    _os.remove(path)  # let open_writer create it fresh
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [
+        (":function/caching_helper", ":name", "redis caching helper function"),
+        (":decision/redis", ":description", "redis caching helper function"),
+    ])
+    fact_index.close_writer(con)
+    try:
+        results = fact_index.query_facts(path, "redis caching helper function", top_n=10, boost=2.0)
+        assert results[0][0] == ":decision/redis"
+    finally:
+        _os.remove(path)
+
+
+def test_query_facts_missing_index_raises():
+    import pytest
+    with pytest.raises(sqlite3.OperationalError):
+        fact_index.query_facts("/nonexistent/does-not-exist.sqlite3", "anything", top_n=10, boost=2.0)

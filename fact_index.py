@@ -92,3 +92,59 @@ def delete_facts(con: sqlite3.Connection, triples: Sequence[Tuple[str, str, str]
     con.executemany(
         "DELETE FROM facts_fts WHERE entity = ? AND attribute = ? AND value = ?", triples
     )
+
+
+_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize(text: str) -> List[str]:
+    """Split text on non-alphanumeric chars, lowercase, filter empties."""
+    return _TOKEN_PATTERN.findall(text.lower())
+
+
+def _fts5_match_query(text: str) -> Optional[str]:
+    """Build an FTS5 MATCH expression that matches ANY query token (OR
+    semantics), matching the "any token overlap" relevance model the old
+    rank_bm25-based FactIndex used. Returns None if there are no usable
+    tokens. Each token is double-quoted to neutralize FTS5 special syntax
+    characters a raw user message could otherwise trigger."""
+    tokens = _tokenize(text)
+    if not tokens:
+        return None
+    return " OR ".join(f'"{t}"' for t in tokens)
+
+
+def query_facts(path: str, text: str, top_n: int, boost: float) -> List[List[str]]:
+    """Ranked, read-only query against the index.
+
+    Returns up to top_n [entity, attribute, value] rows, best match first.
+    Facts whose entity starts with a memory-fact prefix (_MEMORY_PREFIXES)
+    get their score multiplied by boost. FTS5's bm25() is negative-is-better
+    (SQLite convention, opposite of rank_bm25) -- multiplying a negative
+    score by boost > 1 makes it more negative, i.e. better, so this has the
+    same boosting effect as the old FactIndex's positive-score multiply.
+
+    Raises sqlite3.OperationalError if the index file doesn't exist -- the
+    caller (mcp_server.handle_memory_prepare_turn) is responsible for
+    triggering a backfill and retrying.
+    """
+    match_expr = _fts5_match_query(text)
+    if match_expr is None:
+        return []
+    con = open_reader(path)
+    try:
+        rows = con.execute(
+            "SELECT entity, attribute, value, bm25(facts_fts) AS score "
+            "FROM facts_fts WHERE facts_fts MATCH ? "
+            "ORDER BY score ASC LIMIT ?",
+            (match_expr, top_n * 4),  # over-fetch before boost re-sort, trimmed below
+        ).fetchall()
+    finally:
+        con.close()
+    scored = []
+    for entity, attribute, value, score in rows:
+        if entity.startswith(_MEMORY_PREFIXES):
+            score *= boost
+        scored.append((score, [entity, attribute, value]))
+    scored.sort(key=lambda pair: pair[0])
+    return [row for _, row in scored[:top_n]]
