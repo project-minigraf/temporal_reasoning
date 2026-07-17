@@ -1884,6 +1884,37 @@ class TestMinigrafAudit:
         assert "retracted" in result
         assert "violations" in result
 
+    def test_audit_retract_removes_from_fact_index_by_keyword_ident(self, real_db):
+        """The Datalog retract uses #uuid literals (audit's own design,
+        so it can retract without a keyword-to-UUID lookup), but the entity
+        was originally indexed under its keyword ident -- the index
+        deletion must use kw_ident, not the #uuid string, or the row is
+        stranded."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/bad :description "placeholder"] '
+            '[:decision/bad :entity-type :type/decision] '
+            '[:decision/bad :ident ":decision/bad"]]',
+            reason="test",
+        )
+        # Manufacture a real schema violation for audit to find: retract the
+        # entity's only non-system attribute (:description), leaving just
+        # :entity-type/:ident (both in _SYSTEM_ATTRS, filtered out of
+        # attr_facts). handle_minigraf_audit's own "if not attr_facts"
+        # fallback then substitutes a single :__no_attributes__ fact, which
+        # _validate_facts flags two ways: "decision" requires :description
+        # (missing) and :__no_attributes__ itself is an unknown attribute.
+        # Verified directly against _validate_facts (mcp_server.py) before
+        # writing this test, rather than assumed.
+        mcp_server._retract(real_db, '[[:decision/bad :description "placeholder"]]')
+        result = mcp_server.handle_minigraf_audit()
+        assert result["ok"] is True
+        assert result["retracted"] >= 1
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "decision bad", top_n=10, boost=2.0)
+        assert not any(r[0] == ":decision/bad" for r in results)
+
 
 class TestPhase5Schema:
     def test_module_entity_passes_validation(self):

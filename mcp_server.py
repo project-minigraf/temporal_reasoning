@@ -3314,8 +3314,13 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
                                 retract_triples.append(
                                     f'[#uuid "{entity_uuid}" {a} "{escaped}"]'
                                 )
-                        retract_expr = f"(retract [{' '.join(retract_triples)}])"
-                        _db_execute(db, retract_expr)
+                        retract_facts = "[" + " ".join(retract_triples) + "]"
+                        index_triples = [
+                            (kw_ident, ":entity-type", f":type/{entity_type}"),
+                        ] + [
+                            (kw_ident, a, v) for a, v in attr_rows if isinstance(v, str)
+                        ]
+                        _retract(db, retract_facts, index_triples=index_triples)
                         _db_checkpoint(db)
                         _update_mtime()
                         retracted += 1
