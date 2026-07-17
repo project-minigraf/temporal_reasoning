@@ -4144,11 +4144,11 @@ def _count_commit_entities(db: Any) -> int:
     return int(results[0][0]) if results else 0
 
 
-def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str) -> None:
+def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str, index_con: Optional[Any] = None) -> None:
     """Record the last successfully ingested commit hash in the graph."""
     existing = _watermark_query(db)
     if existing:
-        _retract(db, f'[[:ingestion/watermark :hash "{existing}"]]')
+        _retract(db, f'[[:ingestion/watermark :hash "{existing}"]]', index_con=index_con)
     _transact(
         db,
         f'[[:ingestion/watermark :entity-type :type/ingestion] '
@@ -4156,10 +4156,11 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
         f'[:ingestion/watermark :description "git ingestion watermark"] '
         f'[:ingestion/watermark :hash "{commit_hash}"]]',
         commit_ts_iso,
+        index_con=index_con,
     )
 
 
-def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int) -> None:
+def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int, index_con: Optional[Any] = None) -> None:
     """Record the wall-clock time, final commit hash, and cumulative ingested count."""
     _transact(
         db,
@@ -4170,6 +4171,7 @@ def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int)
         f'[:ingestion/last-run-at :last-commit "{commit_hash}"] '
         f'[:ingestion/last-run-at :total-ingested {total_ingested}]]',
         run_at,
+        index_con=index_con,
     )
 
 
@@ -5611,7 +5613,7 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     )
 
 
-def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
+def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str, index_con: Optional[Any] = None) -> None:
     """Ingest git tags as :tag/<slug> entities with :tagged-commit references.
 
     Called once after the commit walk. All tags are re-ingested on every run
@@ -5637,7 +5639,7 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
             ]
             if date_raw:
                 triples.append(f'[{tag_ident} :date "{_edn_escape(date_raw)}"]')
-            _transact(db, "[" + " ".join(triples) + "]", run_ts_iso)
+            _transact(db, "[" + " ".join(triples) + "]", run_ts_iso, index_con=index_con)
         except Exception:
             pass  # non-fatal per tag
 
@@ -6447,7 +6449,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         except Exception:
                             pass  # non-fatal; parent edges are best-effort
 
-                        await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason)
+                        await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason, index_con)
                         await loop.run_in_executor(write_executor, _db_checkpoint, db)
                         await loop.run_in_executor(write_executor, index_con.commit)
 
@@ -6457,6 +6459,20 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
+
+                # Call _ingest_tags and _last_run_write before closing index_con
+                # so they use the batched connection instead of opening new ones
+                if completed_all:
+                    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                    db = await _ensure_db_async()
+                    try:
+                        await loop.run_in_executor(write_executor, _ingest_tags, db, repo_path, now, index_con)
+                        await loop.run_in_executor(
+                            write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"], index_con
+                        )
+                        await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                    finally:
+                        _db = None
             finally:
                 # ProcessPoolExecutor.shutdown(wait=True) blocks joining the
                 # worker OS processes — measured ~90ms even for a pool that
@@ -6470,17 +6486,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 await loop.run_in_executor(write_executor, executor.shutdown)
 
             if completed_all:
-                now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                db = await _ensure_db_async()
-                try:
-                    await loop.run_in_executor(write_executor, _ingest_tags, db, repo_path, now)
-                    await loop.run_in_executor(
-                        write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"]
-                    )
-                    await loop.run_in_executor(write_executor, _db_checkpoint, db)
-                finally:
-                    _db = None
-
                 _ingest_progress["status"] = "complete"
                 _index_cache.invalidate()
             else:
