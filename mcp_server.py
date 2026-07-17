@@ -4148,27 +4148,28 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
     """Record the last successfully ingested commit hash in the graph."""
     existing = _watermark_query(db)
     if existing:
-        _db_execute(db, f'(retract [[:ingestion/watermark :hash "{existing}"]])')
-    _db_execute(
+        _retract(db, f'[[:ingestion/watermark :hash "{existing}"]]')
+    _transact(
         db,
-        f'(transact {{:valid-from "{commit_ts_iso}"}} '
         f'[[:ingestion/watermark :entity-type :type/ingestion] '
         f'[:ingestion/watermark :ident ":ingestion/watermark"] '
         f'[:ingestion/watermark :description "git ingestion watermark"] '
-        f'[:ingestion/watermark :hash "{commit_hash}"]])',
+        f'[:ingestion/watermark :hash "{commit_hash}"]]',
+        commit_ts_iso,
     )
 
 
 def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int) -> None:
     """Record the wall-clock time, final commit hash, and cumulative ingested count."""
-    _db_execute(
+    _transact(
         db,
-        f'(transact [[:ingestion/last-run-at :entity-type :type/ingestion] '
+        f'[[:ingestion/last-run-at :entity-type :type/ingestion] '
         f'[:ingestion/last-run-at :ident ":ingestion/last-run-at"] '
         f'[:ingestion/last-run-at :description "last ingestion run timestamp"] '
         f'[:ingestion/last-run-at :last-run-at "{run_at}"] '
         f'[:ingestion/last-run-at :last-commit "{commit_hash}"] '
-        f'[:ingestion/last-run-at :total-ingested {total_ingested}]])',
+        f'[:ingestion/last-run-at :total-ingested {total_ingested}]]',
+        run_at,
     )
 
 
@@ -5636,7 +5637,7 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
             ]
             if date_raw:
                 triples.append(f'[{tag_ident} :date "{_edn_escape(date_raw)}"]')
-            _db_execute(db, f'(transact {{:valid-from "{run_ts_iso}"}} [{" ".join(triples)}])')
+            _transact(db, "[" + " ".join(triples) + "]", run_ts_iso)
         except Exception:
             pass  # non-fatal per tag
 

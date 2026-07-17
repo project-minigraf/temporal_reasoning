@@ -906,6 +906,45 @@ class TestTransactRetractChokePoint:
         assert json.loads(raw)["results"] == [["hello"]]  # the graph write still succeeded
 
 
+class TestBookkeepingWritesFactIndex:
+    def test_watermark_update_indexes_new_hash(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server._watermark_update(real_db, "abc123", "2026-01-01T00:00:00.000Z", "test")
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0)
+        assert any(r[2] == "abc123" for r in results)
+
+    def test_watermark_update_removes_old_hash_from_index(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server._watermark_update(real_db, "abc123", "2026-01-01T00:00:00.000Z", "test")
+        mcp_server._watermark_update(real_db, "def456", "2026-01-02T00:00:00.000Z", "test")
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0)
+        assert not any(r[2] == "abc123" for r in results)
+
+    def test_last_run_write_indexes(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server._last_run_write(real_db, "abc123", "2026-01-01T00:00:00.000Z", 42)
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0)
+        assert results
+
+    def test_ingest_tags_indexes(self, real_db, tmp_path, monkeypatch):
+        import mcp_server
+        import fact_index
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "a" * 40, "2026-01-01T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-01T00:00:00.000Z")
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "v1.0.0", top_n=10, boost=2.0)
+        assert results
+
+
 class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, real_db):
         import mcp_server
