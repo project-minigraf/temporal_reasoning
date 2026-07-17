@@ -7738,6 +7738,45 @@ class TestHandleMemoryPrepareTurnFts5:
         result = mcp_server.handle_memory_prepare_turn("sqlite postgres embedded")
         assert "prefer sqlite over postgres for embedded use" in result
 
+    def test_backfill_preserves_all_facts_for_an_idented_entity(self, real_db, tmp_path, monkeypatch):
+        """Coverage gap a review caught: an entity WITH an explicit :ident
+        fact (the shape every code-ingestion entity has, and the exact shape
+        the #141 fixture above uses) still needs ALL of its facts -- not
+        just the single :ident triple -- to survive a backfill rescan. A
+        query that combines the [?e :ident ?ident] bound clause with a free
+        [?e ?a ?v] clause sharing the same entity variable is a riskier
+        Datalog shape than it looks: nothing in this codebase documents or
+        tests its join semantics for a shared free variable elsewhere, so
+        it could silently collapse to returning only the row that satisfied
+        the bound clause -- dropping :description/:entity-type/etc even
+        though the entity itself is correctly idented. This asserts
+        directly against fact_index.query_facts (not just
+        handle_memory_prepare_turn's formatted text, which could mask a
+        collapse if enough other facts happened to be present) that the
+        :description fact specifically -- not just the :ident stub -- comes
+        back after backfill."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "use redis for caching layer"] '
+            '[:decision/use-redis :entity-type :type/decision] '
+            '[:decision/use-redis :ident ":decision/use-redis"]]',
+            reason="test",
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        os.remove(index_path)
+        mcp_server._rebuild_index_from_graph()
+        results = fact_index.query_facts(
+            index_path, "use redis for caching layer", top_n=50, boost=2.0
+        )
+        rows_for_entity = [row for row in results if row[0] == ":decision/use-redis"]
+        attrs = {row[1] for row in rows_for_entity}
+        assert attrs == {":description", ":entity-type", ":ident"}, (
+            f"expected all 3 facts for :decision/use-redis to survive backfill, got: {rows_for_entity}"
+        )
+        description_values = [row[2] for row in rows_for_entity if row[1] == ":description"]
+        assert description_values == ["use redis for caching layer"]
+
 
 class TestIndexCacheInvalidation:
     def test_successful_transact_triggers_invalidation(self, real_db):

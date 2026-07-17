@@ -4664,47 +4664,45 @@ def _rebuild_index_from_graph() -> None:
     install, a pre-existing graph from before this feature shipped, or
     corruption recovery).
 
-    Uses the same :ident-projection clause-ordering fix _preload_known_
-    entities established (project through :ident explicitly, rather than
-    binding ?e directly, which resolves to minigraf's internal UUID, not
-    the keyword ident) -- this is the #141 root cause, and the one
-    remaining place in this design a Datalog rescan still needs it.
+    Uses two separate queries rather than one combined query, deliberately:
+    a query combining a bound clause ([?e :ident ?ident]) with a free clause
+    sharing the same entity variable ([?e ?a ?v]) is a strictly riskier
+    Datalog shape to depend on than it looks -- its join semantics for a
+    shared free variable aren't something this codebase documents or tests
+    elsewhere, unlike a plain single-purpose lookup query.
+    _preload_known_entities never combines the two: it always names every
+    attribute explicitly (?path, ?desc, ?date) instead of using a free
+    [?e ?a ?v] clause, so matching its clause *ordering* alone (which this
+    function's first draft did) doesn't carry over the same safety
+    guarantee -- the free-vs-named-clause distinction is what actually
+    matters, not just where :ident appears in the :where list.
 
-    A plain ident-projected query alone is not sufficient, though: it only
-    recovers entities that happen to carry an explicit :ident fact (written
-    by the code-ingestion call sites), and silently drops every other
-    entity's facts entirely -- Datalog conjunction requires every clause
-    to match, so an entity with no :ident fact never satisfies
-    "[?e :ident ?ident] [?e ?a ?v]" for ANY of its attributes, not just the
-    identity one. Facts recorded the documented handle_minigraf_transact
-    way (SKILL.md's own examples never add an :ident triple) are exactly
-    this case, and they're the dominant content of a real pre-existing
-    graph -- the primary scenario backfill exists to serve. So this does a
-    second, bare [?e ?a ?v] rescan and folds in only the rows whose entity
-    wasn't already covered by the :ident-projected set, indexing those
-    under their raw internal-UUID entity value. That UUID never starts
-    with a _MEMORY_PREFIXES keyword, so it is simply not boost-eligible
-    (accurately reflecting that its true keyword ident is unrecoverable
-    from the graph alone) rather than being dropped from the index outright.
+    The fix: query 1 builds a UUID -> keyword-ident lookup table using ONLY
+    the bound clause (no free clause combined). Query 2 is the bare, already
+    independently-verified-correct full scan (see #141's root-cause note:
+    binding ?e directly yields minigraf's internal UUID, not the keyword
+    ident). Substituting the ident where known (falling back to the raw
+    UUID otherwise) in Python gives full fact content for every entity,
+    idented or not -- unlike a dropped fact, an entity recovered under its
+    raw UUID just isn't boost-eligible (never starts with a
+    _MEMORY_PREFIXES keyword), which accurately reflects that its true
+    keyword ident is unrecoverable from the graph alone once written
+    without an explicit :ident fact.
     """
     db = get_db()
     now = _now_utc_ms()
     ident_raw = _db_execute(
-        db,
-        f'(query [:find ?e ?ident ?a ?v :valid-at "{now}" '
-        f':where [?e :ident ?ident] [?e ?a ?v]])',
+        db, f'(query [:find ?e ?ident :valid-at "{now}" :where [?e :ident ?ident]])'
     )
-    ident_facts = json.loads(ident_raw).get("results", [])
-    known_entities = {str(e) for e, _ident, _a, _v in ident_facts}
-    triples = [(str(ident), str(a), str(v)) for _e, ident, a, v in ident_facts]
+    ident_map = {e: ident for e, ident in json.loads(ident_raw).get("results", [])}
 
-    bare_raw = _db_execute(
+    facts_raw = _db_execute(
         db, f'(query [:find ?e ?a ?v :valid-at "{now}" :where [?e ?a ?v]])'
     )
-    for e, a, v in json.loads(bare_raw).get("results", []):
-        if str(e) not in known_entities:
-            triples.append((str(e), str(a), str(v)))
-
+    triples = [
+        (ident_map.get(str(e), str(e)), str(a), str(v))
+        for e, a, v in json.loads(facts_raw).get("results", [])
+    ]
     path = fact_index.index_path_for(_graph_path or _get_graph_path())
     fact_index.rebuild_index(path, triples)
 
