@@ -4356,6 +4356,12 @@ def _build_query_clauses(user_message: str) -> str:
 
 _MEMORY_PREFIXES = (":decision/", ":preference/", ":constraint/", ":dependency/")
 
+# Entity-type names (without the ":type/" prefix) for the same memory-fact
+# categories as _MEMORY_PREFIXES — used to scope the heuristic fallback's
+# broad scan (see _handle_memory_prepare_turn_heuristic) to just the facts
+# a user records via memory_finalize_turn, not the entire code graph.
+_MEMORY_ENTITY_TYPES = tuple(p.strip(":/") for p in _MEMORY_PREFIXES)
+
 
 def _tokenize(text: str) -> List[str]:
     """Split text on non-alphanumeric chars, lowercase, filter empties.
@@ -4512,16 +4518,30 @@ def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
             continue
 
     if not collected:
-        # Broad fallback scan — still respect temporal clause
-        try:
-            raw = _db_execute(
-                db, f"(query [:find ?e ?a ?v {temporal_clauses} :where [?e ?a ?v]])"
-            )
-            data = json.loads(raw)
-            all_results = data.get("results", [])
-            collected = all_results[:scan_limit]
-        except (MiniGrafError, json.JSONDecodeError):
-            pass
+        # Broad fallback scan — bounded to memory-fact entity types (decision/
+        # preference/constraint/dependency) rather than the whole graph. An
+        # unscoped [?e ?a ?v] scan pulls every code-structure and commit fact
+        # git ingestion has ever added too — on a real repo that dwarfs the
+        # handful of manually recorded memory facts and was the source of an
+        # 80s/7GB blowup on a 21k-commit graph (issue #117).
+        for entity_type in _MEMORY_ENTITY_TYPES:
+            if len(collected) >= scan_limit:
+                break
+            try:
+                raw = _db_execute(
+                    db,
+                    f"(query [:find ?e ?a ?v {temporal_clauses} "
+                    f":where [?e :entity-type :type/{entity_type}] [?e ?a ?v]])",
+                )
+                data = json.loads(raw)
+                for row in data.get("results", []):
+                    key = tuple(row)
+                    if key not in seen:
+                        seen.add(key)
+                        collected.append(row)
+            except (MiniGrafError, json.JSONDecodeError):
+                continue
+        collected = collected[:scan_limit]
 
     if not collected:
         return ""

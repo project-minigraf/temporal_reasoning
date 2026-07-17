@@ -35,7 +35,7 @@ except ImportError:
 
 requires_bm25 = pytest.mark.skipif(
     not _HAS_RANK_BM25,
-    reason="rank_bm25 not installed (pip install -e .[bm25] or .[dev])",
+    reason="rank_bm25 not installed — it is a core dependency (pip install -e .)",
 )
 
 
@@ -838,6 +838,47 @@ class TestMemoryPrepareTurn:
         result = mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
 
         assert "Redis" in result
+
+    def test_broad_scan_excludes_non_memory_entity_types(self, real_db):
+        """The broad-scan fallback must not surface code-structure facts (e.g.
+        git-ingested modules) — on a real repo those dwarf the handful of
+        manually recorded memory facts and turned the fallback into an
+        unbounded full-graph scan (issue #117: 80s/7GB on a 21k-commit graph).
+        It must stay scoped to memory entity types (decision/preference/
+        constraint/dependency) even when nothing targeted matched.
+        """
+        import mcp_server
+        real_db.execute(
+            '(transact {} [[:module/auth-py :entity-type :type/module] '
+            '[:module/auth-py :ident ":module/auth-py"] '
+            '[:module/auth-py :description "authentication helper module"]])'
+        )
+        real_db.execute(
+            '(transact {} [[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            '[:decision/redis :description "use Redis for caching"]])'
+        )
+
+        result = mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
+
+        assert "Redis" in result
+        assert "auth-py" not in result
+        assert "authentication helper" not in result
+
+    def test_broad_scan_scopes_query_by_entity_type(self, real_db):
+        """The fallback's broad scan must restrict :where to memory entity
+        types instead of running an unscoped [?e ?a ?v] scan over every
+        triple in the graph.
+        """
+        import mcp_server
+
+        with execute_spy() as calls:
+            mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
+
+        broad_scan_calls = [
+            c for c in calls if "contains?" not in c and ":where [?e ?a ?v]" in c
+        ]
+        assert not broad_scan_calls, f"found unscoped broad scan: {broad_scan_calls}"
 
     def test_respects_scan_limit_env_var(self, real_db, monkeypatch):
         import mcp_server
