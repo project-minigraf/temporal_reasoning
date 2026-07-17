@@ -129,12 +129,12 @@ today's one-document-per-fact-row `FactIndex`.
 ### Write path — the choke point
 
 Every write to the graph must also update the index, incrementally, so the
-index never drifts and never needs a rescan under normal operation. An
-exhaustive grep of every raw `_db_execute(db, ...)` call building a
-`(transact ...)` or `(retract ...)` Datalog string (quote-agnostic, so it
-catches both `f"..."` and `f'...'` call sites, and cross-checked against
-manual reads for calls whose Datalog string spans multiple lines) turned up
-exactly **11** call sites — 8 transact, 3 retract:
+index never drifts and never needs a rescan under normal operation. A fully
+exhaustive pass — every `_db_execute(db, ...)` call site in the file, not
+filtered by any same-line pattern (an earlier, quote-agnostic-but-still-
+same-line-anchored grep pass missed calls where the Datalog string is built
+into a local variable on an earlier line) — turned up exactly **12** call
+sites: 8 transact, 4 retract.
 
 Transact:
 1. `handle_minigraf_transact` (interactive tool)
@@ -161,20 +161,54 @@ Retract:
    executes against the database.)
 3. `_watermark_update`'s retract of the *previous* watermark hash, before
    writing the new one
+4. `handle_minigraf_audit`'s schema-violation auto-retract — found only by
+   manually reading every `_db_execute` call site, since the Datalog string
+   (`retract_expr`) is assembled into a local variable one line above the
+   call, invisible to any same-line grep. This site has a real subtlety:
+   it retracts using `#uuid "{entity_uuid}"`-tagged literals (deliberately
+   — so it can retract without a keyword-to-UUID lookup), but the entity
+   was originally *inserted* into the index under its keyword ident (e.g.
+   `:decision/foo`), which the function separately resolves as `kw_ident`
+   for its own violation-reporting output. If the index-deletion step just
+   reused whatever entity string appears in the Datalog retract call, it
+   would search the index for the UUID string, find nothing, and leave the
+   original keyword-ident rows stranded. See the decoupled signature below.
 
-All 11 are migrated to two new choke-point functions:
+All 12 are migrated to two new choke-point functions. Their signature
+deliberately **decouples** the Datalog string sent to minigraf from the
+triples used to update the index, rather than deriving one from the other
+via a second regex parser:
 
 ```python
-def _transact(db, triples: List[List], valid_from: str,
-               valid_to: Optional[str] = None, reason: str = "") -> str:
-    """Build and execute a (transact ...) Datalog call, then feed the index."""
+def _transact(db, datalog_facts: str, valid_from: str,
+               index_triples: List[Tuple[str, str, str]],
+               valid_to: Optional[str] = None,
+               index_con: Optional["sqlite3.Connection"] = None) -> str:
+    """Execute (transact {...opts...} datalog_facts) against minigraf, then
+    (only when valid_to is None) insert index_triples into the fact index.
 
-def _retract(db, triples: List[List]) -> str:
-    """Build and execute a (retract [...]) Datalog call, then remove rows."""
+    index_triples is caller-supplied (entity, attribute, value) tuples using
+    whatever entity form is actually searchable/meaningful (e.g. the keyword
+    ident) — independent of what entity-reference form datalog_facts itself
+    uses. For every call site except handle_minigraf_audit these are the
+    same triples serialized into datalog_facts; audit's are not (see above).
+    """
+
+def _retract(db, datalog_facts: str,
+             index_triples: List[Tuple[str, str, str]],
+             index_con: Optional["sqlite3.Connection"] = None) -> str:
+    """Execute (retract datalog_facts) against minigraf, then delete
+    index_triples from the fact index (same decoupling as _transact)."""
 ```
 
-This is mechanical per call site — each already holds the triples as Python
-lists before serializing them into a Datalog string — but it touches every
+`index_con`, when supplied, is an already-open write connection the caller
+controls the commit boundary for (used by ingestion's batching, below); when
+omitted, the function opens a connection, writes, commits, and closes it
+immediately (the interactive single-fact path).
+
+This is mechanical for 11 of the 12 call sites — each already holds the
+triples as Python data before serializing them into a Datalog string, so
+`index_triples` is just "the same values, structured" — but it touches every
 write path, by design, so the index can never silently fall out of sync with
 one write site that was missed.
 
