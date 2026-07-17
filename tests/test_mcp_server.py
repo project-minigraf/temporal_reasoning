@@ -5632,7 +5632,7 @@ class TestIngestionWrites:
         last_run_calls = []
         monkeypatch.setattr(
             mcp_server, "_last_run_write",
-            lambda db, h, t, n: last_run_calls.append((h, t, n))
+            lambda db, h, t, n, index_con=None: last_run_calls.append((h, t, n))
         )
         # _run_ingestion's completion path fires IndexCache.invalidate() on a
         # background daemon thread that calls get_db() after this test's real_db
@@ -5659,7 +5659,7 @@ class TestIngestionWrites:
         last_run_calls = []
         monkeypatch.setattr(
             mcp_server, "_last_run_write",
-            lambda db, h, t, n: last_run_calls.append((h, t, n))
+            lambda db, h, t, n, index_con=None: last_run_calls.append((h, t, n))
         )
         # See test_run_ingestion_writes_last_run_on_completion for why this is
         # neutralized (harmless background-thread stderr noise, not a bug in
