@@ -10,6 +10,7 @@ full design rationale.
 import os
 import re
 import sqlite3
+import time
 from typing import List, Optional, Sequence, Tuple
 
 # Same categories mcp_server.py's write paths use to decide which entities
@@ -159,19 +160,46 @@ def rebuild_index(path: str, facts: Sequence[Tuple[str, str, str]]) -> None:
     """Full rebuild: drop and recreate facts_fts, then bulk-insert facts.
 
     Used for backfill (index file missing -- fresh install, pre-existing
-    graph, or corruption recovery). CREATE VIRTUAL TABLE IF NOT EXISTS makes
-    this safe under a concurrent racing rebuild from another process: the
-    second caller's DROP+CREATE+INSERT still runs to completion under
-    SQLite's own locking (busy_timeout), it just ends up re-doing work
-    rather than corrupting anything.
+    graph, or corruption recovery). The whole drop+create+insert sequence
+    runs inside one explicit transaction (BEGIN IMMEDIATE ... COMMIT) so a
+    concurrently-racing rebuild from another process can't interleave and
+    produce duplicate rows -- CREATE VIRTUAL TABLE IF NOT EXISTS alone only
+    makes that one statement atomic, not the 3-statement sequence as a
+    whole. isolation_level=None puts the connection in true autocommit
+    mode so Python's own implicit transaction management doesn't conflict
+    with the explicit BEGIN IMMEDIATE.
+
+    PRAGMA journal_mode=WAL does not reliably honor busy_timeout's
+    retry-and-wait behavior in SQLite (a documented quirk, not something
+    BEGIN IMMEDIATE fixes) -- a second racer can still hit "database is
+    locked" on that specific PRAGMA even with busy_timeout configured. The
+    outer retry loop below handles that, mirroring this codebase's existing
+    exponential-backoff pattern for minigraf's own lock contention
+    (mcp_server.py's _LOCK_RETRY_MAX/_LOCK_RETRY_BASE).
     """
-    con = sqlite3.connect(path, timeout=5.0)
-    try:
-        con.execute("PRAGMA journal_mode=WAL")
-        _configure(con)
-        con.execute("DROP TABLE IF EXISTS facts_fts")
-        ensure_schema(con)
-        insert_facts(con, facts)
-        con.commit()
-    finally:
-        con.close()
+    attempts = 6
+    base_delay = 0.02
+    for attempt in range(attempts):
+        con = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+        try:
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute(f"PRAGMA mmap_size={_MMAP_SIZE}")
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DROP TABLE IF EXISTS facts_fts")
+            con.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5("
+                "entity, attribute, value, tokenize='unicode61')"
+            )
+            insert_facts(con, facts)
+            con.execute("COMMIT")
+            return
+        except sqlite3.OperationalError as e:
+            message = str(e).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            if attempt == attempts - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+        finally:
+            con.close()
