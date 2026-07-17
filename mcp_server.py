@@ -4776,7 +4776,7 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
                 )
             else:
                 triples = f'[{entity} {attribute} "{value}"]'
-            _db_execute(db, f'(transact {{:valid-from "{now_z}"}} [{triples}])')
+            _transact(db, "[" + triples + "]", now_z)
             stored += 1
         except MiniGrafError:
             continue
@@ -5018,7 +5018,7 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
             return {"ok": True, "stored_count": 0, "strategy": "agent"}
         _refresh_if_stale()
         db = get_db()
-        _db_execute(db, f'(transact {{:valid-from "{valid_at}"}} {datalog})')
+        _transact(db, datalog, valid_at)
         _db_checkpoint(db)
         _update_mtime()
         # Approximate: count "[:" occurrences as a proxy for triple count.

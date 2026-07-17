@@ -1379,6 +1379,34 @@ class TestAgentStrategy:
         assert queried["results"] == [["Kafka"]]
 
 
+class TestConversationalMemoryFactIndex:
+    def test_transact_extracted_facts_indexes(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server._transact_extracted_facts([
+            {"entity": ":decision/x", "entity_type": "decision", "attribute": ":description", "value": "use redis"},
+        ])
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0)
+        assert any(r[0] == ":decision/x" for r in results)
+
+    def test_agent_extract_and_transact_indexes(self, real_db, monkeypatch):
+        import mcp_server
+        import fact_index
+        import asyncio as _asyncio
+
+        async def fake_request(conversation_delta, canonical_section):
+            return '[[:decision/x :description "use redis"] [:decision/x :entity-type :type/decision] [:decision/x :ident ":decision/x"]]'
+
+        monkeypatch.setattr(mcp_server, "_request_agent_memory_block_async", fake_request)
+        monkeypatch.setattr(mcp_server, "_query_canonical_entities", lambda: "")
+        result = _asyncio.run(mcp_server._agent_extract_and_transact("we should use redis"))
+        assert result["ok"] is True
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0)
+        assert any(r[0] == ":decision/x" for r in results)
+
+
 class TestMcpToolWiring:
     def test_list_tools_returns_ten_tools(self, real_db):
         import asyncio
