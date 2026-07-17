@@ -5,8 +5,8 @@ Temporal Reasoning provides persistent bi-temporal graph memory for AI coding ag
 ## Quick Start
 
 ```bash
-# Install dependencies and sync skill
-python install.py
+# Install dependencies and sync skill (--harness is required: claude-code, opencode, or codex)
+python install.py --harness claude-code
 
 # Use in code
 from minigraf import query, transact

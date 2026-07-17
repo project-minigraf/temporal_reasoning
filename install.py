@@ -3,10 +3,17 @@
 Installation script for temporal-reasoning skill.
 Installs minigraf and mcp Python packages, syncs skill files, provides next steps.
 
+--harness is required and selects exactly one target; only that harness's
+skill directory (and, for claude-code, Claude Code's config files) is
+created or updated. Supported values: claude-code, opencode, codex.
+
 Usage:
-    python install.py          # Full install
-    python install.py --check  # Just check dependencies
-    python install.py --force  # Force reinstall even if recent
+    python install.py --harness claude-code            # Full install for Claude Code
+    python install.py --harness opencode                # Sync skill files for OpenCode
+    python install.py --harness codex                   # Sync skill files for Codex CLI
+    python install.py --harness claude-code --check      # Just check dependencies
+    python install.py --harness claude-code --force      # Force reinstall even if recent
+    python install.py --harness claude-code --target DIR # Install into a specific project directory
 """
 
 import sys
@@ -34,11 +41,42 @@ PLUGIN_VERSION = _plugin_version()
 
 FILES_TO_SYNC = ["SKILL.md", "mcp_server.py", "skill.json"]
 DIRS_TO_SYNC = ["tools", "hooks"]
-SKILL_DIRS = [
-    os.path.join(".codex", "skills", "temporal-reasoning"),
-    os.path.join(".opencode", "skills", "temporal-reasoning"),
-    os.path.join("skills", "temporal-reasoning"),
-]
+SUPPORTED_HARNESSES = ("claude-code", "opencode", "codex")
+HARNESS_SKILL_DIRS = {
+    "codex": os.path.join(".codex", "skills", "temporal-reasoning"),
+    "opencode": os.path.join(".opencode", "skills", "temporal-reasoning"),
+    "claude-code": os.path.join("skills", "temporal-reasoning"),
+}
+_MANUAL_CONFIG_TEMPLATE = {
+    "opencode": os.path.join("hooks", "opencode.json"),
+    "codex": os.path.join("hooks", "codex.toml"),
+}
+_HARNESS_FLAG_VALUE_ARGS = ("--harness", "--target")
+
+
+def _resolve_harness(argv):
+    """Parse and validate the required --harness argument from *argv*.
+
+    Returns the harness string on success. On a missing or invalid value,
+    prints actionable usage text and returns None — callers must treat None
+    as "stop before writing any files."
+    """
+    if "--harness" not in argv:
+        print("✗ --harness is required.")
+        print(f"  Supported harnesses: {', '.join(SUPPORTED_HARNESSES)}")
+        print(f"  Usage: python install.py --harness <{'|'.join(SUPPORTED_HARNESSES)}>")
+        return None
+    idx = argv.index("--harness")
+    if idx + 1 >= len(argv):
+        print("✗ --harness requires a value.")
+        print(f"  Supported harnesses: {', '.join(SUPPORTED_HARNESSES)}")
+        return None
+    value = argv[idx + 1]
+    if value not in SUPPORTED_HARNESSES:
+        print(f"✗ Unknown harness {value!r}.")
+        print(f"  Supported harnesses: {', '.join(SUPPORTED_HARNESSES)}")
+        return None
+    return value
 
 
 def ensure_venv() -> bool:
@@ -187,25 +225,24 @@ def _write_last_update() -> None:
         f.write(datetime.now(timezone.utc).isoformat())
 
 
-def _sync_files(target_dir: str) -> None:
+def _sync_files(target_dir: str, harness: str) -> None:
     import shutil
-    for rel_dir in SKILL_DIRS:
-        dest_dir = os.path.join(target_dir, rel_dir)
-        os.makedirs(dest_dir, exist_ok=True)
-        for fname in FILES_TO_SYNC:
-            src = os.path.join(REPO_DIR, fname)
-            if os.path.exists(src):
-                shutil.copy2(src, os.path.join(dest_dir, fname))
-        for dname in DIRS_TO_SYNC:
-            src_dir = os.path.join(REPO_DIR, dname)
-            if os.path.isdir(src_dir):
-                shutil.copytree(src_dir, os.path.join(dest_dir, dname), dirs_exist_ok=True)
+    rel_dir = HARNESS_SKILL_DIRS[harness]
+    dest_dir = os.path.join(target_dir, rel_dir)
+    os.makedirs(dest_dir, exist_ok=True)
+    for fname in FILES_TO_SYNC:
+        src = os.path.join(REPO_DIR, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dest_dir, fname))
+    for dname in DIRS_TO_SYNC:
+        src_dir = os.path.join(REPO_DIR, dname)
+        if os.path.isdir(src_dir):
+            shutil.copytree(src_dir, os.path.join(dest_dir, dname), dirs_exist_ok=True)
     synced = ", ".join(FILES_TO_SYNC + DIRS_TO_SYNC)
-    dirs = ", ".join(SKILL_DIRS)
-    print(f"✓ Synced [{synced}] → [{dirs}]")
+    print(f"✓ Synced [{synced}] → [{rel_dir}]")
 
 
-def update_skill(target_dir: str) -> bool:
+def update_skill(target_dir: str, harness: str) -> bool:
     """Pull from GitHub and sync skill files to target_dir."""
     print("Checking for skill updates...")
     try:
@@ -220,7 +257,7 @@ def update_skill(target_dir: str) -> bool:
         _write_last_update()
         if result.stdout.strip() and "Already up to date" not in result.stdout:
             print("Pulling latest from GitHub...")
-        _sync_files(target_dir)
+        _sync_files(target_dir, harness)
         print("✓ Skill up-to-date")
         return True
     except subprocess.CalledProcessError:
@@ -235,12 +272,21 @@ def update_skill(target_dir: str) -> bool:
 
 
 def _get_target_dir() -> str:
-    if "--target" in sys.argv:
-        idx = sys.argv.index("--target")
-        if idx + 1 < len(sys.argv):
-            return os.path.abspath(sys.argv[idx + 1])
-    # Accept a bare positional path argument (e.g. `python install.py /path/to/project`)
-    for arg in sys.argv[1:]:
+    argv = sys.argv[1:]
+    if "--target" in argv:
+        idx = argv.index("--target")
+        if idx + 1 < len(argv):
+            return os.path.abspath(argv[idx + 1])
+    # Accept a bare positional path argument (e.g. `python install.py /path/to/project`),
+    # skipping over recognized flags and the values that belong to them.
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in _HARNESS_FLAG_VALUE_ARGS:
+            skip_next = True
+            continue
         if not arg.startswith("-"):
             return os.path.abspath(arg)
     return os.getcwd()
@@ -662,7 +708,7 @@ def register_plugin_with_claude() -> bool:
     return True
 
 
-def main(target_dir: str = "") -> None:
+def main(target_dir: str = "", harness: str = "claude-code") -> None:
     print("=" * 50)
     print("Temporal Reasoning Skill Setup")
     print("=" * 50)
@@ -694,6 +740,18 @@ def main(target_dir: str = "") -> None:
         results.append(check_func())
         print()
 
+    if harness != "claude-code":
+        ok = all(results)
+        print("=" * 50)
+        print("✓ Setup complete!" if ok else "✗ Setup incomplete — fix errors above")
+        print("=" * 50)
+        print()
+        print(f"Skill files synced to your {harness} skill directory.")
+        print(f"Manual MCP + hook configuration required — see {_MANUAL_CONFIG_TEMPLATE[harness]} for a template.")
+        if not ok:
+            sys.exit(1)
+        return
+
     print("Configuring .mcp.json...")
     mcp_ok = setup_mcp_json(target_dir)
     print()
@@ -717,11 +775,6 @@ def main(target_dir: str = "") -> None:
         print()
         print("Replace any 'your-api-key-here' placeholders in:")
         print("  .claude/settings.local.json    — hooks + Claude Code env (ANTHROPIC_API_KEY)")
-        print()
-        print("Other agents (manual config — see hooks/ for templates):")
-        print("    hooks/codex.toml    — Codex CLI")
-        print("    hooks/hermes.yaml   — Hermes")
-        print("    hooks/opencode.json — OpenCode")
     else:
         print("=" * 50)
         print("✗ Setup incomplete — fix errors above")
@@ -730,14 +783,22 @@ def main(target_dir: str = "") -> None:
 
 
 if __name__ == "__main__":
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__)
+        sys.exit(0)
+
+    harness = _resolve_harness(sys.argv[1:])
+    if harness is None:
+        sys.exit(2)
+
     target_dir = _get_target_dir()
     force = "--force" in sys.argv
     if target_dir != REPO_DIR:
         print(f"Installing into: {target_dir}")
 
     if force or should_update():
-        update_skill(target_dir)
+        update_skill(target_dir, harness)
     else:
-        _sync_files(target_dir)
+        _sync_files(target_dir, harness)
 
-    main(target_dir)
+    main(target_dir, harness)
