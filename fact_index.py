@@ -20,6 +20,10 @@ _MEMORY_PREFIXES = (":decision/", ":preference/", ":constraint/", ":dependency/"
 
 _MMAP_SIZE = 1_073_741_824  # 1 GiB
 _BUSY_TIMEOUT_MS = 5000
+_SCHEMA_SQL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5("
+    "entity, attribute, value, tokenize='unicode61')"
+)
 
 
 def index_path_for(graph_path: str) -> str:
@@ -41,11 +45,15 @@ def _configure(con: sqlite3.Connection) -> None:
 
 def ensure_schema(con: sqlite3.Connection) -> None:
     """Create facts_fts if it doesn't exist yet. Idempotent and safe under
-    concurrent callers (IF NOT EXISTS + busy_timeout serializes racers)."""
-    con.execute(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5("
-        "entity, attribute, value, tokenize='unicode61')"
-    )
+    concurrent callers (IF NOT EXISTS + busy_timeout serializes racers).
+
+    Commits internally -- do NOT call this from rebuild_index(), which needs
+    the CREATE statement inside its own explicit BEGIN IMMEDIATE transaction;
+    this function's internal commit() would end that transaction early and
+    reintroduce the non-atomicity race rebuild_index's retry loop exists to
+    prevent. rebuild_index() inlines the schema SQL (_SCHEMA_SQL) instead.
+    """
+    con.execute(_SCHEMA_SQL)
     con.commit()
 
 
@@ -182,15 +190,12 @@ def rebuild_index(path: str, facts: Sequence[Tuple[str, str, str]]) -> None:
     for attempt in range(attempts):
         con = sqlite3.connect(path, timeout=5.0, isolation_level=None)
         try:
-            con.execute("PRAGMA busy_timeout=5000")
+            con.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
             con.execute("PRAGMA journal_mode=WAL")
             con.execute(f"PRAGMA mmap_size={_MMAP_SIZE}")
             con.execute("BEGIN IMMEDIATE")
             con.execute("DROP TABLE IF EXISTS facts_fts")
-            con.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5("
-                "entity, attribute, value, tokenize='unicode61')"
-            )
+            con.execute(_SCHEMA_SQL)  # NOT ensure_schema() -- see its docstring
             insert_facts(con, facts)
             con.execute("COMMIT")
             return
