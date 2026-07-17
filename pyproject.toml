@@ -51,7 +51,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["mcp_server", "report_issue"]
+py-modules = ["mcp_server", "report_issue", "fact_index"]
 
 [tool.ruff]
 line-length = 100
