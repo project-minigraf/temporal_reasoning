@@ -6642,6 +6642,33 @@ class TestRunIngestionBatchedIndexWrites:
         assert len(commit_calls) == 3
 
 
+class TestRunIngestionParentEdgeFactIndex:
+    @pytest.mark.asyncio
+    async def test_parent_edge_is_searchable_via_fact_index(self, real_db, git_repo, monkeypatch):
+        """Review-finding regression test (#118): the git-ingestion
+        :parent-edge write (one transact per parent hash, guarding against
+        an EAVT collision on merge commits) called _db_execute directly
+        with a raw, single-quoted f-string Datalog literal instead of
+        routing through _transact -- so :parent triples were written to the
+        graph but never to the persisted fact index, silently unsearchable
+        via fact_index.query_facts unlike every other structural fact type
+        (:contains, :depends-on, ...) ingested through _ingest_transact.
+        git_repo (tests/test_mcp_server.py:4165) has two linear commits, so
+        the second commit produces exactly one :parent edge back to the
+        first -- enough to prove the edge lands in the index."""
+        import mcp_server
+        import fact_index
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "parent", top_n=50, boost=2.0)
+        parent_rows = [r for r in results if r[1] == ":parent"]
+        assert parent_rows, "no :parent-attribute rows found in the fact index after ingestion"
+
+
 class TestRunIngestionConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_run_matches_sequential_facts(

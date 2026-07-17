@@ -6290,15 +6290,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                         # Ingest :parent edges — one transact per parent to avoid EAVT
                         # collision for merge commits (which have two parent hashes).
+                        # Routed through _transact (not a raw _db_execute call) so the
+                        # edge also lands in the persisted fact index -- see #118 review
+                        # finding: this call site used to build its own raw (transact
+                        # ...) string and bypass the index choke point entirely.
                         try:
                             for parent_hash in _git_parent_hashes(repo_path, commit_hash):
                                 parent_ident = f":commit/{parent_hash[:12]}"
                                 await loop.run_in_executor(
                                     write_executor,
-                                    _db_execute,
+                                    _transact,
                                     db,
-                                    f'(transact {{:valid-from "{commit_ts_iso}"}} '
-                                    f'[[{commit_ident} :parent {parent_ident}]])',
+                                    f'[[{commit_ident} :parent {parent_ident}]]',
+                                    commit_ts_iso,
+                                    None,
+                                    None,
+                                    index_con,
                                 )
                         except Exception:
                             pass  # non-fatal; parent edges are best-effort
