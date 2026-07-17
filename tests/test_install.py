@@ -91,3 +91,109 @@ class TestSyncLists:
 
     def test_hooks_in_dirs_to_sync(self):
         assert "hooks" in install.DIRS_TO_SYNC
+
+
+class TestResolveHarness:
+    def test_missing_harness_returns_none(self):
+        assert install._resolve_harness([]) is None
+
+    def test_missing_harness_value_returns_none(self):
+        assert install._resolve_harness(["--harness"]) is None
+
+    def test_invalid_harness_value_returns_none(self):
+        assert install._resolve_harness(["--harness", "vim"]) is None
+
+    def test_valid_claude_code_harness(self):
+        assert install._resolve_harness(["--harness", "claude-code"]) == "claude-code"
+
+    def test_valid_opencode_harness(self):
+        assert install._resolve_harness(["--harness", "opencode"]) == "opencode"
+
+    def test_valid_codex_harness(self):
+        assert install._resolve_harness(["--harness", "codex"]) == "codex"
+
+    def test_harness_value_alongside_other_flags(self):
+        argv = ["--target", "/some/path", "--harness", "codex", "--force"]
+        assert install._resolve_harness(argv) == "codex"
+
+
+class TestGetTargetDir:
+    def test_harness_value_not_mistaken_for_target_dir(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["install.py", "--harness", "codex"])
+        assert install._get_target_dir() == install.os.getcwd()
+
+    def test_explicit_target_still_works_with_harness(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            sys, "argv",
+            ["install.py", "--harness", "opencode", "--target", str(tmp_path)],
+        )
+        assert install._get_target_dir() == install.os.path.abspath(str(tmp_path))
+
+    def test_bare_positional_path_still_works_with_harness(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            sys, "argv",
+            ["install.py", "--harness", "claude-code", str(tmp_path)],
+        )
+        assert install._get_target_dir() == install.os.path.abspath(str(tmp_path))
+
+
+class TestSyncFilesHarnessScoping:
+    @pytest.mark.parametrize("harness,expected_dir,other_dirs", [
+        ("claude-code", "skills/temporal-reasoning",
+         [".codex/skills/temporal-reasoning", ".opencode/skills/temporal-reasoning"]),
+        ("opencode", ".opencode/skills/temporal-reasoning",
+         [".codex/skills/temporal-reasoning", "skills/temporal-reasoning"]),
+        ("codex", ".codex/skills/temporal-reasoning",
+         [".opencode/skills/temporal-reasoning", "skills/temporal-reasoning"]),
+    ])
+    def test_only_selected_harness_dir_is_written(self, tmp_path, harness, expected_dir, other_dirs):
+        install._sync_files(str(tmp_path), harness)
+        assert (tmp_path / expected_dir / "SKILL.md").exists()
+        for other in other_dirs:
+            assert not (tmp_path / other).exists()
+
+
+class TestMainHarnessGating:
+    def _patch_common(self, monkeypatch):
+        monkeypatch.setattr(install, "ensure_venv", lambda: True)
+        monkeypatch.setattr(install, "check_python_version", lambda: True)
+        monkeypatch.setattr(install, "check_minigraf_package", lambda: True)
+        monkeypatch.setattr(install, "check_mcp_package", lambda: True)
+        monkeypatch.setattr(install, "check_tree_sitter_packages", lambda: True)
+        monkeypatch.setattr(install, "check_mcp_server_importable", lambda: True)
+
+    def test_non_claude_harness_skips_claude_specific_setup(self, monkeypatch, tmp_path):
+        self._patch_common(monkeypatch)
+        mcp_json = MagicMock(return_value=True)
+        settings_json = MagicMock(return_value=True)
+        settings_local = MagicMock(return_value=True)
+        register = MagicMock(return_value=True)
+        monkeypatch.setattr(install, "setup_mcp_json", mcp_json)
+        monkeypatch.setattr(install, "setup_claude_settings_json", settings_json)
+        monkeypatch.setattr(install, "setup_claude_settings", settings_local)
+        monkeypatch.setattr(install, "register_plugin_with_claude", register)
+
+        install.main(str(tmp_path), "opencode")
+
+        mcp_json.assert_not_called()
+        settings_json.assert_not_called()
+        settings_local.assert_not_called()
+        register.assert_not_called()
+
+    def test_claude_code_harness_runs_claude_specific_setup(self, monkeypatch, tmp_path):
+        self._patch_common(monkeypatch)
+        mcp_json = MagicMock(return_value=True)
+        settings_json = MagicMock(return_value=True)
+        settings_local = MagicMock(return_value=True)
+        register = MagicMock(return_value=True)
+        monkeypatch.setattr(install, "setup_mcp_json", mcp_json)
+        monkeypatch.setattr(install, "setup_claude_settings_json", settings_json)
+        monkeypatch.setattr(install, "setup_claude_settings", settings_local)
+        monkeypatch.setattr(install, "register_plugin_with_claude", register)
+
+        install.main(str(tmp_path), "claude-code")
+
+        mcp_json.assert_called_once_with(str(tmp_path))
+        settings_json.assert_called_once_with(str(tmp_path))
+        settings_local.assert_called_once_with(str(tmp_path))
+        register.assert_called_once()
