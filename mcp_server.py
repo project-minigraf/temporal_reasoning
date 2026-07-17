@@ -4669,7 +4669,14 @@ def _rebuild_index_from_graph() -> None:
     sharing the same entity variable ([?e ?a ?v]) is a strictly riskier
     Datalog shape to depend on than it looks -- its join semantics for a
     shared free variable aren't something this codebase documents or tests
-    elsewhere, unlike a plain single-purpose lookup query.
+    elsewhere, unlike a plain single-purpose lookup query. Concretely,
+    against a stale minigraf==1.1.1 (older than this project's pinned
+    minigraf>=1.2.1 floor, but observed installed on one dev machine's
+    non-project Python), that combined-clause query collapsed to returning
+    only the single triple that satisfied the bound clause, discarding
+    every other fact the entity had -- not reproduced under the pinned
+    1.2.1. The two-query form removes the dependency on that join shape
+    either way, at the cost of one extra query on this rarely-run path.
     _preload_known_entities never combines the two: it always names every
     attribute explicitly (?path, ?desc, ?date) instead of using a free
     [?e ?a ?v] clause, so matching its clause *ordering* alone (which this
