@@ -1,6 +1,18 @@
 """Unit tests for mcp_server.py.
 
-All tests mock MiniGrafDb so no live minigraf install is required.
+All tests use a real minigraf backend — the `real_db` fixture opens a genuine
+MiniGrafDb.open_in_memory() instance, so every test exercises real Datalog
+parsing, schema validation, and bi-temporal semantics. A handful of
+multi-commit git-ingestion tests use a real file-backed MiniGrafDb.open()
+instead of `real_db`, since they need the graph to persist across separate
+ingestion runs against the same path. A narrow exception: the DB lock-retry
+cluster (TestGetDbLockRetry, TestTryOpenWithSelfHealReuse,
+TestOpenDbAtWithExtendedRetry) uses real file-backed MiniGrafDb.open() with
+genuine subprocess-manufactured lock contention, since locking is inherently
+file-based. External, non-minigraf network APIs (LLM provider clients,
+GitHub via the report_issue module) still get mocked to avoid real API
+cost/network/non-determinism in CI — see docs/testing-conventions.md for the
+full rationale and pattern reference.
 """
 import asyncio
 import contextlib
@@ -28,47 +40,84 @@ requires_bm25 = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def reset_mcp_server_db():
+def reset_mcp_server_db(monkeypatch):
     """Reset the module-level _db singleton, grammar cache, and index cache between tests."""
     import mcp_server
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
     mcp_server._index_cache = mcp_server.IndexCache()
     yield
+    # Suppress index cache rebuilds during teardown to avoid race with background
+    # rebuild threads that may still be running from the previous test (see #133).
+    monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
     mcp_server._index_cache = mcp_server.IndexCache()
 
 
 @pytest.fixture
-def mock_minigraf_db():
-    """Mock MiniGrafDb class and instance."""
-    with patch("mcp_server.MiniGrafDb") as mock_class:
-        db_instance = MagicMock()
-        db_instance.execute.return_value = json.dumps({"results": []})
-        mock_class.open.return_value = db_instance
-        yield mock_class, db_instance
+def real_db(monkeypatch, tmp_path):
+    """Open a real (non-mocked) in-memory MiniGrafDb for the duration of the test.
+    Full Datalog parsing, schema validation, and bi-temporal semantics — just
+    backed by open_in_memory() instead of a disk file, so tests stay fast."""
+    from minigraf import MiniGrafDb
+    real_open_in_memory = MiniGrafDb.open_in_memory
+    monkeypatch.setattr(MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory()))
+    import mcp_server
+    mcp_server.open_db(str(tmp_path / "t.graph"))
+    yield mcp_server.get_db()
+
+
+@contextlib.contextmanager
+def execute_spy():
+    """Wrap mcp_server._db_execute to record (db, datalog) for every real call,
+    while still executing for real. Yields the list of recorded datalog strings."""
+    import mcp_server
+    real_execute = mcp_server._db_execute
+    calls = []
+
+    def spy(db_arg, datalog):
+        calls.append(datalog)
+        return real_execute(db_arg, datalog)
+
+    mcp_server._db_execute = spy
+    try:
+        yield calls
+    finally:
+        mcp_server._db_execute = real_execute
 
 
 class TestOpenDb:
-    def test_opens_db_at_given_path(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_opens_db_at_given_path(self, monkeypatch, tmp_path):
+        from minigraf import MiniGrafDb
+        real_open_in_memory = MiniGrafDb.open_in_memory
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory()))
         import mcp_server
-        graph_path = str(tmp_path / "test.graph")
-        mcp_server.open_db(graph_path)
-        mock_class.open.assert_called_once_with(graph_path)
+        path = str(tmp_path / "t.graph")
 
-    def test_registers_session_rules(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+        result = mcp_server.open_db(path)
+
+        assert result is not None
+        assert mcp_server._graph_path == path
+        # A real handle can execute — proof it's a live db, not a stub.
+        assert json.loads(result.execute("(query [:find ?e :where [?e :foo ?v]])"))["results"] == []
+
+    def test_registers_session_rules(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "test.graph"))
-        # Four rules registered at startup
-        assert db_instance.execute.call_count == len(mcp_server.SESSION_RULES)
-        for rule in mcp_server.SESSION_RULES:
-            db_instance.execute.assert_any_call(rule)
+        # Session rules are query-invocable once registered; pick one from
+        # SESSION_RULES and confirm it doesn't error when invoked as a rule call.
+        assert mcp_server.SESSION_RULES  # sanity: rules exist to register
+        # Invoke the 'linked' rule (first rule in SESSION_RULES) to confirm
+        # it was registered and is callable.
+        result = json.loads(real_db.execute("(query [:find ?a ?b :where (linked ?a ?b)])"))
+        assert "results" in result
+        # No exception during open_db (already happened via the real_db fixture)
+        # is itself the regression signal for registration failures.
 
-    def test_get_db_auto_opens_when_db_none(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_get_db_auto_opens_when_db_none(self, monkeypatch, tmp_path):
+        from minigraf import MiniGrafDb
+        real_open_in_memory = MiniGrafDb.open_in_memory
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory()))
         import mcp_server
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "auto.graph"))
         mcp_server._db = None
@@ -76,21 +125,102 @@ class TestOpenDb:
 
         result = mcp_server.get_db()
 
-        assert result is db_instance
+        assert result is not None
+        assert mcp_server._graph_path == str(tmp_path / "auto.graph")
 
-    def test_get_db_returns_instance_after_open(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_get_db_returns_instance_after_open(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "test.graph"))
-        assert mcp_server.get_db() is db_instance
+        result = mcp_server.get_db()
+        assert result is real_db
 
-    def test_uses_env_var_for_graph_path(self, mock_minigraf_db, monkeypatch, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_uses_env_var_for_graph_path(self, monkeypatch, tmp_path):
+        from minigraf import MiniGrafDb
+        real_open_in_memory = MiniGrafDb.open_in_memory
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory()))
+        import mcp_server
         custom_path = str(tmp_path / "custom.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", custom_path)
-        import mcp_server
-        mcp_server.open_db()
-        mock_class.open.assert_called_once_with(custom_path)
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+
+        mcp_server.get_db()
+
+        assert mcp_server._graph_path == custom_path
+
+
+@contextlib.contextmanager
+def _hold_lock_subprocess(path, exit_immediately=False, hold_seconds=None):
+    """Spawn a real subprocess that opens a real MiniGrafDb at `path`, producing
+    genuine cross-process lock contention.
+
+    Exactly one of three modes applies, chosen by the arguments:
+
+    - exit_immediately=True: the subprocess opens, prints its PID, and exits
+      right away; this call blocks until it's reaped, so the yielded PID is
+      guaranteed to be real and already-dead by the time control returns to
+      the caller.
+      NOTE: the installed minigraf build resolves a dead-holder lock file
+      internally the moment MiniGrafDb.open() is next called on that path —
+      verified empirically (see task-2-report.md) — so a subprocess that exits
+      cleanly actually removes its own lock file rather than leaving a stale
+      one behind, and even a hand-written stale lock file naming a dead PID
+      lets a fresh open() succeed silently with no MiniGrafError raised at
+      all. Practical effect: real subprocess timing can reproduce "holder is
+      alive and contending" and "holder has cleanly finished", but not
+      "open() raises citing a holder that's already dead" — that combination
+      is not reachable through genuine process death on this platform, only
+      through an unschedulable microsecond TOCTOU race. Tests that need to
+      exercise mcp_server._clear_stale_lock's own dead-PID-detection logic use
+      the PID yielded here (real, verifiably dead) to reconstruct that
+      on-disk artifact by hand and call the real function directly — see
+      test_self_heals_stale_lock_from_dead_pid and
+      test_self_heals_dead_holder_mid_loop for the full rationale.
+
+    - hold_seconds=<float>: the subprocess holds the lock for that many real
+      wall-clock seconds (a genuine `time.sleep` inside the subprocess, not a
+      mock) and then exits cleanly on its own — for "succeeds once real
+      contention clears within N seconds" tests. Control returns to the
+      caller as soon as the subprocess has opened the db and printed its PID
+      (i.e. while it's still holding the lock), so the caller can immediately
+      contend against it.
+
+    - neither given (the default): the subprocess holds the lock alive until
+      the `with` block exits — for "holder still alive" tests.
+
+    In every mode, yields the holder subprocess's PID, and the `finally`
+    clause guarantees the subprocess is terminated/reaped and its stdout pipe
+    closed no matter what happens inside the `with` block (including an
+    unexpected exception), so nothing leaks.
+    """
+    if exit_immediately and hold_seconds is not None:
+        raise ValueError("exit_immediately and hold_seconds are mutually exclusive")
+    if hold_seconds is not None:
+        sleep_stmt = f"time.sleep({hold_seconds})\n"
+    elif exit_immediately:
+        sleep_stmt = ""
+    else:
+        sleep_stmt = "time.sleep(30)\n"
+    hold_script = (
+        "import minigraf, sys, time\n"
+        f"db = minigraf.MiniGrafDb.open({path!r})\n"
+        "print(str(__import__('os').getpid()), flush=True)\n"
+        + sleep_stmt
+    )
+    proc = _subprocess.Popen(
+        [sys.executable, "-c", hold_script],
+        stdout=_subprocess.PIPE, text=True,
+    )
+    pid_line = proc.stdout.readline().strip()
+    holder_pid = int(pid_line)
+    if exit_immediately:
+        proc.wait(timeout=5)  # guarantee the PID is actually dead before returning
+    try:
+        yield holder_pid
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        proc.stdout.close()
 
 
 class TestGetDbLockRetry:
@@ -99,112 +229,143 @@ class TestGetDbLockRetry:
     the caller (e.g. the git-ingestion loop), and must self-heal a stale
     lock left behind by a dead holder process."""
 
-    def test_retries_on_lock_error_then_succeeds(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
-        mock_class.open.side_effect = [
-            MiniGrafError("Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."),
-            db_instance,
-        ]
+    def test_retries_on_lock_error_then_succeeds(self, tmp_path, monkeypatch):
         import mcp_server
+        graph_path = str(tmp_path / "t.graph")
         mcp_server._db = None
-        mcp_server._graph_path = str(tmp_path / "t.graph")
-        result = mcp_server.get_db()
-        assert result is db_instance
-        assert mock_class.open.call_count == 2
+        mcp_server._graph_path = graph_path
 
-    def test_gives_up_after_max_attempts(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+        # Real backoff (not mocked) — the subprocess needs genuine wall-clock
+        # time to hold the lock and then exit before a later retry attempt
+        # observes it free again.
+        with _hold_lock_subprocess(graph_path, hold_seconds=0.1):
+            result = mcp_server.get_db()
+
+        assert result is not None
+
+    def test_gives_up_after_max_attempts(self, tmp_path, monkeypatch):
         monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
-        lock_err = MiniGrafError("Database is locked by another process (lock file: x.graph.lock, holder PID: 1).")
-        mock_class.open.side_effect = lock_err
         import mcp_server
+        graph_path = str(tmp_path / "t.graph")
         mcp_server._db = None
-        mcp_server._graph_path = str(tmp_path / "t.graph")
-        with pytest.raises(MiniGrafError):
+        mcp_server._graph_path = graph_path
+
+        with _hold_lock_subprocess(graph_path):
+            with pytest.raises(MiniGrafError):
+                mcp_server.get_db()
+
+    def test_non_lock_errors_are_not_retried(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        import mcp_server
+        # A real, deterministic non-lock MiniGrafError: pointing the graph
+        # path at a directory (not a file) fails with "Is a directory" on
+        # the very first open() attempt — no fabricated exception, no mock.
+        graph_path = str(tmp_path / "adir")
+        os.makedirs(graph_path)
+        mcp_server._db = None
+        mcp_server._graph_path = graph_path
+
+        with pytest.raises(MiniGrafError) as exc_info:
             mcp_server.get_db()
-        assert mock_class.open.call_count == mcp_server._LOCK_RETRY_MAX
+        assert "locked" not in str(exc_info.value).lower()
 
-    def test_non_lock_errors_are_not_retried(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
-        mock_class.open.side_effect = MiniGrafError("corrupt graph file")
-        import mcp_server
-        mcp_server._db = None
-        mcp_server._graph_path = str(tmp_path / "t.graph")
-        with pytest.raises(MiniGrafError):
-            mcp_server.get_db()
-        assert mock_class.open.call_count == 1  # no retry for non-lock errors
-
-    def test_self_heals_stale_lock_from_dead_pid(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_self_heals_stale_lock_from_dead_pid(self, tmp_path, monkeypatch):
         """If the lock's recorded holder PID is no longer running, the stale
         .lock file should be removed so the retry can succeed without
-        requiring the operator to delete it manually."""
-        mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        requiring the operator to delete it manually.
+
+        NOTE: as documented on _hold_lock_subprocess, a real open() call
+        never actually raises "locked" for a lock file naming an
+        already-dead PID on this platform/minigraf build — it self-heals
+        silently inside MiniGrafDb.open() itself before mcp_server.py's own
+        _clear_stale_lock ever gets a chance to run. This test therefore (a)
+        exercises the real _clear_stale_lock function directly against a
+        real stale lock file naming a real, verifiably-dead PID (obtained
+        from a genuinely spawned-and-reaped subprocess, not a hardcoded
+        guess), and (b) separately confirms the practically-important
+        end-to-end guarantee: get_db() must not get stuck just because a
+        stale lock file is lying around.
+        """
+        import mcp_server
         graph_path = str(tmp_path / "t.graph")
         lock_path = graph_path + ".lock"
-        with open(lock_path, "w") as f:
-            f.write("stale")
-        # PID 999999 should not exist on any reasonable test machine.
-        dead_pid = 999999
-        mock_class.open.side_effect = [
-            MiniGrafError(f"Database is locked by another process (lock file: {lock_path}, holder PID: {dead_pid})."),
-            db_instance,
-        ]
-        import mcp_server
         mcp_server._db = None
         mcp_server._graph_path = graph_path
-        result = mcp_server.get_db()
-        assert result is db_instance
+
+        with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
+            pass  # holder opened, printed its PID, and is confirmed reaped/dead
+
+        with open(lock_path, "w") as f:
+            f.write(str(dead_pid))
+        assert mcp_server._clear_stale_lock(graph_path, dead_pid) is True
         assert not os.path.exists(lock_path)
 
-    def test_leaves_lock_alone_when_holder_pid_alive(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
-        graph_path = str(tmp_path / "t.graph")
-        lock_path = graph_path + ".lock"
         with open(lock_path, "w") as f:
-            f.write("held")
-        live_pid = os.getpid()  # definitely alive — this test process
-        mock_class.open.side_effect = [
-            MiniGrafError(f"Database is locked by another process (lock file: {lock_path}, holder PID: {live_pid})."),
-            db_instance,
-        ]
+            f.write(str(dead_pid))
+        result = mcp_server.get_db()
+        assert result is not None
+
+    def test_leaves_lock_alone_when_holder_pid_alive(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
         import mcp_server
+        graph_path = str(tmp_path / "t.graph")
         mcp_server._db = None
         mcp_server._graph_path = graph_path
-        result = mcp_server.get_db()
-        assert result is db_instance
-        assert os.path.exists(lock_path)  # untouched — holder is still alive
+        lock_path = graph_path + ".lock"
 
-    def test_retries_open_after_clearing_stale_lock_on_final_attempt(
-        self, mock_minigraf_db, tmp_path, monkeypatch
-    ):
+        with _hold_lock_subprocess(graph_path):
+            with pytest.raises(MiniGrafError):
+                mcp_server.get_db()
+            assert os.path.exists(lock_path)  # untouched — real holder still alive
+
+    def test_retries_open_after_clearing_stale_lock_on_final_attempt(self, tmp_path, monkeypatch):
         """Regression test for #91: previously, clearing a stale lock on the
         final retry attempt still fell through to raising the just-resolved
         lock error, because the follow-up open was gated on `attempt <
         _LOCK_RETRY_MAX - 1`. The clear must always be followed by one more
-        open attempt, no matter which iteration triggered it."""
-        mock_class, db_instance = mock_minigraf_db
-        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        open attempt, no matter which iteration triggered it.
+
+        NOTE: mcp_server._clear_stale_lock itself is not reachable end-to-end
+        here for the same reason documented on _hold_lock_subprocess — real
+        holder death and a real "locked" MiniGrafError never coincide on
+        this platform. What's still real and worth guarding: the retry loop
+        must keep contending against a real, live-held lock all the way
+        through its *last* attempt and succeed the moment that real
+        contention clears, instead of giving up early. A real subprocess
+        holds the lock through the first several backoff attempts and exits
+        only shortly before the final one; a real (uninstrumented-behavior)
+        open() call counter — not a canned exception — proves the loop
+        actually reached its last attempt rather than succeeding trivially
+        on the first.
+        """
         import mcp_server
-
-        lock_err = MiniGrafError(
-            "Database is locked by another process (lock file: x.graph.lock, holder PID: 999999)."
-        )
-        monkeypatch.setattr(mcp_server, "_clear_stale_lock", lambda path, pid: True)
-        # Every regular attempt's immediate post-clear retry also fails,
-        # except the very last one (triggered on the final loop iteration).
-        mock_class.open.side_effect = [lock_err] * (2 * mcp_server._LOCK_RETRY_MAX - 1) + [db_instance]
-
+        graph_path = str(tmp_path / "t.graph")
         mcp_server._db = None
-        mcp_server._graph_path = str(tmp_path / "t.graph")
+        mcp_server._graph_path = graph_path
 
-        result = mcp_server.get_db()
+        open_calls = {"n": 0}
+        real_open = mcp_server.MiniGrafDb.open
 
-        assert result is db_instance
-        assert mock_class.open.call_count == 2 * mcp_server._LOCK_RETRY_MAX
+        def counting_open(path):
+            open_calls["n"] += 1
+            return real_open(path)
+
+        monkeypatch.setattr(mcp_server.MiniGrafDb, "open", staticmethod(counting_open))
+
+        # get_db()'s cumulative real backoff before each of its 5 attempts is
+        # 0, .05, .15, .35, .75s — hold the lock past the 4th attempt (~.35s)
+        # but let it die before the 5th (~.75s), forcing success on the last
+        # possible attempt.
+        with _hold_lock_subprocess(graph_path, hold_seconds=0.5):
+            result = mcp_server.get_db()
+
+        assert result is not None
+        assert open_calls["n"] == mcp_server._LOCK_RETRY_MAX, (
+            f"expected the retry loop to genuinely exhaust all "
+            f"{mcp_server._LOCK_RETRY_MAX} attempts against real contention "
+            f"before succeeding on the last one, got {open_calls['n']} real "
+            "open() calls"
+        )
 
 
 class TestTryOpenWithSelfHealReuse:
@@ -222,16 +383,17 @@ class TestTryOpenWithSelfHealReuse:
     surfaces as "locked by another process" with the lock file's own PID
     equal to our own."""
 
-    def test_concurrent_open_attempts_only_open_db_once(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_concurrent_open_attempts_only_open_db_once(self, tmp_path, monkeypatch):
         import mcp_server
         import threading
         import time as _time
+        from minigraf import MiniGrafDb
 
         path = str(tmp_path / "race.graph")
         mcp_server._db = None
         mcp_server._graph_path = ""
 
+        real_open_in_memory = MiniGrafDb.open_in_memory
         open_call_count = {"n": 0}
         open_lock = threading.Lock()
 
@@ -239,9 +401,9 @@ class TestTryOpenWithSelfHealReuse:
             with open_lock:
                 open_call_count["n"] += 1
             _time.sleep(0.05)  # widen the race window so racers overlap
-            return db_instance
+            return real_open_in_memory()
 
-        mock_class.open.side_effect = slow_open
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(slow_open))
 
         results = []
         results_lock = threading.Lock()
@@ -263,7 +425,7 @@ class TestTryOpenWithSelfHealReuse:
             "must recheck _db under _db_native_lock before opening a second handle (#107)"
         )
         assert len(results) == 5
-        assert all(r is db_instance for r in results)
+        assert all(r is results[0] for r in results)
 
 
 class TestGetDbConcurrentResetRace:
@@ -280,13 +442,10 @@ class TestGetDbConcurrentResetRace:
         import sys as _sys
         import threading
         import mcp_server
+        from minigraf import MiniGrafDb
 
-        class FakeDb:
-            def execute(self, datalog):
-                return json.dumps({"results": []})
-
-        fake_db = FakeDb()
-        mcp_server._db = fake_db
+        real_db = MiniGrafDb.open_in_memory()
+        mcp_server._db = real_db
 
         target_code = mcp_server.get_db.__code__
         src_lines, start_line = inspect.getsourcelines(mcp_server.get_db)
@@ -325,7 +484,7 @@ class TestGetDbConcurrentResetRace:
         finally:
             t.join(timeout=2)
 
-        assert outcome.get("db") is fake_db, (
+        assert outcome.get("db") is real_db, (
             "get_db() returned a stale/None value after a concurrent reset "
             "of the global between its None-check and its return (#122)"
         )
@@ -393,71 +552,73 @@ class TestOpenDbAtWithExtendedRetry:
     time-budgeted backoff used only for ingestion startup lock acquisition,
     separate from get_db()'s ~1.55s budget (#106)."""
 
-    def test_succeeds_after_retries_within_budget(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        fake_time = {"t": 0.0}
-        monkeypatch.setattr("mcp_server.time.monotonic", lambda: fake_time["t"])
-        monkeypatch.setattr(
-            "mcp_server.time.sleep",
-            lambda s: fake_time.__setitem__("t", fake_time["t"] + s),
-        )
-        live_pid = os.getpid()  # alive -> self-heal never fires, pure backoff-then-succeed
-        lock_err = MiniGrafError(
-            f"Database is locked by another process (lock file: x.graph.lock, holder PID: {live_pid})."
-        )
-        mock_class.open.side_effect = [lock_err, lock_err, db_instance]
+    def test_succeeds_after_retries_within_budget(self, tmp_path, monkeypatch):
         import mcp_server
-        result = mcp_server._open_db_at_with_extended_retry(str(tmp_path / "t.graph"))
-        assert result is db_instance
-        assert mock_class.open.call_count == 3
+        graph_path = str(tmp_path / "t.graph")
 
-    def test_gives_up_after_budget_exhausted(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        fake_time = {"t": 0.0}
-        monkeypatch.setattr("mcp_server.time.monotonic", lambda: fake_time["t"])
-        monkeypatch.setattr(
-            "mcp_server.time.sleep",
-            lambda s: fake_time.__setitem__("t", fake_time["t"] + s),
-        )
-        live_pid = os.getpid()  # alive -> self-heal never fires; pure budget exhaustion
-        lock_err = MiniGrafError(
-            f"Database is locked by another process (lock file: x.graph.lock, holder PID: {live_pid})."
-        )
-        mock_class.open.side_effect = lock_err  # always raises the same error
-        import mcp_server
-        with pytest.raises(MiniGrafError):
-            mcp_server._open_db_at_with_extended_retry(str(tmp_path / "t.graph"))
-        # Far more retries than the old ~1.55s/5-attempt budget would allow —
-        # proves the extended budget, not the general-purpose one, was used.
-        assert mock_class.open.call_count >= 10
+        # Real backoff (not mocked) — the subprocess needs genuine wall-clock
+        # time to hold the lock and then exit before a later retry attempt
+        # observes it free again. The extended retry's 120s budget is real
+        # wall-clock time too, so this stays far inside it.
+        with _hold_lock_subprocess(graph_path, hold_seconds=0.1):
+            result = mcp_server._open_db_at_with_extended_retry(graph_path)
 
-    def test_non_lock_error_propagates_immediately(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+        assert result is not None
+
+    def test_gives_up_after_budget_exhausted(self, tmp_path, monkeypatch):
         monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
-        mock_class.open.side_effect = MiniGrafError("corrupt graph file")
+        # Shrink the 120s real-time budget so the test doesn't actually wait
+        # two minutes — the budget is real wall-clock time (time.monotonic
+        # is not mocked), so this must be a real constant, not a faked clock.
         import mcp_server
-        with pytest.raises(MiniGrafError):
-            mcp_server._open_db_at_with_extended_retry(str(tmp_path / "t.graph"))
-        assert mock_class.open.call_count == 1  # no retry for non-lock errors
+        monkeypatch.setattr(mcp_server, "_INGEST_LOCK_RETRY_BUDGET", 0.3)
+        graph_path = str(tmp_path / "t.graph")
 
-    def test_self_heals_dead_holder_mid_loop(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+        with _hold_lock_subprocess(graph_path):
+            with pytest.raises(MiniGrafError):
+                mcp_server._open_db_at_with_extended_retry(graph_path)
+
+    def test_non_lock_error_propagates_immediately(self, tmp_path, monkeypatch):
         monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        import mcp_server
+        # A real, deterministic non-lock MiniGrafError: pointing the graph
+        # path at a directory (not a file) fails with "Is a directory" on
+        # the very first open() attempt — no fabricated exception, no mock.
+        graph_path = str(tmp_path / "adir")
+        os.makedirs(graph_path)
+
+        with pytest.raises(MiniGrafError) as exc_info:
+            mcp_server._open_db_at_with_extended_retry(graph_path)
+        assert "locked" not in str(exc_info.value).lower()
+
+    def test_self_heals_dead_holder_mid_loop(self, tmp_path, monkeypatch):
+        """NOTE: as documented on _hold_lock_subprocess (see TestGetDbLockRetry
+        for the full rationale), a real open() call never actually raises
+        "locked" for a lock file naming an already-dead PID on this
+        platform/minigraf build — it self-heals silently inside
+        MiniGrafDb.open() itself. This test therefore (a) exercises the real
+        _clear_stale_lock function directly against a real stale lock file
+        naming a real, verifiably-dead PID, and (b) separately confirms the
+        practically-important end-to-end guarantee: the extended retry must
+        not get stuck just because a stale lock file is lying around.
+        """
+        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
+        import mcp_server
         graph_path = str(tmp_path / "t.graph")
         lock_path = graph_path + ".lock"
+
+        with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
+            pass  # holder opened, printed its PID, and is confirmed reaped/dead
+
         with open(lock_path, "w") as f:
-            f.write("stale")
-        dead_pid = 999999  # not running on any reasonable test machine
-        mock_class.open.side_effect = [
-            MiniGrafError(
-                f"Database is locked by another process (lock file: {lock_path}, holder PID: {dead_pid})."
-            ),
-            db_instance,
-        ]
-        import mcp_server
-        result = mcp_server._open_db_at_with_extended_retry(graph_path)
-        assert result is db_instance
+            f.write(str(dead_pid))
+        assert mcp_server._clear_stale_lock(graph_path, dead_pid) is True
         assert not os.path.exists(lock_path)
+
+        with open(lock_path, "w") as f:
+            f.write(str(dead_pid))
+        result = mcp_server._open_db_at_with_extended_retry(graph_path)
+        assert result is not None
 
 
 class TestLiveLockHolderPid:
@@ -541,107 +702,80 @@ class TestPidIsAlive:
 
 
 class TestMinigrafQuery:
-    def test_returns_results_on_success(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": [["FastAPI", ":decision"]]})
+    def test_returns_results_on_success(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        real_db.execute('(transact {} [[:decision/redis :description "use Redis"]])')
 
-        result = mcp_server.handle_minigraf_query("[:find ?n :where [?e :name ?n]]")
+        result = mcp_server.handle_minigraf_query(
+            '[:find ?d :where [:decision/redis :description ?d]]'
+        )
 
-        db_instance.execute.assert_called_once()
         assert result["ok"] is True
-        assert result["results"] == [["FastAPI", ":decision"]]
+        assert result["results"] == [["use Redis"]]
 
-    def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_error_on_minigraf_error(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad datalog")
-
-        result = mcp_server.handle_minigraf_query("[:bad]")
-
+        result = mcp_server.handle_minigraf_query("(this is not valid datalog")
         assert result["ok"] is False
-        assert "bad datalog" in result["error"]
+        assert "error" in result
 
 
 class TestMinigrafTransact:
-    def test_requires_reason(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_requires_reason(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
-        result = mcp_server.handle_minigraf_transact("[[:e :a :v]]", reason="")
-
+        result = mcp_server.handle_minigraf_transact("[[:decision/x :description \"y\"]]", reason="")
         assert result["ok"] is False
         assert "reason" in result["error"].lower()
 
-    def test_transacts_and_checkpoints(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "3"})
+    def test_transacts_and_checkpoints(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="test"
+        )
 
-        result = mcp_server.handle_minigraf_transact("[[:e :a :v]]", reason="test")
-
-        # execute is called at least once for the transact (background index rebuild may
-        # add an extra call; assert any transact call was made rather than assert_called_once)
-        assert any("transact" in str(c) for c in db_instance.execute.call_args_list)
-        db_instance.checkpoint.assert_called_once()
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/cache :description ?d]])'
+        ))
+        assert queried["results"] == [["use Redis"]]
 
-    def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_error_on_minigraf_error(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad facts")
-
-        result = mcp_server.handle_minigraf_transact("[[:bad]]", reason="test")
-
+        result = mcp_server.handle_minigraf_transact("(not valid datalog", reason="test")
         assert result["ok"] is False
-        assert "bad facts" in result["error"]
+        assert "error" in result
 
 
 class TestMinigrafRetract:
-    def test_requires_reason(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_requires_reason(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         result = mcp_server.handle_minigraf_retract("[[:e :a :v]]", reason="")
-
         assert result["ok"] is False
 
-    def test_retracts_and_checkpoints(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "4"})
+    def test_retracts_and_checkpoints(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        real_db.execute('(transact {} [[:decision/old :description "deprecated"]])')
 
-        result = mcp_server.handle_minigraf_retract("[[:e :a :v]]", reason="gone")
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/old :description "deprecated"]]', reason="gone"
+        )
 
-        db_instance.checkpoint.assert_called_once()
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/old :description ?d]])'
+        ))
+        assert queried["results"] == []
 
-    def test_returns_error_on_minigraf_error(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_error_on_minigraf_error(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad retract")
-
-        result = mcp_server.handle_minigraf_retract("[[:e :a :v]]", reason="gone")
-
+        result = mcp_server.handle_minigraf_retract("(not valid datalog", reason="gone")
         assert result["ok"] is False
-        assert "bad retract" in result["error"]
+        assert "error" in result
 
 
 class TestMinigrafReportIssue:
-    def test_delegates_to_report_issue(self, mock_minigraf_db, tmp_path):
+    def test_delegates_to_report_issue(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mock_module = MagicMock()
         mock_module.report_issue.return_value = {
             "ok": True, "method": "gh", "repo": "org/repo", "result": "https://github.com/org/repo/issues/1"
@@ -655,123 +789,108 @@ class TestMinigrafReportIssue:
             "bug", "something broke", datalog=None, error=None
         )
 
-    def test_propagates_failure_from_report_issue(self, mock_minigraf_db, tmp_path):
+    def test_propagates_failure_from_report_issue(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mock_module = MagicMock()
         mock_module.report_issue.return_value = {"ok": False, "error": "gh command failed"}
         with patch.dict("sys.modules", {"report_issue": mock_module}):
             result = mcp_server.handle_minigraf_report_issue("bug", "something broke")
         assert result == {"ok": False, "error": "gh command failed"}
 
-    def test_returns_error_on_import_failure(self, mock_minigraf_db, tmp_path):
+    def test_returns_error_on_import_failure(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         with patch.dict("sys.modules", {"report_issue": None}):
             result = mcp_server.handle_minigraf_report_issue("bug", "something broke")
         assert result["ok"] is False
 
 
 class TestMemoryPrepareTurn:
-    def test_returns_empty_string_when_graph_empty(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    def test_returns_empty_string_when_graph_empty(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         result = mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
 
-        assert isinstance(result, str)
+        assert result == ""
 
-    def test_includes_matching_facts_in_output(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_includes_matching_facts_in_output(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute(
+            '(transact {} [[:decision/postgres :entity-type :type/decision] '
+            '[:decision/postgres :ident ":decision/postgres"] '
+            '[:decision/postgres :description "we use postgresql for storage"]])'
+        )
 
-        def execute_side_effect(cmd):
-            if "contains?" in cmd and "postgres" in cmd.lower():
-                return json.dumps({"results": [[":name", "PostgreSQL 15"]]})
-            return json.dumps({"results": []})
-
-        db_instance.execute.side_effect = execute_side_effect
         result = mcp_server._handle_memory_prepare_turn_heuristic("what did we decide about postgres?")
 
-        assert "PostgreSQL" in result or "postgres" in result.lower() or result == ""
+        assert "postgresql" in result.lower()
 
-    def test_falls_back_to_broad_scan_when_no_targeted_results(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_falls_back_to_broad_scan_when_no_targeted_results(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        # Seeded fact shares no substring with the message's candidate entities
+        # ("tell", "framework") — the targeted contains? query must come back
+        # empty, forcing the unfiltered broad-scan fallback to surface it.
+        real_db.execute(
+            '(transact {} [[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            '[:decision/redis :description "use Redis for caching"]])'
+        )
 
-        call_count = [0]
-
-        def execute_side_effect(cmd):
-            call_count[0] += 1
-            # Targeted queries return nothing; broad scan returns something
-            if "contains?" in cmd:
-                return json.dumps({"results": []})
-            return json.dumps({"results": [[":e", ":name", "FastAPI"]]})
-
-        db_instance.execute.side_effect = execute_side_effect
         result = mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
 
-        # Broad scan should have been called
-        assert call_count[0] > 0
+        assert "Redis" in result
 
-    def test_respects_scan_limit_env_var(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_respects_scan_limit_env_var(self, real_db, monkeypatch):
+        import mcp_server
         monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "10")
-        db_instance.execute.return_value = json.dumps({"results": []})
+        # None of these facts share a substring with the message's candidate
+        # entities, so the targeted query stays empty and every one of these
+        # triples is eligible for the broad-scan fallback — the scan_limit is
+        # only meaningfully tested if the graph holds more rows than the limit.
+        triples = []
+        for i in range(30):
+            ident = f":decision/item-{i}"
+            triples.append(f'[{ident} :entity-type :type/decision]')
+            triples.append(f'[{ident} :ident "{ident}"]')
+            triples.append(f'[{ident} :description "unrelated fact {i}"]')
+        real_db.execute(f'(transact {{}} [{" ".join(triples)}])')
+
+        result = mcp_server._handle_memory_prepare_turn_heuristic("xyzzy plugh quux")
+
+        lines = result.split("\n")
+        assert lines[0] == "Relevant memory context:"
+        assert len(lines) - 1 == 10
+
+    def test_uses_valid_at_for_message_with_explicit_iso_date(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
-        mcp_server._handle_memory_prepare_turn_heuristic("hello")
-        # Should not raise; limit is respected internally
+        with execute_spy() as calls:
+            mcp_server._handle_memory_prepare_turn_heuristic("what did we decide before 2026-01-15?")
 
-    def test_uses_valid_at_for_message_with_explicit_iso_date(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
-        import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
-
-        mcp_server._handle_memory_prepare_turn_heuristic("what did we decide before 2026-01-15?")
-
-        calls = [str(c) for c in db_instance.execute.call_args_list]
         assert any(':valid-at "2026-01-15"' in c for c in calls)
 
-    def test_caps_number_of_entities_scanned(self, mock_minigraf_db, tmp_path):
+    def test_caps_number_of_entities_scanned(self, real_db):
         """A long message must not issue one full-graph contains? scan per token.
 
         Each contains? query is an unindexed O(graph-size) linear scan (see
         issue #96); an unbounded entity count turns a single hook invocation
         into an unbounded number of full scans as the user's message grows.
         """
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         long_message = " ".join(f"distinctentityword{i}" for i in range(200))
-        mcp_server._handle_memory_prepare_turn_heuristic(long_message)
+        with execute_spy() as calls:
+            mcp_server._handle_memory_prepare_turn_heuristic(long_message)
 
-        contains_calls = [
-            c for c in db_instance.execute.call_args_list if "contains?" in str(c)
-        ]
+        contains_calls = [c for c in calls if "contains?" in c]
         assert len(contains_calls) <= mcp_server._MAX_HEURISTIC_ENTITIES
 
-    def test_uses_current_utc_timestamp_for_current_state_queries(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
-        import mcp_server, re
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+    def test_uses_current_utc_timestamp_for_current_state_queries(self, real_db):
+        import mcp_server
+        import re
 
-        mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
+        with execute_spy() as calls:
+            mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
 
-        calls = [str(c) for c in db_instance.execute.call_args_list]
         # Should contain a UTC timestamp like 2026-05-02T15:44:52.184Z
         assert any(re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z', c) for c in calls)
 
@@ -858,29 +977,26 @@ class TestHeuristicExtraction:
 
 
 class TestMemoryFinalizeTurnHeuristic:
-    def test_transacts_extracted_facts(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_transacts_extracted_facts(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
-        db_instance.execute.return_value = json.dumps({"tx": "5"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         result = asyncio.run(mcp_server.handle_memory_finalize_turn(
             "User: We'll use Redis.\nAgent: Stored."
         ))
 
         assert result["ok"] is True
-        assert isinstance(result["stored_count"], int)
+        assert result["stored_count"] == 1
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == [["Redis"]]
 
-    def test_returns_zero_stored_when_no_signals(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_returns_zero_stored_when_no_signals(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         result = asyncio.run(mcp_server.handle_memory_finalize_turn("The weather is fine."))
 
@@ -949,12 +1065,10 @@ class TestCallLlm:
 
 
 class TestLlmStrategyOpenAI:
-    def test_calls_openai_api(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_calls_openai_api(self, real_db, monkeypatch):
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
         monkeypatch.setenv("MINIGRAF_LLM_MODEL", "gpt-4o-mini")
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        db_instance.execute.return_value = json.dumps({"tx": "6"})
         import mcp_server
 
         fake_response_text = '[[:decision/redis :description "Redis"]]\n'
@@ -964,7 +1078,6 @@ class TestLlmStrategyOpenAI:
         )
 
         with patch("mcp_server._get_openai_client", return_value=mock_openai_client):
-            mcp_server.open_db(str(tmp_path / "t.graph"))
             result = mcp_server._llm_extract_and_transact(
                 "User: We'll use Redis.\nAgent: Stored."
             )
@@ -972,29 +1085,32 @@ class TestLlmStrategyOpenAI:
         assert result["ok"] is True
         assert result["stored_count"] > 0
         mock_openai_client.chat.completions.create.assert_called_once()
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == [["Redis"]]
 
-    def test_falls_back_to_heuristic_on_openai_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_falls_back_to_heuristic_on_openai_failure(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
         monkeypatch.setenv("MINIGRAF_LLM_MODEL", "gpt-4o-mini")
-        db_instance.execute.return_value = json.dumps({"tx": "7"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with patch("mcp_server._get_openai_client", side_effect=Exception("no key")):
             result = asyncio.run(mcp_server.handle_memory_finalize_turn("We'll use Kafka."))
 
         assert result["ok"] is True
         assert "heuristic" in result["strategy"]
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/kafka :description ?d]])'
+        ))
+        assert queried["results"] == [["Kafka"]]
 
 
 class TestLlmStrategy:
-    def test_calls_anthropic_api(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_calls_anthropic_api(self, real_db, monkeypatch):
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        db_instance.execute.return_value = json.dumps({"tx": "6"})
         import mcp_server
 
         fake_response_text = '[[:decision/redis :description "Redis"]]\n'
@@ -1004,21 +1120,21 @@ class TestLlmStrategy:
         mock_anthropic_client.messages.create.return_value = mock_message
 
         with patch("mcp_server._get_anthropic_client", return_value=mock_anthropic_client):
-            mcp_server.open_db(str(tmp_path / "t.graph"))
             result = mcp_server._llm_extract_and_transact(
                 "User: We'll use Redis.\nAgent: Stored."
             )
 
         assert result["ok"] is True
         mock_anthropic_client.messages.create.assert_called_once()
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == [["Redis"]]
 
-    def test_falls_back_to_heuristic_on_api_failure(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_falls_back_to_heuristic_on_api_failure(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
-        db_instance.execute.return_value = json.dumps({"tx": "7"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with patch("mcp_server._get_anthropic_client", side_effect=Exception("no key")):
             result = asyncio.run(mcp_server.handle_memory_finalize_turn("We'll use Kafka."))
@@ -1026,16 +1142,17 @@ class TestLlmStrategy:
         assert result["ok"] is True
         assert "heuristic" in result["strategy"]
         assert "warning" in result
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/kafka :description ?d]])'
+        ))
+        assert queried["results"] == [["Kafka"]]
 
 
 class TestAgentStrategy:
-    def test_returns_ok_result(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_returns_ok_result(self, real_db, monkeypatch):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "agent")
-        db_instance.execute.return_value = json.dumps({"tx": "8"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with patch("mcp_server._request_agent_memory_block_async",
                    new_callable=AsyncMock,
@@ -1043,13 +1160,16 @@ class TestAgentStrategy:
             result = asyncio.run(mcp_server._agent_extract_and_transact("We chose Kafka."))
 
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/kafka :description ?d]])'
+        ))
+        assert queried["results"] == [["Kafka"]]
 
 
 class TestMcpToolWiring:
-    def test_list_tools_returns_ten_tools(self, mock_minigraf_db, tmp_path):
+    def test_list_tools_returns_ten_tools(self, real_db):
         import asyncio
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         tools = asyncio.run(mcp_server.list_tools())
 
@@ -1061,16 +1181,13 @@ class TestMcpToolWiring:
             "minigraf_audit", "minigraf_ingest_git", "minigraf_ingest_status",
         }
 
-    def test_call_tool_minigraf_query(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_minigraf_query(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": [["FastAPI"]]})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        real_db.execute('(transact {} [[:e1 :name "FastAPI"]])')
 
         result = asyncio.run(mcp_server.call_tool(
-            "minigraf_query", {"datalog": "[:find ?n :where [?e :name ?n]]"}
+            "minigraf_query", {"datalog": "[:find ?n :where [:e1 :name ?n]]"}
         ))
 
         assert len(result) == 1
@@ -1078,13 +1195,9 @@ class TestMcpToolWiring:
         assert data["ok"] is True
         assert data["results"] == [["FastAPI"]]
 
-    def test_call_tool_minigraf_transact(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_minigraf_transact(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "10"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
 
         result = asyncio.run(mcp_server.call_tool(
             "minigraf_transact",
@@ -1094,13 +1207,14 @@ class TestMcpToolWiring:
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/cache :description ?d]])'
+        ))
+        assert queried["results"] == [["Redis"]]
 
-    def test_call_tool_memory_prepare_turn(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_memory_prepare_turn(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         result = asyncio.run(mcp_server.call_tool(
             "memory_prepare_turn", {"user_message": "what database are we using?"}
@@ -1109,28 +1223,27 @@ class TestMcpToolWiring:
         assert len(result) == 1
         assert isinstance(result[0].text, str)
 
-    def test_call_tool_memory_finalize_turn(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_memory_finalize_turn(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "11"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         result = asyncio.run(mcp_server.call_tool(
-            "memory_finalize_turn", {"conversation_delta": "The sky is blue."}
+            "memory_finalize_turn", {"conversation_delta": "We'll use Redis for caching."}
         ))
 
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["ok"] is True
+        assert data["stored_count"] >= 1
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] != []
 
-    def test_call_tool_minigraf_retract(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_minigraf_retract(self, real_db):
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "12"})
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
+        real_db.execute('(transact {} [[:decision/cache :description "Redis"]])')
 
         result = asyncio.run(mcp_server.call_tool(
             "minigraf_retract",
@@ -1140,13 +1253,14 @@ class TestMcpToolWiring:
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/cache :description ?d]])'
+        ))
+        assert queried["results"] == []
 
-    def test_db_released_after_call_tool(self, mock_minigraf_db, tmp_path):
+    def test_db_released_after_call_tool(self, real_db):
         import asyncio
         import mcp_server
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         asyncio.run(mcp_server.call_tool(
             "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
@@ -1154,41 +1268,44 @@ class TestMcpToolWiring:
 
         assert mcp_server._db is None, "lock must be released after call_tool so prepare_hook can open the DB"
 
-    def test_call_tool_unknown_raises(self, mock_minigraf_db, tmp_path):
+    def test_call_tool_unknown_raises(self, real_db):
         import asyncio
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         with pytest.raises(Exception, match="Unknown tool"):
             asyncio.run(mcp_server.call_tool("nonexistent_tool", {}))
 
-    def test_call_tool_lock_retry_does_not_block_event_loop(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_call_tool_lock_retry_does_not_block_event_loop(self, tmp_path, monkeypatch):
         """Regression test for #99: lock-retry backoff hit while opening the DB
         for a tool call must not use a blocking time.sleep(), since call_tool
         runs on the single-threaded asyncio event loop — a blocking sleep there
         would freeze the very coroutine (e.g. ingestion) that's about to
-        release the lock we're waiting on."""
+        release the lock we're waiting on.
+
+        Uses a real subprocess (_hold_lock_subprocess, see TestGetDbLockRetry)
+        to manufacture genuine cross-process lock contention rather than
+        mocking MiniGrafDb.open, since this test specifically exercises the
+        real lock-retry backoff path (_ensure_db_async), not general dispatch."""
         import asyncio
-        mock_class, db_instance = mock_minigraf_db
         import mcp_server
+        graph_path = str(tmp_path / "t.graph")
         mcp_server._db = None
-        mcp_server._graph_path = str(tmp_path / "t.graph")
-        lock_err = MiniGrafError(
-            "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
-        )
-        mock_class.open.side_effect = [lock_err, db_instance]
+        mcp_server._graph_path = graph_path
 
         def fail_if_called(_delay):
             raise AssertionError("time.sleep() must not be called on the event-loop retry path (see #99)")
         monkeypatch.setattr(mcp_server.time, "sleep", fail_if_called)
 
-        result = asyncio.run(mcp_server.call_tool(
-            "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
-        ))
+        # Real backoff (not mocked) — the subprocess needs genuine wall-clock
+        # time to hold the lock and then exit before a later retry attempt
+        # observes it free again.
+        with _hold_lock_subprocess(graph_path, hold_seconds=0.1):
+            result = asyncio.run(mcp_server.call_tool(
+                "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
+            ))
 
         data = json.loads(result[0].text)
         assert data["ok"] is True
-        assert mock_class.open.call_count == 2
 
 
 class TestParseValidAtHint:
@@ -1328,48 +1445,36 @@ class TestHeuristicNormalization:
 
 
 class TestTransactExtractedFactsSchema:
-    def test_invalid_entity_type_is_skipped(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "1"})
+    def test_invalid_entity_type_is_skipped(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
-
         facts = [{"entity": ":service/auth", "entity_type": "service",
                   "attribute": ":description", "value": "auth service"}]
         stored = mcp_server._transact_extracted_facts(facts)
 
         assert stored == 0
-        transact_calls = [c for c in db_instance.execute.call_args_list
-                          if "transact" in str(c)]
-        assert len(transact_calls) == 0
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:service/auth :description ?d]])'
+        ))
+        assert queried["results"] == []
 
-    def test_valid_fact_is_stored(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "2"})
+    def test_valid_fact_is_stored(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
-
         facts = [{"entity": ":decision/redis", "entity_type": "decision",
                   "attribute": ":description", "value": "use Redis"}]
         stored = mcp_server._transact_extracted_facts(facts)
 
         assert stored == 1
-        # Verify :ident triple is included for audit retraction
-        transact_calls = [c for c in db_instance.execute.call_args_list
-                          if "transact" in str(c)]
-        assert len(transact_calls) == 1
-        assert ":ident" in str(transact_calls[0])
-        assert '":decision/redis"' in str(transact_calls[0])
+        desc = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert desc["results"] == [["use Redis"]]
+        ident = json.loads(real_db.execute(
+            '(query [:find ?i :where [:decision/redis :ident ?i]])'
+        ))
+        assert ident["results"] == [[":decision/redis"]]
 
-    def test_mixed_batch_stores_only_valid(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "3"})
+    def test_mixed_batch_stores_only_valid(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.reset_mock()
-
         facts = [
             {"entity": ":decision/redis", "entity_type": "decision",
              "attribute": ":description", "value": "use Redis"},
@@ -1379,6 +1484,14 @@ class TestTransactExtractedFactsSchema:
         stored = mcp_server._transact_extracted_facts(facts)
 
         assert stored == 1
+        redis = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert redis["results"] == [["use Redis"]]
+        auth = json.loads(real_db.execute(
+            '(query [:find ?d :where [:service/auth :description ?d]])'
+        ))
+        assert auth["results"] == []
 
 
 class TestParseTransactFacts:
@@ -1419,11 +1532,8 @@ class TestParseTransactFacts:
 
 
 class TestMinigrafTransactSchema:
-    def test_rejects_unknown_entity_type(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_rejects_unknown_entity_type(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         result = mcp_server.handle_minigraf_transact(
             '[[:service/auth :description "auth service"]]',
             reason="test"
@@ -1432,25 +1542,21 @@ class TestMinigrafTransactSchema:
         assert result["ok"] is False
         assert "schema" in result["error"].lower() or "violation" in result["error"].lower()
 
-    def test_accepts_valid_fact(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "5"})
+    def test_accepts_valid_fact(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         result = mcp_server.handle_minigraf_transact(
             '[[:decision/redis :description "use Redis"]]',
             reason="test"
         )
 
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == [["use Redis"]]
 
-    def test_keyword_only_transact_bypasses_schema_validation(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx": "6"})
+    def test_keyword_only_transact_bypasses_schema_validation(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         # Keyword-only triple (no quoted string values) — not schema-validated by design
         result = mcp_server.handle_minigraf_transact(
             '[[:service/auth :calls :component/jwt]]',
@@ -1458,192 +1564,147 @@ class TestMinigrafTransactSchema:
         )
 
         assert result["ok"] is True
+        queried = json.loads(real_db.execute(
+            '(query [:find ?c :where [:service/auth :calls ?c]])'
+        ))
+        assert queried["results"] == [[":component/jwt"]]
 
 
 class TestQueryCanonicalEntities:
-    def test_returns_empty_string_when_no_entities(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    def test_returns_empty_string_when_no_entities(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         result = mcp_server._query_canonical_entities()
         assert result == ""
 
-    def test_formats_entities_as_lines(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_formats_entities_as_lines(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        # Two-step: first call returns ident list, second returns description.
-        # Set side_effect after open_db to avoid consuming SESSION_RULES calls.
-        db_instance.execute.side_effect = [
-            json.dumps({"results": [[":decision/redis"]]}),  # ident query
-            json.dumps({"results": [["use Redis"]]}),         # desc query
-        ] + [json.dumps({"results": []})] * 5
-
-        result = mcp_server._query_canonical_entities()
-        assert ":decision/redis" in result
-        assert "use Redis" in result
-
-    def test_caps_at_50_entities(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        # First call: ident query returns 60 items (only first 50 are processed).
-        # Subsequent calls: one description query per processed ident.
-        # Set side_effect after open_db to avoid consuming SESSION_RULES calls.
-        ident_results = [[f":decision/item-{i}"] for i in range(60)]
-        desc_calls = [json.dumps({"results": [[f"item {i}"]]}) for i in range(50)]
-        db_instance.execute.side_effect = (
-            [json.dumps({"results": ident_results})] + desc_calls
+        real_db.execute(
+            '(transact {} [[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            '[:decision/redis :description "use Redis"]])'
         )
 
         result = mcp_server._query_canonical_entities()
+
+        assert ":decision/redis" in result
+        assert "use Redis" in result
+
+    def test_caps_at_50_entities(self, real_db):
+        import mcp_server
+        triples = []
+        for i in range(60):
+            ident = f":decision/item-{i}"
+            triples.append(f'[{ident} :entity-type :type/decision]')
+            triples.append(f'[{ident} :ident "{ident}"]')
+            triples.append(f'[{ident} :description "item {i}"]')
+        real_db.execute(f'(transact {{}} [{" ".join(triples)}])')
+
+        result = mcp_server._query_canonical_entities()
+
         assert result.count(":decision/") == 50
 
-    def test_injected_into_llm_prompt(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_injected_into_llm_prompt(self, real_db, monkeypatch):
+        import mcp_server
         monkeypatch.setenv("MINIGRAF_LLM_MODEL", "claude-haiku-4-5-20251001")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute(
+            '(transact {} [[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            '[:decision/redis :description "use Redis"]])'
+        )
 
         captured_prompt = {}
         def fake_call_llm(model, prompt):
             captured_prompt["prompt"] = prompt
             return "[]"
 
-        with patch("mcp_server._query_canonical_entities", return_value="  :decision/redis — use Redis"):
-            with patch("mcp_server._call_llm", side_effect=fake_call_llm):
-                mcp_server._llm_extract_and_transact("User: test\nAgent: ok")
+        with patch("mcp_server._call_llm", side_effect=fake_call_llm):
+            mcp_server._llm_extract_and_transact("User: test\nAgent: ok")
 
         assert ":decision/redis" in captured_prompt.get("prompt", "")
 
-    def test_injected_into_agent_prompt(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_injected_into_agent_prompt(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute(
+            '(transact {} [[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            '[:decision/redis :description "use Redis"]])'
+        )
 
         captured = {}
         async def fake_request_block(conversation_delta, canonical_entities_section=""):
             captured["canonical_entities_section"] = canonical_entities_section
             return "[]"
 
-        with patch("mcp_server._query_canonical_entities", return_value="  :decision/redis — use Redis"):
-            with patch("mcp_server._request_agent_memory_block_async", side_effect=fake_request_block):
-                import asyncio
-                asyncio.run(mcp_server._agent_extract_and_transact("User: test\nAgent: ok"))
+        with patch("mcp_server._request_agent_memory_block_async", side_effect=fake_request_block):
+            import asyncio
+            asyncio.run(mcp_server._agent_extract_and_transact("User: test\nAgent: ok"))
 
         assert ":decision/redis" in captured.get("canonical_entities_section", "")
 
 
 class TestMinigrafAudit:
-    def test_clean_db_returns_zero_retracted(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        # No entities of any known type
-        db_instance.execute.return_value = json.dumps({"results": []})
+    def test_clean_db_returns_zero_retracted(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         result = mcp_server.handle_minigraf_audit()
-
         assert result["ok"] is True
         assert result["retracted"] == 0
         assert result["violations"] == []
 
-    def test_entity_missing_required_attr_is_retracted(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_entity_missing_required_attr_is_retracted(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
-        # handle_minigraf_audit uses type query → UUID, then #uuid attr query.
-        # Step 1: type query for "decision" returns UUID.
-        # Step 2: attr query using #uuid tagged literal returns all attributes.
-        # Entity has :ident + :entity-type (system) + :rationale (domain).
-        # Missing :description → violation → retract call using #uuid.
-        # Remaining entity types return empty.
-        uuid = "bcc294db-aef9-53ae-8da8-9434eb6d1642"
-        db_instance.execute.side_effect = [
-            json.dumps({"results": [[uuid]]}),         # Step 1: type query for decision
-            json.dumps({"results": [                   # Step 2: #uuid attr query
-                [":entity-type", ":type/decision"],
-                [":ident", ":decision/redis"],
-                [":rationale", "fast"],
-            ]}),
-            json.dumps({"tx": "10"}),                  # retract call
-        ] + [json.dumps({"results": []})] * 10         # remaining type queries
+        # Entity has :ident + :entity-type + :rationale but is missing the
+        # required :description — should be flagged and retracted.
+        real_db.execute(
+            '(transact {} [[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            '[:decision/redis :rationale "fast"]])'
+        )
 
         result = mcp_server.handle_minigraf_audit()
 
         assert result["ok"] is True
         assert result["retracted"] == 1
         assert len(result["violations"]) == 1
+        remaining = json.loads(real_db.execute(
+            '(query [:find ?r :where [:decision/redis :rationale ?r]])'
+        ))
+        assert remaining["results"] == []  # retracted, no longer queryable at current time
 
-        retract_calls = [
-            str(call) for call in db_instance.execute.call_args_list
-            if "retract" in str(call)
-        ]
-        assert len(retract_calls) >= 1, "Expected at least one retract call"
-        assert "#uuid" in retract_calls[0]
-        assert uuid in retract_calls[0]
-
-    def test_as_of_reports_violations_without_retracting(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_as_of_reports_violations_without_retracting(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
-        uuid = "bcc294db-aef9-53ae-8da8-9434eb6d1642"
-        db_instance.execute.side_effect = [
-            json.dumps({"results": [[uuid]]}),
-            json.dumps({"results": [
-                [":entity-type", ":type/decision"],
-                [":ident", ":decision/redis"],
-                [":rationale", "fast"],
-            ]}),
-        ] + [json.dumps({"results": []})] * 10
+        real_db.execute(
+            '(transact {} [[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            '[:decision/redis :rationale "fast"]])'
+        )
 
         result = mcp_server.handle_minigraf_audit(as_of=5)
 
         assert result["ok"] is True
         assert result["retracted"] == 0  # read-only when as_of provided
         assert len(result["violations"]) == 1
+        still_present = json.loads(real_db.execute(
+            '(query [:find ?r :where [:decision/redis :rationale ?r]])'
+        ))
+        assert still_present["results"] == [["fast"]]  # not retracted
 
-    def test_ident_attr_used_for_display_in_violations(self, mock_minigraf_db, tmp_path):
+    def test_ident_attr_used_for_display_in_violations(self, real_db):
         """Violation report shows keyword ident from :ident, not the raw UUID."""
-        mock_class, db_instance = mock_minigraf_db
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
-        uuid = "dca29477-f050-517e-9b4a-ef6d5dcada09"
         kw = ":decision/claude-haiku-4-5-20251001"
-        db_instance.execute.side_effect = [
-            json.dumps({"results": [[uuid]]}),
-            json.dumps({"results": [
-                [":entity-type", ":type/decision"],
-                [":ident", kw],
-            ]}),
-            json.dumps({"tx": "10"}),
-        ] + [json.dumps({"results": []})] * 10
+        real_db.execute(
+            f'(transact {{}} [[{kw} :entity-type :type/decision] [{kw} :ident "{kw}"]])'
+        )
 
         result = mcp_server.handle_minigraf_audit()
 
         assert result["retracted"] == 1
-        assert result["violations"][0]["entity"] == kw  # keyword ident in report
-        retract_calls = [
-            str(call) for call in db_instance.execute.call_args_list
-            if "retract" in str(call)
-        ]
-        assert "#uuid" in retract_calls[0]
-        assert uuid in retract_calls[0]
+        assert result["violations"][0]["entity"] == kw
 
-    def test_result_shape(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    def test_result_shape(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-
         result = mcp_server.handle_minigraf_audit()
-
         assert "ok" in result
         assert "audited" in result
         assert "retracted" in result
@@ -1651,37 +1712,32 @@ class TestMinigrafAudit:
 
 
 class TestPhase5Schema:
-    def test_module_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+    def test_module_entity_passes_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":module/src-auth-py", "entity_type": "module",
                   "attribute": ":description", "value": "src/auth.py"}]
         assert mcp_server._validate_facts(facts) == []
 
-    def test_function_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+    def test_function_entity_passes_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":function/src-auth-py-login", "entity_type": "function",
                   "attribute": ":description", "value": "login"}]
         assert mcp_server._validate_facts(facts) == []
 
-    def test_class_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+    def test_class_entity_passes_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":class/src-auth-py-user", "entity_type": "class",
                   "attribute": ":description", "value": "User"}]
         assert mcp_server._validate_facts(facts) == []
 
-    def test_ingestion_entity_passes_validation(self, mock_minigraf_db, tmp_path):
+    def test_ingestion_entity_passes_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":ingestion/watermark", "entity_type": "ingestion",
                   "attribute": ":description", "value": "git ingestion watermark"}]
         assert mcp_server._validate_facts(facts) == []
 
-    def test_unknown_code_attr_fails_validation(self, mock_minigraf_db, tmp_path):
+    def test_unknown_code_attr_fails_validation(self):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         facts = [{"entity": ":module/foo", "entity_type": "module",
                   "attribute": ":description", "value": "foo.py"},
                  {"entity": ":module/foo", "entity_type": "module",
@@ -1689,12 +1745,42 @@ class TestPhase5Schema:
         violations = mcp_server._validate_facts(facts)
         assert any("unknown-attr" in v for v in violations)
 
-    def test_contains_rule_registered_at_startup(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_contains_rule_registered_at_startup(self, real_db):
+        """SESSION_RULES registers `linked`/`reachable` over the :contains
+        edge (module/class -> function/field structural containment):
+            (rule [(linked ?a ?b) [?a :contains ?b]])
+            (rule [(reachable ?a ?b) [?a :contains ?b]])
+        Prove those clauses were actually registered at open_db time by
+        transacting a real :contains edge and invoking `linked`/`reachable`
+        with the subject pinned to the literal entity (so the returned
+        value is the human-readable keyword, not the entity's internal
+        UUID) to confirm the rule actually derives the edge — a raw
+        [?a :contains ?b] triple pattern would pass even if the rule
+        registration silently failed, so this specifically calls through
+        the rule name.
+        """
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        executed = [call.args[0] for call in db_instance.execute.call_args_list]
-        assert any("contains" in r for r in executed)
+        real_db.execute(
+            '(transact {} [[:module/foo :contains :function/bar]])'
+        )
+
+        linked = json.loads(real_db.execute(
+            '(query [:find ?b :where (linked :module/foo ?b)])'
+        ))
+        assert linked["results"] == [[":function/bar"]]
+
+        reachable = json.loads(real_db.execute(
+            '(query [:find ?b :where (reachable :module/foo ?b)])'
+        ))
+        assert reachable["results"] == [[":function/bar"]]
+
+        # A non-matching pair must not spuriously match — proves this is a
+        # real join against the transacted data, not a rule that always
+        # succeeds regardless of the graph contents.
+        no_match = json.loads(real_db.execute(
+            '(query [:find ?b :where (linked :module/nonexistent ?b)])'
+        ))
+        assert no_match["results"] == []
 
 
 class TestGetParser:
@@ -3801,11 +3887,8 @@ class TestTsxParserLoading:
 
 
 class TestMinigrafIngestStatus:
-    def test_returns_idle_before_ingestion(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    def test_returns_idle_before_ingestion(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -3818,44 +3901,41 @@ class TestMinigrafIngestStatus:
         assert result["last_commit"] is None
         assert result["total_ingested"] is None
 
-    def test_returns_last_run_at_from_graph(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_last_run_at_from_graph(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        def execute_side_effect(query, *args, **kwargs):
-            if ":last-run-at" in query and ":last-commit" in query:
-                return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
-            return json.dumps({"results": []})
-        db_instance.execute.side_effect = execute_side_effect
+        real_db.execute(
+            '(transact {} [[:ingestion/last-run-at :entity-type :type/ingestion] '
+            '[:ingestion/last-run-at :last-run-at "2026-05-27T10:00:00Z"] '
+            '[:ingestion/last-run-at :last-commit "deadbeef"]])'
+        )
+
         result = mcp_server.handle_minigraf_ingest_status()
+
         assert result["last_run_at"] == "2026-05-27T10:00:00Z"
         assert result["last_commit"] == "deadbeef"
 
-    def test_running_status_skips_graph_query(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_running_status_skips_graph_query(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "running", "processed": 3, "total": 10,
             "current_commit": "abc123", "error": None,
         }
-        db_instance.execute.reset_mock()
-        result = mcp_server.handle_minigraf_ingest_status()
+        with execute_spy() as calls:
+            result = mcp_server.handle_minigraf_ingest_status()
+
         assert result["status"] == "running"
         assert result["processed"] == 3
         assert result["total"] == 10
         assert result["current_commit"] == "abc123"
         # Must not query the graph while running
-        db_instance.execute.assert_not_called()
+        assert calls == []
 
-    def test_reports_owner_pid_when_skipped(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_reports_owner_pid_when_skipped(self, real_db, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
@@ -3866,10 +3946,8 @@ class TestMinigrafIngestStatus:
         assert result["owner_pid"] == 424242
         assert result["stale"] is False
 
-    def test_skipped_status_is_stale_when_owner_pid_dead(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_skipped_status_is_stale_when_owner_pid_dead(self, real_db, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
@@ -3878,10 +3956,8 @@ class TestMinigrafIngestStatus:
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["stale"] is True
 
-    def test_error_status_reports_stale_when_holder_pid_dead(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_error_status_reports_stale_when_holder_pid_dead(self, real_db, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "",
@@ -3892,10 +3968,8 @@ class TestMinigrafIngestStatus:
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["stale"] is True
 
-    def test_error_status_not_stale_when_holder_pid_alive(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_error_status_not_stale_when_holder_pid_alive(self, real_db, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "",
@@ -3906,10 +3980,8 @@ class TestMinigrafIngestStatus:
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["stale"] is False
 
-    def test_error_status_omits_stale_when_no_pid_in_message(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_error_status_omits_stale_when_no_pid_in_message(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": "corrupt graph file", "owner_pid": None,
@@ -3917,57 +3989,64 @@ class TestMinigrafIngestStatus:
         result = mcp_server.handle_minigraf_ingest_status()
         assert "stale" not in result
 
-    def test_returns_total_ingested_from_graph(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_returns_total_ingested_from_graph(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        def execute_side_effect(query, *args, **kwargs):
-            if ":last-run-at" in query and ":last-commit" in query:
-                return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
-            if ":type/commit" in query:
-                return json.dumps({"results": [[1017]]})
-            return json.dumps({"results": []})
-        db_instance.execute.side_effect = execute_side_effect
+        real_db.execute(
+            '(transact {} [[:ingestion/last-run-at :entity-type :type/ingestion] '
+            '[:ingestion/last-run-at :last-run-at "2026-05-27T10:00:00Z"] '
+            '[:ingestion/last-run-at :last-commit "deadbeef"]])'
+        )
+        # Batch all 1017 commit entities into a single transact call (one
+        # round-trip) rather than looping individual execute() calls — the
+        # count query only cares that 1017 :type/commit entities exist, not
+        # how many transacts it took to write them.
+        n = 1017
+        triples = " ".join(f"[:commit/c{i} :entity-type :type/commit]" for i in range(n))
+        real_db.execute(f"(transact {{}} [{triples}])")
+
         result = mcp_server.handle_minigraf_ingest_status()
+
         assert result["total_ingested"] == 1017
 
     def test_total_ingested_reflects_true_persisted_count_not_stale_watermark(
-        self, mock_minigraf_db, tmp_path
+        self, real_db
     ):
         """Regression test for #85: total_ingested must come from a direct
         :type/commit entity count, not the :total-ingested watermark — the
         watermark is only written on clean run completion, so after a run is
-        interrupted mid-way it drifts far below the true persisted count."""
-        mock_class, db_instance = mock_minigraf_db
+        interrupted mid-way it drifts far below the true persisted count.
+
+        A count of 50 (vs. a stale watermark of 4) is representative enough:
+        the test only needs stale-watermark-count != real-count, not any
+        specific magnitude, so it doesn't need to replay the original mock's
+        arbitrary 21715."""
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        def execute_side_effect(query, *args, **kwargs):
-            if ":last-run-at" in query and ":last-commit" in query:
-                return json.dumps({"results": [["2026-05-27T10:00:00Z", "deadbeef"]]})
-            if ":total-ingested" in query:
-                # Stale watermark from the last *completed* run — far below reality.
-                return json.dumps({"results": [[104]]})
-            if ":type/commit" in query:
-                # True count of durably persisted commit entities.
-                return json.dumps({"results": [[21715]]})
-            return json.dumps({"results": []})
-        db_instance.execute.side_effect = execute_side_effect
-        result = mcp_server.handle_minigraf_ingest_status()
-        assert result["total_ingested"] == 21715
+        real_db.execute(
+            '(transact {} [[:ingestion/last-run-at :entity-type :type/ingestion] '
+            '[:ingestion/last-run-at :last-run-at "2026-05-27T10:00:00Z"] '
+            '[:ingestion/last-run-at :last-commit "deadbeef"] '
+            # Stale watermark from the last *completed* run — far below reality.
+            '[:ingestion/last-run-at :total-ingested 4]])'
+        )
+        n = 50
+        triples = " ".join(f"[:commit/c{i} :entity-type :type/commit]" for i in range(n))
+        real_db.execute(f"(transact {{}} [{triples}])")
 
-    def test_total_ingested_absent_returns_none(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        result = mcp_server.handle_minigraf_ingest_status()
+
+        # True count of durably persisted commit entities, not the stale watermark.
+        assert result["total_ingested"] == 50
+
+    def test_total_ingested_absent_returns_none(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -5083,92 +5162,83 @@ class TestExtractCommitRename:
 
 
 class TestIngestionWrites:
-    def test_ingest_transact_uses_valid_from(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_ingest_transact_uses_valid_from(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        db_instance.execute.reset_mock()
-
         mcp_server._ingest_transact(
-            db,
+            real_db,
             ['[:module/foo :description "foo.py"]'],
             "2025-03-01T10:00:00Z",
             "git:abc test",
         )
-        call_args = db_instance.execute.call_args[0][0]
-        assert ':valid-from "2025-03-01T10:00:00Z"' in call_args
-        assert ":valid-to" not in call_args
-        # Documented grammar: options map must come BEFORE the fact vector.
-        assert call_args.index(":valid-from") < call_args.index("[:module/foo")
+        # Not visible before its valid-from time...
+        before = json.loads(real_db.execute(
+            '(query [:valid-at "2025-02-01T00:00:00Z" :find ?d '
+            ':where [:module/foo :description ?d]])'
+        ))
+        assert before["results"] == []
+        # ...but visible at/after it.
+        after = json.loads(real_db.execute(
+            '(query [:valid-at "2025-03-01T10:00:00Z" :find ?d '
+            ':where [:module/foo :description ?d]])'
+        ))
+        assert after["results"] == [["foo.py"]]
 
-    def test_ingest_close_uses_valid_from_and_valid_to(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_ingest_close_uses_valid_from_and_valid_to(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        db_instance.execute.reset_mock()
-
         mcp_server._ingest_close(
-            db,
+            real_db,
             ['[:module/foo :description "foo.py"]'],
             "2025-01-01T00:00:00Z",
             "2025-03-01T10:00:00Z",
             "git:abc delete",
         )
-        call_args = db_instance.execute.call_args[0][0]
-        assert ':valid-from "2025-01-01T00:00:00Z"' in call_args
-        assert ':valid-to "2025-03-01T10:00:00Z"' in call_args
-        # Documented grammar: options map must come BEFORE the fact vector.
-        assert call_args.index(":valid-from") < call_args.index("[:module/foo")
+        within_window = json.loads(real_db.execute(
+            '(query [:valid-at "2025-02-01T00:00:00Z" :find ?d '
+            ':where [:module/foo :description ?d]])'
+        ))
+        assert within_window["results"] == [["foo.py"]]
+        after_close = json.loads(real_db.execute(
+            '(query [:valid-at "2025-03-02T00:00:00Z" :find ?d '
+            ':where [:module/foo :description ?d]])'
+        ))
+        assert after_close["results"] == [], (
+            "this is the exact bi-temporal bounds check that a mock-only test "
+            "can never catch — it's the class of bug #133 exists to prevent"
+        )
 
-    def test_watermark_update_transacts_hash(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_watermark_update_transacts_hash(self, real_db):
+        """_watermark_update (mcp_server.py) writes [:ingestion/watermark :hash <hash>]
+        directly (see its source) — the query below uses that exact ident/attribute,
+        not a guess."""
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        db_instance.execute.reset_mock()
+        mcp_server._watermark_update(real_db, "deadbeef", "2025-03-01T10:00:00Z", "git:deadbeef x: y")
+        result = json.loads(real_db.execute(
+            '(query [:find ?h :where [:ingestion/watermark :hash ?h]])'
+        ))
+        assert result["results"] == [["deadbeef"]]
 
-        mcp_server._watermark_update(db, "deadbeef", "2025-03-01T10:00:00Z", "git:deadbeef x: y")
-        call_args = db_instance.execute.call_args[0][0]
-        assert "deadbeef" in call_args
-        assert ":ingestion/watermark" in call_args
-
-    def test_watermark_query_returns_none_when_absent(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    def test_watermark_query_returns_none_when_absent(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        result = mcp_server._watermark_query(db)
+        result = mcp_server._watermark_query(real_db)
         assert result is None
 
-    def test_watermark_query_returns_hash_when_present(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": [["abc123"]]})
+    def test_watermark_query_returns_hash_when_present(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        result = mcp_server._watermark_query(db)
+        mcp_server._watermark_update(real_db, "abc123", "2025-01-01T00:00:00Z", "seed")
+        result = mcp_server._watermark_query(real_db)
         assert result == "abc123"
 
-    def test_ingest_transact_noop_for_empty_triples(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_ingest_transact_noop_for_empty_triples(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        db_instance.execute.reset_mock()
-        mcp_server._ingest_transact(db, [], "2025-03-01T10:00:00Z", "r")
-        db_instance.execute.assert_not_called()
+        with execute_spy() as calls:
+            mcp_server._ingest_transact(real_db, [], "2025-03-01T10:00:00Z", "r")
+        assert calls == []
 
-    def test_ingest_close_noop_for_empty_triples(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_ingest_close_noop_for_empty_triples(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        db_instance.execute.reset_mock()
-        mcp_server._ingest_close(db, [], "2025-01-01T00:00:00Z", "2025-03-01T00:00:00Z", "r")
-        db_instance.execute.assert_not_called()
+        with execute_spy() as calls:
+            mcp_server._ingest_close(real_db, [], "2025-01-01T00:00:00Z", "2025-03-01T00:00:00Z", "r")
+        assert calls == []
 
     def test_build_close_triples_includes_ident_and_description(self):
         import mcp_server
@@ -5264,42 +5334,43 @@ class TestIngestionWrites:
         assert entity_descriptions.get(module_ident) == "auth.py"
 
     def test_preload_known_entities_loads_descriptions_and_valid_from(
-        self, mock_minigraf_db, git_repo
+        self, real_db, git_repo
     ):
-        mock_class, db_instance = mock_minigraf_db
+        """_preload_known_entities' query (see its source) requires the full
+        [:entity-type :ident :file/:path :description :introduced-by] shape
+        plus the introducing commit's :date — a bare :description/:file pair
+        (as an earlier draft of this test assumed) never matches the query
+        and silently yields empty results, so the seed below mirrors the
+        real fact shape _run_ingestion actually writes."""
         import mcp_server
-        mcp_server.open_db(str(git_repo / "t.graph"))
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":function/auth-py-login", "auth.py", "login", "2025-01-15T10:00:00Z"]]
-        })
-        db = mcp_server.get_db()
-        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
-            mcp_server._preload_known_entities(db, str(git_repo))
+        real_db.execute(
+            '(transact [[:function/auth-py-login :entity-type :type/function] '
+            '[:function/auth-py-login :ident ":function/auth-py-login"] '
+            '[:function/auth-py-login :file "auth.py"] '
+            '[:function/auth-py-login :description "login"] '
+            '[:function/auth-py-login :introduced-by :commit/c1] '
+            '[:commit/c1 :date "2025-01-15T10:00:00Z"]])'
         )
+
+        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
+            mcp_server._preload_known_entities(real_db, str(git_repo))
+        )
+
         assert entity_valid_from.get(":function/auth-py-login") == "2025-01-15T10:00:00Z"
         assert entity_descriptions.get(":function/auth-py-login") == "login"
 
-    def test_last_run_write_transacts_correct_fields(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_last_run_write_transacts_correct_fields(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        db_instance.execute.reset_mock()
+        mcp_server._last_run_write(real_db, "deadbeef", "2026-05-27T10:00:00Z", 1017)
 
-        mcp_server._last_run_write(db, "deadbeef", "2026-05-27T10:00:00Z", 1017)
+        result = json.loads(real_db.execute(
+            '(query [:find ?t ?c ?n :where '
+            '[?e :entity-type :type/ingestion] '
+            '[?e :last-run-at ?t] [?e :last-commit ?c] [?e :total-ingested ?n]])'
+        ))
+        assert result["results"] == [["2026-05-27T10:00:00Z", "deadbeef", 1017]]
 
-        call_args = db_instance.execute.call_args[0][0]
-        assert ":ingestion/last-run-at" in call_args
-        assert ":last-run-at" in call_args
-        assert "2026-05-27T10:00:00Z" in call_args
-        assert ":last-commit" in call_args
-        assert "deadbeef" in call_args
-        assert ":type/ingestion" in call_args
-        assert ":total-ingested" in call_args
-        assert "1017" in call_args
-        assert ":valid-from" not in call_args
-
-    def test_run_ingestion_writes_last_run_on_completion(self, mock_minigraf_db, git_repo, monkeypatch):
+    def test_run_ingestion_writes_last_run_on_completion(self, real_db, git_repo, monkeypatch):
         """Uses the real git_repo fixture (2 real commits) rather than
         faking a commit list + empty _git_diff_tree_raw: _extract_commit
         runs in a spawned worker process (#116), which re-imports
@@ -5309,9 +5380,7 @@ class TestIngestionWrites:
         worker. _last_run_write itself still runs on write_executor, an
         in-process thread, so patching it here still works as before.
         """
-        mock_class, db_instance = mock_minigraf_db
         import mcp_server
-        mcp_server.open_db(str(git_repo / "t.graph"))
 
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
         last_hash = commits[-1][0]
@@ -5321,6 +5390,14 @@ class TestIngestionWrites:
             mcp_server, "_last_run_write",
             lambda db, h, t, n: last_run_calls.append((h, t, n))
         )
+        # _run_ingestion's completion path fires IndexCache.invalidate() on a
+        # background daemon thread that calls get_db() after this test's real_db
+        # fixture has already released/reset _db — real_db's monkeypatched
+        # MiniGrafDb.open also reverts once this test function returns, so that
+        # thread's reopen races teardown and can log a harmless but noisy
+        # "[IndexCache] rebuild failed" to stderr. Neutralize it: this test is
+        # about _last_run_write's call args, not the search index.
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
 
         asyncio.run(mcp_server._run_ingestion(str(git_repo), "HEAD"))
 
@@ -5329,10 +5406,8 @@ class TestIngestionWrites:
         assert last_run_calls[0][1].endswith("Z")
         assert last_run_calls[0][2] == 2  # 2 commits processed
 
-    def test_run_ingestion_writes_last_run_when_no_commits(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
+    def test_run_ingestion_writes_last_run_when_no_commits(self, real_db, tmp_path, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
 
         monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: "abc123")
         monkeypatch.setattr(mcp_server, "_git_commits", lambda repo, watermark, branch: [])
@@ -5342,6 +5417,10 @@ class TestIngestionWrites:
             mcp_server, "_last_run_write",
             lambda db, h, t, n: last_run_calls.append((h, t, n))
         )
+        # See test_run_ingestion_writes_last_run_on_completion for why this is
+        # neutralized (harmless background-thread stderr noise, not a bug in
+        # what this test verifies).
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
 
         asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
 
@@ -5654,142 +5733,183 @@ class TestBuildCodeTriplesGlobalsAndFields:
 
 
 class TestPreloadKnownDeps:
-    def test_reloads_open_depends_on_edge(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_reloads_open_depends_on_edge(self, real_db):
+        """Real-backend regression test for the #133 UUID-vs-ident bug:
+        _preload_known_deps' query used to bind the bare ?src subject
+        variable directly (`[?src :depends-on ?dep]`), which a real minigraf
+        backend resolves to its *internal* UUID rather than the
+        ":module/…" keyword ident used to create the entity — confirmed
+        empirically during the #133 investigation:
+            db.execute('(transact [[:module/mod-a-py :entity-type :type/module]
+              [:module/mod-a-py :ident ":module/mod-a-py"]]))')
+            db.execute('(transact {:valid-from "2024-01-01T00:00:00Z"}
+              [[:module/mod-a-py :depends-on :module/mod-b]])')
+            db.execute('(query [:find ?src ?dep :where [?src :depends-on ?dep]])')
+            => {"results": [["6b877d67-...uuid...", ":module/mod-b"]]}
+        `ident_to_file.get(src_ident)` was then keyed by the ":module/…"
+        ident string, which never matched a UUID — every row was silently
+        dropped, so against a real backend the function returned ({}, {})
+        unconditionally, discarding all known deps on every restart. Fixed
+        by projecting `[?src :ident ?srci]` and finding ?srci instead of
+        ?src (mirroring _preload_known_entities).
+
+        This test also proves the fix's clause ORDERING is correct, not
+        just that it returns non-empty: minigraf's per-fact :db/valid-from
+        pseudo-attribute binds to whichever EAV clause on ?src most
+        recently precedes it in clause order, so the entity's :ident fact
+        and its :depends-on fact are seeded here with deliberately
+        DIFFERENT :valid-from timestamps (2020 vs. 2024). If the :ident
+        clause were placed after :depends-on (or anywhere but immediately
+        before it), ?vf would silently rebind to the :ident fact's
+        valid-from (2020) instead of the :depends-on fact's (2024) —
+        a different, provably wrong value that this assertion would catch.
+        """
         import mcp_server
 
-        src_ident = mcp_server._code_ident("module", "mod_a.py")
-        dep_ident = mcp_server._canonical_ident("module", "mod_b")
-        # 1704067200000 ms == 2024-01-01T00:00:00.000Z
-        db_instance.execute.return_value = json.dumps(
-            {"results": [[src_ident, dep_ident, 1704067200000]]}
+        real_db.execute(
+            '(transact {:valid-from "2020-01-01T00:00:00Z"} '
+            '[[:module/mod-a-py :entity-type :type/module] '
+            '[:module/mod-a-py :ident ":module/mod-a-py"]])'
         )
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
+        real_db.execute(
+            '(transact {:valid-from "2024-01-01T00:00:00Z"} '
+            '[[:module/mod-a-py :depends-on :module/mod-b]])'
+        )
 
-        file_entities = {"mod_a.py": [src_ident]}
-        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, file_entities)
+        file_entities = {"mod_a.py": [":module/mod-a-py"]}
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(real_db, file_entities)
 
-        assert file_deps["mod_a.py"] == {dep_ident}
-        assert dep_valid_from[(src_ident, dep_ident)] == "2024-01-01T00:00:00.000Z"
+        assert file_deps["mod_a.py"] == {":module/mod-b"}
+        assert dep_valid_from[(":module/mod-a-py", ":module/mod-b")] == "2024-01-01T00:00:00.000Z"
 
-    def test_query_includes_any_valid_time_and_forever_filter(self, mock_minigraf_db, tmp_path):
+    def test_query_includes_any_valid_time_and_forever_filter(self, real_db):
         """The query must ask for :any-valid-time (required for any per-fact
         pseudo-attribute to bind) and filter :db/valid-to down to the
         VALID_TIME_FOREVER sentinel so closed edges aren't reloaded as open."""
-        mock_class, db_instance = mock_minigraf_db
         import mcp_server
-        db_instance.execute.return_value = json.dumps({"results": []})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        db_instance.execute.reset_mock()
+        with execute_spy() as calls:
+            mcp_server._preload_known_deps(real_db, {})
 
-        mcp_server._preload_known_deps(db, {})
-
-        query = db_instance.execute.call_args[0][0]
+        assert len(calls) == 1
+        query = calls[0]
         assert ":any-valid-time" in query
         assert ":depends-on" in query
         assert ":db/valid-from" in query
         assert ":db/valid-to" in query
         assert "9223372036854775807" in query
 
-    def test_no_deps_returns_empty_structures(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_no_deps_returns_empty_structures(self, real_db):
         import mcp_server
-        db_instance.execute.return_value = json.dumps({"results": []})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-
-        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, {"mod_a.py": []})
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(real_db, {"mod_a.py": []})
 
         assert file_deps == {}
         assert dep_valid_from == {}
 
-    def test_query_failure_is_non_fatal(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_query_failure_is_non_fatal(self, real_db, monkeypatch):
+        """Break _preload_known_deps' hard-coded query into genuinely
+        malformed Datalog by corrupting the _VALID_TIME_FOREVER_MS constant
+        it interpolates into the `(= ?vt ...)` predicate — the real minigraf
+        parser then raises a real MiniGrafError ("Unclosed vector" for
+        unbalanced brackets), confirming the function's try/except actually
+        catches a real parse failure rather than a mocked exception."""
         import mcp_server
-        from minigraf import MiniGrafError
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        db_instance.execute.side_effect = MiniGrafError("boom")
+        monkeypatch.setattr(mcp_server, "_VALID_TIME_FOREVER_MS", "))) malformed [[[")
 
-        file_deps, dep_valid_from = mcp_server._preload_known_deps(db, {"mod_a.py": []})
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(real_db, {"mod_a.py": []})
 
         assert file_deps == {}
         assert dep_valid_from == {}
 
 
 class TestPreloadExternalDependencies:
-    def test_preload_known_entities_includes_external_dependency(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_preload_known_entities_includes_external_dependency(self, real_db, tmp_path):
         import mcp_server
-        # _preload_known_entities' query shape is [?ident ?path ?desc ?date] per entity_type
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":module/vendor-lib", "vendor/lib", "lib", "2026-01-01T00:00:00Z"]]
-        })
-        mcp_server.open_db(str(tmp_path / "memory.graph"))
-        db = mcp_server.get_db()
-
-        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
-            mcp_server._preload_known_entities(db, str(tmp_path))
+        real_db.execute(
+            '(transact [[:module/vendor-lib :entity-type :type/external-dependency] '
+            '[:module/vendor-lib :ident ":module/vendor-lib"] '
+            '[:module/vendor-lib :path "vendor/lib"] '
+            '[:module/vendor-lib :description "lib"] '
+            '[:module/vendor-lib :introduced-by :commit/c1] '
+            '[:commit/c1 :date "2026-01-01T00:00:00Z"]])'
         )
 
-        assert ":module/vendor-lib" in entity_valid_from
+        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
+            mcp_server._preload_known_entities(real_db, str(tmp_path))
+        )
+
+        assert entity_valid_from[":module/vendor-lib"] == "2026-01-01T00:00:00Z"
         assert entity_descriptions[":module/vendor-lib"] == "lib"
         assert "vendor/lib" in file_entities
         assert submodule_paths[":module/vendor-lib"] == "vendor/lib"
 
-    def test_preload_pinned_commits_reloads_current_sha(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+    def test_preload_pinned_commits_reloads_current_sha(self, real_db):
+        """Real-backend regression test for the #133 UUID-vs-ident bug in
+        _preload_pinned_commits — same root cause as
+        TestPreloadKnownDeps.test_reloads_open_depends_on_edge:
+        the query used to bind the bare ?e subject variable directly
+        (`[?e :pinned-commit ?sha]`), which a real minigraf backend
+        resolves to its internal UUID rather than the entity's ":module/…"
+        ident. Every call site that reads this function's return value
+        (_run_ingestion's gitlink bump/remove handling) looks it up by
+        ident string (`pinned_commit_state.get(ext_ident, ...)`), so
+        against a real backend the lookup always missed after a restart,
+        silently resetting each pin's original valid-from. Fixed by
+        projecting `[?e :ident ?ei]` and finding ?ei instead of ?e.
+
+        As with the depends-on test, the :ident fact and the :pinned-commit
+        fact are seeded with deliberately DIFFERENT :valid-from timestamps
+        (2020 vs. 2026) to prove the fix's clause ORDERING (:ident before
+        :pinned-commit) is correct — not just that the result is non-empty.
+        If :ident were ordered wrong, ?vf would bind to the :ident fact's
+        valid-from (2020) instead of the :pinned-commit fact's (2026).
+        """
         import mcp_server
-        # _preload_pinned_commits' query shape is [?e ?sha ?vf] with :any-valid-time
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":module/vendor-lib", "abc123", 1735689600000]]
-        })
-        mcp_server.open_db(str(tmp_path / "memory.graph"))
-        db = mcp_server.get_db()
 
-        pinned = mcp_server._preload_pinned_commits(db)
+        real_db.execute(
+            '(transact {:valid-from "2020-01-01T00:00:00Z"} '
+            '[[:module/vendor-lib :entity-type :type/external-dependency] '
+            '[:module/vendor-lib :ident ":module/vendor-lib"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-01-01T00:00:00Z"} '
+            '[[:module/vendor-lib :pinned-commit "abc123"]])'
+        )
 
-        assert pinned[":module/vendor-lib"][0] == "abc123"
-        assert pinned[":module/vendor-lib"][1].endswith("Z")
+        pinned = mcp_server._preload_pinned_commits(real_db)
 
-    def test_preload_pinned_commits_returns_empty_on_query_failure(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
+        assert pinned[":module/vendor-lib"] == ("abc123", "2026-01-01T00:00:00.000Z")
+
+    def test_preload_pinned_commits_returns_empty_on_query_failure(self, real_db, monkeypatch):
+        """Same malformed-query technique as
+        TestPreloadKnownDeps.test_query_failure_is_non_fatal: corrupt
+        _VALID_TIME_FOREVER_MS so the hard-coded `(= ?vt ...)` predicate
+        becomes genuinely unparseable Datalog, triggering a real
+        MiniGrafError from the real parser."""
         import mcp_server
-        from minigraf import MiniGrafError
-        mcp_server.open_db(str(tmp_path / "memory.graph"))
-        db = mcp_server.get_db()
-        db_instance.execute.side_effect = MiniGrafError("boom")
+        monkeypatch.setattr(mcp_server, "_VALID_TIME_FOREVER_MS", "))) malformed [[[")
 
-        assert mcp_server._preload_pinned_commits(db) == {}
+        assert mcp_server._preload_pinned_commits(real_db) == {}
 
 
 class TestTotalIngestedQuery:
-    def test_returns_zero_when_absent(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    def test_returns_zero_when_absent(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        assert mcp_server._total_ingested_query(db) == 0
+        assert mcp_server._total_ingested_query(real_db) == 0
 
-    def test_returns_stored_count(self, mock_minigraf_db, tmp_path):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": [[462]]})
+    def test_returns_stored_count(self, real_db):
         import mcp_server
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db = mcp_server.get_db()
-        assert mcp_server._total_ingested_query(db) == 462
+        real_db.execute(
+            '(transact [[:ingestion/last-run-at :entity-type :type/ingestion] '
+            '[:ingestion/last-run-at :total-ingested 462]])'
+        )
+        assert mcp_server._total_ingested_query(real_db) == 462
 
 
 class TestRunIngestion:
     @pytest.mark.asyncio
-    async def test_ingestion_processes_all_commits(self, mock_minigraf_db, git_repo):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_ingestion_processes_all_commits(self, real_db, git_repo, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(git_repo / "memory.graph"))
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -5799,11 +5919,8 @@ class TestRunIngestion:
         assert mcp_server._ingest_progress["processed"] == 2
 
     @pytest.mark.asyncio
-    async def test_sets_error_at_timestamp_on_failure(self, mock_minigraf_db, git_repo, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_sets_error_at_timestamp_on_failure(self, real_db, git_repo, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
@@ -5820,40 +5937,53 @@ class TestRunIngestion:
         assert mcp_server._ingest_progress["error_at"].endswith("Z")
 
     @pytest.mark.asyncio
-    async def test_watermark_updated_after_each_commit(self, mock_minigraf_db, git_repo):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_watermark_updated_after_each_commit(self, real_db, git_repo, monkeypatch):
         import mcp_server
-        mcp_server.open_db(str(git_repo / "memory.graph"))
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
-        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        with execute_spy() as calls:
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
         watermark_calls = [
-            c for c in db_instance.execute.call_args_list
-            if ":ingestion/watermark" in str(c) and "transact" in str(c)
+            c for c in calls if ":ingestion/watermark" in c and "transact" in c
         ]
         assert len(watermark_calls) >= 2  # one per commit
 
     @pytest.mark.asyncio
     async def test_per_commit_get_db_lock_retry_does_not_block_event_loop(
-        self, mock_minigraf_db, git_repo, monkeypatch
+        self, real_db, git_repo, monkeypatch
     ):
         """Regression test for #99: a lock-retry hit while reacquiring the DB
         between commits must not block via time.sleep() — _run_ingestion runs
         on the single-threaded event loop, and a blocking sleep there would
         freeze the very coroutine responsible for eventually releasing that
-        lock."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
-        import mcp_server
+        lock.
 
-        lock_err = MiniGrafError(
-            "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
-        )
-        mock_class.open.side_effect = [db_instance, lock_err, db_instance, db_instance, db_instance]
-        mcp_server.open_db(str(git_repo / "memory.graph"))
+        Real-backend version: rather than a canned MagicMock.open.side_effect
+        list, this wraps the real (in-memory-backed) MiniGrafDb.open that
+        real_db already installed — same technique as
+        TestGetDbLockRetry.test_retries_open_after_clearing_stale_lock_on_final_attempt
+        — so the very first post-preload reacquire raises a genuine
+        MiniGrafError('...locked...') once, then every subsequent call opens
+        a real handle normally."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
+        base_open = MiniGrafDb.open
+        call_count = {"n": 0}
+
+        def flaky_open(path):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise MiniGrafError(
+                    "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
+                )
+            return base_open(path)
+
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(flaky_open))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -5867,10 +5997,11 @@ class TestRunIngestion:
 
         assert mcp_server._ingest_progress["status"] == "complete"
         assert mcp_server._ingest_progress["processed"] == 2
+        assert call_count["n"] >= 2, "expected the flaky open() to actually be exercised"
 
     @pytest.mark.asyncio
     async def test_preload_phase_does_not_block_event_loop(
-        self, mock_minigraf_db, git_repo, monkeypatch
+        self, real_db, git_repo, monkeypatch
     ):
         """Regression test for #103: opening the DB and running the startup
         preload queries (_watermark_query, _count_commit_entities,
@@ -5879,8 +6010,6 @@ class TestRunIngestion:
         between them, so on a large graph the phase could run long enough to
         starve the stdio handshake past a client's connection timeout,
         leaving the server permanently unable to connect."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
 
         def slow_preload(db, repo_path):
@@ -5913,12 +6042,9 @@ class TestRunIngestion:
         )
 
     @pytest.mark.asyncio
-    async def test_db_released_between_commits(self, mock_minigraf_db, git_repo):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_db_released_between_commits(self, real_db, git_repo, monkeypatch):
         import mcp_server
-        mcp_server._db = None
-        mcp_server.open_db(str(git_repo / "memory.graph"))
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -5937,7 +6063,7 @@ class TestRunIngestion:
 
     @pytest.mark.asyncio
     async def test_local_db_reference_dropped_before_commit_enumeration(
-        self, mock_minigraf_db, git_repo
+        self, git_repo, monkeypatch
     ):
         """Regression test for #84's deeper root cause: minigraf exposes no
         explicit close(), so the OS-level file lock is only released once
@@ -5954,8 +6080,17 @@ class TestRunIngestion:
         mask a missing explicit clear — a potentially slow, synchronous
         `git log` walk here would hold the lock for its entire duration
         unless `db` is explicitly dropped.
+
+        No real_db fixture here — this test's whole point
+        is CPython refcounting on the DB handle object itself, so it needs a
+        deliberately lightweight, non-mock handle. real_db's actual FFI
+        object carries its own internal cross-references that would pollute
+        sys.getrefcount() just as badly as MagicMock's self-referential
+        state does (see _FakeDb's docstring below), so MiniGrafDb.open is
+        monkeypatched directly to a plain-object factory instead.
         """
-        mock_class, _ = mock_minigraf_db
+        import mcp_server
+        from minigraf import MiniGrafDb
 
         class _FakeDb:
             """Plain object, not MagicMock — MagicMock carries internal
@@ -5973,8 +6108,8 @@ class TestRunIngestion:
             opened_instances.append(inst)
             return inst
 
-        mock_class.open.side_effect = _open
-        import mcp_server
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(_open))
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._db = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6002,11 +6137,10 @@ class TestRunIngestion:
         )
 
     @pytest.mark.asyncio
-    async def test_handle_minigraf_ingest_git_returns_immediately(self, mock_minigraf_db, git_repo, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_handle_minigraf_ingest_git_returns_immediately(self, real_db, git_repo, monkeypatch):
         import mcp_server
         monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -6015,13 +6149,16 @@ class TestRunIngestion:
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is True
         assert "job_id" in result
+        # Cleanup: let the real background ingestion this started finish
+        # before the test (and real_db's MiniGrafDb.open monkeypatch) tears
+        # down, so nothing is left running against a reverted fixture.
+        await mcp_server._ingest_task
 
     @pytest.mark.asyncio
-    async def test_second_call_while_running_returns_error(self, mock_minigraf_db, git_repo, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_second_call_while_running_returns_error(self, real_db, git_repo, monkeypatch):
         import mcp_server
         monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -6031,9 +6168,13 @@ class TestRunIngestion:
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is False
         assert "already in progress" in result["error"]
+        # Cleanup: drain the still-running first ingestion task.
+        await mcp_server._ingest_task
 
     @pytest.mark.asyncio
-    async def test_returns_error_for_invalid_repo(self, mock_minigraf_db, monkeypatch):
+    async def test_returns_error_for_invalid_repo(self, monkeypatch):
+        """Fails at the git-repo validity check, before any DB is ever
+        touched — no DB fixture needed at all."""
         import mcp_server
         monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
         mcp_server._ingest_task = None
@@ -6046,7 +6187,11 @@ class TestRunIngestion:
         assert "Not a git repository" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_skips_when_live_holder_present(self, mock_minigraf_db, git_repo, tmp_path, monkeypatch):
+    async def test_skips_when_live_holder_present(self, git_repo, tmp_path, monkeypatch):
+        """_live_lock_holder_pid is monkeypatched directly and the skip path
+        returns before any DB is ever opened, so no DB fixture is needed —
+        the original test only ever received the mocked DB fixture
+        incidentally, never using its mock instance."""
         import mcp_server
         mcp_server._ingest_task = None
         mcp_server._graph_path = str(tmp_path / "t.graph")
@@ -6066,13 +6211,12 @@ class TestRunIngestion:
         assert mcp_server._ingest_progress["owner_pid"] == 424242
 
     @pytest.mark.asyncio
-    async def test_proceeds_when_no_live_holder(self, mock_minigraf_db, git_repo, monkeypatch):
+    async def test_proceeds_when_no_live_holder(self, real_db, git_repo, monkeypatch):
         """When no live process owns the graph lock, handle_minigraf_ingest_git
         proceeds normally and starts the ingestion task."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -6082,10 +6226,11 @@ class TestRunIngestion:
         assert result["ok"] is True
         assert "job_id" in result
         assert mcp_server._ingest_task is not None
+        await mcp_server._ingest_task
 
     @pytest.mark.asyncio
     async def test_status_not_idle_immediately_after_ingest_git_starts(
-        self, mock_minigraf_db, git_repo, monkeypatch
+        self, real_db, git_repo, monkeypatch
     ):
         """Regression test for #109: handle_minigraf_ingest_git creates
         _ingest_task and returns before _run_ingestion's preload phase has
@@ -6094,10 +6239,9 @@ class TestRunIngestion:
         the reported contradiction, where a caller sees status "idle" but
         a subsequent minigraf_ingest_git call is rejected with "already in
         progress" because the task-existence check is accurate immediately."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -6106,10 +6250,11 @@ class TestRunIngestion:
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
         assert result["ok"] is True
         assert mcp_server._ingest_progress["status"] == "starting"
+        await mcp_server._ingest_task
 
     @pytest.mark.asyncio
     async def test_ingest_git_resolves_branch_via_default_when_not_specified(
-        self, mock_minigraf_db, git_repo, monkeypatch
+        self, real_db, git_repo, monkeypatch
     ):
         """#130: omitting `branch` must resolve through _default_git_branch,
         not hardcode "HEAD"."""
@@ -6134,7 +6279,7 @@ class TestRunIngestion:
 
     @pytest.mark.asyncio
     async def test_ingest_git_explicit_branch_overrides_default(
-        self, mock_minigraf_db, git_repo, monkeypatch
+        self, real_db, git_repo, monkeypatch
     ):
         """An explicit `branch` argument must win over _default_git_branch,
         which shouldn't even be consulted in that case."""
@@ -6162,20 +6307,20 @@ class TestRunIngestion:
         assert captured["branch"] == "feature-x"
 
     @pytest.mark.asyncio
-    async def test_processed_seeded_from_prior_ingested(self, mock_minigraf_db, git_repo, monkeypatch):
+    async def test_processed_seeded_from_prior_ingested(self, real_db, git_repo, monkeypatch):
         """processed starts at the true persisted commit count and increments
         cumulatively — regression test for #85 (seeding must not rely on the
-        :total-ingested watermark, which goes stale after an interrupted run)."""
-        mock_class, db_instance = mock_minigraf_db
-        # _count_commit_entities returns 462 (true persisted count); all other
-        # queries — including the stale :total-ingested watermark — return [].
-        def execute_side_effect(query, *args, **kwargs):
-            if ":type/commit" in query:
-                return json.dumps({"results": [[462]]})
-            return json.dumps({"results": []})
-        db_instance.execute.side_effect = execute_side_effect
+        :total-ingested watermark, which goes stale after an interrupted run).
+
+        _count_commit_entities is monkeypatched directly to the desired prior
+        count rather than seeded via 462 real :type/commit entities — this
+        test is about _run_ingestion's seeding arithmetic (prior_ingested +
+        newly-processed commits), not about _count_commit_entities' own query
+        correctness, which has its own coverage (TestTotalIngestedQuery and
+        friends)."""
         import mcp_server
-        mcp_server.open_db(str(git_repo / "memory.graph"))
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
+        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 462)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -6188,21 +6333,21 @@ class TestRunIngestion:
 
     @pytest.mark.asyncio
     async def test_processed_seed_ignores_stale_total_ingested_watermark(
-        self, mock_minigraf_db, git_repo
+        self, real_db, git_repo, monkeypatch
     ):
         """A stale :total-ingested watermark (left behind by a prior run that
         was interrupted before writing its completion record) must not affect
-        seeding — only the true :type/commit count matters."""
-        mock_class, db_instance = mock_minigraf_db
-        def execute_side_effect(query, *args, **kwargs):
-            if ":type/commit" in query:
-                return json.dumps({"results": [[21715]]})
-            if ":total-ingested" in query:
-                return json.dumps({"results": [[104]]})  # stale, must be ignored
-            return json.dumps({"results": []})
-        db_instance.execute.side_effect = execute_side_effect
+        seeding — only the true :type/commit count matters.
+
+        Same rationale as test_processed_seeded_from_prior_ingested for
+        monkeypatching _count_commit_entities directly rather than seeding
+        21715 real entities; _total_ingested_query is likewise monkeypatched
+        to a stale value to prove _run_ingestion's seeding never even
+        consults it."""
         import mcp_server
-        mcp_server.open_db(str(git_repo / "memory.graph"))
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
+        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 21715)
+        monkeypatch.setattr(mcp_server, "_total_ingested_query", lambda db: 104)  # stale, must be ignored
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -6214,13 +6359,28 @@ class TestRunIngestion:
 
 class TestRunIngestionConcurrency:
     @pytest.mark.asyncio
-    async def test_concurrent_run_matches_sequential_facts(self, mock_minigraf_db, git_repo_with_deps, monkeypatch):
+    async def test_concurrent_run_matches_sequential_facts(
+        self, tmp_path, git_repo_with_deps, monkeypatch
+    ):
         """A run using the thread-pool pipeline must produce the exact same
-        set of transacted triples, in the same commit order, as today's
-        sequential loop — this is the core correctness guarantee for the
-        producer/consumer split."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        set of transacted triples, in the same commit order, AND the exact
+        same set of durably persisted facts, as today's sequential loop —
+        this is the core correctness guarantee for the producer/consumer
+        split.
+
+        Uses a real, file-backed MiniGrafDb per run (not the `real_db`
+        in-memory fixture): `_run_ingestion` releases and reacquires its DB
+        handle between every commit and again after the run completes, and
+        `MiniGrafDb.open_in_memory()` hands back a brand-new, isolated store
+        on every call. Under the in-memory fixture, those reopens would
+        silently wipe state at each boundary, so querying "the graph" after
+        the run would only ever reflect the last write in isolation — the
+        comparison below would be vacuous. A real on-disk graph (same
+        pattern as TestRunIngestionBitemporalClose's
+        test_renamed_to_is_open_ended_against_real_graph) genuinely persists
+        across those reopens, so the facts queried back after each run
+        reflect that run's true cumulative state.
+        """
         import mcp_server
 
         # Capture the true, unpatched transact function once — each run below
@@ -6228,16 +6388,24 @@ class TestRunIngestionConcurrency:
         # pick up the previous run's capture wrapper instead of the original.
         real_ingest_transact = mcp_server._ingest_transact
 
-        async def run_and_capture(worker_count):
+        async def run_and_capture(worker_count, graph_path):
             if worker_count is None:
                 monkeypatch.delenv("MINIGRAF_INGEST_WORKERS", raising=False)
             else:
                 monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", str(worker_count))
 
-            # Reset module-level state so the second run starts exactly as
-            # clean as the first (same watermark, same progress, no leftover
-            # shutdown signal).
-            mcp_server.open_db(str(git_repo_with_deps / "memory.graph"))
+            # Fresh, dedicated on-disk graph per run so each run starts from
+            # a genuinely empty store — no leftover watermark, progress, or
+            # shutdown signal from the previous run.
+            mcp_server._db = None
+            mcp_server._graph_path = None
+            mcp_server.open_db(str(graph_path))
+            # Prevent IndexCache's background rebuild thread (spawned on
+            # ingestion completion) from racing this test's own DB
+            # open/close cycles across the two runs below — see the
+            # established precedent for this same monkeypatch on other
+            # real-backend _run_ingestion tests in this file.
+            monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
             mcp_server._ingest_progress = {
                 "status": "idle", "processed": 0, "total": 0,
                 "current_commit": "", "error": None,
@@ -6254,28 +6422,47 @@ class TestRunIngestionConcurrency:
             await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
             assert mcp_server._ingest_progress["status"] == "complete"
             assert mcp_server._ingest_progress["processed"] == 1
-            return transacted
 
-        sequential_triples = await run_and_capture(1)
-        concurrent_triples = await run_and_capture(4)
+            # Query the real, persisted graph for every currently-valid fact.
+            # The :last-run-at value is excluded: it legitimately carries a
+            # wall-clock timestamp (see _last_run_write), so it differs
+            # between the two runs below without indicating any divergence
+            # in the actual ingested content. Everything else — including
+            # that same entity's :ident/:last-commit/:total-ingested — is
+            # deterministic given the same repo content and is compared.
+            db = mcp_server.get_db()
+            raw = mcp_server._db_execute(db, "(query [:find ?e ?a ?v :where [?e ?a ?v]])")
+            rows = json.loads(raw)["results"]
+            facts = {
+                (e, a, v) for e, a, v in rows
+                if a != ":last-run-at"
+            }
+            mcp_server._db = None  # release the file lock for the next run
+            return transacted, facts
+
+        sequential_triples, sequential_facts = await run_and_capture(1, tmp_path / "sequential.graph")
+        concurrent_triples, concurrent_facts = await run_and_capture(4, tmp_path / "concurrent.graph")
 
         mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
         mod_b_ident = mcp_server._code_ident("module", "mod_b.py")
         all_triples = [t for batch in sequential_triples for t in batch]
         assert any(mod_a_ident in t for t in all_triples)
         assert any(mod_b_ident in t for t in all_triples)
+        assert any(a == ":ident" and v == mod_a_ident for e, a, v in sequential_facts)
+        assert any(a == ":ident" and v == mod_b_ident for e, a, v in sequential_facts)
 
-        # The core equivalence guarantee: identical triples, identical
-        # per-commit batching, identical order — regardless of how many
-        # worker threads did the extraction.
+        # The core equivalence guarantee: identical triples emitted in
+        # identical per-commit batches and identical order, AND identical
+        # facts genuinely persisted to (and read back from) the graph —
+        # regardless of how many worker threads did the extraction.
         assert concurrent_triples == sequential_triples
+        assert concurrent_facts == sequential_facts
 
     @pytest.mark.asyncio
-    async def test_worker_count_env_var_is_respected(self, mock_minigraf_db, git_repo, monkeypatch):
+    async def test_worker_count_env_var_is_respected(self, real_db, git_repo, monkeypatch):
         monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", "1")
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6287,7 +6474,7 @@ class TestRunIngestionConcurrency:
 
     @pytest.mark.asyncio
     async def test_one_commits_file_failure_does_not_affect_other_commits(
-        self, mock_minigraf_db, git_repo
+        self, real_db, git_repo, monkeypatch
     ):
         """A file-content fetch failure must be induced for real, not via
         monkeypatch: _extract_commit runs in a spawned worker process
@@ -6296,9 +6483,8 @@ class TestRunIngestionConcurrency:
         actual loose git blob object for auth.py makes `git show
         <hash>:auth.py` genuinely fail inside the worker, exercising the
         same try/except continue path the old monkeypatch used to reach."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6328,7 +6514,7 @@ class TestRunIngestionConcurrency:
 class TestRunIngestionEventLoopResponsiveness:
     @pytest.mark.asyncio
     async def test_event_loop_stays_responsive_during_heavy_extraction(
-        self, mock_minigraf_db, tmp_path
+        self, real_db, tmp_path, monkeypatch
     ):
         """#116: tree-sitter's C parse holds the GIL for its whole duration
         (confirmed empirically — a single hammering thread stalls a
@@ -6348,9 +6534,6 @@ class TestRunIngestionEventLoopResponsiveness:
         full ~500ms parse; a process pool's residual cost is bounded by
         the tiny output, not the parse time.
         """
-        db_instance = mock_minigraf_db[1]
-        db_instance.execute.return_value = json.dumps({"results": []})
-
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -6364,6 +6547,7 @@ class TestRunIngestionEventLoopResponsiveness:
         _subprocess.run(["git", "commit", "-m", "add big file"], cwd=repo, check=True, capture_output=True)
 
         import mcp_server
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6398,13 +6582,11 @@ class TestRunIngestionEventLoopResponsiveness:
 
 class TestRunIngestionShutdown:
     @pytest.mark.asyncio
-    async def test_shutdown_mid_run_stops_at_commit_boundary(self, mock_minigraf_db, git_repo, monkeypatch):
+    async def test_shutdown_mid_run_stops_at_commit_boundary(self, real_db, git_repo, monkeypatch):
         """git_repo has 2 commits. Request shutdown right after the first
         commit's extraction is consumed but before the second is processed;
         the loop must stop cleanly with status 'stopped' and only 1 commit
         durably processed."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
@@ -6427,32 +6609,26 @@ class TestRunIngestionShutdown:
         assert mcp_server._ingest_progress["processed"] == 1
 
     @pytest.mark.asyncio
-    async def test_resumes_from_watermark_after_shutdown(self, mock_minigraf_db, git_repo, monkeypatch):
+    async def test_resumes_from_watermark_after_shutdown(self, git_repo, monkeypatch):
         """After a simulated shutdown mid-run, a second _run_ingestion call
-        against the same (mocked) DB state must pick up the watermark that
-        was written for the last fully-completed commit and finish the
-        remaining commit(s), without re-processing or skipping any."""
-        mock_class, db_instance = mock_minigraf_db
+        against the same DB must pick up the watermark that was written for
+        the last fully-completed commit and finish the remaining commit(s),
+        without re-processing or skipping any.
+
+        Uses a real, file-backed MiniGrafDb (not the `real_db` in-memory
+        fixture, and not a MagicMock): the watermark written by run 1 must
+        genuinely be visible to run 2's preload read, across the DB
+        open/close cycles _run_ingestion performs both between commits and
+        between the two separate _run_ingestion calls below. Neither a
+        canned-response mock nor `MiniGrafDb.open_in_memory()` (which hands
+        back a brand-new, isolated store on every open) can model that —
+        only a real on-disk graph, reopened at the same path both times,
+        actually persists the watermark for run 2 to read.
+        """
         import mcp_server
-
-        # In-memory fake DB standing in for minigraf so the watermark
-        # written by run 1 is genuinely visible to run 2 (the default mock
-        # always returns the same canned response and can't model this).
-        state = {"watermark": None}
-
-        def execute(cmd, *a, **k):
-            if "(query" in cmd and ":ingestion/watermark" in cmd and ":hash" in cmd:
-                if state["watermark"]:
-                    return json.dumps({"results": [[state["watermark"]]]})
-                return json.dumps({"results": []})
-            if "(transact" in cmd and ":ingestion/watermark" in cmd:
-                import re
-                m = re.search(r':hash "([0-9a-f]+)"', cmd)
-                if m:
-                    state["watermark"] = m.group(1)
-            return json.dumps({"results": []})
-
-        db_instance.execute.side_effect = execute
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6474,6 +6650,14 @@ class TestRunIngestionShutdown:
         first_run_processed = mcp_server._ingest_progress["processed"]
         assert first_run_processed == 1
 
+        # Prove the watermark and the first commit's entity were genuinely
+        # persisted to disk before run 2 starts (not just left in the
+        # in-process _ingest_progress counter).
+        db = mcp_server.get_db()
+        watermark = mcp_server._watermark_query(db)
+        assert watermark, "run 1's watermark must be durably persisted for run 2 to resume from"
+        assert mcp_server._count_commit_entities(db) == 1
+
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -6481,10 +6665,16 @@ class TestRunIngestionShutdown:
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         assert mcp_server._ingest_progress["status"] == "complete"
-        # Second run only had the 1 remaining commit to do, and
-        # _count_commit_entities (mocked to [] here) seeds prior_ingested=0,
-        # so processed reflects just that run's own work.
-        assert mcp_server._ingest_progress["processed"] == 1
+        # Second run's preload now sees the 1 :type/commit entity genuinely
+        # persisted by run 1 (a real DB, not a canned mock response), so
+        # prior_ingested correctly seeds at 1; processed = prior_ingested (1)
+        # + the 1 remaining commit this run itself completes = 2. This is
+        # also proof the watermark actually gated re-processing: git_repo
+        # has 2 commits total, and only 1 was processed in each run.
+        assert mcp_server._ingest_progress["processed"] == 2
+        assert mcp_server._count_commit_entities(mcp_server.get_db()) == 2
+
+        mcp_server._db = None  # release the real file lock for subsequent tests
 
 
 class TestMainShutdown:
@@ -6826,13 +7016,9 @@ class TestIndexCache:
         cache = IndexCache()
         assert cache.get() is None
 
-    def test_rebuild_populates_index(self, mock_minigraf_db, tmp_path):
+    def test_rebuild_populates_index(self, real_db):
         import mcp_server
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":decision/use-redis", ":description", "use redis"]]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute('(transact {} [[:decision/use-redis :description "use redis"]])')
         cache = mcp_server.IndexCache()
         cache._rebuild()
         assert cache.get() is not None
@@ -6884,6 +7070,7 @@ class TestIndexCache:
     def test_rebuild_leaves_current_unchanged_on_error(self, monkeypatch):
         import mcp_server
         from mcp_server import IndexCache, FactIndex
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         cache = IndexCache()
         stale = FactIndex([[":decision/old", ":description", "old"]], boost=2.0)
         cache._current = stale
@@ -6896,57 +7083,65 @@ class TestIndexCache:
 
 @requires_bm25
 class TestMemoryPrepareTurnBM25:
-    def test_returns_empty_when_no_index(self, mock_minigraf_db, tmp_path):
+    def test_returns_empty_when_no_index(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         fresh_cache = mcp_server.IndexCache()  # no index built yet
         with patch.object(mcp_server, "_index_cache", fresh_cache), \
              patch.object(mcp_server, "_BM25_AVAILABLE", True):
             result = mcp_server.handle_memory_prepare_turn("redis caching")
         assert result == ""
 
-    def test_returns_empty_for_unmatched_query(self, mock_minigraf_db, tmp_path):
+    def test_returns_empty_for_unmatched_query(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":decision/use-redis", ":description", "use redis"]]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute('(transact {} [[:decision/use-redis :description "use redis"]])')
         cache = mcp_server.IndexCache()
         cache._rebuild()
         with patch.object(mcp_server, "_index_cache", cache):
             result = mcp_server.handle_memory_prepare_turn("elephants trombone")
         assert result == ""
 
-    def test_memory_facts_rank_above_git_facts(self, mock_minigraf_db, tmp_path):
+    def test_memory_facts_rank_above_git_facts(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [
-                [":decision/use-redis", ":description", "use redis for caching"],
-                [":commit/abc123def456", ":subject", "feat use redis caching layer"],
-                [":function/unrelated", ":name", "some other thing entirely"],
-            ]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        # NOTE: against a real backend, minigraf resolves every entity ident
+        # (e.g. ":decision/use-redis") to an internal UUID — an unbound [?e
+        # ?a ?v] query never returns the keyword literal in the ?e position
+        # (see _query_canonical_entities' docstring a few hundred lines up,
+        # which documents this exact UUID-vs-ident distinction). That means
+        # FactIndex._is_memory — which keys off row[0], i.e. ?e — never
+        # matches a real fact, so the memory-fact BM25 boost this test's name
+        # references never actually fires in production either; verified by
+        # calling IndexCache._rebuild() against a real db with a
+        # ":decision/..."-prefixed + explicit :ident fact and observing
+        # _is_memory == [False, False]. This assertion therefore exercises
+        # natural BM25 relevance ranking (decision text scores higher than
+        # commit text for this query on doc-length/term-frequency grounds
+        # alone), not the boost path — see
+        # https://github.com/project-minigraf/temporal_reasoning/issues/141
+        # for the full writeup of this pre-existing bug.
+        real_db.execute(
+            '(transact {} ['
+            '[:decision/use-redis :description "use redis for caching"] '
+            '[:commit/abc123def456 :subject "feat use redis caching layer"] '
+            '[:function/unrelated :name "some other thing entirely"]'
+            '])'
+        )
         cache = mcp_server.IndexCache()
         cache._rebuild()
         with patch.object(mcp_server, "_index_cache", cache):
             result = mcp_server.handle_memory_prepare_turn("redis caching")
         assert "Relevant memory context:" in result
-        assert result.index(":decision/use-redis") < result.index(":commit/abc123def456")
+        assert result.index("use redis for caching") < result.index("feat use redis caching layer")
 
-    def test_respects_scan_limit(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_respects_scan_limit(self, real_db, monkeypatch):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[f":decision/item-{i}", ":description", f"redis item {i}"] for i in range(20)]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        triples = " ".join(
+            f'[:decision/item-{i} :description "redis item {i}"]' for i in range(20)
+        )
+        real_db.execute(f'(transact {{}} [{triples}])')
         monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "3")
         cache = mcp_server.IndexCache()
         cache._rebuild()
@@ -6957,62 +7152,42 @@ class TestMemoryPrepareTurnBM25:
 
 
 class TestIndexCacheInvalidation:
-    def test_successful_transact_triggers_invalidation(self, mock_minigraf_db, tmp_path):
+    def test_successful_transact_triggers_invalidation(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx_id": 1, "count": 1})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
             mcp_server.handle_minigraf_transact(
                 '[[:decision/test :description "test"]]', reason="test"
             )
             mock_inv.assert_called_once()
 
-    def test_failed_transact_does_not_trigger_invalidation(self, mock_minigraf_db, tmp_path):
+    def test_failed_transact_does_not_trigger_invalidation(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        from minigraf import MiniGrafError
-        mock_class, db_instance = mock_minigraf_db
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad tx")
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_minigraf_transact(
-                '[[:decision/test :description "test"]]', reason="test"
-            )
+            mcp_server.handle_minigraf_transact("(not valid datalog", reason="test")
             mock_inv.assert_not_called()
 
-    def test_successful_retract_triggers_invalidation(self, mock_minigraf_db, tmp_path):
+    def test_successful_retract_triggers_invalidation(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"tx_id": 2, "count": 1})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute('(transact {} [[:decision/test :description "test"]])')
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
             mcp_server.handle_minigraf_retract(
                 '[[:decision/test :description "test"]]', reason="cleanup"
             )
             mock_inv.assert_called_once()
 
-    def test_failed_retract_does_not_trigger_invalidation(self, mock_minigraf_db, tmp_path):
+    def test_failed_retract_does_not_trigger_invalidation(self, real_db):
         import mcp_server
         from unittest.mock import patch
-        from minigraf import MiniGrafError
-        mock_class, db_instance = mock_minigraf_db
-        mcp_server.open_db(str(tmp_path / "t.graph"))
-        db_instance.execute.side_effect = MiniGrafError("bad retract")
         with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_minigraf_retract(
-                '[[:decision/test :description "test"]]', reason="cleanup"
-            )
+            mcp_server.handle_minigraf_retract("(not valid datalog", reason="cleanup")
             mock_inv.assert_not_called()
 
-    def test_run_ingestion_triggers_invalidation_on_completion(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_run_ingestion_triggers_invalidation_on_completion(self, real_db, tmp_path, monkeypatch):
         import mcp_server
         from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
-        mcp_server.open_db(str(tmp_path / "t.graph"))
         monkeypatch.setattr(mcp_server, "_git_commits", lambda *a, **k: [])
         monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
         monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}, {}, {}))
@@ -7025,44 +7200,21 @@ class TestIndexCacheInvalidation:
 
 
 class TestBM25GracefulDegradation:
-    def test_falls_back_to_heuristic_when_bm25_unavailable(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_falls_back_to_heuristic_when_bm25_unavailable(self, real_db, monkeypatch):
         import mcp_server
-        from unittest.mock import patch
-        mock_class, db_instance = mock_minigraf_db
         # The heuristic extracts entities from "decided to use redis":
         #   "decided" (7 chars) and "redis" (5 chars) pass the _MIN_ENTITY_LEN=4 filter.
-        # For each entity it calls db.execute() with a contains? query.
-        # Using side_effect so the first entity query returns a match and the
-        # second returns empty (deduplication handles any overlap).
-        session_rule_count = len(mcp_server.SESSION_RULES)
-        call_count = 0
-
-        def side_effect(query_str):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= session_rule_count:
-                # SESSION_RULES registrations during open_db
-                return json.dumps({"ok": True})
-            # First entity query ("decided") — return a matching fact
-            if call_count == session_rule_count + 1:
-                return json.dumps({"results": [["use", "decided to use redis"]]})
-            # Subsequent entity queries — return empty
-            return json.dumps({"results": []})
-
-        db_instance.execute.side_effect = side_effect
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        # A fact whose value contains both substrings satisfies the heuristic's
+        # (contains? ?v "<entity>") query for either extracted entity.
+        real_db.execute('(transact {} [[:decision/use-redis :description "decided to use redis"]])')
         monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
         result = mcp_server.handle_memory_prepare_turn("decided to use redis")
         # Heuristic path produces "Relevant memory context:" when facts are found
         assert "Relevant memory context:" in result
 
-    def test_index_cache_rebuild_noop_when_bm25_unavailable(self, mock_minigraf_db, tmp_path, monkeypatch):
+    def test_index_cache_rebuild_noop_when_bm25_unavailable(self, real_db, monkeypatch):
         import mcp_server
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({
-            "results": [[":decision/use-redis", ":description", "use redis"]]
-        })
-        mcp_server.open_db(str(tmp_path / "t.graph"))
+        real_db.execute('(transact {} [[:decision/use-redis :description "use redis"]])')
         monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
         monkeypatch.setattr(mcp_server, "_BM25Okapi", None)
         cache = mcp_server.IndexCache()
@@ -7179,6 +7331,11 @@ def git_repo_with_deletion(tmp_path):
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
 
+    # Sleep so the two commits land in different git-timestamp seconds (git's
+    # committer time has 1s resolution): real-backend tests point-in-time
+    # query :valid-at the add commit's timestamp to confirm the fact was open
+    # right after creation, which requires add_ts != delete_ts.
+    time.sleep(1.1)
     (repo / "auth.py").unlink()
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "delete auth"], cwd=repo, check=True, capture_output=True)
@@ -7199,6 +7356,7 @@ def git_repo_with_intra_file_deletion(tmp_path):
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
 
+    time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
     (repo / "auth.py").write_text("def login(): pass\n")
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "remove logout"], cwd=repo, check=True, capture_output=True)
@@ -7219,6 +7377,7 @@ def git_repo_with_rename(tmp_path):
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
 
+    time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
     _subprocess.run(["git", "mv", "old_auth.py", "new_auth.py"], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "rename auth"], cwd=repo, check=True, capture_output=True)
 
@@ -7293,6 +7452,7 @@ class TestClosedEntityLifecyclePurge:
 
     async def _ingest_and_open(self, repo, monkeypatch):
         import mcp_server
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         graph = str(repo / "memory.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         mcp_server._db = None
@@ -7367,121 +7527,204 @@ class TestRunIngestionBitemporalClose:
 
     @pytest.mark.asyncio
     async def test_file_deletion_closes_with_real_description_not_empty_string(
-        self, mock_minigraf_db, git_repo_with_deletion, monkeypatch
+        self, git_repo_with_deletion
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Verified against the REAL minigraf backend: the deleted function's
+        :description fact must be closed using its REAL value ("login"), not
+        an empty-string placeholder. If the close path used the wrong (empty)
+        value, the retract in `_ingest_close` would silently no-op (it is
+        best-effort) and the real fact would leak open forever -- observable
+        here as the fact still being visible in a current-time query after
+        the deletion commit."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_deletion / "memory.graph"))
+        repo = git_repo_with_deletion
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_deletion), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        assert close_triples_seen, "Expected _ingest_close to be called on file deletion"
-        assert not any(':description ""' in t for t in close_triples_seen), \
-            "Close triples must not use empty string as description placeholder"
-        assert any(':description "login"' in t for t in close_triples_seen), \
-            "Close triples must carry the real description of the deleted function"
+            fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+
+            # While the file existed, the REAL description was open.
+            open_desc = results(
+                f'(query [:find ?d :valid-at "{add_ts}" :where [{fn_ident} :description ?d]])'
+            )
+            assert open_desc == [["login"]], \
+                f"Expected the real description 'login' to be open after the add commit, got {open_desc}"
+
+            # After deletion, the fact must be CLOSED -- an empty-string
+            # placeholder bug would leave the real value visible forever
+            # because the retract could never match it.
+            current_desc = results(f"(query [:find ?d :where [{fn_ident} :description ?d]])")
+            assert current_desc == [], \
+                f"Deleted function's :description must be closed at current time, got {current_desc}"
+        finally:
+            mcp_server._db = None  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
     async def test_file_deletion_close_includes_ident_and_contains_triples(
-        self, mock_minigraf_db, git_repo_with_deletion, monkeypatch
+        self, git_repo_with_deletion
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Verified against the REAL backend: deleting a file must close BOTH
+        the function's own :ident fact AND the parent module's :contains
+        edge pointing at it -- not just one or the other."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_deletion / "memory.graph"))
+        repo = git_repo_with_deletion
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_deletion), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        module_ident = mcp_server._code_ident("module", "auth.py")
-        assert any(":ident" in t and fn_ident in t for t in close_triples_seen), \
-            "Close triples must include :ident fact for the deleted function"
-        assert any(":contains" in t and fn_ident in t and module_ident in t
-                   for t in close_triples_seen), \
-            "Close triples must include the module :contains edge for the deleted function"
+            fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+            module_ident = mcp_server._code_ident("module", "auth.py")
+
+            # Both facts were open right after creation.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{fn_ident} :ident ?x]])'
+            ) == [[fn_ident]]
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{module_ident} :contains ?x]])'
+            ) == [[fn_ident]]
+
+            # Both must be closed (invisible at current time) after deletion.
+            assert results(f"(query [:find ?x :where [{fn_ident} :ident ?x]])") == [], \
+                "Deleted function's :ident fact must be closed"
+            assert results(f"(query [:find ?x :where [{module_ident} :contains ?x]])") == [], \
+                "Deleted function's :contains edge from the module must be closed"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_intra_file_deletion_closes_removed_function(
-        self, mock_minigraf_db, git_repo_with_intra_file_deletion, monkeypatch
+        self, git_repo_with_intra_file_deletion
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Verified against the REAL backend: removing one function from a
+        file that still contains other functions must close only the
+        removed function's entity, leaving the still-present sibling open."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_intra_file_deletion / "memory.graph"))
+        repo = git_repo_with_intra_file_deletion
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_intra_file_deletion), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        logout_ident = mcp_server._code_ident("function", "auth.py", "logout")
-        login_ident = mcp_server._code_ident("function", "auth.py", "login")
+            logout_ident = mcp_server._code_ident("function", "auth.py", "logout")
+            login_ident = mcp_server._code_ident("function", "auth.py", "login")
 
-        assert any(logout_ident in t for t in close_triples_seen), \
-            "logout() removed from modified file must trigger a close"
-        assert not any(login_ident in t and ":ident" in t for t in close_triples_seen), \
-            "login() still present in file must not be closed"
+            # Both were open right after the add commit.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{logout_ident} :ident ?x]])'
+            ) == [[logout_ident]]
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{login_ident} :ident ?x]])'
+            ) == [[login_ident]]
+
+            # logout() removed from the modified file must be closed now.
+            assert results(f"(query [:find ?x :where [{logout_ident} :ident ?x]])") == [], \
+                "logout() removed from modified file must trigger a close"
+            # login() still present in the file must stay open.
+            assert results(f"(query [:find ?x :where [{login_ident} :ident ?x]])") == [[login_ident]], \
+                "login() still present in file must not be closed"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_renamed_file_links_old_and_new_via_rename_edges(
-        self, mock_minigraf_db, git_repo_with_rename, monkeypatch
+        self, git_repo_with_rename
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Verified against the REAL backend: renaming a file must close the
+        old module while still creating the new module's entities, and the
+        :renamed-from/:renamed-to link must stay visible at current time --
+        it must never get folded into the old module's closed window."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_rename / "memory.graph"))
+        repo = git_repo_with_rename
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_rename), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        old_module_ident = mcp_server._code_ident("module", "old_auth.py")
-        new_module_ident = mcp_server._code_ident("module", "new_auth.py")
-        new_fn_ident = mcp_server._code_ident("function", "new_auth.py", "login")
+            old_module_ident = mcp_server._code_ident("module", "old_auth.py")
+            new_module_ident = mcp_server._code_ident("module", "new_auth.py")
+            new_fn_ident = mcp_server._code_ident("function", "new_auth.py", "login")
 
-        assert any(old_module_ident in t for t in close_triples_seen), \
-            "Old module entities must still be closed when file is renamed"
-        # :renamed-to is an open-ended fact (Fix 1): it must be transacted, NOT
-        # folded into the old module's closed valid window via _ingest_close.
-        assert not any(":renamed-to" in t for t in close_triples_seen), \
-            "Old module's close triples must NOT carry :renamed-to (it is open-ended)"
+            # Old module was open right after creation.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{old_module_ident} :ident ?x]])'
+            ) == [[old_module_ident]]
 
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert new_fn_ident in transact_calls, \
-            "New module's entities must still be created after file is renamed"
-        assert f"{new_module_ident} :renamed-from {old_module_ident}" in transact_calls, \
-            "New module's open triples must include :renamed-from pointing at the old ident"
-        assert f"{old_module_ident} :renamed-to {new_module_ident}" in transact_calls, \
-            "Old module's :renamed-to must be transacted open-ended, not closed"
+            # Old module must be closed after the rename.
+            assert results(f"(query [:find ?x :where [{old_module_ident} :ident ?x]])") == [], \
+                "Old module entities must still be closed when file is renamed"
+
+            # New module's function must be created and stay open (not closed).
+            assert results(f"(query [:find ?x :where [{new_fn_ident} :ident ?x]])") == [[new_fn_ident]], \
+                "New module's entities must still be created after file is renamed"
+
+            # :renamed-to/:renamed-from must remain visible at current time
+            # (Fix 1: open-ended, not folded into the closed window).
+            assert results(
+                f"(query [:find ?x :where [{old_module_ident} :renamed-to ?x]])"
+            ) == [[new_module_ident]], \
+                "Old module's :renamed-to must be transacted open-ended, not closed"
+            assert results(
+                f"(query [:find ?x :where [{new_module_ident} :renamed-from ?x]])"
+            ) == [[old_module_ident]], \
+                "New module's open triples must include :renamed-from pointing at the old ident"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_in_file_function_rename_links_via_rename_edges(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
+        """Verified against the REAL backend, with a pass-through spy on
+        `_db_execute` (still forwards every call to the real backend and
+        lets ingestion persist) so we can count the actual retract commands
+        issued, exactly like `test_renamed_to_is_open_ended_against_real_graph`."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7494,40 +7737,67 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename fn"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+        real_execute = mcp_server._db_execute
+        executed_cmds = []
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        def spy(db, datalog):
+            executed_cmds.append(datalog)
+            return real_execute(db, datalog)
 
-        old_fn_ident = mcp_server._code_ident("function", "auth.py", "oldName")
-        new_fn_ident = mcp_server._code_ident("function", "auth.py", "newName")
+        mcp_server._db_execute = spy
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._db_execute = real_execute
 
-        # Fix 1: :renamed-to is transacted open-ended, not folded into a close.
-        assert not any(":renamed-to" in t for t in close_triples_seen)
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert f"{new_fn_ident} :renamed-from {old_fn_ident}" in transact_calls
-        assert f"{old_fn_ident} :renamed-to {new_fn_ident}" in transact_calls
-        # Fix 4: the old ident must be closed exactly ONCE (rename loop only), not
-        # also as a plain removal — count distinct close batches carrying its :ident.
-        old_ident_close_count = sum(
-            1 for t in close_triples_seen if f"{old_fn_ident} :ident" in t
-        )
-        assert old_ident_close_count == 1, \
-            f"same-file rename should close old ident once, got {old_ident_close_count}"
+        try:
+            old_fn_ident = mcp_server._code_ident("function", "auth.py", "oldName")
+            new_fn_ident = mcp_server._code_ident("function", "auth.py", "newName")
+
+            # Fix 1: :renamed-to is transacted open-ended, never carrying :valid-to.
+            renamed_to_triple = f"{old_fn_ident} :renamed-to {new_fn_ident}"
+            renamed_to_cmds = [c for c in executed_cmds if renamed_to_triple in c]
+            assert renamed_to_cmds, ":renamed-to must be emitted against the real DB"
+            for c in renamed_to_cmds:
+                assert ":valid-to" not in c, ":renamed-to must never be closed with a :valid-to"
+
+            # Fix 4: the old ident must be closed exactly ONCE (rename loop
+            # only, not also a second time as a plain removal) -- observed as
+            # exactly one retract command against its :ident fact.
+            old_ident_retracts = [
+                c for c in executed_cmds
+                if c.strip().startswith("(retract") and f"{old_fn_ident} :ident" in c
+            ]
+            assert len(old_ident_retracts) == 1, \
+                f"same-file rename should close old ident once, got {len(old_ident_retracts)}: {old_ident_retracts}"
+
+            # Real graph reflects the rename: old closed, new open, links resolve.
+            db = mcp_server.get_db()
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            assert results(f"(query [:find ?x :where [{old_fn_ident} :ident ?x]])") == [], \
+                "Old function must be closed after in-file rename"
+            assert results(f"(query [:find ?x :where [{new_fn_ident} :ident ?x]])") == [[new_fn_ident]], \
+                "New function must be open after in-file rename"
+            assert results(f"(query [:find ?x :where [{new_fn_ident} :renamed-from ?x]])") == [[old_fn_ident]]
+            assert results(f"(query [:find ?x :where [{old_fn_ident} :renamed-to ?x]])") == [[new_fn_ident]]
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_global_rename_links_via_rename_edges_end_to_end(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
+        """Verified against the REAL backend via a pass-through `_db_execute`
+        spy, same pattern as `test_in_file_function_rename_links_via_rename_edges`."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7546,44 +7816,71 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename global"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+        real_execute = mcp_server._db_execute
+        executed_cmds = []
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        def spy(db, datalog):
+            executed_cmds.append(datalog)
+            return real_execute(db, datalog)
 
-        old_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
-        new_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_Y")
+        mcp_server._db_execute = spy
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._db_execute = real_execute
 
-        # Fix 1: :renamed-to open-ended via transact, not in the close window.
-        assert not any(":renamed-to" in t for t in close_triples_seen)
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert f"{new_ident} :renamed-from {old_ident}" in transact_calls
-        assert f"{old_ident} :renamed-to {new_ident}" in transact_calls
-        # Fix 4: the renamed old global is closed once (rename loop), not twice.
-        old_ident_close_count = sum(
-            1 for t in close_triples_seen if f"{old_ident} :ident" in t
-        )
-        assert old_ident_close_count == 1, \
-            f"same-file global rename should close old ident once, got {old_ident_close_count}"
+        try:
+            old_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_X")
+            new_ident = mcp_server._code_ident("variable", "config.py", "GLOBAL_Y")
+
+            # Fix 1: :renamed-to open-ended via transact, never with :valid-to.
+            renamed_to_triple = f"{old_ident} :renamed-to {new_ident}"
+            renamed_to_cmds = [c for c in executed_cmds if renamed_to_triple in c]
+            assert renamed_to_cmds, ":renamed-to must be emitted against the real DB"
+            for c in renamed_to_cmds:
+                assert ":valid-to" not in c, ":renamed-to must never be closed with a :valid-to"
+
+            # Fix 4: the renamed old global is closed once (rename loop), not twice.
+            old_ident_retracts = [
+                c for c in executed_cmds
+                if c.strip().startswith("(retract") and f"{old_ident} :ident" in c
+            ]
+            assert len(old_ident_retracts) == 1, \
+                f"same-file global rename should close old ident once, got {len(old_ident_retracts)}: {old_ident_retracts}"
+
+            db = mcp_server.get_db()
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            assert results(f"(query [:find ?x :where [{old_ident} :ident ?x]])") == [], \
+                "Old global must be closed after rename"
+            assert results(f"(query [:find ?x :where [{new_ident} :ident ?x]])") == [[new_ident]], \
+                "New global must be open after rename"
+            assert results(f"(query [:find ?x :where [{new_ident} :renamed-from ?x]])") == [[old_ident]]
+            assert results(f"(query [:find ?x :where [{old_ident} :renamed-to ?x]])") == [[new_ident]]
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_rename_to_unsupported_ext_closes_old_entities(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Forward -M regression, end-to-end through _run_ingestion: renaming a
         tracked .py to an unsupported .txt must close the old module AND its
         child function/global via the synthetic-delete path. Pre-fix the whole
         "R" row was dropped in _extract_commit, so nothing was ever closed and
-        the old entities leaked open forever."""
+        the old entities leaked open forever.
+
+        Verified against the REAL backend via a pass-through `_db_execute` spy
+        (real persistence) plus real bi-temporal queries: open at the add
+        commit, closed at current time."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7592,48 +7889,71 @@ class TestRunIngestionBitemporalClose:
         (repo / "auth.py").write_text("AUTH_KEY = 1234567890123\n\ndef login(x):\n    return x + 1\n")
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
         _subprocess.run(["git", "mv", "auth.py", "auth.txt"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename to txt"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+        real_execute = mcp_server._db_execute
+        executed_cmds = []
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        def spy(db, datalog):
+            executed_cmds.append(datalog)
+            return real_execute(db, datalog)
 
-        module_ident = mcp_server._code_ident("module", "auth.py")
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        var_ident = mcp_server._code_ident("variable", "auth.py", "AUTH_KEY")
+        mcp_server._db_execute = spy
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._db_execute = real_execute
 
-        assert any(":ident" in t and module_ident in t for t in close_triples_seen), \
-            "Old module must be closed when renamed to an unsupported extension"
-        assert any(":ident" in t and fn_ident in t for t in close_triples_seen), \
-            "Old function must be closed when its file is renamed to an unsupported extension"
-        assert any(":ident" in t and var_ident in t for t in close_triples_seen), \
-            "Old global must be closed when its file is renamed to an unsupported extension"
-        # No .txt module should ever be opened.
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        txt_module_ident = mcp_server._code_ident("module", "auth.txt")
-        assert txt_module_ident not in transact_calls, \
-            "No module entity should be created for the unsupported .txt path"
+        try:
+            module_ident = mcp_server._code_ident("module", "auth.py")
+            fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+            var_ident = mcp_server._code_ident("variable", "auth.py", "AUTH_KEY")
+
+            db = mcp_server.get_db()
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            for ident, label in (
+                (module_ident, "module"), (fn_ident, "function"), (var_ident, "global"),
+            ):
+                assert results(
+                    f'(query [:find ?x :valid-at "{add_ts}" :where [{ident} :ident ?x]])'
+                ) == [[ident]], f"Old {label} must have been open right after the add commit"
+                assert results(f"(query [:find ?x :where [{ident} :ident ?x]])") == [], \
+                    f"Old {label} must be closed when its file is renamed to an unsupported extension"
+
+            # No .txt module should ever be opened.
+            txt_module_ident = mcp_server._code_ident("module", "auth.txt")
+            assert not any(txt_module_ident in c for c in executed_cmds if c.strip().startswith("(transact")), \
+                "No module entity should be created for the unsupported .txt path"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_rename_from_unsupported_ext_creates_no_phantom_module(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Reverse -M regression, end-to-end: renaming an unsupported .txt into
         a tracked .py must NOT close a phantom old module (the .txt ident was
         never opened) and must NOT write a dangling :renamed-from edge. Pre-fix
         _run_ingestion's R-branch unconditionally closed :module/notes-txt and
-        wrote a :renamed-from pointing at it."""
+        wrote a :renamed-from pointing at it.
+
+        Verified against the REAL backend: since the .txt module ident was
+        never a real entity, it must have NO :ident fact at any point in time
+        -- not even right after the add commit."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7645,35 +7965,45 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "mv", "notes.txt", "notes.py"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename to py"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        old_module_ident = mcp_server._code_ident("module", "notes.txt")
-        new_module_ident = mcp_server._code_ident("module", "notes.py")
-        new_fn_ident = mcp_server._code_ident("function", "notes.py", "login")
+            old_module_ident = mcp_server._code_ident("module", "notes.txt")
+            new_module_ident = mcp_server._code_ident("module", "notes.py")
+            new_fn_ident = mcp_server._code_ident("function", "notes.py", "login")
 
-        # No phantom old module closed, no dangling rename edges either way.
-        assert not any(old_module_ident in t for t in close_triples_seen), \
-            "The never-opened .txt module must not be closed (no phantom)"
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert f"{new_module_ident} :renamed-from {old_module_ident}" not in transact_calls, \
-            "No :renamed-from edge should dangle at the never-opened .txt module"
-        assert old_module_ident not in transact_calls, \
-            "The .txt module ident must appear nowhere in transacted triples"
-        # The new .py path is still ingested normally.
-        assert new_fn_ident in transact_calls, \
-            "The new .py file's entities must still be created as a plain add"
+            # No phantom old module: it must never have had an :ident fact,
+            # not even right after the (never-ingested) add commit.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{old_module_ident} :ident ?x]])'
+            ) == [], "The never-opened .txt module must never have an :ident fact (no phantom)"
+            assert results(f"(query [:find ?x :where [{old_module_ident} :ident ?x]])") == [], \
+                "The never-opened .txt module must not be closed (no phantom)"
+
+            # No dangling :renamed-from edge either way.
+            assert results(
+                f"(query [:find ?x :where [{new_module_ident} :renamed-from ?x]])"
+            ) == [], "No :renamed-from edge should dangle at the never-opened .txt module"
+
+            # The new .py path is still ingested normally.
+            assert results(f"(query [:find ?x :where [{new_fn_ident} :ident ?x]])") == [[new_fn_ident]], \
+                "The new .py file's entities must still be created as a plain add"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_renamed_to_is_open_ended_against_real_graph(self, tmp_path):
@@ -7853,12 +8183,15 @@ class TestRunIngestionBitemporalClose:
 
     @pytest.mark.asyncio
     async def test_unchanged_global_and_field_survive_unrelated_edit(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Fix 2: an unchanged module global and class field must NOT be closed
         when a later commit only edits an unrelated function body. Pre-fix,
         current_extracted_idents omitted globals/fields, so every still-present
-        global/field looked 'removed' on any M commit and was wrongly closed."""
+        global/field looked 'removed' on any M commit and was wrongly closed.
+
+        Verified against the REAL backend: both facts must still be visible
+        in a current-time query after the unrelated edit commit."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7876,36 +8209,49 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "edit f body"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        gvar_ident = mcp_server._code_ident("variable", "x.py", "GLOBAL_CONF")
-        field_ident = mcp_server._code_ident("field", "x.py", "C.field_a")
-        assert not any(gvar_ident in t for t in close_triples_seen), \
-            "Unchanged global must NOT be closed on an unrelated function edit"
-        assert not any(field_ident in t for t in close_triples_seen), \
-            "Unchanged field must NOT be closed on an unrelated function edit"
+            gvar_ident = mcp_server._code_ident("variable", "x.py", "GLOBAL_CONF")
+            field_ident = mcp_server._code_ident("field", "x.py", "C.field_a")
+
+            # Both were open right after the add commit.
+            assert results(f'(query [:find ?x :valid-at "{add_ts}" :where [{gvar_ident} :ident ?x]])') == [[gvar_ident]]
+            assert results(f'(query [:find ?x :valid-at "{add_ts}" :where [{field_ident} :ident ?x]])') == [[field_ident]]
+
+            # Both must STILL be open (not closed) after the unrelated edit.
+            assert results(f"(query [:find ?x :where [{gvar_ident} :ident ?x]])") == [[gvar_ident]], \
+                "Unchanged global must NOT be closed on an unrelated function edit"
+            assert results(f"(query [:find ?x :where [{field_ident} :ident ?x]])") == [[field_ident]], \
+                "Unchanged field must NOT be closed on an unrelated function edit"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_file_rename_closes_unmatched_child_and_dependency(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Fix 3: when a file is renamed, child entities the matcher could not
         confirm a continuity edge for (e.g. short/ambiguous bodies) and the old
         path's :depends-on edges must still be closed as plain removals under
         the OLD path. Pre-fix only the old module was closed, leaking unmatched
-        children and dependency edges open forever alongside the new file's."""
+        children and dependency edges open forever alongside the new file's.
+
+        Verified against the REAL backend via real bi-temporal queries."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7917,48 +8263,64 @@ class TestRunIngestionBitemporalClose:
         (repo / "main.py").write_text("import dep\n\ndef go():\n    pass\n")
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
         _subprocess.run(["git", "mv", "main.py", "app.py"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename main to app"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        old_go = mcp_server._code_ident("function", "main.py", "go")
-        old_module = mcp_server._code_ident("module", "main.py")
-        dep_module = mcp_server._code_ident("module", "dep.py")
+            old_go = mcp_server._code_ident("function", "main.py", "go")
+            old_module = mcp_server._code_ident("module", "main.py")
+            dep_module = mcp_server._code_ident("module", "dep.py")
+            new_module = mcp_server._code_ident("module", "app.py")
 
-        # Unmatched old child closed as a PLAIN removal (no :renamed-to linkage).
-        assert any(f"{old_go} :ident" in t for t in close_triples_seen), \
-            "Unmatched old child function must be closed under the old path"
-        assert not any("renamed-to" in t and old_go in t for t in close_triples_seen), \
-            "Unmatched child has no continuity edge — must not get a :renamed-to"
-        # Old path's surviving dependency edge is closed too.
-        assert any(
-            f"{old_module} :depends-on {dep_module}" in t for t in close_triples_seen
-        ), "Old path's :depends-on edge must be closed on file rename"
-        # The new file is still ingested.
-        transact_calls = " ".join(str(c) for c in db_instance.execute.call_args_list)
-        assert mcp_server._code_ident("module", "app.py") + " :entity-type" in transact_calls, \
-            "New renamed file's module must still be created"
+            # Unmatched old child was open right after add, then closed as a
+            # PLAIN removal (no :renamed-to linkage) after the rename.
+            assert results(f'(query [:find ?x :valid-at "{add_ts}" :where [{old_go} :ident ?x]])') == [[old_go]]
+            assert results(f"(query [:find ?x :where [{old_go} :ident ?x]])") == [], \
+                "Unmatched old child function must be closed under the old path"
+            assert results(f"(query [:find ?x :where [{old_go} :renamed-to ?x]])") == [], \
+                "Unmatched child has no continuity edge — must not get a :renamed-to"
+
+            # Old path's surviving dependency edge is closed too.
+            assert results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{old_module} :depends-on ?x]])'
+            ) == [[dep_module]]
+            assert results(f"(query [:find ?x :where [{old_module} :depends-on ?x]])") == [], \
+                "Old path's :depends-on edge must be closed on file rename"
+
+            # The new file is still ingested.
+            assert results(f"(query [:find ?x :where [{new_module} :ident ?x]])") == [[new_module]], \
+                "New renamed file's module must still be created"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_same_file_rename_closes_old_ident_exactly_once(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """Fix 4: an in-place rename must close the old ident exactly once (via
         the renamed_pairs loop, with :renamed-to linkage) — not also a second
-        time as a plain removal from the M-status removal detector."""
+        time as a plain removal from the M-status removal detector.
+
+        Verified against the REAL backend, with a pass-through `_db_execute`
+        spy so we can count the actual retract commands issued, same pattern
+        as `test_in_file_function_rename_links_via_rename_edges`."""
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -7971,28 +8333,51 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "rename fn"], cwd=repo, check=True, capture_output=True)
 
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
-        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
 
-        close_triples_seen = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+        real_execute = mcp_server._db_execute
+        executed_cmds = []
 
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        def spy(db, datalog):
+            executed_cmds.append(datalog)
+            return real_execute(db, datalog)
 
-        old_fn = mcp_server._code_ident("function", "auth.py", "oldName")
-        close_count = sum(1 for t in close_triples_seen if f"{old_fn} :ident" in t)
-        assert close_count == 1, \
-            f"same-file rename must close old ident exactly once, got {close_count}"
-        new_fn = mcp_server._code_ident("function", "auth.py", "newName")
-        assert any(f"{old_fn} :renamed-to {new_fn}" in t for t in
-                   [c for call in db_instance.execute.call_args_list for c in [str(call)]]), \
-            "the single close path must be the rename path (with :renamed-to linkage)"
+        mcp_server._db_execute = spy
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._db_execute = real_execute
+
+        try:
+            old_fn = mcp_server._code_ident("function", "auth.py", "oldName")
+            new_fn = mcp_server._code_ident("function", "auth.py", "newName")
+
+            old_ident_retracts = [
+                c for c in executed_cmds
+                if c.strip().startswith("(retract") and f"{old_fn} :ident" in c
+            ]
+            assert len(old_ident_retracts) == 1, \
+                f"same-file rename must close old ident exactly once, got {len(old_ident_retracts)}: {old_ident_retracts}"
+
+            renamed_to_triple = f"{old_fn} :renamed-to {new_fn}"
+            assert any(renamed_to_triple in c for c in executed_cmds), \
+                "the single close path must be the rename path (with :renamed-to linkage)"
+
+            db = mcp_server.get_db()
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            assert results(f"(query [:find ?x :where [{old_fn} :ident ?x]])") == [], \
+                "Old function must be closed after same-file rename"
+            assert results(f"(query [:find ?x :where [{new_fn} :ident ?x]])") == [[new_fn]], \
+                "New function must be open after same-file rename"
+        finally:
+            mcp_server._db = None
 
 
 # ---------------------------------------------------------------------------
@@ -8031,6 +8416,7 @@ def git_repo_with_dep_removal(tmp_path):
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "add modules with dep"], cwd=repo, check=True, capture_output=True)
 
+    time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
     (repo / "mod_a.py").write_text("def main(): pass\n")
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "remove import"], cwd=repo, check=True, capture_output=True)
@@ -8100,65 +8486,94 @@ class TestRunIngestionBitemporalDeps:
 
     @pytest.mark.asyncio
     async def test_new_import_writes_depends_on_via_ingest_transact(
-        self, mock_minigraf_db, git_repo_with_deps, monkeypatch
+        self, git_repo_with_deps
     ):
-        """Adding a file with an import must call _ingest_transact with a :depends-on triple
-        using the git commit timestamp."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Adding a file with an import must write a :depends-on triple whose
+        :valid-from is the git commit timestamp.
+
+        Verified against the REAL backend: the edge must be open both right
+        after the add commit (:valid-at) and at current time."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_deps / "memory.graph"))
+        repo = git_repo_with_deps
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        transact_calls: list = []
-        real_ingest_transact = mcp_server._ingest_transact
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        def capture_transact(db, triples, ts_iso, reason=""):
-            transact_calls.extend(triples)
-            return real_ingest_transact(db, triples, ts_iso, reason)
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+            mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
+            # mod_b.py genuinely exists in file_entities, so the generalized
+            # tiered matcher (Task 12) resolves "mod_b" to the real internal
+            # module via the basename tier, instead of the old Rust-only fallback.
+            mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
 
-        await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
-
-        mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
-        # mod_b.py genuinely exists in file_entities, so the generalized
-        # tiered matcher (Task 12) now resolves "mod_b" to the real internal
-        # module via the basename tier, instead of the old Rust-only fallback.
-        mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
-        dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
-        assert any(dep_triple in t for t in transact_calls), (
-            f"Expected _ingest_transact to be called with '{dep_triple}' during commit loop, "
-            f"got: {transact_calls}"
-        )
+            at_add = results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{mod_a_ident} :depends-on ?x]])'
+            )
+            assert at_add == [[mod_b_resolved]], (
+                f"Expected {mod_a_ident} :depends-on {mod_b_resolved} to be open "
+                f"right after the add commit, got: {at_add}"
+            )
+            current = results(f"(query [:find ?x :where [{mod_a_ident} :depends-on ?x]])")
+            assert current == [[mod_b_resolved]], (
+                f"Expected the :depends-on edge to still be open at current time, got: {current}"
+            )
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_removed_import_closes_depends_on_edge(
-        self, mock_minigraf_db, git_repo_with_dep_removal, monkeypatch
+        self, git_repo_with_dep_removal
     ):
-        """Removing an import in a modified file must call _ingest_close with the
-        :depends-on triple so the edge gets a :valid-to bound."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+        """Removing an import in a modified file must close the :depends-on
+        edge with a :valid-to bound.
+
+        Verified against the REAL backend: the edge must be open at the add
+        commit and closed (invisible) at current time, after the removal commit."""
         import mcp_server
-        mcp_server.open_db(str(git_repo_with_dep_removal / "memory.graph"))
+        repo = git_repo_with_dep_removal
+        commits = mcp_server._git_commits(str(repo), None)
+        add_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        close_triples_seen: list = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
 
-        await mcp_server._run_ingestion(str(git_repo_with_dep_removal), "HEAD")
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
 
-        mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
-        mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
-        dep_triple = f"{mod_a_ident} :depends-on {mod_b_resolved}"
-        assert any(dep_triple in t for t in close_triples_seen), (
-            f"Expected _ingest_close to be called with '{dep_triple}' when import removed, "
-            f"got: {close_triples_seen}"
-        )
+            mod_a_ident = mcp_server._code_ident("module", "mod_a.py")
+            mod_b_resolved = mcp_server._code_ident("module", "mod_b.py")
+
+            at_add = results(
+                f'(query [:find ?x :valid-at "{add_ts}" :where [{mod_a_ident} :depends-on ?x]])'
+            )
+            assert at_add == [[mod_b_resolved]], \
+                f"Expected the :depends-on edge to be open right after the add commit, got: {at_add}"
+
+            current = results(f"(query [:find ?x :where [{mod_a_ident} :depends-on ?x]])")
+            assert current == [], (
+                f"Expected the :depends-on edge to be closed (:valid-to bound) after the "
+                f"import was removed, got: {current}"
+            )
+        finally:
+            mcp_server._db = None
 
 
 class TestUnresolvedImportTagging:
@@ -8174,9 +8589,7 @@ class TestUnresolvedImportTagging:
         assert is_resolved is False
 
     @pytest.mark.asyncio
-    async def test_unresolved_import_gets_tagged_external_dependency(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_unresolved_import_gets_tagged_external_dependency(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8187,6 +8600,8 @@ class TestUnresolvedImportTagging:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -8198,16 +8613,27 @@ class TestUnresolvedImportTagging:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        tokio_ident = mcp_server._canonical_ident("module", "tokio")
-        assert any(f"[{tokio_ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
-        assert any(f'[{tokio_ident} :description "tokio"]' in t for t in transact_calls)
+            tokio_ident = mcp_server._canonical_ident("module", "tokio")
+            assert any(f"[{tokio_ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
+            assert any(f'[{tokio_ident} :description "tokio"]' in t for t in transact_calls)
+
+            # Verified against the REAL backend: the tag actually persisted,
+            # not just that a matching triple string was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{tokio_ident} :entity-type ?x]])")
+            ).get("results", [])
+            assert results == [[":type/external-dependency"]], \
+                "tokio's external-dependency tag must be queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
-    async def test_unresolved_relative_import_not_tagged_external_end_to_end(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_unresolved_relative_import_not_tagged_external_end_to_end(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8218,6 +8644,8 @@ class TestUnresolvedImportTagging:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
 
@@ -8229,12 +8657,25 @@ class TestUnresolvedImportTagging:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        missing_ident = mcp_server._canonical_ident("module", "./missing")
-        assert not any(
-            f"[{missing_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
-        )
+            missing_ident = mcp_server._canonical_ident("module", "./missing")
+            assert not any(
+                f"[{missing_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
+            )
+
+            # Verified against the REAL backend: nothing under the relative
+            # import's ident is queryable as an external-dependency.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{missing_ident} :entity-type ?x]])")
+            ).get("results", [])
+            assert results == [], \
+                "unresolved relative import must not be queryable as an entity at all"
+        finally:
+            mcp_server._db = None
 
 
 class TestGitIngestionPathIgnore:
@@ -8243,12 +8684,10 @@ class TestGitIngestionPathIgnore:
 
     @pytest.mark.asyncio
     async def test_default_ignored_directory_produces_no_code_entities(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch
     ):
         """A file under a default-ignored directory (vendor/) must not produce
         any :type/module, :type/function, or :type/class triples."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8260,6 +8699,8 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add vendored lib"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -8271,16 +8712,32 @@ class TestGitIngestionPathIgnore:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        vendored_module_ident = mcp_server._code_ident("module", "vendor/lib.py")
-        assert not any(vendored_module_ident in t for t in transact_calls)
-        assert not any(":entity-type :type/function" in t for t in transact_calls)
-        assert not any(":entity-type :type/class" in t for t in transact_calls)
+            vendored_module_ident = mcp_server._code_ident("module", "vendor/lib.py")
+            assert not any(vendored_module_ident in t for t in transact_calls)
+            assert not any(":entity-type :type/function" in t for t in transact_calls)
+            assert not any(":entity-type :type/class" in t for t in transact_calls)
+
+            # Verified against the REAL backend: nothing under vendor/ is
+            # queryable at all, not just that no matching triple was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            module_results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{vendored_module_ident} :ident ?x]])")
+            ).get("results", [])
+            assert module_results == [], "vendored module must not be queryable against the real graph"
+            func_results = json.loads(
+                real_execute(db, "(query [:find ?e :where [?e :entity-type :type/function]])")
+            ).get("results", [])
+            assert func_results == [], "no function entities should exist under the ignored vendor/ directory"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_import_into_ignored_path_becomes_external_dependency(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch
     ):
         """Before this feature, vendor/foo.py would resolve as a normal in-tree
         module (see _resolve_module_import's segment-suffix matcher) and
@@ -8288,8 +8745,6 @@ class TestGitIngestionPathIgnore:
         an external-dependency entity. Excluding vendor/ from known_files must
         make it fall through to the same fallback used for real external
         packages (see TestUnresolvedImportTagging)."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8302,6 +8757,8 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add vendor and main"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -8313,22 +8770,33 @@ class TestGitIngestionPathIgnore:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        external_ident = mcp_server._canonical_ident("module", "vendor.foo")
-        assert any(
-            f"[{external_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
-        )
+            external_ident = mcp_server._canonical_ident("module", "vendor.foo")
+            assert any(
+                f"[{external_ident} :entity-type :type/external-dependency]" in t for t in transact_calls
+            )
+
+            # Verified against the REAL backend: the external-dependency tag
+            # actually persisted, not just that a matching triple was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{external_ident} :entity-type ?x]])")
+            ).get("results", [])
+            assert results == [[":type/external-dependency"]], \
+                "vendor.foo's external-dependency tag must be queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_env_var_ignore_pattern_excludes_custom_directory(
-        self, mock_minigraf_db, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch
     ):
         """MINIGRAF_INGEST_IGNORE must add to the default ignore list, not
         replace it — a custom pattern not in the built-in defaults must still
         be honored."""
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8341,6 +8809,8 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "commit", "-m", "add generated file"], cwd=repo, check=True, capture_output=True)
 
         monkeypatch.setenv("MINIGRAF_INGEST_IGNORE", "generated/")
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -8352,10 +8822,22 @@ class TestGitIngestionPathIgnore:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        generated_module_ident = mcp_server._code_ident("module", "generated/codegen.py")
-        assert not any(generated_module_ident in t for t in transact_calls)
+            generated_module_ident = mcp_server._code_ident("module", "generated/codegen.py")
+            assert not any(generated_module_ident in t for t in transact_calls)
+
+            # Verified against the REAL backend: nothing under generated/ is
+            # queryable at all, not just that no matching triple was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{generated_module_ident} :ident ?x]])")
+            ).get("results", [])
+            assert results == [], "generated/ module must not be queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
 
 class TestResolveModuleImportTieredMatcher:
@@ -8502,11 +8984,14 @@ def git_repo_with_future_dep(tmp_path):
 class TestPerCommitAccurateImportResolution:
     @pytest.mark.asyncio
     async def test_import_of_not_yet_existing_file_tagged_external_at_introduction(
-        self, mock_minigraf_db, git_repo_with_future_dep, monkeypatch
+        self, git_repo_with_future_dep, monkeypatch
     ):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
         import mcp_server
+        commits = mcp_server._git_commits(str(git_repo_with_future_dep), None)
+        commit1_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo_with_future_dep / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None,
@@ -8520,17 +9005,35 @@ class TestPerCommitAccurateImportResolution:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(git_repo_with_future_dep), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(git_repo_with_future_dep), "HEAD")
 
-        mod_b_external_ident = mcp_server._canonical_ident("module", "mod_b")
-        assert any(
-            f"[{mod_b_external_ident} :entity-type :type/external-dependency]" in t
-            for t in transact_calls
-        ), (
-            "mod_b.py did not exist yet at commit 1, so resolving mod_a's import "
-            "must use commit 1's own tree and tag it external — not silently "
-            "resolve against HEAD's tree, where mod_b.py exists by the end."
-        )
+            mod_b_external_ident = mcp_server._canonical_ident("module", "mod_b")
+            assert any(
+                f"[{mod_b_external_ident} :entity-type :type/external-dependency]" in t
+                for t in transact_calls
+            ), (
+                "mod_b.py did not exist yet at commit 1, so resolving mod_a's import "
+                "must use commit 1's own tree and tag it external — not silently "
+                "resolve against HEAD's tree, where mod_b.py exists by the end."
+            )
+
+            # Verified against the REAL backend: at commit 1's own timestamp,
+            # mod_b was actually queryable as an external-dependency, not just
+            # that a matching triple string was captured.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(
+                    db,
+                    f'(query [:find ?x :valid-at "{commit1_ts}" '
+                    f':where [{mod_b_external_ident} :entity-type ?x]])',
+                )
+            ).get("results", [])
+            assert results == [[":type/external-dependency"]], \
+                "mod_b must be queryable as external-dependency at commit 1's timestamp"
+        finally:
+            mcp_server._db = None
 
 
 class TestResolveModuleImportRelative:
@@ -8619,9 +9122,7 @@ class TestRunIngestionGitlinks:
         return sub_hash
 
     @pytest.mark.asyncio
-    async def test_submodule_add_creates_external_dependency_entity(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_submodule_add_creates_external_dependency_entity(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8630,6 +9131,8 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         sub_hash = self._add_submodule_commit(repo)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
@@ -8641,18 +9144,33 @@ class TestRunIngestionGitlinks:
             return real_ingest_transact(db, triples, ts_iso, reason)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        ident = mcp_server._code_ident("module", "vendor/lib")
-        assert any(f"[{ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
-        assert any(f'[{ident} :pinned-commit "{sub_hash}"]' in t for t in transact_calls)
-        assert any(f'[{ident} :submodule-name "lib"]' in t for t in transact_calls)
-        assert any(f'[{ident} :submodule-url "https://example.com/lib.git"]' in t for t in transact_calls)
+            ident = mcp_server._code_ident("module", "vendor/lib")
+            assert any(f"[{ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
+            assert any(f'[{ident} :pinned-commit "{sub_hash}"]' in t for t in transact_calls)
+            assert any(f'[{ident} :submodule-name "lib"]' in t for t in transact_calls)
+            assert any(f'[{ident} :submodule-url "https://example.com/lib.git"]' in t for t in transact_calls)
+
+            # Verified against the REAL backend, same count() pattern as
+            # test_submodule_removal_closes_entity_type_and_path_against_real_graph.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+
+            def count(attr, value):
+                raw = real_execute(db, f"(query [:find ?e :where [?e {attr} {value}]])")
+                return len(json.loads(raw).get("results", []))
+
+            assert count(":pinned-commit", f'"{sub_hash}"') == 1, \
+                "submodule's pinned-commit must be queryable against the real graph"
+            assert count(":submodule-name", '"lib"') == 1, \
+                "submodule's name must be queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
-    async def test_submodule_bump_closes_old_pinned_commit(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_submodule_bump_closes_old_pinned_commit(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8660,6 +9178,7 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         first_sha = self._add_submodule_commit(repo)
+        time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
 
         sub_dir = tmp_path / f"{repo.name}-sub"
         _subprocess.run(["git", "-C", str(sub_dir), "commit", "--allow-empty", "-m", "bump"], check=True, capture_output=True)
@@ -8672,23 +9191,51 @@ class TestRunIngestionGitlinks:
         )
         _subprocess.run(["git", "commit", "-m", "bump submodule"], cwd=repo, check=True, capture_output=True)
 
+        commits = mcp_server._git_commits(str(repo), None)
+        first_commit_ts = commits[0][1]
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
         close_triples_seen: list = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        real_ingest_close = mcp_server._ingest_close
 
-        ident = mcp_server._code_ident("module", "vendor/lib")
-        assert any(f'[{ident} :pinned-commit "{first_sha}"]' in t for t in close_triples_seen)
+        def capture_close(db, triples, orig_ts, commit_ts, reason=""):
+            close_triples_seen.extend(triples)
+            return real_ingest_close(db, triples, orig_ts, commit_ts, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_close", capture_close)
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+
+            ident = mcp_server._code_ident("module", "vendor/lib")
+            assert any(f'[{ident} :pinned-commit "{first_sha}"]' in t for t in close_triples_seen)
+
+            # Verified against the REAL backend via real bi-temporal queries:
+            # the old pinned-commit was open right after the add commit, then
+            # closed (no longer current) after the bump — replaced by the new sha.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+
+            def results(query):
+                return json.loads(real_execute(db, query)).get("results", [])
+
+            assert results(
+                f'(query [:find ?x :valid-at "{first_commit_ts}" :where [{ident} :pinned-commit ?x]])'
+            ) == [[first_sha]], "old pinned-commit must have been open right after the submodule add"
+            assert results(
+                f'(query [:find ?x :where [{ident} :pinned-commit "{first_sha}"]])'
+            ) == [], "old pinned-commit must be closed (not current) after the bump"
+            assert results(
+                f"(query [:find ?x :where [{ident} :pinned-commit ?x]])"
+            ) == [[second_sha]], "current pinned-commit must reflect the bumped submodule sha"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
-    async def test_submodule_removal_closes_entity(self, mock_minigraf_db, tmp_path, monkeypatch):
-        mock_class, db_instance = mock_minigraf_db
-        db_instance.execute.return_value = json.dumps({"results": []})
+    async def test_submodule_removal_closes_entity(self, tmp_path, monkeypatch):
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -8700,18 +9247,36 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "rm", "-f", "vendor/lib"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "remove submodule"], cwd=repo, check=True, capture_output=True)
 
+        mcp_server._db = None
+        mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
 
         close_triples_seen: list = []
-        monkeypatch.setattr(
-            mcp_server, "_ingest_close",
-            lambda db, triples, orig_ts, commit_ts, reason: close_triples_seen.extend(triples),
-        )
-        await mcp_server._run_ingestion(str(repo), "HEAD")
+        real_ingest_close = mcp_server._ingest_close
 
-        ident = mcp_server._code_ident("module", "vendor/lib")
-        assert any(f'[{ident} :ident "{ident}"]' in t for t in close_triples_seen)
+        def capture_close(db, triples, orig_ts, commit_ts, reason=""):
+            close_triples_seen.extend(triples)
+            return real_ingest_close(db, triples, orig_ts, commit_ts, reason)
+
+        monkeypatch.setattr(mcp_server, "_ingest_close", capture_close)
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+
+            ident = mcp_server._code_ident("module", "vendor/lib")
+            assert any(f'[{ident} :ident "{ident}"]' in t for t in close_triples_seen)
+
+            # Verified against the REAL backend: the removed submodule's
+            # :ident is actually closed, not just captured in a close triple.
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, f"(query [:find ?x :where [{ident} :ident ?x]])")
+            ).get("results", [])
+            assert results == [], \
+                "removed submodule's :ident must be closed and no longer queryable against the real graph"
+        finally:
+            mcp_server._db = None
 
     @pytest.mark.asyncio
     async def test_submodule_removal_closes_entity_type_and_path_against_real_graph(self, tmp_path):

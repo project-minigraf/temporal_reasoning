@@ -21,6 +21,7 @@ result = query("[:find ?d :where [?e :decision/description ?d]]")
 - `minigraf.py` - Python wrapper for direct use outside MCP
 - `SKILL.md` - Skill definition with all query syntax
 - `install.py` - Setup script (runs weekly updates)
+- `docs/testing-conventions.md` - Real-backend-only test conventions for `tests/test_mcp_server.py`
 - `hooks/claude-code.json` - Claude Code MCP + auto-memory hook config
 
 ## Graph Storage

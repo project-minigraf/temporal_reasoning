@@ -5369,11 +5369,27 @@ def _preload_known_deps(
     }
 
     try:
+        # Bind the source module's :ident object (the canonical ":module/…"
+        # string _code_ident produces), not the bare ?src subject variable —
+        # minigraf returns an internal UUID for a subject in find position,
+        # which would never match ident_to_file's ident-string keys. This
+        # mirrors _preload_known_entities/_preload_field_class_idents.
+        #
+        # The [?src :ident ?srci] clause must precede [?src :depends-on ?dep]
+        # in clause order: minigraf's :db/valid-from/:db/valid-to pseudo-
+        # attributes bind to whichever EAV clause on ?src most recently
+        # precedes them, so putting :ident after :depends-on would make ?vf
+        # bind to the :depends-on fact's valid-from (unaffected here) but
+        # putting it *between* :depends-on and :db/valid-from would instead
+        # make ?vf bind to the :ident fact's own valid-from — wrong. Keeping
+        # :ident first and :depends-on immediately before the two pseudo-
+        # attribute clauses preserves the correct binding.
         raw = _db_execute(
             db,
-            "(query [:find ?src ?dep ?vf "
+            "(query [:find ?srci ?dep ?vf "
             ":any-valid-time "
-            ":where [?src :depends-on ?dep] "
+            ":where [?src :ident ?srci] "
+            "[?src :depends-on ?dep] "
             "[?src :db/valid-from ?vf] "
             "[?src :db/valid-to ?vt] "
             f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
@@ -5411,11 +5427,18 @@ def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
     """
     pinned: Dict[str, tuple] = {}
     try:
+        # Bind the entity's :ident object, not the bare ?e subject variable —
+        # same UUID-vs-ident pitfall _preload_known_deps guards against.
+        # [?e :ident ?ei] must precede [?e :pinned-commit ?sha] so that the
+        # :db/valid-from/:db/valid-to pseudo-attributes (which bind to
+        # whichever EAV clause on ?e most recently precedes them) continue
+        # to bind to the :pinned-commit fact, not the :ident fact.
         raw = _db_execute(
             db,
-            "(query [:find ?e ?sha ?vf "
+            "(query [:find ?ei ?sha ?vf "
             ":any-valid-time "
-            ":where [?e :pinned-commit ?sha] "
+            ":where [?e :ident ?ei] "
+            "[?e :pinned-commit ?sha] "
             "[?e :db/valid-from ?vf] "
             "[?e :db/valid-to ?vt] "
             f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
