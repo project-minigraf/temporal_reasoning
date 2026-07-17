@@ -133,11 +133,16 @@ def query_facts(path: str, text: str, top_n: int, boost: float) -> List[List[str
         return []
     con = open_reader(path)
     try:
+        # No LIMIT here: FTS5 MATCH already bounds the result set to rows
+        # containing at least one OR'd query token (not a full-corpus scan),
+        # and the memory-fact boost below needs to see every matching row --
+        # a fact whose *unboosted* bm25 rank falls outside a pre-boost LIMIT
+        # window would never get a chance to be promoted by the boost.
         rows = con.execute(
             "SELECT entity, attribute, value, bm25(facts_fts) AS score "
             "FROM facts_fts WHERE facts_fts MATCH ? "
-            "ORDER BY score ASC LIMIT ?",
-            (match_expr, top_n * 4),  # over-fetch before boost re-sort, trimmed below
+            "ORDER BY score ASC",
+            (match_expr,),
         ).fetchall()
     finally:
         con.close()

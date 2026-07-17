@@ -166,3 +166,33 @@ def test_query_facts_missing_index_raises():
     import pytest
     with pytest.raises(sqlite3.OperationalError):
         fact_index.query_facts("/nonexistent/does-not-exist.sqlite3", "anything", top_n=10, boost=2.0)
+
+
+def test_query_facts_boost_surfaces_fact_outside_old_limit_window(tmp_path):
+    """Review-finding regression test: a previous implementation applied
+    `LIMIT top_n * 4` to the raw (pre-boost) SQL query, then boosted and
+    re-sorted only that pre-fetched window in Python. A :decision/-prefixed
+    fact whose *unboosted* bm25 rank fell outside that window was silently
+    dropped before the boost ever got a chance to promote it -- not merely
+    ranked lower, but entirely absent from the results.
+
+    Here 15 non-memory facts all score strongly (short text, high term
+    frequency for both query tokens) and rank ahead of one :decision/-prefixed
+    fact whose match is diluted by 40 filler tokens (weak raw bm25 score).
+    With top_n=3, the old `LIMIT top_n * 4` (12) would fetch only the 12
+    strongest noise facts and never even see the decision fact. A large
+    boost (5.0) applied to the buried fact's true (weak) raw score is more
+    than enough to beat every noise fact's raw score once it IS considered
+    -- proving the fix fetches the full matching set before boosting."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    triples = [
+        (f":function/noise{i}", ":name", "redis caching redis caching") for i in range(15)
+    ]
+    decision_text = "redis caching " + " ".join(f"filler{i}" for i in range(40))
+    triples.append((":decision/buried", ":description", decision_text))
+    fact_index.insert_facts(con, triples)
+    fact_index.close_writer(con)
+    results = fact_index.query_facts(path, "redis caching", top_n=3, boost=5.0)
+    entities = [row[0] for row in results]
+    assert ":decision/buried" in entities
