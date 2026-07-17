@@ -129,15 +129,40 @@ today's one-document-per-fact-row `FactIndex`.
 ### Write path — the choke point
 
 Every write to the graph must also update the index, incrementally, so the
-index never drifts and never needs a rescan under normal operation. Today
-there are roughly ten call sites that build `f'(transact ...)'` / `f'(retract
-...)'` Datalog strings and call `_db_execute` directly: `_ingest_transact`
-(git ingestion, per-commit), `handle_minigraf_transact`,
-`handle_minigraf_retract`, `_build_close_triples`'s bounded re-transact,
-watermark/tag/last-run-at bookkeeping writes, and the conversational-memory
-extraction path (`_transact_extracted_facts` and friends).
+index never drifts and never needs a rescan under normal operation. An
+exhaustive grep of every raw `_db_execute(db, ...)` call building a
+`(transact ...)` or `(retract ...)` Datalog string (quote-agnostic, so it
+catches both `f"..."` and `f'...'` call sites, and cross-checked against
+manual reads for calls whose Datalog string spans multiple lines) turned up
+exactly **11** call sites — 8 transact, 3 retract:
 
-All of these are migrated to two new choke-point functions:
+Transact:
+1. `handle_minigraf_transact` (interactive tool)
+2. `_ingest_transact` (git ingestion, per-commit code-structure facts)
+3. `_ingest_close`'s bounded re-transact (`valid_from` **and** `valid_to`
+   both set — the historical-record half of closing an entity)
+4. `_watermark_update`'s write of the new watermark hash
+5. `_last_run_write` (ingestion completion bookkeeping)
+6. `_transact_extracted_facts` (heuristic-extracted memory facts)
+7. `_agent_extract_and_transact` (LLM/agent-extracted memory facts — a
+   distinct raw call, not routed through `_transact_extracted_facts`)
+8. `_ingest_tags` (git tag ingestion)
+
+Retract:
+1. `handle_minigraf_retract` (interactive tool)
+2. `_ingest_close`'s retract-loop — retracts each open-ended assertion
+   one-by-one before the bounded re-transact above. **This is the actual
+   mechanism that removes a closed entity/field/class/module's facts from
+   the live index** — easy to miss because it's a plain `for` triple in a
+   `try/except`, four lines above the more visible bounded-transact call in
+   the same function. (An earlier draft of this doc named `_build_close_
+   triples` here, which is wrong — that function is pure/no-DB-write
+   precomputation, per its own docstring; `_ingest_close` is what actually
+   executes against the database.)
+3. `_watermark_update`'s retract of the *previous* watermark hash, before
+   writing the new one
+
+All 11 are migrated to two new choke-point functions:
 
 ```python
 def _transact(db, triples: List[List], valid_from: str,
@@ -156,10 +181,14 @@ one write site that was missed.
 **Bi-temporal rule for what's "live":** only `valid_to=None` (open-ended)
 transacts are inserted into `facts_fts`. This is the current-valid snapshot
 the index represents — exactly what `IndexCache._rebuild`'s `:valid-at now`
-query returns today. `_build_close_triples`'s bounded re-transact step
+query returns today. `_ingest_close`'s bounded re-transact step
 (`valid_from` **and** `valid_to` both set, writing history after a close) is
 deliberately **not** inserted — it's historical, never part of the
-currently-valid snapshot. `_retract` deletes the corresponding row outright.
+currently-valid snapshot. Concretely, closing an entity nets out to: the
+retract-loop deletes the row for the open-ended assertion (via `_retract`),
+and the paired bounded re-transact never re-adds it (via the `valid_to`
+check in `_transact`) — so a closed entity's facts are absent from
+`facts_fts` after both steps run, with no window where a stale row survives.
 This preserves today's semantics exactly; no historical-query capability is
 introduced.
 
@@ -293,9 +322,13 @@ fast unit tests, a real `tmp_path` file for persistence/cross-process tests)
   `facts_fts` table populated via `_transact` (not the old broken rescan
   path).
 - **Bi-temporal scope test**: assert a bounded (`valid_to` set) re-transact
-  from `_build_close_triples` does *not* appear in `facts_fts`, while the
-  original open-ended assertion it replaces is removed by the paired
-  `_retract`.
+  from `_ingest_close` does *not* appear in `facts_fts`, while the original
+  open-ended assertion it replaces is removed by the paired retract-loop
+  call. This is the test that directly targets the gap this design doc
+  itself had until review: `_ingest_close` makes two separate `_db_execute`
+  calls (retract-loop, then bounded re-transact), and both must be migrated
+  to the choke point for a closed entity to actually disappear from the
+  index.
 - **Backfill test**: delete the index file, confirm the next query triggers
   a full rebuild that reproduces the same rows an incrementally-built index
   would have.
