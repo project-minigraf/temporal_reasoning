@@ -1,6 +1,18 @@
 """Unit tests for mcp_server.py.
 
-All tests mock MiniGrafDb so no live minigraf install is required.
+All tests use a real minigraf backend — the `real_db` fixture opens a genuine
+MiniGrafDb.open_in_memory() instance, so every test exercises real Datalog
+parsing, schema validation, and bi-temporal semantics. A handful of
+multi-commit git-ingestion tests use a real file-backed MiniGrafDb.open()
+instead of `real_db`, since they need the graph to persist across separate
+ingestion runs against the same path. A narrow exception: the DB lock-retry
+cluster (TestGetDbLockRetry, TestTryOpenWithSelfHealReuse,
+TestOpenDbAtWithExtendedRetry) uses real file-backed MiniGrafDb.open() with
+genuine subprocess-manufactured lock contention, since locking is inherently
+file-based. External, non-minigraf network APIs (LLM provider clients,
+GitHub via the report_issue module) still get mocked to avoid real API
+cost/network/non-determinism in CI — see docs/testing-conventions.md for the
+full rationale and pattern reference.
 """
 import asyncio
 import contextlib
@@ -38,16 +50,6 @@ def reset_mcp_server_db():
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
     mcp_server._index_cache = mcp_server.IndexCache()
-
-
-@pytest.fixture
-def mock_minigraf_db():
-    """Mock MiniGrafDb class and instance."""
-    with patch("mcp_server.MiniGrafDb") as mock_class:
-        db_instance = MagicMock()
-        db_instance.execute.return_value = json.dumps({"results": []})
-        mock_class.open.return_value = db_instance
-        yield mock_class, db_instance
 
 
 @pytest.fixture
@@ -437,13 +439,10 @@ class TestGetDbConcurrentResetRace:
         import sys as _sys
         import threading
         import mcp_server
+        from minigraf import MiniGrafDb
 
-        class FakeDb:
-            def execute(self, datalog):
-                return json.dumps({"results": []})
-
-        fake_db = FakeDb()
-        mcp_server._db = fake_db
+        real_db = MiniGrafDb.open_in_memory()
+        mcp_server._db = real_db
 
         target_code = mcp_server.get_db.__code__
         src_lines, start_line = inspect.getsourcelines(mcp_server.get_db)
@@ -482,7 +481,7 @@ class TestGetDbConcurrentResetRace:
         finally:
             t.join(timeout=2)
 
-        assert outcome.get("db") is fake_db, (
+        assert outcome.get("db") is real_db, (
             "get_db() returned a stale/None value after a concurrent reset "
             "of the global between its None-check and its return (#122)"
         )
@@ -6079,7 +6078,7 @@ class TestRunIngestion:
         `git log` walk here would hold the lock for its entire duration
         unless `db` is explicitly dropped.
 
-        No real_db/mock_minigraf_db fixture here — this test's whole point
+        No real_db fixture here — this test's whole point
         is CPython refcounting on the DB handle object itself, so it needs a
         deliberately lightweight, non-mock handle. real_db's actual FFI
         object carries its own internal cross-references that would pollute
@@ -6188,8 +6187,8 @@ class TestRunIngestion:
     async def test_skips_when_live_holder_present(self, git_repo, tmp_path, monkeypatch):
         """_live_lock_holder_pid is monkeypatched directly and the skip path
         returns before any DB is ever opened, so no DB fixture is needed —
-        the original test only ever imported mock_minigraf_db incidentally,
-        never using its MagicMock instance."""
+        the original test only ever received the mocked DB fixture
+        incidentally, never using its mock instance."""
         import mcp_server
         mcp_server._ingest_task = None
         mcp_server._graph_path = str(tmp_path / "t.graph")
@@ -7115,8 +7114,9 @@ class TestMemoryPrepareTurnBM25:
         # _is_memory == [False, False]. This assertion therefore exercises
         # natural BM25 relevance ranking (decision text scores higher than
         # commit text for this query on doc-length/term-frequency grounds
-        # alone), not the boost path — see task-12-report.md for the full
-        # writeup of this pre-existing bug.
+        # alone), not the boost path — see
+        # https://github.com/project-minigraf/temporal_reasoning/issues/141
+        # for the full writeup of this pre-existing bug.
         real_db.execute(
             '(transact {} ['
             '[:decision/use-redis :description "use redis for caching"] '
