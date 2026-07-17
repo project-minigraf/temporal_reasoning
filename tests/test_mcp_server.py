@@ -745,6 +745,16 @@ class TestMinigrafTransact:
         assert result["ok"] is False
         assert "error" in result
 
+    def test_transact_populates_fact_index(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0)
+        assert any(r[0] == ":decision/use-redis" for r in results)
+
 
 class TestMinigrafRetract:
     def test_requires_reason(self, real_db):
@@ -771,6 +781,19 @@ class TestMinigrafRetract:
         result = mcp_server.handle_minigraf_retract("(not valid datalog", reason="gone")
         assert result["ok"] is False
         assert "error" in result
+
+    def test_retract_removes_from_fact_index(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
+        )
+        mcp_server.handle_minigraf_retract(
+            '[[:decision/use-redis :description "use redis for caching"]]', reason="cleanup"
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0)
+        assert results == []
 
 
 class TestParseFactsBlock:
@@ -7305,12 +7328,14 @@ class TestMemoryPrepareTurnBM25:
 class TestIndexCacheInvalidation:
     def test_successful_transact_triggers_invalidation(self, real_db):
         import mcp_server
-        from unittest.mock import patch
-        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_minigraf_transact(
-                '[[:decision/test :description "test"]]', reason="test"
-            )
-            mock_inv.assert_called_once()
+        import fact_index
+        # New behavior: transact populates the fact index directly (not via cache invalidation)
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/test :description "test"]]', reason="test"
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "test", top_n=10, boost=2.0)
+        assert any(r[0] == ":decision/test" for r in results)
 
     def test_failed_transact_does_not_trigger_invalidation(self, real_db):
         import mcp_server
@@ -7321,13 +7346,15 @@ class TestIndexCacheInvalidation:
 
     def test_successful_retract_triggers_invalidation(self, real_db):
         import mcp_server
-        from unittest.mock import patch
+        import fact_index
+        # New behavior: retract removes from the fact index directly (not via cache invalidation)
         real_db.execute('(transact {} [[:decision/test :description "test"]])')
-        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            mcp_server.handle_minigraf_retract(
-                '[[:decision/test :description "test"]]', reason="cleanup"
-            )
-            mock_inv.assert_called_once()
+        mcp_server.handle_minigraf_retract(
+            '[[:decision/test :description "test"]]', reason="cleanup"
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "test", top_n=10, boost=2.0)
+        assert results == []
 
     def test_failed_retract_does_not_trigger_invalidation(self, real_db):
         import mcp_server

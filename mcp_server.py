@@ -3160,13 +3160,12 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     _refresh_if_stale()
     db = get_db()
     try:
-        raw = _db_execute(db, f'(transact {{:valid-from "{_now_utc_ms()}"}} {facts})')
+        raw = _transact(db, facts, _now_utc_ms())
         _db_checkpoint(db)
         _update_mtime()
         result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
-            _index_cache.invalidate()
         return result
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
@@ -3179,13 +3178,12 @@ def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
     _refresh_if_stale()
     db = get_db()
     try:
-        raw = _db_execute(db, f"(retract {facts})")
+        raw = _retract(db, facts)
         _db_checkpoint(db)
         _update_mtime()
         result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
-            _index_cache.invalidate()
         return result
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
