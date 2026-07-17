@@ -7651,6 +7651,94 @@ class TestMemoryPrepareTurnBM25:
         assert len(lines) <= 3
 
 
+class TestHandleMemoryPrepareTurnFts5:
+    def test_returns_ranked_context_for_matching_query(self, real_db):
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
+        )
+        result = mcp_server.handle_memory_prepare_turn("redis caching")
+        assert "use redis for caching" in result
+
+    def test_returns_empty_for_unmatched_query(self, real_db):
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
+        )
+        result = mcp_server.handle_memory_prepare_turn("elephants trombone")
+        assert result == ""
+
+    def test_memory_facts_rank_above_non_memory_facts(self, real_db):
+        """#141 regression, end to end through handle_memory_prepare_turn:
+        the boost now actually fires, since the index's entity column is
+        always the real keyword ident (callers supply it directly), never a
+        re-derived Datalog ?e binding.
+
+        The non-memory fact's value deliberately repeats the query tokens
+        three times so it out-ranks the memory fact on raw BM25 term
+        frequency alone (verified separately: boost=1.0 puts
+        :function/unrelated first). That makes this test actually
+        discriminating -- it can only pass because the boost multiplier
+        flips the order, not because the memory fact would have won on
+        unboosted relevance anyway (a single, non-repeated match, as the
+        original brief's fixture used, ranks the memory fact first
+        regardless of whether the boost fires at all, which would let a
+        broken boost pass silently).
+        """
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "redis caching"]]', reason="test"
+        )
+        mcp_server._ingest_transact(
+            mcp_server.get_db(),
+            ['[:function/unrelated :name "redis caching redis caching redis caching"]'],
+            "2026-01-01T00:00:00.000Z", "test",
+        )
+        result = mcp_server.handle_memory_prepare_turn("redis caching")
+        redis_pos = result.find(":decision/use-redis")
+        other_pos = result.find(":function/unrelated")
+        assert redis_pos != -1
+        assert other_pos == -1 or redis_pos < other_pos
+
+    def test_triggers_backfill_when_index_file_missing(self, real_db, tmp_path, monkeypatch):
+        """The lazy-backfill path: if the index file doesn't exist (e.g. a
+        pre-existing graph from before this feature shipped), the first
+        query rebuilds it from a real graph rescan and still returns
+        results, rather than returning empty."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        os.remove(index_path)  # simulate a missing index despite an existing graph
+        result = mcp_server.handle_memory_prepare_turn("redis caching")
+        assert "use redis for caching" in result
+
+    def test_backfill_recovers_facts_written_without_explicit_ident(self, real_db, tmp_path, monkeypatch):
+        """Real pre-existing graphs are dominated by facts written the
+        documented handle_minigraf_transact way (SKILL.md's own examples
+        never add an :ident triple) -- an :ident fact only exists for
+        entities extraction code deliberately adds it for. If backfill's
+        rescan required an :ident fact to recover ANY given entity's facts
+        (a plain ident-projected [?e :ident ?ident] [?e ?a ?v] join drops
+        entities with no :ident fact entirely, since Datalog conjunction
+        requires every clause to match), the single most common real-world
+        backfill scenario -- recovering old decisions recorded before this
+        feature shipped -- would silently return nothing for most of the
+        graph. This asserts backfill still surfaces such a fact's text."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/no-explicit-ident :description "prefer sqlite over postgres for embedded use"]]',
+            reason="test",
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        os.remove(index_path)
+        result = mcp_server.handle_memory_prepare_turn("sqlite postgres embedded")
+        assert "prefer sqlite over postgres for embedded use" in result
+
+
 class TestIndexCacheInvalidation:
     def test_successful_transact_triggers_invalidation(self, real_db):
         import mcp_server

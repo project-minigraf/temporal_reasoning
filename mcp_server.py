@@ -4656,28 +4656,80 @@ def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
     return f"Relevant memory context:\n{block}"
 
 
-def handle_memory_prepare_turn(user_message: str) -> str:
-    """Query graph for facts relevant to the user message.
+def _rebuild_index_from_graph() -> None:
+    """One-time full rebuild: rescan the graph's current-valid snapshot and
+    write it into a fresh fact_index table. This is the only place a full
+    Datalog rescan happens post-launch (everywhere else is incremental via
+    _transact/_retract) -- used for backfill (index file missing: fresh
+    install, a pre-existing graph from before this feature shipped, or
+    corruption recovery).
 
-    Uses BM25-ranked retrieval over a cached FactIndex when rank_bm25 is
-    available. Falls back to the heuristic (substring token) implementation
-    when rank_bm25 is not installed.
+    Uses the same :ident-projection clause-ordering fix _preload_known_
+    entities established (project through :ident explicitly, rather than
+    binding ?e directly, which resolves to minigraf's internal UUID, not
+    the keyword ident) -- this is the #141 root cause, and the one
+    remaining place in this design a Datalog rescan still needs it.
 
-    Returns a formatted context block string for injection as additionalContext,
-    or an empty string if no relevant facts are found.
-
-    Callers on the event-loop thread (call_tool) must await _ensure_db_async()
-    first — the heuristic fallback's get_db() assumes _db is already open so
-    it never falls back to its own blocking retry (issue #99).
+    A plain ident-projected query alone is not sufficient, though: it only
+    recovers entities that happen to carry an explicit :ident fact (written
+    by the code-ingestion call sites), and silently drops every other
+    entity's facts entirely -- Datalog conjunction requires every clause
+    to match, so an entity with no :ident fact never satisfies
+    "[?e :ident ?ident] [?e ?a ?v]" for ANY of its attributes, not just the
+    identity one. Facts recorded the documented handle_minigraf_transact
+    way (SKILL.md's own examples never add an :ident triple) are exactly
+    this case, and they're the dominant content of a real pre-existing
+    graph -- the primary scenario backfill exists to serve. So this does a
+    second, bare [?e ?a ?v] rescan and folds in only the rows whose entity
+    wasn't already covered by the :ident-projected set, indexing those
+    under their raw internal-UUID entity value. That UUID never starts
+    with a _MEMORY_PREFIXES keyword, so it is simply not boost-eligible
+    (accurately reflecting that its true keyword ident is unrecoverable
+    from the graph alone) rather than being dropped from the index outright.
     """
-    if not _BM25_AVAILABLE:
-        return _handle_memory_prepare_turn_heuristic(user_message)
+    db = get_db()
+    now = _now_utc_ms()
+    ident_raw = _db_execute(
+        db,
+        f'(query [:find ?e ?ident ?a ?v :valid-at "{now}" '
+        f':where [?e :ident ?ident] [?e ?a ?v]])',
+    )
+    ident_facts = json.loads(ident_raw).get("results", [])
+    known_entities = {str(e) for e, _ident, _a, _v in ident_facts}
+    triples = [(str(ident), str(a), str(v)) for _e, ident, a, v in ident_facts]
 
+    bare_raw = _db_execute(
+        db, f'(query [:find ?e ?a ?v :valid-at "{now}" :where [?e ?a ?v]])'
+    )
+    for e, a, v in json.loads(bare_raw).get("results", []):
+        if str(e) not in known_entities:
+            triples.append((str(e), str(a), str(v)))
+
+    path = fact_index.index_path_for(_graph_path or _get_graph_path())
+    fact_index.rebuild_index(path, triples)
+
+
+def handle_memory_prepare_turn(user_message: str) -> str:
+    """Query the persisted fact index for facts relevant to the user message.
+
+    Returns a formatted context block string for injection as
+    additionalContext, or an empty string if no relevant facts are found.
+    If the index file doesn't exist yet (fresh install, pre-existing graph,
+    or corruption recovery), triggers a one-time backfill rebuild and
+    retries once.
+    """
     scan_limit = int(os.environ.get("MINIGRAF_PREPARE_SCAN_LIMIT", "50"))
-    index = _index_cache.get()
-    if index is None:
-        return ""
-    results = index.query(user_message, top_n=scan_limit)
+    boost = float(os.environ.get("MINIGRAF_MEMORY_BOOST", "2.0"))
+    path = fact_index.index_path_for(_graph_path or _get_graph_path())
+    try:
+        results = fact_index.query_facts(path, user_message, top_n=scan_limit, boost=boost)
+    except Exception:
+        try:
+            _rebuild_index_from_graph()
+            results = fact_index.query_facts(path, user_message, top_n=scan_limit, boost=boost)
+        except Exception as e:
+            print(f"[fact_index] backfill failed: {e}", file=sys.stderr)
+            return ""
     if not results:
         return ""
     return f"Relevant memory context:\n{_format_facts(results)}"
