@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from minigraf import MiniGrafDb, MiniGrafError
+import fact_index
 
 try:
     from rank_bm25 import BM25Okapi as _BM25Okapi
@@ -3041,6 +3042,102 @@ def handle_minigraf_query(datalog: str) -> Dict[str, Any]:
         return _parse_query_result(raw)
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
+
+
+_FACTS_TRIPLE_PATTERN = re.compile(
+    r'\[(\:[^\s\]]+)\s+(\:[^\s\]]+)\s+("(?:[^"\\]|\\.)*"|\:[^\s\]]+)\]'
+)
+
+
+def _parse_facts_block(facts_str: str) -> List[Tuple[str, str, str]]:
+    """Parse every [entity attribute value] triple out of a Datalog facts
+    block or a single triple string -- scans for all matches rather than
+    requiring a strict split, so it works on both shapes uniformly (mirrors
+    _parse_transact_facts' existing regex-scan approach, extended to also
+    capture keyword-valued triples, which schema validation intentionally
+    skips but the index must not). Value is unquoted for string-valued
+    triples, kept as-is (a keyword or entity reference) otherwise.
+    """
+    triples = []
+    for m in _FACTS_TRIPLE_PATTERN.finditer(facts_str):
+        entity, attribute, raw_value = m.groups()
+        value = raw_value[1:-1] if raw_value.startswith('"') else raw_value
+        triples.append((entity, attribute, value))
+    return triples
+
+
+def _index_write(
+    action: str,
+    triples: List[Tuple[str, str, str]],
+    index_con: Optional[Any] = None,
+) -> None:
+    """Apply an insert or delete to the fact index, never raising -- index
+    maintenance must never block a graph write (mirrors IndexCache._rebuild's
+    existing exception handling). action is 'insert' or 'delete'. When
+    index_con is provided, writes onto it without committing (caller controls
+    the transaction boundary — used by ingestion's batching). Otherwise opens
+    a connection, writes, commits, and closes immediately.
+    """
+    if not triples:
+        return
+    try:
+        if index_con is not None:
+            (fact_index.insert_facts if action == "insert" else fact_index.delete_facts)(
+                index_con, triples
+            )
+            return
+        path = fact_index.index_path_for(_graph_path or _get_graph_path())
+        con = fact_index.open_writer(path)
+        try:
+            (fact_index.insert_facts if action == "insert" else fact_index.delete_facts)(
+                con, triples
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception as e:
+        print(f"[fact_index] {action} failed: {e}", file=sys.stderr)
+
+
+def _transact(
+    db: Any,
+    datalog_facts: str,
+    valid_from: str,
+    valid_to: Optional[str] = None,
+    index_triples: Optional[List[Tuple[str, str, str]]] = None,
+    index_con: Optional[Any] = None,
+) -> str:
+    """Execute (transact {opts} datalog_facts) against minigraf, then --
+    only when valid_to is None -- write index_triples into the fact index.
+
+    index_triples defaults to auto-parsing datalog_facts via
+    _parse_facts_block(); pass it explicitly when the Datalog string's own
+    entity reference isn't the searchable identity (e.g.
+    handle_minigraf_audit's #uuid-tagged retracts, whose index_triples must
+    use the resolved keyword ident instead).
+    """
+    opts = f':valid-from "{valid_from}"'
+    if valid_to is not None:
+        opts += f' :valid-to "{valid_to}"'
+    raw = _db_execute(db, f"(transact {{{opts}}} {datalog_facts})")
+    if valid_to is None:
+        triples = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
+        _index_write("insert", triples, index_con=index_con)
+    return raw
+
+
+def _retract(
+    db: Any,
+    datalog_facts: str,
+    index_triples: Optional[List[Tuple[str, str, str]]] = None,
+    index_con: Optional[Any] = None,
+) -> str:
+    """Execute (retract datalog_facts) against minigraf, then delete
+    index_triples from the fact index (same decoupling as _transact)."""
+    raw = _db_execute(db, f"(retract {datalog_facts})")
+    triples = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
+    _index_write("delete", triples, index_con=index_con)
+    return raw
 
 
 def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:

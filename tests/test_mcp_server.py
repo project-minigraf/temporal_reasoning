@@ -773,6 +773,116 @@ class TestMinigrafRetract:
         assert "error" in result
 
 
+class TestParseFactsBlock:
+    def test_single_string_valued_triple(self):
+        import mcp_server
+        result = mcp_server._parse_facts_block('[:decision/x :description "hello"]')
+        assert result == [(":decision/x", ":description", "hello")]
+
+    def test_keyword_valued_triple(self):
+        import mcp_server
+        result = mcp_server._parse_facts_block("[:decision/x :entity-type :type/decision]")
+        assert result == [(":decision/x", ":entity-type", ":type/decision")]
+
+    def test_whole_block_multiple_triples(self):
+        import mcp_server
+        block = (
+            '[[:decision/x :description "hello"] '
+            '[:decision/x :entity-type :type/decision] '
+            '[:decision/x :ident ":decision/x"]]'
+        )
+        result = mcp_server._parse_facts_block(block)
+        assert result == [
+            (":decision/x", ":description", "hello"),
+            (":decision/x", ":entity-type", ":type/decision"),
+            (":decision/x", ":ident", ":decision/x"),
+        ]
+
+    def test_empty_block(self):
+        import mcp_server
+        assert mcp_server._parse_facts_block("[]") == []
+
+
+class TestTransactRetractChokePoint:
+    def test_transact_writes_to_index(self, real_db, tmp_path):
+        import mcp_server
+        import fact_index
+        mcp_server._transact(
+            real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z",
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0)
+        assert results == [[":decision/x", ":description", "hello"]]
+
+    def test_transact_writes_to_minigraf(self, real_db):
+        import mcp_server
+        mcp_server._transact(
+            real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z",
+        )
+        raw = mcp_server._db_execute(real_db, '(query [:find ?v :where [:decision/x :description ?v]])')
+        import json
+        assert json.loads(raw)["results"] == [["hello"]]
+
+    def test_transact_with_valid_to_does_not_index(self, real_db):
+        """Bounded (historical) transacts must not appear in the live index."""
+        import mcp_server
+        import fact_index
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        # Pre-create the index file: a bounded transact must not write to the
+        # index at all (not even to create it), so query_facts needs a real
+        # (empty) index file to query against rather than hitting the
+        # "index file missing" path (fact_index.open_reader's OperationalError).
+        fact_index.close_writer(fact_index.open_writer(index_path))
+        mcp_server._transact(
+            real_db, '[[:decision/x :description "hello"]]',
+            "2025-01-01T00:00:00.000Z", valid_to="2025-06-01T00:00:00.000Z",
+        )
+        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0)
+        assert results == []
+
+    def test_retract_removes_from_index(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server._transact(real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z")
+        mcp_server._retract(real_db, '[[:decision/x :description "hello"]]')
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0)
+        assert results == []
+
+    def test_retract_removes_from_minigraf(self, real_db):
+        import mcp_server
+        import json
+        mcp_server._transact(real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z")
+        mcp_server._retract(real_db, '[[:decision/x :description "hello"]]')
+        raw = mcp_server._db_execute(real_db, '(query [:find ?v :where [:decision/x :description ?v]])')
+        assert json.loads(raw)["results"] == []
+
+    def test_transact_explicit_index_triples_overrides_auto_derive(self, real_db):
+        """handle_minigraf_audit's use case: the Datalog string references a
+        #uuid literal, but the index should record the resolved keyword ident."""
+        import mcp_server
+        import fact_index
+        mcp_server._transact(
+            real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z",
+            index_triples=[(":decision/explicit-override", ":description", "hello")],
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0)
+        assert results == [[":decision/explicit-override", ":description", "hello"]]
+
+    def test_transact_index_write_failure_does_not_raise(self, real_db, monkeypatch):
+        """Index maintenance must never block a graph write -- mirrors
+        IndexCache._rebuild's existing try/except at the call site."""
+        import mcp_server
+        import fact_index
+        monkeypatch.setattr(fact_index, "open_writer", lambda path: (_ for _ in ()).throw(OSError("disk full")))
+        # Must not raise despite the index write failing.
+        mcp_server._transact(real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z")
+        raw = mcp_server._db_execute(real_db, '(query [:find ?v :where [:decision/x :description ?v]])')
+        import json
+        assert json.loads(raw)["results"] == [["hello"]]  # the graph write still succeeded
+
+
 class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, real_db):
         import mcp_server
