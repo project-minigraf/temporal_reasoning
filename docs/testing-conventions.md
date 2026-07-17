@@ -118,3 +118,17 @@ value. Use `execute_spy()`, which wraps the real `mcp_server._db_execute` to
 record calls while still executing them for real — this is not a mock in
 the sense this convention eliminates; it never fakes a return value or
 bypasses real parsing.
+
+## Real sqlite3 for the fact index
+
+`tests/test_fact_index.py` and any `mcp_server.py` test touching the
+persisted fact index follow the same "real backend, always" rule extended
+to `fact_index.py`'s SQLite FTS5 file: tests open a real `sqlite3.Connection`
+(a `tmp_path`-backed file, or `:memory:` where cross-process behavior isn't
+under test) — never a mocked `sqlite3.Connection`. The one test that
+specifically needs a second real OS process (not just a second connection)
+is `test_cross_process_reader_sees_writer_commits`, which spawns a real
+subprocess via `subprocess.run` to prove the index is actually shared via
+the filesystem/OS page cache, not via any in-process Python state — mirrors
+the existing DB lock-retry cluster's "spawn a real subprocess to
+manufacture a real condition" pattern.

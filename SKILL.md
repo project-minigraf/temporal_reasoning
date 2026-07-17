@@ -528,7 +528,9 @@ Full Datalog grammar: https://github.com/project-minigraf/minigraf/wiki/Datalog-
 
 ## Graph Storage
 
-Default: `memory.graph` in the current working directory. Run all commands from the same project root to ensure consistent graph access.
+Default: `memory.graph` in the current working directory. Run all commands from the same project root to ensure consistent graph access. Override with `MINIGRAF_GRAPH_PATH=/custom/path`.
+
+Memory retrieval uses a persisted SQLite FTS5 fact index alongside the graph, at `<graph_path>.fts.sqlite3` by default. Override with `MINIGRAF_INDEX_PATH=/custom/path`.
 
 ## Dependencies
 

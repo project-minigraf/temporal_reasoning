@@ -307,3 +307,33 @@ def test_memory_prefixes_exclude_git_entity_types():
     assert not ":commit/abc123".startswith(fact_index._MEMORY_PREFIXES)
     assert not ":function/foo-bar".startswith(fact_index._MEMORY_PREFIXES)
     assert not ":module/src-main".startswith(fact_index._MEMORY_PREFIXES)
+
+
+def test_cross_process_reader_sees_writer_commits(tmp_path):
+    """The definitive #118 regression test: a fresh subprocess (no shared
+    Python state, no RPC) opening the index file read-only after the main
+    process writes to it must see the committed rows via the OS page
+    cache -- this is the exact scenario the UserPromptSubmit hook is in on
+    every turn."""
+    import subprocess
+    import sys as _sys
+
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [(":decision/use-redis", ":description", "use redis for caching")])
+    fact_index.close_writer(con)
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = (
+        f"import sys; sys.path.insert(0, {repo_root!r})\n"
+        "import fact_index\n"
+        f"results = fact_index.query_facts({path!r}, 'redis caching', top_n=10, boost=2.0)\n"
+        "assert results, 'subprocess found no results — cross-process sharing broken'\n"
+        "assert results[0][0] == ':decision/use-redis'\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [_sys.executable, "-c", script], capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "OK" in result.stdout
