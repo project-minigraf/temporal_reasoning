@@ -4068,12 +4068,13 @@ def _ingest_transact(
     triples: List[str],
     commit_ts_iso: str,
     reason: str,
+    index_con: Optional[Any] = None,
 ) -> None:
     """Transact code-structure facts with :valid-from set to the commit timestamp."""
     if not triples:
         return
     facts_str = "[" + " ".join(triples) + "]"
-    _db_execute(db, f'(transact {{:valid-from "{commit_ts_iso}"}} {facts_str})')
+    _transact(db, facts_str, commit_ts_iso, index_con=index_con)
 
 
 def _ingest_close(
@@ -6002,6 +6003,19 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # the extraction pool's own shutdown has already been submitted to it.
         write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
+        # Single fact-index write connection for the whole ingestion run,
+        # opened on write_executor's one worker thread and never touched from
+        # any other thread thereafter (sqlite3 connections are thread-affine
+        # by default) -- every use below is itself routed through
+        # write_executor, so all access stays on the thread that created it.
+        # Committed once per source-commit (matching the existing
+        # _db_checkpoint(db) cadence just below), not once per triple: large
+        # repositories can cross 1M facts well before ingestion completes,
+        # and per-triple commits would be dominated by fsync overhead at
+        # that scale.
+        index_path = fact_index.index_path_for(_graph_path or _get_graph_path())
+        index_con = await loop.run_in_executor(write_executor, fact_index.open_writer, index_path)
+
         try:
             # Extraction (git show + tree-sitter parse + triple construction) runs
             # in real OS processes, not threads (#116): tree-sitter's C parse holds
@@ -6400,21 +6414,21 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         contains_triples = [t for t in add_triples if ":contains" in t]
                         other_triples = [t for t in add_triples if ":contains" not in t]
                         await loop.run_in_executor(
-                            write_executor, _ingest_transact, db, other_triples, commit_ts_iso, reason
+                            write_executor, _ingest_transact, db, other_triples, commit_ts_iso, reason, index_con
                         )
                         for ct in contains_triples:
                             await loop.run_in_executor(
-                                write_executor, _ingest_transact, db, [ct], commit_ts_iso, reason
+                                write_executor, _ingest_transact, db, [ct], commit_ts_iso, reason, index_con
                             )
                         # :depends-on triples transacted individually — same EAVT collision risk
                         # as :contains when multiple deps share the same source module
                         for dt in dep_add_triples:
                             await loop.run_in_executor(
-                                write_executor, _ingest_transact, db, [dt], commit_ts_iso, reason
+                                write_executor, _ingest_transact, db, [dt], commit_ts_iso, reason, index_con
                             )
                         for close_triples, orig_ts in close_items:
                             await loop.run_in_executor(
-                                write_executor, _ingest_close, db, close_triples, orig_ts, commit_ts_iso, reason
+                                write_executor, _ingest_close, db, close_triples, orig_ts, commit_ts_iso, reason, index_con
                             )
 
                         # Ingest :parent edges — one transact per parent to avoid EAVT
@@ -6434,6 +6448,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                         await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason)
                         await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                        await loop.run_in_executor(write_executor, index_con.commit)
 
                     finally:
                         _db = None  # release file lock between commits
@@ -6450,6 +6465,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # whole span, undoing this fix's own purpose in its teardown.
                 # Routing it through write_executor keeps the wait off the
                 # event-loop thread, same as every other blocking call above.
+                await loop.run_in_executor(write_executor, fact_index.close_writer, index_con)
                 await loop.run_in_executor(write_executor, executor.shutdown)
 
             if completed_all:

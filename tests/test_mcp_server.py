@@ -6235,6 +6235,24 @@ class TestPreloadExternalDependencies:
         assert mcp_server._preload_pinned_commits(real_db) == {}
 
 
+class TestIngestTransactFactIndex:
+    def test_ingest_transact_writes_to_index_with_explicit_con(self, real_db):
+        import mcp_server
+        import fact_index
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        con = fact_index.open_writer(index_path)
+        try:
+            mcp_server._ingest_transact(
+                real_db, ['[:module/foo :description "the foo module"]'],
+                "2026-01-01T00:00:00.000Z", "test", index_con=con,
+            )
+            con.commit()
+        finally:
+            fact_index.close_writer(con)
+        results = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0)
+        assert results
+
+
 class TestTotalIngestedQuery:
     def test_returns_zero_when_absent(self, real_db):
         import mcp_server
@@ -6701,6 +6719,77 @@ class TestRunIngestion:
         assert mcp_server._ingest_progress["processed"] == 21717  # 21715 + 2 commits
 
 
+class TestRunIngestionBatchedIndexWrites:
+    @pytest.mark.asyncio
+    async def test_ingestion_commits_index_once_per_commit_not_per_triple(self, real_db, git_repo, monkeypatch):
+        """Guards the 1M+-fact scale concern: SQLite commit-call count must
+        scale with the number of ingested commits, not the number of facts.
+
+        Uses the existing `git_repo` fixture (tests/test_mcp_server.py:4124)
+        -- two commits, each adding one file (auth.py, then models.py) -- and
+        calls _run_ingestion directly, the same pattern the existing
+        refcount regression test uses (see
+        test_db_instance_not_retained_during_commit_enumeration, which calls
+        `await mcp_server._run_ingestion(str(git_repo), "HEAD")` directly
+        rather than going through handle_minigraf_ingest_git's
+        fire-and-forget wrapper).
+
+        Asserts an exact count, not just an upper bound: an upper-bound-only
+        assertion (e.g. `<= 3`) would pass vacuously if the whole feature were
+        broken and zero index writes ever happened, which is exactly the kind
+        of structurally-unfalsifiable test earlier tasks in this plan caught.
+        A prior manual count (see the per-triple `_index_write` call count
+        below) confirmed this fixture would need 4 separate open+commit+close
+        cycles if ingestion still wrote to the index one triple-batch at a
+        time (the pre-Task-8 behavior) -- each with its own fsync -- versus
+        exactly 1 connection open and 3 commits (one per source commit, plus
+        one final flush-on-close) once batched. The gap between those two
+        numbers is what would grow unboundedly on a 1M-fact repo if this
+        regressed back to per-triple commits.
+        """
+        import mcp_server
+        import fact_index
+
+        commit_calls = []
+        open_calls = []
+        original_open_writer = fact_index.open_writer
+
+        class CountingConnection:
+            def __init__(self, con):
+                self._con = con
+            def __getattr__(self, name):
+                return getattr(self._con, name)
+            def commit(self):
+                commit_calls.append(1)
+                self._con.commit()
+
+        def counting_open_writer(path):
+            open_calls.append(1)
+            return CountingConnection(original_open_writer(path))
+
+        monkeypatch.setattr(fact_index, "open_writer", counting_open_writer)
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        # Exactly one connection opened for the whole run -- proves writes
+        # were batched onto a single session, not reopened per triple-batch
+        # (which is what pre-Task-8 _ingest_transact/_ingest_close did via
+        # _index_write's index_con=None fallback, one open+commit+close per
+        # call). A regression back to per-call connections would make this
+        # >= 4 for this fixture (see docstring).
+        assert len(open_calls) == 1
+        # git_repo has 2 commits -> 2 per-commit commits (one right after
+        # each commit's _db_checkpoint) + 1 final flush inside
+        # fact_index.close_writer at run end = 3. This is a tight equality,
+        # not just an upper bound: 0 (nothing wired up) and any count that
+        # scaled with the ~36 individual facts these 2 commits produce would
+        # both fail it, so a regression to either "no batching wired up" or
+        # "still committing per triple" is caught, not just silently allowed
+        # through by a loose bound.
+        assert len(commit_calls) == 3
+
+
 class TestRunIngestionConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_run_matches_sequential_facts(
@@ -6758,9 +6847,9 @@ class TestRunIngestionConcurrency:
 
             transacted: list = []
 
-            def capture(db, triples, ts_iso, reason=""):
+            def capture(db, triples, ts_iso, reason="", index_con=None):
                 transacted.append(list(triples))
-                return real_ingest_transact(db, triples, ts_iso, reason)
+                return real_ingest_transact(db, triples, ts_iso, reason, index_con=index_con)
 
             monkeypatch.setattr(mcp_server, "_ingest_transact", capture)
             await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
@@ -8976,9 +9065,9 @@ class TestUnresolvedImportTagging:
         transact_calls: list = []
         real_ingest_transact = mcp_server._ingest_transact
 
-        def capture_transact(db, triples, ts_iso, reason=""):
+        def capture_transact(db, triples, ts_iso, reason="", index_con=None):
             transact_calls.extend(triples)
-            return real_ingest_transact(db, triples, ts_iso, reason)
+            return real_ingest_transact(db, triples, ts_iso, reason, index_con=index_con)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
         try:
@@ -9020,9 +9109,9 @@ class TestUnresolvedImportTagging:
         transact_calls: list = []
         real_ingest_transact = mcp_server._ingest_transact
 
-        def capture_transact(db, triples, ts_iso, reason=""):
+        def capture_transact(db, triples, ts_iso, reason="", index_con=None):
             transact_calls.extend(triples)
-            return real_ingest_transact(db, triples, ts_iso, reason)
+            return real_ingest_transact(db, triples, ts_iso, reason, index_con=index_con)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
         try:
@@ -9075,9 +9164,9 @@ class TestGitIngestionPathIgnore:
         transact_calls: list = []
         real_ingest_transact = mcp_server._ingest_transact
 
-        def capture_transact(db, triples, ts_iso, reason=""):
+        def capture_transact(db, triples, ts_iso, reason="", index_con=None):
             transact_calls.extend(triples)
-            return real_ingest_transact(db, triples, ts_iso, reason)
+            return real_ingest_transact(db, triples, ts_iso, reason, index_con=index_con)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
         try:
@@ -9133,9 +9222,9 @@ class TestGitIngestionPathIgnore:
         transact_calls: list = []
         real_ingest_transact = mcp_server._ingest_transact
 
-        def capture_transact(db, triples, ts_iso, reason=""):
+        def capture_transact(db, triples, ts_iso, reason="", index_con=None):
             transact_calls.extend(triples)
-            return real_ingest_transact(db, triples, ts_iso, reason)
+            return real_ingest_transact(db, triples, ts_iso, reason, index_con=index_con)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
         try:
@@ -9185,9 +9274,9 @@ class TestGitIngestionPathIgnore:
         transact_calls: list = []
         real_ingest_transact = mcp_server._ingest_transact
 
-        def capture_transact(db, triples, ts_iso, reason=""):
+        def capture_transact(db, triples, ts_iso, reason="", index_con=None):
             transact_calls.extend(triples)
-            return real_ingest_transact(db, triples, ts_iso, reason)
+            return real_ingest_transact(db, triples, ts_iso, reason, index_con=index_con)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
         try:
@@ -9368,9 +9457,9 @@ class TestPerCommitAccurateImportResolution:
         transact_calls: list = []
         real_ingest_transact = mcp_server._ingest_transact
 
-        def capture_transact(db, triples, ts_iso, reason=""):
+        def capture_transact(db, triples, ts_iso, reason="", index_con=None):
             transact_calls.extend(triples)
-            return real_ingest_transact(db, triples, ts_iso, reason)
+            return real_ingest_transact(db, triples, ts_iso, reason, index_con=index_con)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
         try:
@@ -9507,9 +9596,9 @@ class TestRunIngestionGitlinks:
         transact_calls: list = []
         real_ingest_transact = mcp_server._ingest_transact
 
-        def capture_transact(db, triples, ts_iso, reason=""):
+        def capture_transact(db, triples, ts_iso, reason="", index_con=None):
             transact_calls.extend(triples)
-            return real_ingest_transact(db, triples, ts_iso, reason)
+            return real_ingest_transact(db, triples, ts_iso, reason, index_con=index_con)
 
         monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
         try:
@@ -9570,9 +9659,9 @@ class TestRunIngestionGitlinks:
         close_triples_seen: list = []
         real_ingest_close = mcp_server._ingest_close
 
-        def capture_close(db, triples, orig_ts, commit_ts, reason=""):
+        def capture_close(db, triples, orig_ts, commit_ts, reason="", index_con=None):
             close_triples_seen.extend(triples)
-            return real_ingest_close(db, triples, orig_ts, commit_ts, reason)
+            return real_ingest_close(db, triples, orig_ts, commit_ts, reason, index_con=index_con)
 
         monkeypatch.setattr(mcp_server, "_ingest_close", capture_close)
         try:
@@ -9623,9 +9712,9 @@ class TestRunIngestionGitlinks:
         close_triples_seen: list = []
         real_ingest_close = mcp_server._ingest_close
 
-        def capture_close(db, triples, orig_ts, commit_ts, reason=""):
+        def capture_close(db, triples, orig_ts, commit_ts, reason="", index_con=None):
             close_triples_seen.extend(triples)
-            return real_ingest_close(db, triples, orig_ts, commit_ts, reason)
+            return real_ingest_close(db, triples, orig_ts, commit_ts, reason, index_con=index_con)
 
         monkeypatch.setattr(mcp_server, "_ingest_close", capture_close)
         try:
