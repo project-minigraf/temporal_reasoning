@@ -17,6 +17,7 @@ full rationale and pattern reference.
 import asyncio
 import contextlib
 import json
+import sqlite3
 import sys
 import os
 import subprocess as _subprocess
@@ -27,32 +28,22 @@ from minigraf import MiniGrafError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-try:
-    import rank_bm25  # noqa: F401
-    _HAS_RANK_BM25 = True
-except ImportError:
-    _HAS_RANK_BM25 = False
-
-requires_bm25 = pytest.mark.skipif(
-    not _HAS_RANK_BM25,
-    reason="rank_bm25 not installed — it is a core dependency (pip install -e .)",
-)
-
 
 @pytest.fixture(autouse=True)
-def reset_mcp_server_db(monkeypatch):
-    """Reset the module-level _db singleton, grammar cache, and index cache between tests."""
+def reset_mcp_server_db():
+    """Reset the module-level _db singleton and grammar cache between tests.
+
+    The fact index needs no equivalent reset: real_db's tmp_path already
+    gives each test an isolated graph path, and fact_index.index_path_for()
+    derives the sidecar index path from it, so each test's index file lives
+    in its own fresh temp directory with no cross-test state to leak.
+    """
     import mcp_server
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
-    mcp_server._index_cache = mcp_server.IndexCache()
     yield
-    # Suppress index cache rebuilds during teardown to avoid race with background
-    # rebuild threads that may still be running from the previous test (see #133).
-    monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
-    mcp_server._index_cache = mcp_server.IndexCache()
 
 
 @pytest.fixture
@@ -974,188 +965,6 @@ class TestMinigrafReportIssue:
         with patch.dict("sys.modules", {"report_issue": None}):
             result = mcp_server.handle_minigraf_report_issue("bug", "something broke")
         assert result["ok"] is False
-
-
-class TestMemoryPrepareTurn:
-    def test_returns_empty_string_when_graph_empty(self, real_db):
-        import mcp_server
-
-        result = mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
-
-        assert result == ""
-
-    def test_includes_matching_facts_in_output(self, real_db):
-        import mcp_server
-        real_db.execute(
-            '(transact {} [[:decision/postgres :entity-type :type/decision] '
-            '[:decision/postgres :ident ":decision/postgres"] '
-            '[:decision/postgres :description "we use postgresql for storage"]])'
-        )
-
-        result = mcp_server._handle_memory_prepare_turn_heuristic("what did we decide about postgres?")
-
-        assert "postgresql" in result.lower()
-
-    def test_falls_back_to_broad_scan_when_no_targeted_results(self, real_db):
-        import mcp_server
-        # Seeded fact shares no substring with the message's candidate entities
-        # ("tell", "framework") — the targeted contains? query must come back
-        # empty, forcing the unfiltered broad-scan fallback to surface it.
-        real_db.execute(
-            '(transact {} [[:decision/redis :entity-type :type/decision] '
-            '[:decision/redis :ident ":decision/redis"] '
-            '[:decision/redis :description "use Redis for caching"]])'
-        )
-
-        result = mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
-
-        assert "Redis" in result
-
-    def test_broad_scan_excludes_non_memory_entity_types(self, real_db):
-        """The broad-scan fallback must not surface code-structure facts (e.g.
-        git-ingested modules) — on a real repo those dwarf the handful of
-        manually recorded memory facts and turned the fallback into an
-        unbounded full-graph scan (issue #117: 80s/7GB on a 21k-commit graph).
-        It must stay scoped to memory entity types (decision/preference/
-        constraint/dependency) even when nothing targeted matched.
-        """
-        import mcp_server
-        real_db.execute(
-            '(transact {} [[:module/auth-py :entity-type :type/module] '
-            '[:module/auth-py :ident ":module/auth-py"] '
-            '[:module/auth-py :description "authentication helper module"]])'
-        )
-        real_db.execute(
-            '(transact {} [[:decision/redis :entity-type :type/decision] '
-            '[:decision/redis :ident ":decision/redis"] '
-            '[:decision/redis :description "use Redis for caching"]])'
-        )
-
-        result = mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
-
-        assert "Redis" in result
-        assert "auth-py" not in result
-        assert "authentication helper" not in result
-
-    def test_broad_scan_scopes_query_by_entity_type(self, real_db):
-        """The fallback's broad scan must restrict :where to memory entity
-        types instead of running an unscoped [?e ?a ?v] scan over every
-        triple in the graph.
-        """
-        import mcp_server
-
-        with execute_spy() as calls:
-            mcp_server._handle_memory_prepare_turn_heuristic("tell me about our framework")
-
-        broad_scan_calls = [
-            c for c in calls if "contains?" not in c and ":where [?e ?a ?v]" in c
-        ]
-        assert not broad_scan_calls, f"found unscoped broad scan: {broad_scan_calls}"
-
-    def test_respects_scan_limit_env_var(self, real_db, monkeypatch):
-        import mcp_server
-        monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "10")
-        # None of these facts share a substring with the message's candidate
-        # entities, so the targeted query stays empty and every one of these
-        # triples is eligible for the broad-scan fallback — the scan_limit is
-        # only meaningfully tested if the graph holds more rows than the limit.
-        triples = []
-        for i in range(30):
-            ident = f":decision/item-{i}"
-            triples.append(f'[{ident} :entity-type :type/decision]')
-            triples.append(f'[{ident} :ident "{ident}"]')
-            triples.append(f'[{ident} :description "unrelated fact {i}"]')
-        real_db.execute(f'(transact {{}} [{" ".join(triples)}])')
-
-        result = mcp_server._handle_memory_prepare_turn_heuristic("xyzzy plugh quux")
-
-        lines = result.split("\n")
-        assert lines[0] == "Relevant memory context:"
-        assert len(lines) - 1 == 10
-
-    def test_uses_valid_at_for_message_with_explicit_iso_date(self, real_db):
-        import mcp_server
-
-        with execute_spy() as calls:
-            mcp_server._handle_memory_prepare_turn_heuristic("what did we decide before 2026-01-15?")
-
-        assert any(':valid-at "2026-01-15"' in c for c in calls)
-
-    def test_caps_number_of_entities_scanned(self, real_db):
-        """A long message must not issue one full-graph contains? scan per token.
-
-        Each contains? query is an unindexed O(graph-size) linear scan (see
-        issue #96); an unbounded entity count turns a single hook invocation
-        into an unbounded number of full scans as the user's message grows.
-        """
-        import mcp_server
-
-        long_message = " ".join(f"distinctentityword{i}" for i in range(200))
-        with execute_spy() as calls:
-            mcp_server._handle_memory_prepare_turn_heuristic(long_message)
-
-        contains_calls = [c for c in calls if "contains?" in c]
-        assert len(contains_calls) <= mcp_server._MAX_HEURISTIC_ENTITIES
-
-    def test_uses_current_utc_timestamp_for_current_state_queries(self, real_db):
-        import mcp_server
-        import re
-
-        with execute_spy() as calls:
-            mcp_server._handle_memory_prepare_turn_heuristic("what database are we using?")
-
-        # Should contain a UTC timestamp like 2026-05-02T15:44:52.184Z
-        assert any(re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z', c) for c in calls)
-
-    def test_contains_filter_actually_matches_against_real_graph(self, tmp_path):
-        """Real (non-mocked) backend regression test for the bare `(contains? ...)`
-        clause bug: without the enclosing brackets, `[(contains? ?v "...")]`
-        parses as a rule-invocation of a non-existent rule and silently
-        contributes zero bindings — the targeted query returns empty with no
-        error, indistinguishable at the Python level from "no match found".
-        A mock never catches this because it never parses the Datalog string.
-
-        Asserting only on the heuristic's overall return value is not enough:
-        when the targeted contains? query comes back empty, the function
-        falls back to an UNFILTERED broad scan (mcp_server.py ~4357-4367)
-        that would still surface this fact regardless of whether the
-        targeted filter itself works — that fallback path masked this exact
-        bug from an end-to-end assertion during manual verification. So this
-        spies on _db_execute to confirm the TARGETED contains? query itself
-        returns the matching row, isolating the code path the bug lives in.
-        """
-        import mcp_server
-        mcp_server.open_db(str(tmp_path / "real.graph"))
-        db = mcp_server.get_db()
-        mcp_server._db_execute(
-            db,
-            '(transact {:valid-from "2024-01-01T00:00:00Z"} '
-            '[[:decision/db :entity-type :type/decision] '
-            '[:decision/db :ident ":decision/db"] '
-            '[:decision/db :description "we use postgresql for storage"]])',
-        )
-
-        real_execute = mcp_server._db_execute
-        contains_results = []
-
-        def spy(db_arg, datalog):
-            raw = real_execute(db_arg, datalog)
-            if "contains?" in datalog and "postgresql" in datalog:
-                contains_results.append(json.loads(raw).get("results", []))
-            return raw
-
-        mcp_server._db_execute = spy
-        try:
-            mcp_server._handle_memory_prepare_turn_heuristic(
-                "what database are we using, postgresql or mysql?"
-            )
-        finally:
-            mcp_server._db_execute = real_execute
-
-        assert contains_results, "the targeted contains? query must have been issued"
-        assert any(
-            any("postgresql" in str(v) for v in row) for rows in contains_results for row in rows
-        ), "the bracketed contains? filter must itself find the matching row, not just the broad-scan fallback"
 
 
 class TestHeuristicExtraction:
@@ -5662,14 +5471,6 @@ class TestIngestionWrites:
             mcp_server, "_last_run_write",
             lambda db, h, t, n, index_con=None: last_run_calls.append((h, t, n))
         )
-        # _run_ingestion's completion path fires IndexCache.invalidate() on a
-        # background daemon thread that calls get_db() after this test's real_db
-        # fixture has already released/reset _db — real_db's monkeypatched
-        # MiniGrafDb.open also reverts once this test function returns, so that
-        # thread's reopen races teardown and can log a harmless but noisy
-        # "[IndexCache] rebuild failed" to stderr. Neutralize it: this test is
-        # about _last_run_write's call args, not the search index.
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
 
         asyncio.run(mcp_server._run_ingestion(str(git_repo), "HEAD"))
 
@@ -5689,10 +5490,6 @@ class TestIngestionWrites:
             mcp_server, "_last_run_write",
             lambda db, h, t, n, index_con=None: last_run_calls.append((h, t, n))
         )
-        # See test_run_ingestion_writes_last_run_on_completion for why this is
-        # neutralized (harmless background-thread stderr noise, not a bug in
-        # what this test verifies).
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
 
         asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
 
@@ -5711,15 +5508,14 @@ class TestIngestCloseFactIndex:
     earlier draft of the design doc mislabeled which half does the real
     removal.
 
-    Seeding below uses mcp_server._transact directly, NOT _ingest_transact.
-    _ingest_transact is migrated separately in Task 8 and, as of this task,
-    is still a raw _db_execute call -- it never touches the fact index.
-    Seeding through it would make every index-state assertion below
-    vacuously true (the fact would never have been indexed to begin with,
-    so "absent from the index after close" would hold no matter what
-    _ingest_close does). Each index-state test below also asserts the seed
-    itself landed in the index, so a future regression to a non-indexing
-    seed would fail loudly here instead of silently validating nothing.
+    Seeding below uses mcp_server._transact directly, NOT _ingest_transact --
+    _ingest_transact was migrated in a later task to route through _transact
+    too (given an index_con), so either would touch the fact index equally
+    now; _transact is used here purely because it needs no index_con
+    plumbing for a single-fact seed. Each index-state test below also
+    asserts the seed itself landed in the index, so a future regression to
+    a non-indexing seed path would fail loudly here instead of silently
+    validating nothing.
     """
 
     def test_close_removes_open_assertion_from_index(self, real_db):
@@ -6338,7 +6134,6 @@ class TestRunIngestion:
     @pytest.mark.asyncio
     async def test_ingestion_processes_all_commits(self, real_db, git_repo, monkeypatch):
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -6368,7 +6163,6 @@ class TestRunIngestion:
     @pytest.mark.asyncio
     async def test_watermark_updated_after_each_commit(self, real_db, git_repo, monkeypatch):
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -6400,7 +6194,6 @@ class TestRunIngestion:
         import mcp_server
         from minigraf import MiniGrafDb
 
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         base_open = MiniGrafDb.open
         call_count = {"n": 0}
 
@@ -6473,7 +6266,6 @@ class TestRunIngestion:
     @pytest.mark.asyncio
     async def test_db_released_between_commits(self, real_db, git_repo, monkeypatch):
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -6538,7 +6330,6 @@ class TestRunIngestion:
             return inst
 
         monkeypatch.setattr(MiniGrafDb, "open", staticmethod(_open))
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._db = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6569,7 +6360,6 @@ class TestRunIngestion:
     async def test_handle_minigraf_ingest_git_returns_immediately(self, real_db, git_repo, monkeypatch):
         import mcp_server
         monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -6587,7 +6377,6 @@ class TestRunIngestion:
     async def test_second_call_while_running_returns_error(self, real_db, git_repo, monkeypatch):
         import mcp_server
         monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -6645,7 +6434,6 @@ class TestRunIngestion:
         proceeds normally and starts the ingestion task."""
         import mcp_server
         monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -6670,7 +6458,6 @@ class TestRunIngestion:
         progress" because the task-existence check is accurate immediately."""
         import mcp_server
         monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -6748,7 +6535,6 @@ class TestRunIngestion:
         correctness, which has its own coverage (TestTotalIngestedQuery and
         friends)."""
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 462)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6774,7 +6560,6 @@ class TestRunIngestion:
         to a stale value to prove _run_ingestion's seeding never even
         consults it."""
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 21715)
         monkeypatch.setattr(mcp_server, "_total_ingested_query", lambda db: 104)  # stale, must be ignored
         mcp_server._ingest_progress = {
@@ -6900,12 +6685,6 @@ class TestRunIngestionConcurrency:
             mcp_server._db = None
             mcp_server._graph_path = None
             mcp_server.open_db(str(graph_path))
-            # Prevent IndexCache's background rebuild thread (spawned on
-            # ingestion completion) from racing this test's own DB
-            # open/close cycles across the two runs below — see the
-            # established precedent for this same monkeypatch on other
-            # real-backend _run_ingestion tests in this file.
-            monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
             mcp_server._ingest_progress = {
                 "status": "idle", "processed": 0, "total": 0,
                 "current_commit": "", "error": None,
@@ -6962,7 +6741,6 @@ class TestRunIngestionConcurrency:
     async def test_worker_count_env_var_is_respected(self, real_db, git_repo, monkeypatch):
         monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", "1")
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -6984,7 +6762,6 @@ class TestRunIngestionConcurrency:
         <hash>:auth.py` genuinely fail inside the worker, exercising the
         same try/except continue path the old monkeypatch used to reach."""
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -7047,7 +6824,6 @@ class TestRunIngestionEventLoopResponsiveness:
         _subprocess.run(["git", "commit", "-m", "add big file"], cwd=repo, check=True, capture_output=True)
 
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -7126,7 +6902,6 @@ class TestRunIngestionShutdown:
         actually persists the watermark for run 2 to read.
         """
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         mcp_server._db = None
         mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo / "memory.graph"))
@@ -7510,147 +7285,6 @@ class TestOrphanWatchdog:
         await asyncio.wait_for(main_task, timeout=2)
 
 
-class TestIndexCache:
-    def test_get_returns_none_before_any_rebuild(self):
-        from mcp_server import IndexCache
-        cache = IndexCache()
-        assert cache.get() is None
-
-    def test_rebuild_populates_index(self, real_db):
-        import mcp_server
-        real_db.execute('(transact {} [[:decision/use-redis :description "use redis"]])')
-        cache = mcp_server.IndexCache()
-        cache._rebuild()
-        assert cache.get() is not None
-
-    def test_stale_index_served_when_already_rebuilding(self):
-        import mcp_server
-        from mcp_server import IndexCache, FactIndex
-        cache = IndexCache()
-        stale = FactIndex([[":decision/old", ":description", "old"]], boost=2.0)
-        cache._current = stale
-        cache._rebuilding = True
-        cache.invalidate()  # no-op because _rebuilding
-        assert cache.get() is stale
-        cache._rebuilding = False
-
-    def test_invalidate_noop_when_rebuilding(self):
-        from mcp_server import IndexCache
-        from unittest.mock import patch
-        cache = IndexCache()
-        cache._rebuilding = True
-        with patch("threading.Thread") as mock_thread:
-            cache.invalidate()
-            mock_thread.assert_not_called()
-        cache._rebuilding = False
-
-    def test_concurrent_invalidate_does_not_spawn_multiple_threads(self):
-        from mcp_server import IndexCache
-        from unittest.mock import patch
-        import threading as th
-        cache = IndexCache()
-        thread_count = []
-
-        original_thread_init = th.Thread.__init__
-
-        def counting_thread_init(self_thread, *args, **kwargs):
-            original_thread_init(self_thread, *args, **kwargs)
-            thread_count.append(1)
-
-        with patch.object(th.Thread, "__init__", counting_thread_init):
-            # Simulate two concurrent callers both passing the guard
-            # before either sets _rebuilding. With the fix, the first call
-            # sets _rebuilding = True before t.start(), so the second call
-            # sees it and returns without spawning.
-            cache.invalidate()
-            cache.invalidate()  # should be a no-op
-        assert len(thread_count) == 1
-        cache._rebuilding = False  # cleanup
-
-    def test_rebuild_leaves_current_unchanged_on_error(self, monkeypatch):
-        import mcp_server
-        from mcp_server import IndexCache, FactIndex
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
-        cache = IndexCache()
-        stale = FactIndex([[":decision/old", ":description", "old"]], boost=2.0)
-        cache._current = stale
-        # Force get_db to raise
-        monkeypatch.setattr(mcp_server, "get_db", lambda: (_ for _ in ()).throw(RuntimeError("db error")))
-        cache._rebuild()
-        assert cache.get() is stale
-        assert cache._rebuilding is False
-
-
-@requires_bm25
-class TestMemoryPrepareTurnBM25:
-    def test_returns_empty_when_no_index(self, real_db):
-        import mcp_server
-        from unittest.mock import patch
-        fresh_cache = mcp_server.IndexCache()  # no index built yet
-        with patch.object(mcp_server, "_index_cache", fresh_cache), \
-             patch.object(mcp_server, "_BM25_AVAILABLE", True):
-            result = mcp_server.handle_memory_prepare_turn("redis caching")
-        assert result == ""
-
-    def test_returns_empty_for_unmatched_query(self, real_db):
-        import mcp_server
-        from unittest.mock import patch
-        real_db.execute('(transact {} [[:decision/use-redis :description "use redis"]])')
-        cache = mcp_server.IndexCache()
-        cache._rebuild()
-        with patch.object(mcp_server, "_index_cache", cache):
-            result = mcp_server.handle_memory_prepare_turn("elephants trombone")
-        assert result == ""
-
-    def test_memory_facts_rank_above_git_facts(self, real_db):
-        import mcp_server
-        from unittest.mock import patch
-        # NOTE: against a real backend, minigraf resolves every entity ident
-        # (e.g. ":decision/use-redis") to an internal UUID — an unbound [?e
-        # ?a ?v] query never returns the keyword literal in the ?e position
-        # (see _query_canonical_entities' docstring a few hundred lines up,
-        # which documents this exact UUID-vs-ident distinction). That means
-        # FactIndex._is_memory — which keys off row[0], i.e. ?e — never
-        # matches a real fact, so the memory-fact BM25 boost this test's name
-        # references never actually fires in production either; verified by
-        # calling IndexCache._rebuild() against a real db with a
-        # ":decision/..."-prefixed + explicit :ident fact and observing
-        # _is_memory == [False, False]. This assertion therefore exercises
-        # natural BM25 relevance ranking (decision text scores higher than
-        # commit text for this query on doc-length/term-frequency grounds
-        # alone), not the boost path — see
-        # https://github.com/project-minigraf/temporal_reasoning/issues/141
-        # for the full writeup of this pre-existing bug.
-        real_db.execute(
-            '(transact {} ['
-            '[:decision/use-redis :description "use redis for caching"] '
-            '[:commit/abc123def456 :subject "feat use redis caching layer"] '
-            '[:function/unrelated :name "some other thing entirely"]'
-            '])'
-        )
-        cache = mcp_server.IndexCache()
-        cache._rebuild()
-        with patch.object(mcp_server, "_index_cache", cache):
-            result = mcp_server.handle_memory_prepare_turn("redis caching")
-        assert "Relevant memory context:" in result
-        assert result.index("use redis for caching") < result.index("feat use redis caching layer")
-
-    def test_respects_scan_limit(self, real_db, monkeypatch):
-        import mcp_server
-        from unittest.mock import patch
-        triples = " ".join(
-            f'[:decision/item-{i} :description "redis item {i}"]' for i in range(20)
-        )
-        real_db.execute(f'(transact {{}} [{triples}])')
-        monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "3")
-        cache = mcp_server.IndexCache()
-        cache._rebuild()
-        with patch.object(mcp_server, "_index_cache", cache):
-            result = mcp_server.handle_memory_prepare_turn("redis")
-        lines = [l for l in result.splitlines() if "|" in l]
-        assert len(lines) <= 3
-
-
 class TestHandleMemoryPrepareTurnFts5:
     def test_returns_ranked_context_for_matching_query(self, real_db):
         import mcp_server
@@ -7777,6 +7411,38 @@ class TestHandleMemoryPrepareTurnFts5:
         description_values = [row[2] for row in rows_for_entity if row[1] == ":description"]
         assert description_values == ["use redis for caching layer"]
 
+    def test_returns_empty_string_on_a_totally_fresh_graph(self, real_db):
+        """Coverage-gap fill (Task 13): the deleted BM25-era
+        TestMemoryPrepareTurnBM25.test_returns_empty_when_no_index and
+        TestMemoryPrepareTurn.test_returns_empty_string_when_graph_empty
+        both pinned this exact scenario -- nothing has ever been transacted,
+        so the sidecar index file doesn't exist yet either. This must
+        gracefully fall through the lazy-backfill path (rebuild against an
+        empty graph, re-query, still empty) and return "", not raise.
+        """
+        import mcp_server
+        result = mcp_server.handle_memory_prepare_turn("what database are we using?")
+        assert result == ""
+
+    def test_respects_scan_limit_env_var(self, real_db, monkeypatch):
+        """Coverage-gap fill (Task 13): the deleted
+        TestMemoryPrepareTurnBM25.test_respects_scan_limit pinned that
+        MINIGRAF_PREPARE_SCAN_LIMIT bounds how many facts
+        handle_memory_prepare_turn returns. handle_memory_prepare_turn still
+        reads this same env var into fact_index.query_facts' top_n (see
+        mcp_server.py), but nothing exercised that wiring end to end after
+        the FTS5 migration until now.
+        """
+        import mcp_server
+        triples = " ".join(
+            f'[:decision/item-{i} :description "redis item {i}"]' for i in range(20)
+        )
+        real_db.execute(f'(transact {{}} [{triples}])')
+        monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "3")
+        result = mcp_server.handle_memory_prepare_turn("redis")
+        lines = [l for l in result.splitlines() if "|" in l]
+        assert len(lines) <= 3
+
 
 class TestIndexCacheInvalidation:
     def test_successful_transact_triggers_invalidation(self, real_db):
@@ -7799,7 +7465,10 @@ class TestIndexCacheInvalidation:
         index_path = fact_index.index_path_for(mcp_server._graph_path)
         try:
             results = fact_index.query_facts(index_path, "leaky", top_n=10, boost=2.0)
-        except Exception:
+        except sqlite3.OperationalError:
+            # The failed transact never reached _index_write, so the index
+            # file may not exist yet at all -- distinct from "exists but
+            # empty". Either way, nothing was leaked into it.
             results = []
         assert results == []
 
@@ -7836,132 +7505,30 @@ class TestIndexCacheInvalidation:
         # anything from the index.
         assert any(r[0] == ":decision/leaky" for r in results)
 
-    def test_run_ingestion_triggers_invalidation_on_completion(self, real_db, tmp_path, monkeypatch):
+    def test_run_ingestion_leaves_ingested_facts_queryable_via_fact_index(self, real_db, git_repo):
+        """Replaces the old IndexCache.invalidate() assertion (#118): the new
+        design has no cache-invalidation step on completion at all --
+        _run_ingestion writes into the persisted fact index incrementally
+        throughout the run via index_con (see TestIngestTransactFactIndex),
+        so there is no discrete "on completion" hook left to spy on. The
+        meaningful post-completion guarantee is behavioral: once the run
+        finishes, facts it ingested are actually queryable through the fact
+        index, not that some particular internal method fired.
+        """
         import mcp_server
-        from unittest.mock import patch
-        monkeypatch.setattr(mcp_server, "_git_commits", lambda *a, **k: [])
-        monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: None)
-        monkeypatch.setattr(mcp_server, "_preload_known_entities", lambda *a, **k: ({}, {}, {}, {}))
-        monkeypatch.setattr(mcp_server, "_ingest_tags", lambda *a, **k: None)
-        monkeypatch.setattr(mcp_server, "_last_run_write", lambda *a, **k: None)
-        with patch.object(mcp_server._index_cache, "invalidate") as mock_inv:
-            import asyncio
-            asyncio.run(mcp_server._run_ingestion(str(tmp_path), "HEAD"))
-            mock_inv.assert_called_once()
-
-
-class TestBM25GracefulDegradation:
-    def test_falls_back_to_heuristic_when_bm25_unavailable(self, real_db, monkeypatch):
-        import mcp_server
-        # The heuristic extracts entities from "decided to use redis":
-        #   "decided" (7 chars) and "redis" (5 chars) pass the _MIN_ENTITY_LEN=4 filter.
-        # A fact whose value contains both substrings satisfies the heuristic's
-        # (contains? ?v "<entity>") query for either extracted entity.
-        real_db.execute('(transact {} [[:decision/use-redis :description "decided to use redis"]])')
-        monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
-        result = mcp_server.handle_memory_prepare_turn("decided to use redis")
-        # Heuristic path produces "Relevant memory context:" when facts are found
-        assert "Relevant memory context:" in result
-
-    def test_index_cache_rebuild_noop_when_bm25_unavailable(self, real_db, monkeypatch):
-        import mcp_server
-        real_db.execute('(transact {} [[:decision/use-redis :description "use redis"]])')
-        monkeypatch.setattr(mcp_server, "_BM25_AVAILABLE", False)
-        monkeypatch.setattr(mcp_server, "_BM25Okapi", None)
-        cache = mcp_server.IndexCache()
-        cache._rebuild()  # should not raise
-        result = cache.get()
-        # When _BM25Okapi is None, FactIndex._bm25 is never initialized
-        assert isinstance(result, mcp_server.FactIndex)
-        assert result._bm25 is None
-
-
-class TestBM25Tokenize:
-    def test_splits_keyword_ident_on_punctuation(self):
-        from mcp_server import _tokenize
-        assert _tokenize(":decision/use-redis") == ["decision", "use", "redis"]
-
-    def test_lowercases_tokens(self):
-        from mcp_server import _tokenize
-        assert _tokenize("use Redis for Caching") == ["use", "redis", "for", "caching"]
-
-    def test_filters_empty_tokens(self):
-        from mcp_server import _tokenize
-        assert _tokenize(":::") == []
-
-    def test_mixed_fact_row(self):
-        from mcp_server import _tokenize
-        assert _tokenize(":commit/abc123 :subject feat add redis") == [
-            "commit", "abc123", "subject", "feat", "add", "redis"
-        ]
-
-    def test_memory_prefix_detected(self):
-        from mcp_server import _MEMORY_PREFIXES
-        assert ":decision/use-redis".startswith(_MEMORY_PREFIXES)
-        assert ":preference/tdd".startswith(_MEMORY_PREFIXES)
-        assert ":constraint/no-js".startswith(_MEMORY_PREFIXES)
-        assert ":dependency/redis".startswith(_MEMORY_PREFIXES)
-
-    def test_git_prefix_not_memory(self):
-        from mcp_server import _MEMORY_PREFIXES
-        assert not ":commit/abc123".startswith(_MEMORY_PREFIXES)
-        assert not ":function/foo-bar".startswith(_MEMORY_PREFIXES)
-        assert not ":module/src-main".startswith(_MEMORY_PREFIXES)
-
-
-@requires_bm25
-class TestFactIndex:
-    def test_empty_facts_returns_empty_query(self):
-        from mcp_server import FactIndex
-        index = FactIndex([], boost=2.0)
-        assert index.query("redis", top_n=10) == []
-
-    def test_query_returns_matching_fact(self):
-        from mcp_server import FactIndex
-        facts = [[":decision/use-redis", ":description", "use redis for caching"]]
-        index = FactIndex(facts, boost=2.0)
-        results = index.query("redis caching", top_n=10)
-        assert len(results) == 1
-        assert results[0] == [":decision/use-redis", ":description", "use redis for caching"]
-
-    def test_memory_fact_outscores_git_fact(self):
-        from mcp_server import FactIndex
-        # Include a third unrelated fact so BM25 IDF is positive (avoids negative-score
-        # small-corpus edge case that would invert the boost when multiplied).
-        facts = [
-            [":decision/use-redis", ":description", "use redis for caching"],
-            [":commit/abc123def456", ":subject", "feat use redis for caching layer"],
-            [":commit/xyz789", ":subject", "fix typo in readme"],
-        ]
-        index = FactIndex(facts, boost=2.0)
-        results = index.query("redis caching", top_n=10)
-        assert results[0][0] == ":decision/use-redis"
-
-    def test_no_overlap_query_returns_empty(self):
-        from mcp_server import FactIndex
-        facts = [[":decision/use-redis", ":description", "use redis for caching"]]
-        index = FactIndex(facts, boost=2.0)
-        results = index.query("elephants trombone completely unrelated", top_n=10)
-        assert results == []
-
-    def test_top_n_respected(self):
-        from mcp_server import FactIndex
-        facts = [[f":decision/item-{i}", ":description", f"redis item {i}"] for i in range(20)]
-        index = FactIndex(facts, boost=2.0)
-        results = index.query("redis", top_n=5)
-        assert len(results) <= 5
-
-    def test_facts_with_no_tokens_skipped(self):
-        from mcp_server import FactIndex
-        # A fact whose text tokenises to [] should not crash
-        facts = [
-            [":::", ":::", ":::"],
-            [":decision/use-redis", ":description", "use redis"],
-        ]
-        index = FactIndex(facts, boost=2.0)
-        results = index.query("redis", top_n=10)
-        assert len(results) == 1
-        assert results[0][0] == ":decision/use-redis"
+        import fact_index
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        asyncio.run(mcp_server._run_ingestion(str(git_repo), "HEAD"))
+        assert mcp_server._ingest_progress["status"] == "complete"
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "auth", top_n=10, boost=2.0)
+        assert results, (
+            "ingested commit/module facts must be queryable via the fact "
+            "index once _run_ingestion completes"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -8103,7 +7670,6 @@ class TestClosedEntityLifecyclePurge:
 
     async def _ingest_and_open(self, repo, monkeypatch):
         import mcp_server
-        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         graph = str(repo / "memory.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         mcp_server._db = None

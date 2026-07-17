@@ -55,8 +55,8 @@ _db: Optional[MiniGrafDb] = None
 
 # Serializes every native call into the shared MiniGrafDb handle across the
 # threads that can touch it concurrently: the event-loop thread (call_tool
-# handlers), the ingestion write_executor thread, IndexCache._rebuild's
-# background thread, and worker threads used for preload/lock-retry. minigraf's
+# handlers), the ingestion write_executor thread, and worker threads used
+# for preload/lock-retry. minigraf's
 # own sidecar .lock file only guarantees single-process exclusivity — it says
 # nothing about concurrent calls into one already-open handle from multiple
 # threads within this same process. Without this, two threads racing a
@@ -84,8 +84,8 @@ _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
 # Extended retry budget for the one-time startup/manual-trigger lock
 # acquisition only (_load_ingestion_preload_state) — separate from
 # _LOCK_RETRY_MAX/_LOCK_RETRY_BASE above, which gate synchronous
-# per-request paths (call_tool, IndexCache rebuild) where long blocking
-# would be harmful. This path runs on a dedicated worker thread and can
+# per-request paths (call_tool) where long blocking would be harmful.
+# This path runs on a dedicated worker thread and can
 # afford to be patient enough to survive a typical orphan-process cleanup
 # window (SIGTERM grace period before SIGKILL) instead of giving up in
 # ~1.55s and entering a permanent "error" state (#106).
@@ -2878,10 +2878,10 @@ def _try_open_with_self_heal(path: str) -> MiniGrafDb:
 def _open_db_at_with_retry(path: str) -> MiniGrafDb:
     """Open MiniGrafDb at path, retrying with blocking backoff on lock contention.
 
-    Only safe off the asyncio event-loop thread (e.g. IndexCache's background
-    rebuild thread): the backoff uses time.sleep(), which would otherwise
-    freeze the single-threaded event loop for the whole retry budget — see
-    _ensure_db_async for the event-loop-safe equivalent (issue #99).
+    Only safe off the asyncio event-loop thread: the backoff uses
+    time.sleep(), which would otherwise freeze the single-threaded event
+    loop for the whole retry budget — see _ensure_db_async for the
+    event-loop-safe equivalent (issue #99).
     """
     delay = _LOCK_RETRY_BASE
     last_exc: Optional[Exception] = None
@@ -2971,12 +2971,14 @@ def get_db() -> MiniGrafDb:
     (call_tool, _run_ingestion) always await _ensure_db_async() first, so _db
     is already populated by the time they reach this function.
 
-    Reads the module-level _db global into a local exactly once. IndexCache's
-    background rebuild thread also calls this function, concurrently with
-    call_tool()'s finally block resetting _db to None — reading the global a
-    second time for the return would let that reset race in between the
-    None-check and the return, yielding None even though _db was live at call
-    time (issue #122).
+    Reads the module-level _db global into a local exactly once. A
+    background thread calling this function concurrently with call_tool()'s
+    finally block resetting _db to None — reading the global a second time
+    for the return would let that reset race in between the None-check and
+    the return, yielding None even though _db was live at call time (issue
+    #122; the original background caller that surfaced this, IndexCache's
+    rebuild thread, was deleted in #118, but the exactly-once read remains a
+    general defensive guarantee against any future background caller).
     """
     db = _db
     if db is None:
@@ -3065,8 +3067,7 @@ def _index_write(
     index_con: Optional[Any] = None,
 ) -> None:
     """Apply an insert or delete to the fact index, never raising -- index
-    maintenance must never block a graph write (mirrors IndexCache._rebuild's
-    existing exception handling). action is 'insert' or 'delete'. When
+    maintenance must never block a graph write. action is 'insert' or 'delete'. When
     index_con is provided, writes onto it without committing (caller controls
     the transaction boundary — used by ingestion's batching). Otherwise opens
     a connection, writes, commits, and closes immediately.
@@ -3343,10 +3344,13 @@ _STOP_WORDS = frozenset(
 
 _MIN_ENTITY_LEN = 4
 
-# Each entity triggers one unindexed, O(graph-size) `contains?` scan in
-# _handle_memory_prepare_turn_heuristic (see issue #96). Cap the count so a
-# long user message can't turn one hook invocation into an unbounded number
-# of full-graph scans.
+# Historical (issue #96): bounded how many unindexed, O(graph-size)
+# `contains?` scans a single hook invocation could trigger in
+# handle_memory_prepare_turn's old heuristic implementation, which was
+# deleted in #118 in favor of querying the persisted FTS5 fact index
+# (fact_index.query_facts) -- that path has no per-entity scan to bound, so
+# this constant is currently unused. Left in place rather than deleted here
+# since removing it is outside this cleanup's scope.
 _MAX_HEURISTIC_ENTITIES = int(os.environ.get("MINIGRAF_PREPARE_MAX_ENTITIES", "8"))
 
 
@@ -4485,8 +4489,8 @@ def _rebuild_index_from_graph() -> None:
     UUID otherwise) in Python gives full fact content for every entity,
     idented or not -- unlike a dropped fact, an entity recovered under its
     raw UUID just isn't boost-eligible (never starts with a
-    _MEMORY_PREFIXES keyword), which accurately reflects that its true
-    keyword ident is unrecoverable from the graph alone once written
+    fact_index._MEMORY_PREFIXES keyword), which accurately reflects that its
+    true keyword ident is unrecoverable from the graph alone once written
     without an explicit :ident fact.
     """
     db = get_db()
@@ -5879,8 +5883,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # to parse, exactly the symptom #116 reports. An explicit "spawn"
             # context is used rather than the platform default ("fork" on Linux)
             # because worker processes are created lazily as commits are submitted
-            # below, by which point write_executor's thread and IndexCache's
-            # background rebuild thread (see #122) may already be alive in this
+            # below, by which point write_executor's thread (and potentially other
+            # background threads -- see #122) may already be alive in this
             # process — forking with other threads running risks inheriting a
             # lock one of them held at the instant of fork, which would deadlock
             # forever in the child. spawn starts each worker from a clean

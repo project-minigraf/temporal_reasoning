@@ -126,6 +126,18 @@ def test_query_facts_excludes_non_matching_rows(tmp_path):
     assert results == []
 
 
+def test_query_facts_on_empty_index_returns_empty(tmp_path):
+    """Coverage-gap fill (Task 13, ported from the deleted mcp_server.py
+    TestFactIndex.test_empty_facts_returns_empty_query): querying an index
+    file that exists but has zero rows must return [] gracefully, not raise
+    -- distinct from test_query_facts_missing_index_raises, where the file
+    doesn't exist at all."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.close_writer(con)
+    assert fact_index.query_facts(path, "redis", top_n=10, boost=2.0) == []
+
+
 def test_query_facts_respects_top_n(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
@@ -253,3 +265,45 @@ def test_concurrent_rebuild_race_is_safe(tmp_path):
     finally:
         con.close()
     assert rows == [(":decision/x",)]
+
+
+# ---------------------------------------------------------------------------
+# _tokenize / _MEMORY_PREFIXES -- ported (Task 13 coverage-gap fill) from the
+# deleted mcp_server.py TestBM25Tokenize, whose subject (mcp_server._tokenize
+# / mcp_server._MEMORY_PREFIXES) no longer exists: fact text is now indexed
+# by SQLite FTS5's own tokenizer, not a custom Python one. fact_index.py
+# still has a same-named/same-shaped private _tokenize (query-side only, for
+# building the MATCH expression) and the same _MEMORY_PREFIXES tuple, so
+# these pin down equivalent behavior at its new home.
+# ---------------------------------------------------------------------------
+
+
+def test_tokenize_splits_keyword_ident_on_punctuation():
+    assert fact_index._tokenize(":decision/use-redis") == ["decision", "use", "redis"]
+
+
+def test_tokenize_lowercases_tokens():
+    assert fact_index._tokenize("use Redis for Caching") == ["use", "redis", "for", "caching"]
+
+
+def test_tokenize_filters_empty_tokens():
+    assert fact_index._tokenize(":::") == []
+
+
+def test_tokenize_mixed_fact_row():
+    assert fact_index._tokenize(":commit/abc123 :subject feat add redis") == [
+        "commit", "abc123", "subject", "feat", "add", "redis"
+    ]
+
+
+def test_memory_prefixes_include_all_memory_entity_types():
+    assert ":decision/use-redis".startswith(fact_index._MEMORY_PREFIXES)
+    assert ":preference/tdd".startswith(fact_index._MEMORY_PREFIXES)
+    assert ":constraint/no-js".startswith(fact_index._MEMORY_PREFIXES)
+    assert ":dependency/redis".startswith(fact_index._MEMORY_PREFIXES)
+
+
+def test_memory_prefixes_exclude_git_entity_types():
+    assert not ":commit/abc123".startswith(fact_index._MEMORY_PREFIXES)
+    assert not ":function/foo-bar".startswith(fact_index._MEMORY_PREFIXES)
+    assert not ":module/src-main".startswith(fact_index._MEMORY_PREFIXES)
