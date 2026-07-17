@@ -139,18 +139,33 @@ class TestGetTargetDir:
 
 class TestSyncFilesHarnessScoping:
     @pytest.mark.parametrize("harness,expected_dir,other_dirs", [
-        ("claude-code", "skills/temporal-reasoning",
-         [".codex/skills/temporal-reasoning", ".opencode/skills/temporal-reasoning"]),
+        ("claude-code", ".claude/skills/temporal-reasoning",
+         [".agents/skills/temporal-reasoning", ".opencode/skills/temporal-reasoning",
+          "skills/temporal-reasoning"]),
         ("opencode", ".opencode/skills/temporal-reasoning",
-         [".codex/skills/temporal-reasoning", "skills/temporal-reasoning"]),
-        ("codex", ".codex/skills/temporal-reasoning",
-         [".opencode/skills/temporal-reasoning", "skills/temporal-reasoning"]),
+         [".agents/skills/temporal-reasoning", ".claude/skills/temporal-reasoning",
+          "skills/temporal-reasoning"]),
+        ("codex", ".agents/skills/temporal-reasoning",
+         [".opencode/skills/temporal-reasoning", ".claude/skills/temporal-reasoning",
+          "skills/temporal-reasoning"]),
     ])
     def test_only_selected_harness_dir_is_written(self, tmp_path, harness, expected_dir, other_dirs):
         install._sync_files(str(tmp_path), harness)
         assert (tmp_path / expected_dir / "SKILL.md").exists()
         for other in other_dirs:
             assert not (tmp_path / other).exists()
+
+    def test_does_not_touch_preexisting_root_skills_dir(self, tmp_path):
+        """Acceptance criterion (#132): a pre-existing root-level skills/ directory
+        must not be overwritten, moved, or deleted by any harness's install."""
+        preexisting = tmp_path / "skills" / "temporal-reasoning" / "SKILL.md"
+        preexisting.parent.mkdir(parents=True)
+        preexisting.write_text("pre-existing sentinel content")
+
+        for harness in install.SUPPORTED_HARNESSES:
+            install._sync_files(str(tmp_path), harness)
+
+        assert preexisting.read_text() == "pre-existing sentinel content"
 
 
 class TestMainHarnessGating:

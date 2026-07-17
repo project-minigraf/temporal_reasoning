@@ -16,13 +16,13 @@ import shutil
 from typing import Callable
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, REPO_DIR)
+import install
 
-# Must match install.py
-SKILL_DIRS = [
-    os.path.join(".codex", "skills", "temporal-reasoning"),
-    os.path.join(".opencode", "skills", "temporal-reasoning"),
-    os.path.join("skills", "temporal-reasoning"),
-]
+# Sourced from install.py's HARNESS_SKILL_DIRS (not hand-duplicated) so this list
+# can't drift out of sync with the per-harness paths install.py actually writes —
+# a hand-maintained copy here previously went stale when #132 changed those paths.
+SKILL_DIRS = list(install.HARNESS_SKILL_DIRS.values())
 
 PLUGIN_KEY = "temporal-reasoning@temporal-reasoning-local"
 MARKETPLACE_KEY = "temporal-reasoning-local"

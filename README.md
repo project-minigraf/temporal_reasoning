@@ -100,7 +100,7 @@ cd /your/project
 python /path/to/temporal_reasoning/install.py --harness claude-code
 ```
 
-Run `install.py` from your project root. It creates a virtualenv, installs dependencies, and — for `--harness claude-code` — writes `.mcp.json` and `.claude/settings*.json` into your project directory. That's it.
+Run `install.py` from your project root. It creates a virtualenv, installs dependencies, syncs the skill into `.claude/skills/temporal-reasoning` (Claude Code's project-local skill scope), and — for `--harness claude-code` — writes `.mcp.json` and `.claude/settings*.json` into your project directory. That's it.
 
 **Optional — LLM extraction strategy:** `install.py` defaults to heuristic (regex) extraction, which requires no API key. To use LLM-based extraction, set `MINIGRAF_EXTRACTION_STRATEGY=llm` and `ANTHROPIC_API_KEY=<your key>` in `.claude/settings.local.json` after running the script.
 
@@ -118,7 +118,7 @@ This syncs the skill into `.opencode/skills/temporal-reasoning`. OpenCode's MCP 
 python /path/to/temporal_reasoning/install.py --harness codex
 ```
 
-This syncs the skill into `.codex/skills/temporal-reasoning`. Codex's MCP + hook wiring is manual — merge `hooks/codex.toml` into your `config.toml`.
+This syncs the skill into `.agents/skills/temporal-reasoning` — Codex CLI's documented project-local skill scope (it scans `.agents/skills` from the current working directory up to the repository root). Codex's MCP + hook wiring is manual — merge `hooks/codex.toml` into your `config.toml`.
 
 ## Quick Start
 
