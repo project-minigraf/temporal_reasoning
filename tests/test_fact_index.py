@@ -196,3 +196,60 @@ def test_query_facts_boost_surfaces_fact_outside_old_limit_window(tmp_path):
     results = fact_index.query_facts(path, "redis caching", top_n=3, boost=5.0)
     entities = [row[0] for row in results]
     assert ":decision/buried" in entities
+
+
+def test_rebuild_index_creates_fresh_table(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    fact_index.rebuild_index(path, [(":decision/x", ":description", "hello world")])
+    results = fact_index.query_facts(path, "hello", top_n=10, boost=2.0)
+    assert len(results) == 1
+    assert results[0][0] == ":decision/x"
+
+
+def test_rebuild_index_replaces_existing_data(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    fact_index.rebuild_index(path, [(":decision/old", ":description", "old fact")])
+    fact_index.rebuild_index(path, [(":decision/new", ":description", "new fact")])
+    con = fact_index.open_reader(path)
+    try:
+        rows = con.execute("SELECT entity FROM facts_fts").fetchall()
+    finally:
+        con.close()
+    assert rows == [(":decision/new",)]
+
+
+def test_rebuild_index_empty_facts(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    fact_index.rebuild_index(path, [])
+    con = fact_index.open_reader(path)
+    try:
+        rows = con.execute("SELECT * FROM facts_fts").fetchall()
+    finally:
+        con.close()
+    assert rows == []
+
+
+def test_concurrent_rebuild_race_is_safe(tmp_path):
+    """Two processes racing to backfill the same missing index file (e.g.
+    two hook invocations firing close together) must not corrupt the file
+    or raise -- CREATE VIRTUAL TABLE IF NOT EXISTS + busy_timeout means the
+    second racer just waits and finds the table already there."""
+    import subprocess
+    import sys as _sys
+    path = str(tmp_path / "t.fts.sqlite3")
+    script = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "import fact_index\n"
+        "fact_index.rebuild_index(%r, [(':decision/x', ':description', 'concurrent')])\n"
+    ) % (str(tmp_path.parent.parent), path)
+    # Run two rebuilds concurrently against the same path.
+    p1 = subprocess.Popen([_sys.executable, "-c", script])
+    p2 = subprocess.Popen([_sys.executable, "-c", script])
+    assert p1.wait(timeout=10) == 0
+    assert p2.wait(timeout=10) == 0
+    con = fact_index.open_reader(path)
+    try:
+        rows = con.execute("SELECT entity FROM facts_fts").fetchall()
+    finally:
+        con.close()
+    assert rows == [(":decision/x",)]

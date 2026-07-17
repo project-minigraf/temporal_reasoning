@@ -153,3 +153,25 @@ def query_facts(path: str, text: str, top_n: int, boost: float) -> List[List[str
         scored.append((score, [entity, attribute, value]))
     scored.sort(key=lambda pair: pair[0])
     return [row for _, row in scored[:top_n]]
+
+
+def rebuild_index(path: str, facts: Sequence[Tuple[str, str, str]]) -> None:
+    """Full rebuild: drop and recreate facts_fts, then bulk-insert facts.
+
+    Used for backfill (index file missing -- fresh install, pre-existing
+    graph, or corruption recovery). CREATE VIRTUAL TABLE IF NOT EXISTS makes
+    this safe under a concurrent racing rebuild from another process: the
+    second caller's DROP+CREATE+INSERT still runs to completion under
+    SQLite's own locking (busy_timeout), it just ends up re-doing work
+    rather than corrupting anything.
+    """
+    con = sqlite3.connect(path, timeout=5.0)
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        _configure(con)
+        con.execute("DROP TABLE IF EXISTS facts_fts")
+        ensure_schema(con)
+        insert_facts(con, facts)
+        con.commit()
+    finally:
+        con.close()
