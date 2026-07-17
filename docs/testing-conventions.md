@@ -64,6 +64,21 @@ and after the fact's valid-time window — not just "does it exist right
 now," which behaves like `:any-valid-time` regardless of bounds and would
 not have caught the argument-order bug either.
 
+## Plain-object doubles for infrastructure concerns
+
+Very rarely, a test needs a plain-object double that isn't `MagicMock` and
+doesn't fake Datalog semantics — not because the test is avoiding Datalog
+concerns, but because a real `MiniGrafDb` instance is unsuitable for
+infrastructure reasons unrelated to correctness. These narrow cases are:
+- `SlowFakeDb` (around line 511 in `test_mcp_server.py`) — used by a
+  `_db_native_lock` serialization test. A real DB executes too fast to
+  expose lock-contention overlap; a deliberately slow plain-object double
+  detects when two threads enter concurrently.
+- `_FakeDb` (around line 6092 in `test_mcp_server.py`) — used by a
+  refcounting test. A real FFI handle's object identity and `sys.getrefcount()`
+  profile differ from a plain Python object; the test measures reference
+  leak patterns and can't use `MagicMock` for the same inflation reason.
+
 ## The one narrow exception: external, non-minigraf APIs
 
 Mocking survives only for genuinely external network services (or

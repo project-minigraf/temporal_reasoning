@@ -40,13 +40,16 @@ requires_bm25 = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def reset_mcp_server_db():
+def reset_mcp_server_db(monkeypatch):
     """Reset the module-level _db singleton, grammar cache, and index cache between tests."""
     import mcp_server
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
     mcp_server._index_cache = mcp_server.IndexCache()
     yield
+    # Suppress index cache rebuilds during teardown to avoid race with background
+    # rebuild threads that may still be running from the previous test (see #133).
+    monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
     mcp_server._index_cache = mcp_server.IndexCache()
@@ -7067,6 +7070,7 @@ class TestIndexCache:
     def test_rebuild_leaves_current_unchanged_on_error(self, monkeypatch):
         import mcp_server
         from mcp_server import IndexCache, FactIndex
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         cache = IndexCache()
         stale = FactIndex([[":decision/old", ":description", "old"]], boost=2.0)
         cache._current = stale
@@ -7448,6 +7452,7 @@ class TestClosedEntityLifecyclePurge:
 
     async def _ingest_and_open(self, repo, monkeypatch):
         import mcp_server
+        monkeypatch.setattr(mcp_server._index_cache, "invalidate", lambda: None)
         graph = str(repo / "memory.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         mcp_server._db = None
