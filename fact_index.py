@@ -83,9 +83,12 @@ def open_writer(path: str) -> sqlite3.Connection:
 def open_reader(path: str) -> sqlite3.Connection:
     """Open a read-only connection against an existing index file.
 
-    Raises sqlite3.OperationalError if the file doesn't exist -- callers
-    (mcp_server.handle_memory_prepare_turn) catch this and trigger a
-    backfill rebuild, then retry.
+    Raises sqlite3.OperationalError if the file doesn't exist. Callers
+    (mcp_server.handle_memory_prepare_turn) are expected to check
+    needs_backfill() proactively before calling this, not to catch this
+    exception reactively -- but the exception is still raised for callers
+    that skip that check, or for a file that vanishes between the check
+    and the open.
     """
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
     _configure(con)
