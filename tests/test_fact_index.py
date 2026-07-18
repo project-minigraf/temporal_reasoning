@@ -470,6 +470,43 @@ def test_concurrent_rebuild_race_is_safe(tmp_path):
     assert rows == [(":decision/x",)]
 
 
+def test_concurrent_rebuild_race_against_a_corrupted_file_is_safe(tmp_path):
+    """Several processes racing to recover the SAME corrupted index file must
+    not raise. Unlike lock/busy contention (a timing-dependent condition, so
+    racers rarely observe it at the exact same instant), corruption is a
+    static property of the file every racer detects at once -- so a naive
+    check-then-remove (os.path.exists then os.remove) is a real TOCTOU race:
+    one racer's os.remove can lose to another racer's os.remove already
+    having deleted the file, raising FileNotFoundError. This must be
+    swallowed, not propagated. Uses several concurrent processes (not just
+    two, like the missing-file race test above) because this race is
+    probabilistic and needs enough concurrent contenders to reliably surface
+    it if the swallow-FileNotFoundError guard regresses."""
+    import subprocess
+    import sys as _sys
+    path = str(tmp_path / "t.fts.sqlite3")
+    with open(path, "wb") as f:
+        f.write(b"not a real sqlite file at all, just garbage bytes")
+    script = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "import fact_index\n"
+        "fact_index.rebuild_index(%r, [(':decision/x', ':description', 'concurrent', None, None)])\n"
+    ) % (str(tmp_path.parent.parent), path)
+    procs = [
+        subprocess.Popen([_sys.executable, "-c", script], stderr=subprocess.PIPE)
+        for _ in range(8)
+    ]
+    for p in procs:
+        _, stderr = p.communicate(timeout=10)
+        assert p.returncode == 0, stderr.decode()
+    con = fact_index.open_reader(path)
+    try:
+        rows = con.execute("SELECT entity FROM facts_fts").fetchall()
+    finally:
+        con.close()
+    assert rows == [(":decision/x",)]
+
+
 # ---------------------------------------------------------------------------
 # _tokenize / _MEMORY_PREFIXES -- ported (Task 13 coverage-gap fill) from the
 # deleted mcp_server.py TestBM25Tokenize, whose subject (mcp_server._tokenize

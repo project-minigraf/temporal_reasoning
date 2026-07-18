@@ -303,17 +303,31 @@ def rebuild_index(
             if attempt == attempts - 1:
                 raise
             time.sleep(base_delay * (2 ** attempt))
-        except sqlite3.DatabaseError:
-            # Any other DatabaseError (OperationalError is handled above and
-            # never reaches here) means the file itself is corrupted -- e.g.
-            # "file is not a database", "malformed disk image". This is not
-            # a transient lock/busy condition, so retrying in place can
-            # never succeed; the only recovery is to remove the corrupted
-            # file and let the next attempt recreate it from scratch via the
-            # same drop+create+insert sequence above.
+        except sqlite3.DatabaseError as e:
+            # sqlite3.DatabaseError is the parent class of OperationalError
+            # (handled above, never reaches here) but also of
+            # ProgrammingError/IntegrityError/DataError/InternalError, none
+            # of which indicate file corruption -- only re-raise as "corrupt,
+            # remove and retry" for the specific messages SQLite actually
+            # uses for a corrupted/non-database file. Anything else (e.g. a
+            # caller bug reaching insert_facts with malformed data) must
+            # propagate immediately, not be masked behind a corruption
+            # detour that deletes a perfectly good file.
+            message = str(e).lower()
+            if "file is not a database" not in message and "malformed" not in message:
+                raise
             if attempt == attempts - 1:
                 raise
-            if os.path.exists(path):
+            # TOCTOU: a concurrently-racing rebuild against the same
+            # corrupted file can already have removed it by the time this
+            # process gets here (unlike lock/busy contention, corruption is
+            # a static file property every racer detects at once, not a
+            # timing-dependent one) -- swallow the resulting FileNotFoundError
+            # rather than letting it propagate uncaught, since the file being
+            # gone is exactly the outcome this branch wants anyway.
+            try:
                 os.remove(path)
+            except FileNotFoundError:
+                pass
         finally:
             con.close()
