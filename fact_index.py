@@ -282,6 +282,17 @@ def rebuild_index(
             con.execute("PRAGMA journal_mode=WAL")
             con.execute(f"PRAGMA mmap_size={_MMAP_SIZE}")
             con.execute("BEGIN IMMEDIATE")
+            # Note: FTS5-shadow-table-only corruption (e.g. facts_fts_data's
+            # structure record) self-heals here unconditionally, before ever
+            # reaching the except sqlite3.DatabaseError branch below -- this
+            # DROP succeeds even against a corrupted shadow table on the
+            # SQLite version this was verified against. If a future SQLite
+            # version makes DROP TABLE validate shadow-table contents before
+            # dropping, that corruption pattern would start raising here
+            # instead, and would need its own message pattern recognized by
+            # the except branch below (its real-world message is "fts5:
+            # corrupt structure record", matching neither of the two
+            # substrings currently checked).
             con.execute("DROP TABLE IF EXISTS facts_fts")
             con.execute("DROP TABLE IF EXISTS index_meta")
             con.execute(_SCHEMA_SQL)  # NOT ensure_schema() -- see its docstring
