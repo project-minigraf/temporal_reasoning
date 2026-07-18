@@ -50,10 +50,12 @@ change the diagnosis or the fix.*
 
 ## Non-goals
 
-- Historical (`:as-of`/`:valid-at`-in-the-past) retrieval through the index.
-  Today's `FactIndex` only ever indexes the current-valid snapshot
-  (`:valid-at now`); this design preserves that scope exactly and does not
-  add a new historical-query capability.
+- ~~Historical (`:as-of`/`:valid-at`-in-the-past) retrieval through the index.~~
+  **Reversed** by the 2026-07-18 bi-temporal fact index design — a first-principles
+  design discussion found that excluding history from the one retrieval path that
+  reaches the model unprompted (the hook) contradicted the project's own bi-temporal-
+  memory premise. See that doc for the current design; historical facts are now
+  indexed as labeled entry points into the graph's archive.
 - Changing what "relevant memory context" means (still whole-graph, boosted
   for memory-fact idents) — this is an infrastructure fix, not a retrieval-
   scope change.
@@ -279,23 +281,13 @@ clause-ordering fix explicitly.
 
 ### Backfill / bootstrap
 
-If the index file doesn't exist — fresh install, a pre-existing graph from
-before this feature shipped, or manual deletion/corruption recovery — a
-one-time full rebuild runs: the same `:valid-at now` rescan query
-`IndexCache._rebuild` uses today, corrected with the `:ident`-projection fix
-above, writing straight into a fresh `facts_fts` table. This is the only
-place a full graph rescan happens post-launch. It's triggered lazily:
-whichever process (hook or server) first finds the index file missing runs
-the rebuild before serving that query — the same self-healing precedent
-already used for stale graph-lock recovery (`_open_db_at_with_retry`).
-
-Backfill is the one deliberate exception to "only the server writes"
-(below): the hook may also perform it, since it can be the first process to
-observe a missing index file after install or corruption-recovery. This is
-safe under ordinary SQLite locking — `CREATE VIRTUAL TABLE IF NOT EXISTS`
-plus a `busy_timeout` means a second, concurrently-racing backfill (e.g. two
-hook invocations firing close together) simply blocks briefly and then finds
-the table already populated, rather than corrupting or duplicating rows.
+**Superseded** by the 2026-07-18 bi-temporal fact index design
+(`docs/superpowers/specs/2026-07-18-bitemporal-fact-index-design.md`), which replaced the
+file-existence check described in the original version of this section with an explicit,
+atomically-set completion marker (`fact_index.needs_backfill()`) — the original approach
+had a real bug: any incremental write reaching the index before the first read would
+create a schema-only file that was indistinguishable from a fully-backfilled one. See the
+newer doc for the current design.
 
 ### Concurrency
 
