@@ -4107,8 +4107,11 @@ def _ingest_close(
        assertion from the live view while keeping it in transaction history).
        This is also the step that removes the fact from the live index.
     2. Re-transact the same facts with explicit :valid-from + :valid-to so the
-       historical valid window is preserved for point-in-time queries. Bounded
-       (valid_to is not None), so _transact does not index this half.
+       historical valid window is preserved for point-in-time queries. This
+       half is bounded (valid_to is not None) but IS indexed too, as a
+       historical row carrying its window -- this is what makes a closed
+       entity's facts recoverable through the fact index as a labeled entry
+       point into history, instead of just vanishing.
 
     Triples are retracted one-by-one to avoid EAVT collision on :contains edges
     (Minigraf's pending index omits value bytes, so batching multiple
