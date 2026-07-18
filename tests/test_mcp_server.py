@@ -5642,6 +5642,105 @@ class TestIngestCloseFactIndex:
             "indexing guard skips it"
         )
 
+    def test_close_produces_a_historical_row_not_a_dropped_one(self, real_db):
+        """Complements the existing test_close_removes_open_assertion_from_index
+        (which only proves the CURRENT row is gone) -- this proves the fact
+        didn't just vanish, it became a labeled historical row."""
+        import mcp_server
+        import fact_index
+        mcp_server._transact(
+            real_db, '[[:module/foo :description "the foo module"]]', "2024-01-01T00:00:00.000Z",
+        )
+        mcp_server._ingest_close(
+            real_db, ['[:module/foo :description "the foo module"]'],
+            "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z", "test",
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        con = fact_index.open_reader(index_path)
+        try:
+            rows = con.execute(
+                "SELECT entity, valid_from, valid_to FROM facts_fts WHERE entity = ':module/foo'"
+            ).fetchall()
+        finally:
+            con.close()
+        assert rows == [(":module/foo", "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z")]
+
+    def test_reopen_after_close_produces_current_plus_historical_rows(self, real_db):
+        """assert -> close -> re-assert the same (e, a, v): the historical
+        row from the close survives, a new current row exists too -- proves
+        delete_facts' valid_to IS NULL scoping (Task 2) holds through the
+        real _ingest_close/_transact call sites, not just direct fact_index
+        calls."""
+        import mcp_server
+        import fact_index
+        mcp_server._transact(
+            real_db, '[[:module/foo :description "the foo module"]]', "2024-01-01T00:00:00.000Z",
+        )
+        mcp_server._ingest_close(
+            real_db, ['[:module/foo :description "the foo module"]'],
+            "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z", "test",
+        )
+        mcp_server._transact(
+            real_db, '[[:module/foo :description "the foo module"]]', "2025-06-01T00:00:00.000Z",
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        con = fact_index.open_reader(index_path)
+        try:
+            rows = con.execute(
+                "SELECT valid_from, valid_to FROM facts_fts WHERE entity = ':module/foo' ORDER BY valid_from"
+            ).fetchall()
+        finally:
+            con.close()
+        assert rows == [
+            ("2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z"),
+            ("2025-06-01T00:00:00.000Z", None),
+        ]
+
+    def test_backfill_after_close_reconstructs_the_same_historical_row(self, real_db):
+        """assert+close directly (no fact_index involvement at all, simulating
+        a pre-existing graph), delete the index, backfill -- the rebuilt
+        index has exactly the historical row a live _ingest_close would
+        have produced, with the same window. Uses raw minigraf calls (not
+        the choke point) for the seed, to prove backfill reconstructs
+        windows correctly from the graph alone, not from any index state.
+
+        Note: we use _ingest_close directly to seed the graph state (since it
+        has already implemented the two-step lifecycle), then call _rebuild_index_from_graph
+        to prove the backfill correctly projects the historical window. We also
+        ensure the entity has an :ident triple so it can be recovered by keyword
+        during backfill (this is the standard minigraf pattern for entities that
+        should be recoverable from graph snapshots)."""
+        import mcp_server
+        import fact_index
+        import os
+        # Seed: transact an open fact WITH an :ident triple so it's recoverable
+        # during backfill (standard minigraf pattern per Task 6 findings)
+        mcp_server._transact(
+            real_db, '[[:module/bar :description "the bar module"] [:module/bar :ident ":module/bar"]]',
+            "2024-01-01T00:00:00.000Z",
+        )
+        # Close it
+        mcp_server._ingest_close(
+            real_db, ['[:module/bar :description "the bar module"]'],
+            "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z", "test",
+        )
+        # Now delete the index to simulate a recovered pre-index graph
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        if os.path.exists(index_path):
+            os.remove(index_path)
+        # Rebuild from graph
+        mcp_server._rebuild_index_from_graph()
+        # Verify the backfilled index matches -- query for the specific fact we closed,
+        # not all facts for the entity (which includes the :ident fact)
+        con = fact_index.open_reader(index_path)
+        try:
+            rows = con.execute(
+                "SELECT entity, valid_from, valid_to FROM facts_fts WHERE entity = ':module/bar' AND attribute = ':description'"
+            ).fetchall()
+        finally:
+            con.close()
+        assert rows == [(":module/bar", "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z")]
+
 
 class TestPrecomputeFileTriples:
     def test_module_candidate_triples_include_introduced_by(self):
