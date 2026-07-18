@@ -192,45 +192,54 @@ def _fts5_match_query(text: str) -> Optional[str]:
     return " OR ".join(f'"{t}"' for t in tokens)
 
 
-def query_facts(path: str, text: str, top_n: int, boost: float) -> List[List[str]]:
+def query_facts(
+    path: str, text: str, top_n: int, boost: float, historical_discount: float
+) -> List[List[str]]:
     """Ranked, read-only query against the index.
 
-    Returns up to top_n [entity, attribute, value] rows, best match first.
-    Facts whose entity starts with a memory-fact prefix (_MEMORY_PREFIXES)
-    get their score multiplied by boost. FTS5's bm25() is negative-is-better
-    (SQLite convention, opposite of rank_bm25) -- multiplying a negative
-    score by boost > 1 makes it more negative, i.e. better, so this has the
-    same boosting effect as the old FactIndex's positive-score multiply.
+    Returns up to top_n [entity, attribute, value, valid_from, valid_to]
+    rows, best match first. Facts whose entity starts with a memory-fact
+    prefix (_MEMORY_PREFIXES) get their score multiplied by boost.
+    Historical facts (valid_to IS NOT NULL) get their score multiplied by
+    historical_discount (expected in (0, 1] -- values below 1 demote
+    history below an equally-relevant current fact; 1.0 is neutral).
+
+    All ranking (boost, historical discount) and the top_n bound are applied
+    entirely in SQL, inside the same ORDER BY that ranks by bm25() --
+    unlike the prior Python-side-rerank-after-fetch approach, a LIMIT here
+    can never drop a boost-eligible fact, because boosting happens before
+    truncation, not after. FTS5's bm25() is negative-is-better (SQLite
+    convention) -- multiplying a negative score by a factor > 1 makes it
+    MORE negative, i.e. better/promoted; a factor in (0, 1) makes it closer
+    to zero, i.e. worse/demoted. Both boost and historical_discount rely on
+    this sign convention: boost should be > 1 to promote, historical_discount
+    should be in (0, 1] to demote or leave unchanged.
 
     Raises sqlite3.OperationalError if the index file doesn't exist -- the
     caller (mcp_server.handle_memory_prepare_turn) is responsible for
-    triggering a backfill and retrying.
+    checking fact_index.needs_backfill() before calling this, not for
+    catching this exception reactively.
     """
     match_expr = _fts5_match_query(text)
     if match_expr is None:
         return []
     con = open_reader(path)
     try:
-        # No LIMIT here: FTS5 MATCH already bounds the result set to rows
-        # containing at least one OR'd query token (not a full-corpus scan),
-        # and the memory-fact boost below needs to see every matching row --
-        # a fact whose *unboosted* bm25 rank falls outside a pre-boost LIMIT
-        # window would never get a chance to be promoted by the boost.
         rows = con.execute(
-            "SELECT entity, attribute, value, bm25(facts_fts) AS score "
+            "SELECT entity, attribute, value, valid_from, valid_to, "
+            "  (bm25(facts_fts) "
+            "    * (CASE WHEN entity LIKE ':decision/%' OR entity LIKE ':preference/%' "
+            "            OR entity LIKE ':constraint/%' OR entity LIKE ':dependency/%' "
+            "       THEN ? ELSE 1.0 END) "
+            "    * (CASE WHEN valid_to IS NULL THEN 1.0 ELSE ? END) "
+            "  ) AS score "
             "FROM facts_fts WHERE facts_fts MATCH ? "
-            "ORDER BY score ASC",
-            (match_expr,),
+            "ORDER BY score ASC LIMIT ?",
+            (boost, historical_discount, match_expr, top_n),
         ).fetchall()
     finally:
         con.close()
-    scored = []
-    for entity, attribute, value, score in rows:
-        if entity.startswith(_MEMORY_PREFIXES):
-            score *= boost
-        scored.append((score, [entity, attribute, value]))
-    scored.sort(key=lambda pair: pair[0])
-    return [row for _, row in scored[:top_n]]
+    return [[entity, attribute, value, valid_from, valid_to] for entity, attribute, value, valid_from, valid_to, _score in rows]
 
 
 def rebuild_index(

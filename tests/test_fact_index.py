@@ -217,7 +217,7 @@ def test_query_facts_ranks_by_relevance(tmp_path):
         (":function/unrelated", ":name", "some other thing entirely", None, None),
     ])
     fact_index.close_writer(con)
-    results = fact_index.query_facts(path, "redis caching", top_n=10, boost=2.0)
+    results = fact_index.query_facts(path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0)
     assert results
     assert results[0][0] == ":decision/use-redis"
 
@@ -227,7 +227,7 @@ def test_query_facts_excludes_non_matching_rows(tmp_path):
     con = fact_index.open_writer(path)
     fact_index.insert_facts(con, [(":function/unrelated", ":name", "some other thing entirely", None, None)])
     fact_index.close_writer(con)
-    results = fact_index.query_facts(path, "redis caching", top_n=10, boost=2.0)
+    results = fact_index.query_facts(path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0)
     assert results == []
 
 
@@ -240,7 +240,7 @@ def test_query_facts_on_empty_index_returns_empty(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
     fact_index.close_writer(con)
-    assert fact_index.query_facts(path, "redis", top_n=10, boost=2.0) == []
+    assert fact_index.query_facts(path, "redis", top_n=10, boost=2.0, historical_discount=1.0) == []
 
 
 def test_query_facts_respects_top_n(tmp_path):
@@ -250,7 +250,7 @@ def test_query_facts_respects_top_n(tmp_path):
         (f":decision/x{i}", ":description", "redis caching option", None, None) for i in range(5)
     ])
     fact_index.close_writer(con)
-    results = fact_index.query_facts(path, "redis caching", top_n=2, boost=2.0)
+    results = fact_index.query_facts(path, "redis caching", top_n=2, boost=2.0, historical_discount=1.0)
     assert len(results) == 2
 
 
@@ -273,7 +273,7 @@ def test_query_facts_boosts_memory_prefixed_entities():
     ])
     fact_index.close_writer(con)
     try:
-        results = fact_index.query_facts(path, "redis caching helper function", top_n=10, boost=2.0)
+        results = fact_index.query_facts(path, "redis caching helper function", top_n=10, boost=2.0, historical_discount=1.0)
         assert results[0][0] == ":decision/redis"
     finally:
         _os.remove(path)
@@ -282,7 +282,7 @@ def test_query_facts_boosts_memory_prefixed_entities():
 def test_query_facts_missing_index_raises():
     import pytest
     with pytest.raises(sqlite3.OperationalError):
-        fact_index.query_facts("/nonexistent/does-not-exist.sqlite3", "anything", top_n=10, boost=2.0)
+        fact_index.query_facts("/nonexistent/does-not-exist.sqlite3", "anything", top_n=10, boost=2.0, historical_discount=1.0)
 
 
 def test_query_facts_boost_surfaces_fact_outside_old_limit_window(tmp_path):
@@ -310,15 +310,82 @@ def test_query_facts_boost_surfaces_fact_outside_old_limit_window(tmp_path):
     triples.append((":decision/buried", ":description", decision_text, None, None))
     fact_index.insert_facts(con, triples)
     fact_index.close_writer(con)
-    results = fact_index.query_facts(path, "redis caching", top_n=3, boost=5.0)
+    results = fact_index.query_facts(path, "redis caching", top_n=3, boost=5.0, historical_discount=1.0)
     entities = [row[0] for row in results]
     assert ":decision/buried" in entities
+
+
+def test_query_facts_historical_discount_demotes(tmp_path):
+    """A historical fact ranks below an equally-matching current fact."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [
+        (":module/old-cache", ":description", "redis caching layer", "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z"),
+        (":module/new-cache", ":description", "redis caching layer", "2025-01-01T00:00:00.000Z", None),
+    ])
+    fact_index.close_writer(con)
+    results = fact_index.query_facts(path, "redis caching layer", top_n=10, boost=2.0, historical_discount=0.5)
+    assert results[0][0] == ":module/new-cache"
+    assert results[1][0] == ":module/old-cache"
+
+
+def test_query_facts_historical_discount_of_one_means_no_discount(tmp_path):
+    """historical_discount=1.0 (the default/neutral value existing tests
+    use) leaves historical and current facts scored purely on relevance --
+    proves the discount parameter, not some other factor, is what causes
+    the demotion in the sibling test above."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [
+        (":module/old-cache", ":description", "redis caching layer identical text here", "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z"),
+        (":module/new-cache", ":description", "redis caching layer identical text here", "2025-01-01T00:00:00.000Z", None),
+    ])
+    fact_index.close_writer(con)
+    results = fact_index.query_facts(path, "redis caching layer identical text here", top_n=10, boost=2.0, historical_discount=1.0)
+    # Identical text -> identical raw bm25 score -> order between the two is
+    # not asserted (implementation-defined tie order), only that BOTH appear.
+    assert {r[0] for r in results} == {":module/old-cache", ":module/new-cache"}
+
+
+def test_query_facts_returns_window_columns(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [
+        (":module/foo", ":description", "the foo module", "2024-01-01T00:00:00.000Z", "2024-06-01T00:00:00.000Z"),
+    ])
+    fact_index.close_writer(con)
+    results = fact_index.query_facts(path, "foo module", top_n=10, boost=2.0, historical_discount=0.5)
+    assert results == [[":module/foo", ":description", "the foo module", "2024-01-01T00:00:00.000Z", "2024-06-01T00:00:00.000Z"]]
+
+
+def test_query_facts_limit_is_bounded_but_boost_still_applies_inside_it(tmp_path):
+    """Regression guard for the Task-2 bug class (an early LIMIT dropping a
+    boost-eligible fact) -- proves the new SQL-side LIMIT, unlike the old
+    unbounded-Python-fetch-then-truncate approach, still lets a buried
+    memory fact win via boost because scoring happens BEFORE the LIMIT in
+    the SQL ORDER BY, not after a Python-side truncation."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    # 20 non-memory facts that outrank the one memory fact on raw bm25 alone
+    # (repeated query terms boost raw term frequency), plus one buried
+    # memory fact with the query terms only once.
+    filler = [
+        (f":function/noise{i}", ":name", "redis caching redis caching redis caching", None, None)
+        for i in range(20)
+    ]
+    con2_facts = filler + [
+        (":decision/buried", ":description", "redis caching", None, None),
+    ]
+    fact_index.insert_facts(con, con2_facts)
+    fact_index.close_writer(con)
+    results = fact_index.query_facts(path, "redis caching", top_n=3, boost=2.0, historical_discount=1.0)
+    assert any(r[0] == ":decision/buried" for r in results)
 
 
 def test_rebuild_index_creates_fresh_table(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     fact_index.rebuild_index(path, [(":decision/x", ":description", "hello world", None, None)])
-    results = fact_index.query_facts(path, "hello", top_n=10, boost=2.0)
+    results = fact_index.query_facts(path, "hello", top_n=10, boost=2.0, historical_discount=1.0)
     assert len(results) == 1
     assert results[0][0] == ":decision/x"
 
@@ -432,7 +499,7 @@ def test_cross_process_reader_sees_writer_commits(tmp_path):
     script = (
         f"import sys; sys.path.insert(0, {repo_root!r})\n"
         "import fact_index\n"
-        f"results = fact_index.query_facts({path!r}, 'redis caching', top_n=10, boost=2.0)\n"
+        f"results = fact_index.query_facts({path!r}, 'redis caching', top_n=10, boost=2.0, historical_discount=1.0)\n"
         "assert results, 'subprocess found no results — cross-process sharing broken'\n"
         "assert results[0][0] == ':decision/use-redis'\n"
         "print('OK')\n"
