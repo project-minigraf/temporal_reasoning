@@ -825,8 +825,8 @@ class TestTransactRetractChokePoint:
             real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z",
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0)
-        assert results == [[":decision/x", ":description", "hello"]]
+        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0, historical_discount=1.0)
+        assert results == [[":decision/x", ":description", "hello", "2026-01-01T00:00:00.000Z", None]]
 
     def test_transact_writes_to_minigraf(self, real_db):
         import mcp_server
@@ -837,22 +837,20 @@ class TestTransactRetractChokePoint:
         import json
         assert json.loads(raw)["results"] == [["hello"]]
 
-    def test_transact_with_valid_to_does_not_index(self, real_db):
-        """Bounded (historical) transacts must not appear in the live index."""
+    def test_transact_with_valid_to_indexes_as_historical(self, real_db):
+        """Bounded (historical) transacts are now indexed too, with their window."""
         import mcp_server
         import fact_index
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
-        # Pre-create the index file: a bounded transact must not write to the
-        # index at all (not even to create it), so query_facts needs a real
-        # (empty) index file to query against rather than hitting the
-        # "index file missing" path (fact_index.open_reader's OperationalError).
-        fact_index.close_writer(fact_index.open_writer(index_path))
         mcp_server._transact(
             real_db, '[[:decision/x :description "hello"]]',
             "2025-01-01T00:00:00.000Z", valid_to="2025-06-01T00:00:00.000Z",
         )
-        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0)
-        assert results == []
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0, historical_discount=1.0)
+        assert len(results) == 1
+        assert results[0][0] == ":decision/x"
+        assert results[0][3] == "2025-01-01T00:00:00.000Z"  # valid_from
+        assert results[0][4] == "2025-06-01T00:00:00.000Z"  # valid_to
 
     def test_retract_removes_from_index(self, real_db):
         import mcp_server
@@ -860,7 +858,7 @@ class TestTransactRetractChokePoint:
         mcp_server._transact(real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z")
         mcp_server._retract(real_db, '[[:decision/x :description "hello"]]')
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
 
     def test_retract_removes_from_minigraf(self, real_db):
@@ -881,8 +879,8 @@ class TestTransactRetractChokePoint:
             index_triples=[(":decision/explicit-override", ":description", "hello")],
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0)
-        assert results == [[":decision/explicit-override", ":description", "hello"]]
+        results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0, historical_discount=1.0)
+        assert results == [[":decision/explicit-override", ":description", "hello", "2026-01-01T00:00:00.000Z", None]]
 
     def test_transact_index_write_failure_does_not_raise(self, real_db, monkeypatch):
         """Index maintenance must never block a graph write -- mirrors

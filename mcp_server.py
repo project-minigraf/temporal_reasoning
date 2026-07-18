@@ -3101,24 +3101,31 @@ def _transact(
     index_triples: Optional[List[Tuple[str, str, str]]] = None,
     index_con: Optional[Any] = None,
 ) -> str:
-    """Execute (transact {opts} datalog_facts) against minigraf, then --
-    only when valid_to is None -- write index_triples into the fact index.
+    """Execute (transact {opts} datalog_facts) against minigraf, then write
+    index_triples into the fact index -- ALWAYS, not just when valid_to is
+    None. A current (valid_to=None) transact is indexed as a live row; a
+    bounded transact is indexed as a historical row carrying its window,
+    which is the actual entry point into retracted/superseded graph regions
+    (see the design doc). This is the one behavior change from the base
+    branch's _transact: previously bounded transacts were skipped entirely.
 
     index_triples defaults to auto-parsing datalog_facts via
-    _parse_facts_block(); pass it explicitly when the Datalog string's own
-    entity reference isn't the searchable identity (e.g.
-    handle_minigraf_audit's #uuid-tagged retracts, whose index_triples must
-    use the resolved keyword ident instead).
+    _parse_facts_block() (which returns 3-tuples (entity, attribute, value)
+    -- the window is appended here, not inside that function, since
+    _parse_facts_block has no way to know valid_from/valid_to); pass
+    index_triples explicitly when the Datalog string's own entity reference
+    isn't the searchable identity (e.g. handle_minigraf_audit's #uuid-tagged
+    retracts, whose index_triples must use the resolved keyword ident
+    instead) -- in that case pass 3-tuples too, the window is still appended
+    here uniformly.
     """
     opts = f':valid-from "{valid_from}"'
     if valid_to is not None:
         opts += f' :valid-to "{valid_to}"'
     raw = _db_execute(db, f"(transact {{{opts}}} {datalog_facts})")
-    if valid_to is None:
-        triples = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
-        # Convert 3-tuples to 5-tuples by adding valid_from and valid_to
-        five_tuples = [(e, a, v, valid_from, None) for e, a, v in triples]
-        _index_write("insert", five_tuples, index_con=index_con)
+    triples_3 = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
+    triples_5 = [(e, a, v, valid_from, valid_to) for e, a, v in triples_3]
+    _index_write("insert", triples_5, index_con=index_con)
     return raw
 
 
@@ -3128,13 +3135,19 @@ def _retract(
     index_triples: Optional[List[Tuple[str, str, str]]] = None,
     index_con: Optional[Any] = None,
 ) -> str:
-    """Execute (retract datalog_facts) against minigraf, then delete
-    index_triples from the fact index (same decoupling as _transact)."""
+    """Execute (retract datalog_facts) against minigraf, then delete the
+    matching CURRENT row from the fact index (same decoupling as _transact
+    -- index_triples overrides auto-derivation when the Datalog entity
+    reference isn't the searchable identity). delete_facts only ever
+    targets valid_to IS NULL rows, so historical rows from an earlier
+    lifecycle of the same (entity, attribute, value) are untouched -- pass
+    None, None for the window here unconditionally, since a retract only
+    ever means "remove the live assertion."
+    """
     raw = _db_execute(db, f"(retract {datalog_facts})")
-    triples = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
-    # Convert 3-tuples to 5-tuples (retracts always delete current rows where valid_to IS NULL)
-    five_tuples = [(e, a, v, None, None) for e, a, v in triples]
-    _index_write("delete", five_tuples, index_con=index_con)
+    triples_3 = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
+    triples_5 = [(e, a, v, None, None) for e, a, v in triples_3]
+    _index_write("delete", triples_5, index_con=index_con)
     return raw
 
 
