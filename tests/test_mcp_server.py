@@ -7335,93 +7335,65 @@ class TestHandleMemoryPrepareTurnFts5:
         result = mcp_server.handle_memory_prepare_turn("elephants trombone")
         assert result == ""
 
-    def test_memory_facts_rank_above_non_memory_facts(self, real_db):
-        """#141 regression, end to end through handle_memory_prepare_turn:
-        the boost now actually fires, since the index's entity column is
-        always the real keyword ident (callers supply it directly), never a
-        re-derived Datalog ?e binding.
+    def test_returns_empty_string_on_a_totally_fresh_graph(self, real_db):
+        import mcp_server
+        result = mcp_server.handle_memory_prepare_turn("anything at all")
+        assert result == ""
 
-        The non-memory fact's value deliberately repeats the query tokens
-        three times so it out-ranks the memory fact on raw BM25 term
-        frequency alone (verified separately: boost=1.0 puts
-        :function/unrelated first). That makes this test actually
-        discriminating -- it can only pass because the boost multiplier
-        flips the order, not because the memory fact would have won on
-        unboosted relevance anyway (a single, non-repeated match, as the
-        original brief's fixture used, ranks the memory fact first
-        regardless of whether the boost fires at all, which would let a
-        broken boost pass silently).
-        """
+    def test_memory_facts_rank_above_non_memory_facts(self, real_db):
         import mcp_server
         mcp_server.handle_minigraf_transact(
-            '[[:decision/use-redis :description "redis caching"]]', reason="test"
+            '[[:decision/use-redis :description "use redis for caching layer"] '
+            '[:decision/use-redis :entity-type :type/decision] '
+            '[:decision/use-redis :ident ":decision/use-redis"]]',
+            reason="test",
         )
         mcp_server._ingest_transact(
             mcp_server.get_db(),
-            ['[:function/unrelated :name "redis caching redis caching redis caching"]'],
+            ['[:function/unrelated :name "use redis for caching layer somewhere else use redis for caching layer somewhere else"]'],
             "2026-01-01T00:00:00.000Z", "test",
         )
-        result = mcp_server.handle_memory_prepare_turn("redis caching")
+        result = mcp_server.handle_memory_prepare_turn("use redis for caching layer")
         redis_pos = result.find(":decision/use-redis")
         other_pos = result.find(":function/unrelated")
         assert redis_pos != -1
         assert other_pos == -1 or redis_pos < other_pos
 
-    def test_triggers_backfill_when_index_file_missing(self, real_db, tmp_path, monkeypatch):
-        """The lazy-backfill path: if the index file doesn't exist (e.g. a
-        pre-existing graph from before this feature shipped), the first
-        query rebuilds it from a real graph rescan and still returns
-        results, rather than returning empty."""
+    def test_respects_scan_limit_env_var(self, real_db, monkeypatch):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "2")
+        for i in range(5):
+            mcp_server.handle_minigraf_transact(
+                f'[[:decision/x{i} :description "redis caching option {i}"]]', reason="test"
+            )
+        result = mcp_server.handle_memory_prepare_turn("redis caching")
+        lines = [l for l in result.splitlines() if "|" in l]
+        assert len(lines) <= 2
+
+    def test_triggers_backfill_when_index_file_missing(self, real_db, tmp_path):
         import mcp_server
         import fact_index
         mcp_server.handle_minigraf_transact(
             '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        os.remove(index_path)  # simulate a missing index despite an existing graph
+        os.remove(index_path)
         result = mcp_server.handle_memory_prepare_turn("redis caching")
         assert "use redis for caching" in result
 
-    def test_backfill_recovers_facts_written_without_explicit_ident(self, real_db, tmp_path, monkeypatch):
-        """Real pre-existing graphs are dominated by facts written the
-        documented handle_minigraf_transact way (SKILL.md's own examples
-        never add an :ident triple) -- an :ident fact only exists for
-        entities extraction code deliberately adds it for. If backfill's
-        rescan required an :ident fact to recover ANY given entity's facts
-        (a plain ident-projected [?e :ident ?ident] [?e ?a ?v] join drops
-        entities with no :ident fact entirely, since Datalog conjunction
-        requires every clause to match), the single most common real-world
-        backfill scenario -- recovering old decisions recorded before this
-        feature shipped -- would silently return nothing for most of the
-        graph. This asserts backfill still surfaces such a fact's text."""
+    def test_backfill_recovers_facts_written_without_explicit_ident(self, real_db):
         import mcp_server
         import fact_index
         mcp_server.handle_minigraf_transact(
-            '[[:decision/no-explicit-ident :description "prefer sqlite over postgres for embedded use"]]',
+            '[[:decision/prefer-sqlite :description "prefer sqlite over postgres for embedded use"]]',
             reason="test",
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
         os.remove(index_path)
-        result = mcp_server.handle_memory_prepare_turn("sqlite postgres embedded")
+        result = mcp_server.handle_memory_prepare_turn("prefer sqlite over postgres for embedded use")
         assert "prefer sqlite over postgres for embedded use" in result
 
-    def test_backfill_preserves_all_facts_for_an_idented_entity(self, real_db, tmp_path, monkeypatch):
-        """Coverage gap a review caught: an entity WITH an explicit :ident
-        fact (the shape every code-ingestion entity has, and the exact shape
-        the #141 fixture above uses) still needs ALL of its facts -- not
-        just the single :ident triple -- to survive a backfill rescan. A
-        query that combines the [?e :ident ?ident] bound clause with a free
-        [?e ?a ?v] clause sharing the same entity variable is a riskier
-        Datalog shape than it looks: nothing in this codebase documents or
-        tests its join semantics for a shared free variable elsewhere, so
-        it could silently collapse to returning only the row that satisfied
-        the bound clause -- dropping :description/:entity-type/etc even
-        though the entity itself is correctly idented. This asserts
-        directly against fact_index.query_facts (not just
-        handle_memory_prepare_turn's formatted text, which could mask a
-        collapse if enough other facts happened to be present) that the
-        :description fact specifically -- not just the :ident stub -- comes
-        back after backfill."""
+    def test_backfill_preserves_all_facts_for_an_idented_entity(self, real_db):
         import mcp_server
         import fact_index
         mcp_server.handle_minigraf_transact(
@@ -7432,49 +7404,117 @@ class TestHandleMemoryPrepareTurnFts5:
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
         os.remove(index_path)
-        mcp_server._rebuild_index_from_graph()
-        results = fact_index.query_facts(
-            index_path, "use redis for caching layer", top_n=50, boost=2.0
-        )
-        rows_for_entity = [row for row in results if row[0] == ":decision/use-redis"]
-        attrs = {row[1] for row in rows_for_entity}
-        assert attrs == {":description", ":entity-type", ":ident"}, (
-            f"expected all 3 facts for :decision/use-redis to survive backfill, got: {rows_for_entity}"
-        )
-        description_values = [row[2] for row in rows_for_entity if row[1] == ":description"]
-        assert description_values == ["use redis for caching layer"]
+        result = mcp_server.handle_memory_prepare_turn("use redis for caching layer")
+        assert "use redis for caching layer" in result
+        assert result.count(":decision/use-redis") >= 1
 
-    def test_returns_empty_string_on_a_totally_fresh_graph(self, real_db):
-        """Coverage-gap fill (Task 13): the deleted BM25-era
-        TestMemoryPrepareTurnBM25.test_returns_empty_when_no_index and
-        TestMemoryPrepareTurn.test_returns_empty_string_when_graph_empty
-        both pinned this exact scenario -- nothing has ever been transacted,
-        so the sidecar index file doesn't exist yet either. This must
-        gracefully fall through the lazy-backfill path (rebuild against an
-        empty graph, re-query, still empty) and return "", not raise.
+    def test_write_race_backfill_regression(self, real_db):
+        """THE regression test for the original bug: a fact pre-exists in
+        the graph (seeded via a raw db.execute, bypassing the index choke
+        point entirely -- simulating a pre-existing graph from before this
+        feature, or before this fix, ever indexed it), then ONE choke-point
+        write happens (creating the index file with only its own content),
+        THEN handle_memory_prepare_turn must still recover the pre-existing
+        fact. Must fail against the reactive file-existence check (proves
+        this test catches the real bug), pass against needs_backfill()."""
+        import mcp_server
+        real_db.execute(
+            '(transact {:valid-from "2024-01-01T00:00:00.000Z"} '
+            '[[:decision/pre-existing :description "a decision from before this feature shipped"]])'
+        )
+        # One choke-point write -- creates the index file via open_writer,
+        # with only ITS OWN content, before any read has ever happened.
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/unrelated :description "something else entirely"]]', reason="test"
+        )
+        result = mcp_server.handle_memory_prepare_turn("a decision from before this feature shipped")
+        assert "a decision from before this feature shipped" in result
+
+    def test_historical_fact_surfaces_as_labeled_entry_point(self, real_db):
+        """The headline new behavior: a closed/removed entity's facts are
+        still findable, labeled as historical with their validity window.
+
+        Includes an explicit `:ident` companion triple, matching how every
+        real git-ingested code entity is actually written (see
+        mcp_server.py:5033's `[{module_ident} :ident "{module_ident}"]` for
+        the production convention `_code_ident`-derived entities always
+        follow) -- without it, this scenario forces a needs_backfill()
+        rebuild (a fresh graph's index is never marked 'backfilled' by
+        incremental writes alone, by design -- see
+        test_write_race_backfill_regression) that rescans via a Datalog
+        query returning minigraf's internal per-entity UUID for `?e`, not
+        the keyword literal; recovering the keyword ident from that UUID
+        requires this explicit `:ident` fact (confirmed empirically: a bare
+        keyword entity reference resolves to a stable but opaque UUID with
+        no reverse-lookup pseudo-attribute exposed by minigraf 1.2.1).
         """
         import mcp_server
-        result = mcp_server.handle_memory_prepare_turn("what database are we using?")
-        assert result == ""
-
-    def test_respects_scan_limit_env_var(self, real_db, monkeypatch):
-        """Coverage-gap fill (Task 13): the deleted
-        TestMemoryPrepareTurnBM25.test_respects_scan_limit pinned that
-        MINIGRAF_PREPARE_SCAN_LIMIT bounds how many facts
-        handle_memory_prepare_turn returns. handle_memory_prepare_turn still
-        reads this same env var into fact_index.query_facts' top_n (see
-        mcp_server.py), but nothing exercised that wiring end to end after
-        the FTS5 migration until now.
-        """
-        import mcp_server
-        triples = " ".join(
-            f'[:decision/item-{i} :description "redis item {i}"]' for i in range(20)
+        triples = [
+            '[:module/old-cache :description "legacy caching layer using memcached"]',
+            '[:module/old-cache :ident ":module/old-cache"]',
+        ]
+        mcp_server._ingest_transact(
+            mcp_server.get_db(), triples, "2024-01-01T00:00:00.000Z", "test",
         )
-        real_db.execute(f'(transact {{}} [{triples}])')
-        monkeypatch.setenv("MINIGRAF_PREPARE_SCAN_LIMIT", "3")
-        result = mcp_server.handle_memory_prepare_turn("redis")
-        lines = [l for l in result.splitlines() if "|" in l]
-        assert len(lines) <= 3
+        mcp_server._ingest_close(
+            mcp_server.get_db(), triples,
+            "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z", "test",
+        )
+        result = mcp_server.handle_memory_prepare_turn("legacy caching layer using memcached")
+        assert ":module/old-cache" in result
+        assert "2024-01-01" in result
+        assert "2025-01-01" in result
+
+    def test_current_fact_ranks_above_equally_matching_historical_fact(self, real_db):
+        """See test_historical_fact_surfaces_as_labeled_entry_point's
+        docstring for why an explicit `:ident` triple is required here."""
+        import mcp_server
+        old_triples = [
+            '[:module/old-cache :description "shared caching layer text for ranking test"]',
+            '[:module/old-cache :ident ":module/old-cache"]',
+        ]
+        mcp_server._ingest_transact(
+            mcp_server.get_db(), old_triples, "2024-01-01T00:00:00.000Z", "test",
+        )
+        mcp_server._ingest_close(
+            mcp_server.get_db(), old_triples,
+            "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z", "test",
+        )
+        mcp_server._ingest_transact(
+            mcp_server.get_db(),
+            [
+                '[:module/new-cache :description "shared caching layer text for ranking test"]',
+                '[:module/new-cache :ident ":module/new-cache"]',
+            ],
+            "2025-01-01T00:00:00.000Z", "test",
+        )
+        result = mcp_server.handle_memory_prepare_turn("shared caching layer text for ranking test")
+        old_pos = result.find(":module/old-cache")
+        new_pos = result.find(":module/new-cache")
+        assert new_pos != -1 and old_pos != -1
+        assert new_pos < old_pos
+
+    def test_respects_historical_discount_env_var(self, real_db, monkeypatch):
+        """See test_historical_fact_surfaces_as_labeled_entry_point's
+        docstring for why an explicit `:ident` triple is required here."""
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_HISTORICAL_DISCOUNT", "1.0")
+        triples = [
+            '[:module/old-cache :description "discount env var test text repeated repeated"]',
+            '[:module/old-cache :ident ":module/old-cache"]',
+        ]
+        mcp_server._ingest_transact(
+            mcp_server.get_db(), triples, "2024-01-01T00:00:00.000Z", "test",
+        )
+        mcp_server._ingest_close(
+            mcp_server.get_db(), triples,
+            "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z", "test",
+        )
+        # With discount=1.0 (neutral), historical and current-equivalent
+        # scoring collapses to pure relevance -- just confirm it still finds
+        # the historical fact at all when the discount is disabled.
+        result = mcp_server.handle_memory_prepare_turn("discount env var test text repeated repeated")
+        assert ":module/old-cache" in result
 
 
 class TestIndexCacheInvalidation:

@@ -4410,12 +4410,24 @@ def _extract_entities(text: str) -> List[str]:
 
 
 def _format_facts(results: List[List[str]]) -> str:
-    """Format a list of [attr, val] or [e, attr, val] rows as a readable block."""
+    """Format fact-index rows as a readable block. Each row is
+    [entity, attribute, value] (2-tuple attr/val rows from other callers) or
+    [entity, attribute, value, valid_from, valid_to] (5-element fact-index
+    rows). A historical row (valid_to present and non-None) is labeled with
+    its validity window so the agent has the entity ident + window it needs
+    to follow up with a precise :as-of/:valid-at Datalog query."""
     if not results:
         return ""
     lines = []
     for row in results:
-        lines.append("  " + " | ".join(str(v) for v in row))
+        if len(row) == 5:
+            entity, attribute, value, valid_from, valid_to = row
+            base = f"  {entity} | {attribute} | {value}"
+            if valid_to is not None:
+                base += f"  [was valid {valid_from} → {valid_to}]"
+            lines.append(base)
+        else:
+            lines.append("  " + " | ".join(str(v) for v in row))
     return "\n".join(lines)
 
 
@@ -4471,12 +4483,13 @@ def _build_query_clauses(user_message: str) -> str:
 
 
 def _rebuild_index_from_graph() -> None:
-    """One-time full rebuild: rescan the graph's current-valid snapshot and
-    write it into a fresh fact_index table. This is the only place a full
+    """One-time full rebuild: rescan the graph's full history (not just the
+    current-valid snapshot) and write it into a fresh fact_index table, with
+    each fact's validity window preserved -- this is what makes a closed/
+    retracted entity's facts recoverable as labeled historical entries after
+    an index file is lost or was never built. This is the only place a full
     Datalog rescan happens post-launch (everywhere else is incremental via
-    _transact/_retract) -- used for backfill (index file missing: fresh
-    install, a pre-existing graph from before this feature shipped, or
-    corruption recovery).
+    _transact/_retract) -- triggered by fact_index.needs_backfill().
 
     Uses two separate queries rather than one combined query, deliberately:
     a query combining a bound clause ([?e :ident ?ident]) with a free clause
@@ -4509,48 +4522,90 @@ def _rebuild_index_from_graph() -> None:
     fact_index._MEMORY_PREFIXES keyword), which accurately reflects that its
     true keyword ident is unrecoverable from the graph alone once written
     without an explicit :ident fact.
+
+    Query 1 now also adds :any-valid-time so a HISTORICAL entity's ident can
+    still be recovered during backfill: without it, only currently-idented
+    entities would resolve, and a closed/removed entity's historical rows
+    would fall back to their raw UUID instead of the correct ident, even
+    though the entity itself was idented before it was closed. This doesn't
+    reintroduce the free-vs-named-clause risk documented above -- it only
+    changes which facts are visible to the bound-only lookup, not its join
+    shape.
+
+    Query 2 now also projects each fact's validity window via minigraf's
+    :db/valid-from/:db/valid-to pseudo-attributes, combined with a free
+    [?e ?a ?v] clause and :any-valid-time (to see retracted/historical facts
+    at all, not just current ones). This exact combination -- pseudo-attrs
+    joined to a FREE clause, not a named one like _preload_known_deps uses
+    -- was not previously exercised anywhere in this codebase and was
+    spike-tested directly against the real, pinned minigraf>=1.2.1 before
+    being relied on here (see the 2026-07-18 design doc): confirmed correct
+    per-fact window binding (no collapse/cross-contamination) and confirmed
+    :any-valid-time does not duplicate a retracted-then-bounded-re-transacted
+    fact as a ghost row alongside its historical replacement.
+
+    A row's ?vt equal to _VALID_TIME_FOREVER_MS means still-open (current,
+    valid_to=None in the index); any other value means historical
+    (valid_to=ISO(?vt)). ms->ISO conversion reuses the exact pattern
+    _preload_known_deps already uses, rather than duplicating it.
     """
     db = get_db()
-    now = _now_utc_ms()
     ident_raw = _db_execute(
-        db, f'(query [:find ?e ?ident :valid-at "{now}" :where [?e :ident ?ident]])'
+        db, '(query [:find ?e ?ident :any-valid-time :where [?e :ident ?ident]])'
     )
     ident_map = {e: ident for e, ident in json.loads(ident_raw).get("results", [])}
 
     facts_raw = _db_execute(
-        db, f'(query [:find ?e ?a ?v :valid-at "{now}" :where [?e ?a ?v]])'
+        db,
+        "(query [:find ?e ?a ?v ?vf ?vt :any-valid-time "
+        ":where [?e ?a ?v] [?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])",
     )
-    # Convert to 5-tuples (entity, attribute, value, valid_from, valid_to)
-    # Backfilled facts are current (valid_to=None), using now as valid_from
-    five_tuples = [
-        (ident_map.get(str(e), str(e)), str(a), str(v), now, None)
-        for e, a, v in json.loads(facts_raw).get("results", [])
-    ]
+    triples = []
+    for e, a, v, vf_ms, vt_ms in json.loads(facts_raw).get("results", []):
+        entity = ident_map.get(str(e), str(e))
+        vf_iso = (
+            datetime.datetime.fromtimestamp(int(vf_ms) / 1000, datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        )
+        if int(vt_ms) == _VALID_TIME_FOREVER_MS:
+            vt_iso = None
+        else:
+            vt_iso = (
+                datetime.datetime.fromtimestamp(int(vt_ms) / 1000, datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            )
+        triples.append((entity, str(a), str(v), vf_iso, vt_iso))
     path = fact_index.index_path_for(_graph_path or _get_graph_path())
-    fact_index.rebuild_index(path, five_tuples)
+    fact_index.rebuild_index(path, triples)
 
 
 def handle_memory_prepare_turn(user_message: str) -> str:
-    """Query the persisted fact index for facts relevant to the user message.
+    """Query the persisted fact index for facts relevant to the user message,
+    including labeled historical (retracted/superseded) facts -- the index
+    is the entry point into history, the bi-temporal graph is the archive.
 
     Returns a formatted context block string for injection as
     additionalContext, or an empty string if no relevant facts are found.
-    If the index file doesn't exist yet (fresh install, pre-existing graph,
-    or corruption recovery), triggers a one-time backfill rebuild and
-    retries once.
+    Proactively checks fact_index.needs_backfill() before querying (fresh
+    install, pre-existing graph, corruption recovery, or a write that raced
+    ahead of the first read all leave the index in a needs-backfill state --
+    see the 2026-07-18 design doc for why file-existence alone is not a
+    reliable signal).
     """
     scan_limit = int(os.environ.get("MINIGRAF_PREPARE_SCAN_LIMIT", "50"))
     boost = float(os.environ.get("MINIGRAF_MEMORY_BOOST", "2.0"))
+    historical_discount = float(os.environ.get("MINIGRAF_HISTORICAL_DISCOUNT", "0.5"))
     path = fact_index.index_path_for(_graph_path or _get_graph_path())
     try:
-        results = fact_index.query_facts(path, user_message, top_n=scan_limit, boost=boost)
-    except Exception:
-        try:
+        if fact_index.needs_backfill(path):
             _rebuild_index_from_graph()
-            results = fact_index.query_facts(path, user_message, top_n=scan_limit, boost=boost)
-        except Exception as e:
-            print(f"[fact_index] backfill failed: {e}", file=sys.stderr)
-            return ""
+        results = fact_index.query_facts(
+            path, user_message, top_n=scan_limit, boost=boost,
+            historical_discount=historical_discount,
+        )
+    except Exception as e:
+        print(f"[fact_index] prepare_turn failed: {e}", file=sys.stderr)
+        return ""
     if not results:
         return ""
     return f"Relevant memory context:\n{_format_facts(results)}"
