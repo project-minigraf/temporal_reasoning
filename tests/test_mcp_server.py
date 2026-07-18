@@ -5500,8 +5500,11 @@ class TestIngestionWrites:
 class TestIngestCloseFactIndex:
     """_ingest_close makes two separate writes -- a retract-loop (the actual
     live-index removal mechanism) and a bounded re-transact (historical,
-    must NOT be indexed). Both must route through the _transact/_retract
-    choke point for a closed entity to actually disappear from the index.
+    now indexed as a historical row). Both must route through the
+    _transact/_retract choke point for a closed entity to actually disappear
+    from the live index. The bounded re-transact carries its valid_from and
+    valid_to window in the index for point-in-time retrieval (the entry point
+    into history that the whole plan is building).
     This is the exact gap the design-review process for #118 caught: an
     earlier draft of the design doc mislabeled which half does the real
     removal.
@@ -5543,7 +5546,7 @@ class TestIngestCloseFactIndex:
         assert results[0][3] == "2026-01-01T00:00:00.000Z"  # valid_from
         assert results[0][4] == "2026-02-01T00:00:00.000Z"  # valid_to
 
-    def test_close_bounded_retransact_not_indexed(self, real_db):
+    def test_close_bounded_retransact_indexed_as_historical(self, real_db):
         """After close, the historical (valid_to-bounded) half of a close is
         indexed as a historical row, not skipped. The open half is retracted
         (removed from live-time queries) and the bounded half is re-transacted
@@ -5588,14 +5591,13 @@ class TestIngestCloseFactIndex:
         resulting index state looks right.
 
         This matters specifically for the bounded re-transact half: a
-        bounded write (valid_to != None) is NEVER indexed whether or not it
-        goes through _transact, since _transact's own indexing guard skips
-        anything with valid_to set. That means an index-state-only test
-        (like the two above) cannot structurally distinguish "correctly
-        migrated to call _transact" from "still calling raw _db_execute,
-        never migrated at all" for that half -- both produce an identical,
-        empty index outcome. This test can, because it inspects the calls
-        themselves rather than their downstream effect on the index.
+        bounded write (valid_to != None) is now indexed as a historical row.
+        An index-state-only test (like the two above) cannot structurally
+        distinguish "correctly migrated to call _transact" from "still calling
+        raw _db_execute, never migrated at all" for that half if the final
+        state could theoretically arise either way. This test can, because it
+        inspects the calls themselves rather than their downstream effect on
+        the index.
         """
         import mcp_server
         # Seed the graph directly (not via _transact/_ingest_transact) so the
