@@ -359,11 +359,16 @@ def test_query_facts_returns_window_columns(tmp_path):
 
 
 def test_query_facts_limit_is_bounded_but_boost_still_applies_inside_it(tmp_path):
-    """Regression guard for the Task-2 bug class (an early LIMIT dropping a
-    boost-eligible fact) -- proves the new SQL-side LIMIT, unlike the old
-    unbounded-Python-fetch-then-truncate approach, still lets a buried
-    memory fact win via boost because scoring happens BEFORE the LIMIT in
-    the SQL ORDER BY, not after a Python-side truncation."""
+    """Verifies boost correctly promotes a buried memory-prefixed fact into a
+    bounded top_n result under the new SQL-side ranking (boost is applied
+    inside the ORDER BY, before the LIMIT, so it can rescue a fact that would
+    otherwise fall outside a small top_n). Note: this scenario also passed
+    under the prior (Task 2-era) implementation, which already fetched all
+    matching rows before boosting/truncating in Python — the earlier bug this
+    whole design guards against (an early SQL LIMIT applied BEFORE boosting)
+    was already fixed before this task; this test documents the still-correct
+    current behavior, not a new discriminating regression guard for this
+    specific rewrite."""
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
     # 20 non-memory facts that outrank the one memory fact on raw bm25 alone
