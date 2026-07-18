@@ -22,8 +22,11 @@ _MMAP_SIZE = 1_073_741_824  # 1 GiB
 _BUSY_TIMEOUT_MS = 5000
 _SCHEMA_SQL = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5("
-    "entity, attribute, value, tokenize='unicode61')"
+    "entity, attribute, value, valid_from UNINDEXED, valid_to UNINDEXED, "
+    "tokenize='unicode61')"
 )
+_META_SCHEMA_SQL = "CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)"
+_SCHEMA_VERSION = "2"
 
 
 def index_path_for(graph_path: str) -> str:
@@ -44,16 +47,27 @@ def _configure(con: sqlite3.Connection) -> None:
 
 
 def ensure_schema(con: sqlite3.Connection) -> None:
-    """Create facts_fts if it doesn't exist yet. Idempotent and safe under
-    concurrent callers (IF NOT EXISTS + busy_timeout serializes racers).
+    """Create facts_fts and index_meta if they don't exist yet, and stamp
+    schema_version. Idempotent and safe under concurrent callers (IF NOT
+    EXISTS + busy_timeout serializes racers). Deliberately does NOT set the
+    'backfilled' meta key -- only rebuild_index() does that, atomically,
+    after a genuinely complete rescan. This is the whole fix for the
+    write-races-ahead-of-read backfill bug: a file created by an incremental
+    write (via open_writer) has a schema but is never mistaken for complete.
 
     Commits internally -- do NOT call this from rebuild_index(), which needs
-    the CREATE statement inside its own explicit BEGIN IMMEDIATE transaction;
-    this function's internal commit() would end that transaction early and
-    reintroduce the non-atomicity race rebuild_index's retry loop exists to
-    prevent. rebuild_index() inlines the schema SQL (_SCHEMA_SQL) instead.
+    both CREATE statements inside its own explicit BEGIN IMMEDIATE
+    transaction; this function's internal commit() would end that
+    transaction early and reintroduce the non-atomicity race rebuild_index's
+    retry loop exists to prevent. rebuild_index() inlines both schema
+    statements instead (_SCHEMA_SQL, _META_SCHEMA_SQL).
     """
     con.execute(_SCHEMA_SQL)
+    con.execute(_META_SCHEMA_SQL)
+    con.execute(
+        "INSERT OR IGNORE INTO index_meta (key, value) VALUES ('schema_version', ?)",
+        (_SCHEMA_VERSION,),
+    )
     con.commit()
 
 
@@ -76,6 +90,46 @@ def open_reader(path: str) -> sqlite3.Connection:
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
     _configure(con)
     return con
+
+
+def needs_backfill(path: str) -> bool:
+    """Return True if the index at `path` has not completed a full backfill.
+
+    True when: the file is missing, unopenable/corrupted, lacks the
+    index_meta table entirely (a v1 index file predating this schema, or a
+    schema-only file from open_writer that never got a real backfill), has
+    a mismatched schema_version, or lacks a 'backfilled'='1' row.
+
+    False only when a real rebuild_index() call has completed and committed
+    -- the sentinel is set inside that same atomic transaction, so it can
+    never be visible without the rebuild genuinely having finished.
+
+    Any sqlite3 exception encountered while checking is itself treated as
+    "needs backfill" -- rebuild_index() is self-healing (DROP TABLE IF
+    EXISTS + recreate), so a corrupted-but-openable file recovers the same
+    way a missing one does.
+    """
+    if not os.path.exists(path):
+        return True
+    try:
+        con = open_reader(path)
+    except sqlite3.Error:
+        return True
+    try:
+        version_row = con.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        if version_row is None or version_row[0] != _SCHEMA_VERSION:
+            return True
+        backfilled_row = con.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone()
+        return backfilled_row is None or backfilled_row[0] != "1"
+    except sqlite3.Error:
+        # index_meta doesn't exist at all (v1 file) or facts_fts is corrupt.
+        return True
+    finally:
+        con.close()
 
 
 def close_writer(con: sqlite3.Connection) -> None:

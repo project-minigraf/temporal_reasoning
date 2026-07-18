@@ -32,6 +32,75 @@ def test_open_writer_creates_schema(tmp_path):
         fact_index.close_writer(con)
 
 
+def test_open_writer_creates_index_meta_table(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        rows = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='index_meta'"
+        ).fetchall()
+        assert rows
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_open_writer_stamps_schema_version_but_not_backfilled(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        version = con.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert version == ("2",)
+        backfilled = con.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone()
+        assert backfilled is None
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_needs_backfill_true_for_missing_file(tmp_path):
+    path = str(tmp_path / "nonexistent.fts.sqlite3")
+    assert fact_index.needs_backfill(path) is True
+
+
+def test_needs_backfill_true_for_schema_only_file(tmp_path):
+    """A file created by open_writer (schema exists) but never backfilled --
+    exactly the write-races-ahead-of-read scenario this whole plan fixes."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.close_writer(con)
+    assert fact_index.needs_backfill(path) is True
+
+
+def test_needs_backfill_false_after_rebuild_index(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    fact_index.rebuild_index(path, [(":decision/x", ":description", "hello")])
+    assert fact_index.needs_backfill(path) is False
+
+
+def test_needs_backfill_true_for_v1_index_file_no_meta_table(tmp_path):
+    """Hand-build a v1-shaped file (facts_fts only, no index_meta at all) --
+    simulates an index file created before this schema-v2 migration shipped."""
+    import sqlite3 as _sqlite3
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = _sqlite3.connect(path)
+    con.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(entity, attribute, value, tokenize='unicode61')"
+    )
+    con.commit()
+    con.close()
+    assert fact_index.needs_backfill(path) is True
+
+
+def test_needs_backfill_true_for_corrupted_file(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    path_obj = tmp_path / "t.fts.sqlite3"
+    path_obj.write_bytes(b"not a real sqlite file at all")
+    assert fact_index.needs_backfill(path) is True
+
+
 def test_open_writer_is_idempotent(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     con1 = fact_index.open_writer(path)
