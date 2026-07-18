@@ -5704,25 +5704,31 @@ class TestIngestCloseFactIndex:
         the choke point) for the seed, to prove backfill reconstructs
         windows correctly from the graph alone, not from any index state.
 
-        Note: we use _ingest_close directly to seed the graph state (since it
-        has already implemented the two-step lifecycle), then call _rebuild_index_from_graph
-        to prove the backfill correctly projects the historical window. We also
-        ensure the entity has an :ident triple so it can be recovered by keyword
-        during backfill (this is the standard minigraf pattern for entities that
-        should be recoverable from graph snapshots)."""
+        The :ident triple is added to the seed so the entity can be recovered
+        by keyword during backfill (a known gotcha from Task 6: _rebuild_index_from_graph
+        cannot recover a keyword ident from a raw graph rescan without an explicit
+        [:entity :ident ":keyword"] companion triple)."""
         import mcp_server
         import fact_index
         import os
-        # Seed: transact an open fact WITH an :ident triple so it's recoverable
-        # during backfill (standard minigraf pattern per Task 6 findings)
-        mcp_server._transact(
-            real_db, '[[:module/bar :description "the bar module"] [:module/bar :ident ":module/bar"]]',
-            "2024-01-01T00:00:00.000Z",
+        # Seed via raw minigraf calls (not _transact/_ingest_close choke points) to
+        # prove _rebuild_index_from_graph works from the graph alone.
+        # Step 1: transact an open fact
+        real_db.execute(
+            '(transact {:valid-from "2024-01-01T00:00:00.000Z"} '
+            '[[:module/bar :description "the bar module"]])'
         )
-        # Close it
-        mcp_server._ingest_close(
-            real_db, ['[:module/bar :description "the bar module"]'],
-            "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z", "test",
+        # Step 2: retract it (the first half of the close operation)
+        real_db.execute('(retract [[:module/bar :description "the bar module"]])')
+        # Step 3: re-transact it bounded (the second half of the close operation)
+        real_db.execute(
+            '(transact {:valid-from "2024-01-01T00:00:00.000Z" :valid-to "2025-01-01T00:00:00.000Z"} '
+            '[[:module/bar :description "the bar module"]])'
+        )
+        # Step 4: add the :ident triple so backfill can recover the entity by keyword
+        real_db.execute(
+            '(transact {:valid-from "2024-01-01T00:00:00.000Z"} '
+            '[[:module/bar :ident ":module/bar"]])'
         )
         # Now delete the index to simulate a recovered pre-index graph
         index_path = fact_index.index_path_for(mcp_server._graph_path)
