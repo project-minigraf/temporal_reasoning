@@ -4679,18 +4679,39 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
     valid_from: override the :valid-from timestamp (ISO 8601). If None, defaults
     to the current UTC time. Pass a past date to backdate facts (e.g. from
     LLM-annotated '; valid-at: YYYY-MM-DD' hints).
+
+    Validation is done per-entity, not per-fact: facts are grouped by entity
+    before validation so that sibling facts for the same entity (e.g. a
+    :description triple and a separate :alias triple, which is how Datalog
+    triples and this function's own extraction prompts always shape
+    multi-attribute entities) are checked together. An entity with
+    :description present anywhere in its group passes the required-attribute
+    check even though any single triple examined in isolation would look
+    incomplete; an entity with no :description anywhere in the batch is still
+    correctly rejected. (Validating fact-by-fact instead of entity-by-entity
+    was a latent bug: it silently dropped every optional-attribute-only fact
+    -- :alias, :rationale, :date -- whenever it arrived as its own triple
+    rather than bundled into the same dict as :description.)
     """
     _refresh_if_stale()
     db = get_db()
     stored = 0
+
+    entity_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for fact in facts:
+        entity_groups.setdefault(fact["entity"], []).append(fact)
+    invalid_entities = {
+        entity for entity, group in entity_groups.items() if _validate_facts(group)
+    }
+
     for fact in facts:
         entity = fact["entity"]
         entity_type = fact.get("entity_type", "")
         attribute = fact["attribute"]
         value = fact["value"]
-        # Schema validation — closed-world: skip invalid facts.
-        violations = _validate_facts([fact])
-        if violations:
+        # Schema validation — closed-world: skip facts belonging to any entity
+        # whose full fact group (across this batch) has violations.
+        if entity in invalid_entities:
             continue
         now_z = valid_from or _now_utc_ms()
         try:
@@ -4737,6 +4758,13 @@ No other attributes are valid.
 
 IMPORTANT — entity resolution: if a reference matches an existing canonical ident or alias above,
 reuse that exact ident. Only mint a new ident if the entity is genuinely new.
+
+IMPORTANT — alias generation: for each NEWLY-minted entity (not one you're reusing an
+existing ident for), also emit an :alias fact with 2-5 comma-separated alternative
+terms, synonyms, or broader concepts a developer might later use to refer to it —
+e.g. for a decision to use Redis, `:alias "in-memory data store, key-value cache,
+caching backend"`. Retrieval is purely lexical (exact word match), so these aliases
+are what let a later, differently-worded query still find this fact.
 
 IMPORTANT — bi-temporality: this database is bi-temporal. Facts have both a transaction time
 (when they were recorded) and a valid time (when they were true in the world). When the conversation
@@ -4905,6 +4933,11 @@ Canonical ident form: lowercase, hyphens only — :decision/redis not :decision/
 {canonical_entities_section}
 Use these attributes: :description (required), :rationale (optional), :date (optional), :alias (optional).
 No other attributes are valid. If an entity matches an existing ident or alias, reuse it exactly.
+
+For each newly-minted entity, also emit an :alias fact with 2-5 comma-separated
+alternative terms or broader concepts someone might use to refer to it later —
+retrieval is purely lexical, so this is what lets a differently-worded query still
+find the fact.
 
 Format:
 [[:entity/ident :attribute "value"]]

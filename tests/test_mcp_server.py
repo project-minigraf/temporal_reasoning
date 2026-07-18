@@ -1186,6 +1186,66 @@ class TestAgentStrategy:
         assert queried["results"] == [["Kafka"]]
 
 
+class TestAliasEnrichment:
+    def test_llm_strategy_alias_bridges_a_lexically_disjoint_query(self, real_db, monkeypatch):
+        """The actual point of this feature: a query using words that never
+        appear in the fact's own description text finds it anyway, via an
+        LLM-generated :alias fact."""
+        import mcp_server
+
+        def fake_call_llm(model, prompt):
+            return (
+                '[[:decision/use-redis :description "use Redis for the caching layer"] '
+                '[:decision/use-redis :alias "in-memory data store, key-value cache, caching backend"]]'
+            )
+
+        monkeypatch.setattr(mcp_server, "_call_llm", fake_call_llm)
+        result = mcp_server._llm_extract_and_transact("let's use Redis for caching")
+        assert result["ok"] is True
+        assert result["stored_count"] >= 1
+        # "key-value cache" appears ONLY in the alias, never in the description.
+        context = mcp_server.handle_memory_prepare_turn("key-value cache")
+        assert ":decision/use-redis" in context
+
+    def test_agent_strategy_alias_bridges_a_lexically_disjoint_query(self, real_db, monkeypatch):
+        """Unlike the LLM strategy, _agent_extract_and_transact transacts the
+        agent's raw Datalog block directly (no _transact_extracted_facts pass,
+        no auto :entity-type/:ident tagging) -- so, matching the existing
+        precedent in TestConversationalMemoryFactIndex.test_agent_extract_and_transact_indexes,
+        the fake response must supply :entity-type/:ident itself for the entity
+        to be ident-resolvable (vs. falling back to its raw UUID) after the
+        mandatory first-call index backfill."""
+        import mcp_server
+        import asyncio as _asyncio
+
+        async def fake_request(conversation_delta, canonical_section):
+            return (
+                '[[:decision/use-redis :description "use Redis for the caching layer"] '
+                '[:decision/use-redis :alias "in-memory data store, key-value cache, caching backend"] '
+                '[:decision/use-redis :entity-type :type/decision] '
+                '[:decision/use-redis :ident ":decision/use-redis"]]'
+            )
+
+        monkeypatch.setattr(mcp_server, "_request_agent_memory_block_async", fake_request)
+        monkeypatch.setattr(mcp_server, "_query_canonical_entities", lambda: "")
+        result = _asyncio.run(mcp_server._agent_extract_and_transact("let's use Redis for caching"))
+        assert result["ok"] is True
+        context = mcp_server.handle_memory_prepare_turn("key-value cache")
+        assert ":decision/use-redis" in context
+
+    def test_llm_extraction_prompt_instructs_alias_generation(self):
+        """A prompt-content smoke test: the instruction must actually exist,
+        not just be theoretically supported by the schema/parser."""
+        import mcp_server
+        assert "alias" in mcp_server._LLM_EXTRACTION_PROMPT.lower()
+        assert "synonym" in mcp_server._LLM_EXTRACTION_PROMPT.lower() or "alternative term" in mcp_server._LLM_EXTRACTION_PROMPT.lower()
+
+    def test_agent_sampling_prompt_instructs_alias_generation(self):
+        import mcp_server
+        assert "alias" in mcp_server._AGENT_SAMPLING_PROMPT.lower()
+        assert "synonym" in mcp_server._AGENT_SAMPLING_PROMPT.lower() or "alternative term" in mcp_server._AGENT_SAMPLING_PROMPT.lower()
+
+
 class TestConversationalMemoryFactIndex:
     def test_transact_extracted_facts_indexes(self, real_db):
         import mcp_server
@@ -1540,6 +1600,53 @@ class TestTransactExtractedFactsSchema:
             '(query [:find ?d :where [:service/auth :description ?d]])'
         ))
         assert auth["results"] == []
+
+    def test_transact_extracted_facts_does_not_drop_sibling_optional_attributes(self, real_db):
+        """Regression test for a real bug: _transact_extracted_facts used to
+        validate each fact dict in isolation, so a standalone :alias (or
+        :rationale/:date) triple for an entity was always judged "missing
+        required :description" and silently dropped, even when a sibling
+        :description fact for the same entity was present elsewhere in the
+        same batch -- exactly the shape the extraction prompts have always
+        asked models to produce. Validation must be done per-entity-group,
+        not per-fact."""
+        import mcp_server
+        facts = [
+            {"entity": ":decision/redis", "entity_type": "decision",
+             "attribute": ":description", "value": "use Redis"},
+            {"entity": ":decision/redis", "entity_type": "decision",
+             "attribute": ":alias", "value": "in-memory store, key-value cache"},
+        ]
+        stored = mcp_server._transact_extracted_facts(facts)
+
+        assert stored == 2
+        result = json.loads(real_db.execute(
+            '(query [:find ?a ?v :where [:decision/redis ?a ?v]])'
+        ))
+        attrs = {a: v for a, v in result["results"]}
+        assert attrs[":description"] == "use Redis"
+        assert attrs[":alias"] == "in-memory store, key-value cache"
+
+    def test_entity_missing_description_entirely_is_still_rejected(self, real_db):
+        """Confirms the per-entity-group fix doesn't loosen validation: an
+        entity with no :description fact ANYWHERE in the batch (not just in
+        the one triple under consideration) must still be rejected. This
+        exact input is unaffected by the grouping change (the entity's group
+        has only one fact, so per-fact and per-group validation coincide),
+        which is what proves the fix only changes behavior for entities that
+        genuinely do have a sibling :description elsewhere in the batch."""
+        import mcp_server
+        facts = [
+            {"entity": ":decision/redis", "entity_type": "decision",
+             "attribute": ":alias", "value": "in-memory store, key-value cache"},
+        ]
+        stored = mcp_server._transact_extracted_facts(facts)
+
+        assert stored == 0
+        result = json.loads(real_db.execute(
+            '(query [:find ?a ?v :where [:decision/redis ?a ?v]])'
+        ))
+        assert result["results"] == []
 
 
 class TestParseTransactFacts:
