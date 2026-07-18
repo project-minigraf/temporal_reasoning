@@ -743,7 +743,7 @@ class TestMinigrafTransact:
             '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/use-redis" for r in results)
 
 
@@ -783,7 +783,7 @@ class TestMinigrafRetract:
             '[[:decision/use-redis :description "use redis for caching"]]', reason="cleanup"
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
 
 
@@ -901,7 +901,7 @@ class TestBookkeepingWritesFactIndex:
         import fact_index
         mcp_server._watermark_update(real_db, "abc123", "2026-01-01T00:00:00.000Z", "test")
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[2] == "abc123" for r in results)
 
     def test_watermark_update_removes_old_hash_from_index(self, real_db):
@@ -910,7 +910,7 @@ class TestBookkeepingWritesFactIndex:
         mcp_server._watermark_update(real_db, "abc123", "2026-01-01T00:00:00.000Z", "test")
         mcp_server._watermark_update(real_db, "def456", "2026-01-02T00:00:00.000Z", "test")
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0, historical_discount=1.0)
         assert not any(r[2] == "abc123" for r in results)
 
     def test_last_run_write_indexes(self, real_db):
@@ -918,7 +918,7 @@ class TestBookkeepingWritesFactIndex:
         import fact_index
         mcp_server._last_run_write(real_db, "abc123", "2026-01-01T00:00:00.000Z", 42)
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0, historical_discount=1.0)
         assert results
 
     def test_ingest_tags_indexes(self, real_db, tmp_path, monkeypatch):
@@ -930,7 +930,7 @@ class TestBookkeepingWritesFactIndex:
         )
         mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-01T00:00:00.000Z")
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "v1.0.0", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "v1.0.0", top_n=10, boost=2.0, historical_discount=1.0)
         assert results
 
 
@@ -1194,7 +1194,7 @@ class TestConversationalMemoryFactIndex:
             {"entity": ":decision/x", "entity_type": "decision", "attribute": ":description", "value": "use redis"},
         ])
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/x" for r in results)
 
     def test_agent_extract_and_transact_indexes(self, real_db, monkeypatch):
@@ -1210,7 +1210,7 @@ class TestConversationalMemoryFactIndex:
         result = _asyncio.run(mcp_server._agent_extract_and_transact("we should use redis"))
         assert result["ok"] is True
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/x" for r in results)
 
 
@@ -1786,7 +1786,7 @@ class TestMinigrafAudit:
         assert result["ok"] is True
         assert result["retracted"] >= 1
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "decision bad", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "decision bad", top_n=10, boost=2.0, historical_discount=1.0)
         assert not any(r[0] == ":decision/bad" for r in results)
 
 
@@ -5526,7 +5526,7 @@ class TestIngestCloseFactIndex:
         index_path = fact_index.index_path_for(mcp_server._graph_path)
         # Sanity: the seed genuinely indexed the fact. If this fails, the
         # assertion below would be vacuous (nothing there to remove).
-        seeded = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0)
+        seeded = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":module/foo" for r in seeded)
 
         mcp_server._ingest_close(
@@ -5534,18 +5534,20 @@ class TestIngestCloseFactIndex:
             "2026-01-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z", "test",
         )
 
-        results = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0)
-        assert results == []
+        results = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0, historical_discount=1.0)
+        # After close, the open assertion is removed from live-time queries
+        # (retract removes it), but _ingest_close re-transacts it bounded as
+        # a historical record so it's still in the index with valid_to set
+        assert len(results) == 1
+        assert results[0][0] == ":module/foo"
+        assert results[0][3] == "2026-01-01T00:00:00.000Z"  # valid_from
+        assert results[0][4] == "2026-02-01T00:00:00.000Z"  # valid_to
 
     def test_close_bounded_retransact_not_indexed(self, real_db):
-        """The historical (valid_to-bounded) half of a close must never
-        appear in the live index -- this is the exact case an earlier draft
-        of the design doc got wrong by only naming the visible half of
-        _ingest_close. Directly asserts nothing at all references
-        :module/foo post-close, not just that this exact text is unmatched
-        -- this also catches a buggy migration that ends up re-indexing the
-        bounded half (a stray row would still surface here even if it used
-        different wording than the original)."""
+        """After close, the historical (valid_to-bounded) half of a close is
+        indexed as a historical row, not skipped. The open half is retracted
+        (removed from live-time queries) and the bounded half is re-transacted
+        to preserve the valid window in the index for point-in-time retrieval."""
         import mcp_server
         import fact_index
         mcp_server._transact(
@@ -5574,7 +5576,11 @@ class TestIngestCloseFactIndex:
             ).fetchall()
         finally:
             con.close()
-        assert rows == []
+        # After close, the bounded version should be in the index as a historical row
+        assert len(rows) == 1
+        assert rows[0][0] == ":module/foo"
+        assert rows[0][3] == "2026-01-01T00:00:00.000Z"  # valid_from
+        assert rows[0][4] == "2026-02-01T00:00:00.000Z"  # valid_to
 
     def test_close_routes_both_writes_through_choke_point(self, real_db, monkeypatch):
         """Structural proof that both halves of _ingest_close call the
@@ -6110,7 +6116,7 @@ class TestIngestTransactFactIndex:
             con.commit()
         finally:
             fact_index.close_writer(con)
-        results = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0, historical_discount=1.0)
         assert results
 
 
@@ -6662,7 +6668,7 @@ class TestRunIngestionParentEdgeFactIndex:
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "parent", top_n=50, boost=2.0)
+        results = fact_index.query_facts(index_path, "parent", top_n=50, boost=2.0, historical_discount=1.0)
         parent_rows = [r for r in results if r[1] == ":parent"]
         assert parent_rows, "no :parent-attribute rows found in the fact index after ingestion"
 
@@ -7478,7 +7484,7 @@ class TestIndexCacheInvalidation:
             '[[:decision/test :description "test"]]', reason="test"
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "test", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "test", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/test" for r in results)
 
     def test_failed_transact_does_not_modify_fact_index(self, real_db):
@@ -7489,7 +7495,7 @@ class TestIndexCacheInvalidation:
         assert result["ok"] is False
         index_path = fact_index.index_path_for(mcp_server._graph_path)
         try:
-            results = fact_index.query_facts(index_path, "leaky", top_n=10, boost=2.0)
+            results = fact_index.query_facts(index_path, "leaky", top_n=10, boost=2.0, historical_discount=1.0)
         except sqlite3.OperationalError:
             # The failed transact never reached _index_write, so the index
             # file may not exist yet at all -- distinct from "exists but
@@ -7506,7 +7512,7 @@ class TestIndexCacheInvalidation:
             '[[:decision/test :description "test"]]', reason="cleanup"
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "test", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "test", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
 
     def test_failed_retract_does_not_modify_fact_index(self, real_db):
@@ -7525,7 +7531,7 @@ class TestIndexCacheInvalidation:
         result = mcp_server.handle_minigraf_retract(bad_facts, reason="cleanup")
         assert result["ok"] is False
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "leaky", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "leaky", top_n=10, boost=2.0, historical_discount=1.0)
         # The entry must still be present -- a failed retract must not remove
         # anything from the index.
         assert any(r[0] == ":decision/leaky" for r in results)
@@ -7549,7 +7555,7 @@ class TestIndexCacheInvalidation:
         asyncio.run(mcp_server._run_ingestion(str(git_repo), "HEAD"))
         assert mcp_server._ingest_progress["status"] == "complete"
         index_path = fact_index.index_path_for(mcp_server._graph_path)
-        results = fact_index.query_facts(index_path, "auth", top_n=10, boost=2.0)
+        results = fact_index.query_facts(index_path, "auth", top_n=10, boost=2.0, historical_discount=1.0)
         assert results, (
             "ingested commit/module facts must be queryable via the fact "
             "index once _run_ingestion completes"
