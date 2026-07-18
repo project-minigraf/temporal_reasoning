@@ -1,5 +1,14 @@
 # Persisted, mmap-able fact index (#118)
 
+> **Partially superseded.** This document describes the index's original (v1) design.
+> The "Backfill / bootstrap" and "Non-goals" sections below have been updated to reflect
+> what actually shipped. Other sections — "Write path", "Query path", "Schema" — still
+> describe the ORIGINAL 3-column, current-only, file-existence-gated design and are now
+> inaccurate on several points (the index is bi-temporal with a 5-column schema, ranking
+> happens entirely in SQL, and backfill uses an atomic completion sentinel, not file
+> existence). See `docs/superpowers/specs/2026-07-18-bitemporal-fact-index-design.md`
+> for the current, accurate design.
+
 ## Problem
 
 Memory retrieval (`handle_memory_prepare_turn`) is backed by `FactIndex` — an
