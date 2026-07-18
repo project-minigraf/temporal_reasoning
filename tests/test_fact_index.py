@@ -76,8 +76,44 @@ def test_needs_backfill_true_for_schema_only_file(tmp_path):
 
 def test_needs_backfill_false_after_rebuild_index(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
-    fact_index.rebuild_index(path, [(":decision/x", ":description", "hello")])
+    fact_index.rebuild_index(path, [(":decision/x", ":description", "hello", None, None)])
     assert fact_index.needs_backfill(path) is False
+
+
+def test_delete_facts_only_deletes_current_rows(tmp_path):
+    """A retract must not touch a historical row for the same (e, a, v) from
+    an earlier lifecycle -- this is the mechanism _ingest_close relies on."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        # A historical row (valid_to set) for this exact triple...
+        fact_index.insert_facts(con, [
+            (":module/foo", ":description", "the foo module", "2024-01-01T00:00:00.000Z", "2024-06-01T00:00:00.000Z"),
+        ])
+        # ...and a CURRENT row for the same triple (as if re-opened later).
+        fact_index.insert_facts(con, [
+            (":module/foo", ":description", "the foo module", "2024-06-01T00:00:00.000Z", None),
+        ])
+        con.commit()
+        fact_index.delete_facts(con, [(":module/foo", ":description", "the foo module", "2024-06-01T00:00:00.000Z", None)])
+        con.commit()
+        rows = con.execute(
+            "SELECT valid_from, valid_to FROM facts_fts WHERE entity = ':module/foo'"
+        ).fetchall()
+        assert rows == [("2024-01-01T00:00:00.000Z", "2024-06-01T00:00:00.000Z")]
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_rebuild_index_stamps_backfilled_sentinel(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    fact_index.rebuild_index(path, [(":decision/x", ":description", "hello", None, None)])
+    con = fact_index.open_reader(path)
+    try:
+        row = con.execute("SELECT value FROM index_meta WHERE key = 'backfilled'").fetchone()
+        assert row == ("1",)
+    finally:
+        con.close()
 
 
 def test_needs_backfill_true_for_v1_index_file_no_meta_table(tmp_path):
@@ -113,10 +149,10 @@ def test_insert_and_read_back(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
     try:
-        fact_index.insert_facts(con, [(":decision/use-redis", ":description", "use redis for caching")])
+        fact_index.insert_facts(con, [(":decision/use-redis", ":description", "use redis for caching", None, None)])
         con.commit()
-        rows = con.execute("SELECT entity, attribute, value FROM facts_fts").fetchall()
-        assert rows == [(":decision/use-redis", ":description", "use redis for caching")]
+        rows = con.execute("SELECT entity, attribute, value, valid_from, valid_to FROM facts_fts").fetchall()
+        assert rows == [(":decision/use-redis", ":description", "use redis for caching", None, None)]
     finally:
         fact_index.close_writer(con)
 
@@ -125,7 +161,7 @@ def test_delete_removes_matching_row(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
     try:
-        triple = (":decision/use-redis", ":description", "use redis for caching")
+        triple = (":decision/use-redis", ":description", "use redis for caching", None, None)
         fact_index.insert_facts(con, [triple])
         con.commit()
         fact_index.delete_facts(con, [triple])
@@ -141,11 +177,11 @@ def test_delete_only_removes_exact_match(tmp_path):
     con = fact_index.open_writer(path)
     try:
         fact_index.insert_facts(con, [
-            (":decision/a", ":description", "keep me"),
-            (":decision/b", ":description", "delete me"),
+            (":decision/a", ":description", "keep me", None, None),
+            (":decision/b", ":description", "delete me", None, None),
         ])
         con.commit()
-        fact_index.delete_facts(con, [(":decision/b", ":description", "delete me")])
+        fact_index.delete_facts(con, [(":decision/b", ":description", "delete me", None, None)])
         con.commit()
         rows = con.execute("SELECT entity FROM facts_fts").fetchall()
         assert rows == [(":decision/a",)]
@@ -156,7 +192,7 @@ def test_delete_only_removes_exact_match(tmp_path):
 def test_open_reader_sees_writer_commits(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     writer = fact_index.open_writer(path)
-    fact_index.insert_facts(writer, [(":decision/x", ":description", "hello")])
+    fact_index.insert_facts(writer, [(":decision/x", ":description", "hello", None, None)])
     writer.commit()
     reader = fact_index.open_reader(path)
     try:
@@ -177,8 +213,8 @@ def test_query_facts_ranks_by_relevance(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
     fact_index.insert_facts(con, [
-        (":decision/use-redis", ":description", "use redis for caching layer"),
-        (":function/unrelated", ":name", "some other thing entirely"),
+        (":decision/use-redis", ":description", "use redis for caching layer", None, None),
+        (":function/unrelated", ":name", "some other thing entirely", None, None),
     ])
     fact_index.close_writer(con)
     results = fact_index.query_facts(path, "redis caching", top_n=10, boost=2.0)
@@ -189,7 +225,7 @@ def test_query_facts_ranks_by_relevance(tmp_path):
 def test_query_facts_excludes_non_matching_rows(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
-    fact_index.insert_facts(con, [(":function/unrelated", ":name", "some other thing entirely")])
+    fact_index.insert_facts(con, [(":function/unrelated", ":name", "some other thing entirely", None, None)])
     fact_index.close_writer(con)
     results = fact_index.query_facts(path, "redis caching", top_n=10, boost=2.0)
     assert results == []
@@ -211,7 +247,7 @@ def test_query_facts_respects_top_n(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
     fact_index.insert_facts(con, [
-        (f":decision/x{i}", ":description", "redis caching option") for i in range(5)
+        (f":decision/x{i}", ":description", "redis caching option", None, None) for i in range(5)
     ])
     fact_index.close_writer(con)
     results = fact_index.query_facts(path, "redis caching", top_n=2, boost=2.0)
@@ -232,8 +268,8 @@ def test_query_facts_boosts_memory_prefixed_entities():
     _os.remove(path)  # let open_writer create it fresh
     con = fact_index.open_writer(path)
     fact_index.insert_facts(con, [
-        (":function/caching_helper", ":name", "redis caching helper function"),
-        (":decision/redis", ":description", "redis caching helper function"),
+        (":function/caching_helper", ":name", "redis caching helper function", None, None),
+        (":decision/redis", ":description", "redis caching helper function", None, None),
     ])
     fact_index.close_writer(con)
     try:
@@ -268,10 +304,10 @@ def test_query_facts_boost_surfaces_fact_outside_old_limit_window(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
     triples = [
-        (f":function/noise{i}", ":name", "redis caching redis caching") for i in range(15)
+        (f":function/noise{i}", ":name", "redis caching redis caching", None, None) for i in range(15)
     ]
     decision_text = "redis caching " + " ".join(f"filler{i}" for i in range(40))
-    triples.append((":decision/buried", ":description", decision_text))
+    triples.append((":decision/buried", ":description", decision_text, None, None))
     fact_index.insert_facts(con, triples)
     fact_index.close_writer(con)
     results = fact_index.query_facts(path, "redis caching", top_n=3, boost=5.0)
@@ -281,7 +317,7 @@ def test_query_facts_boost_surfaces_fact_outside_old_limit_window(tmp_path):
 
 def test_rebuild_index_creates_fresh_table(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
-    fact_index.rebuild_index(path, [(":decision/x", ":description", "hello world")])
+    fact_index.rebuild_index(path, [(":decision/x", ":description", "hello world", None, None)])
     results = fact_index.query_facts(path, "hello", top_n=10, boost=2.0)
     assert len(results) == 1
     assert results[0][0] == ":decision/x"
@@ -289,8 +325,8 @@ def test_rebuild_index_creates_fresh_table(tmp_path):
 
 def test_rebuild_index_replaces_existing_data(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
-    fact_index.rebuild_index(path, [(":decision/old", ":description", "old fact")])
-    fact_index.rebuild_index(path, [(":decision/new", ":description", "new fact")])
+    fact_index.rebuild_index(path, [(":decision/old", ":description", "old fact", None, None)])
+    fact_index.rebuild_index(path, [(":decision/new", ":description", "new fact", None, None)])
     con = fact_index.open_reader(path)
     try:
         rows = con.execute("SELECT entity FROM facts_fts").fetchall()
@@ -321,7 +357,7 @@ def test_concurrent_rebuild_race_is_safe(tmp_path):
     script = (
         "import sys; sys.path.insert(0, %r)\n"
         "import fact_index\n"
-        "fact_index.rebuild_index(%r, [(':decision/x', ':description', 'concurrent')])\n"
+        "fact_index.rebuild_index(%r, [(':decision/x', ':description', 'concurrent', None, None)])\n"
     ) % (str(tmp_path.parent.parent), path)
     # Run two rebuilds concurrently against the same path.
     p1 = subprocess.Popen([_sys.executable, "-c", script])
@@ -389,7 +425,7 @@ def test_cross_process_reader_sees_writer_commits(tmp_path):
 
     path = str(tmp_path / "t.fts.sqlite3")
     con = fact_index.open_writer(path)
-    fact_index.insert_facts(con, [(":decision/use-redis", ":description", "use redis for caching")])
+    fact_index.insert_facts(con, [(":decision/use-redis", ":description", "use redis for caching", None, None)])
     fact_index.close_writer(con)
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

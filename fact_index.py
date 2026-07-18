@@ -137,23 +137,38 @@ def close_writer(con: sqlite3.Connection) -> None:
     con.close()
 
 
-def insert_facts(con: sqlite3.Connection, triples: Sequence[Tuple[str, str, str]]) -> None:
+def insert_facts(
+    con: sqlite3.Connection,
+    triples: Sequence[Tuple[str, str, str, Optional[str], Optional[str]]],
+) -> None:
     """Insert rows into facts_fts. Does not commit -- caller controls the
     transaction boundary (immediate for single-fact writes, batched per
-    ingestion-commit for git ingestion)."""
+    ingestion-commit for git ingestion). Each row is
+    (entity, attribute, value, valid_from, valid_to); valid_to=None means a
+    current (open-ended) fact, a real ISO timestamp means historical."""
     if not triples:
         return
     con.executemany(
-        "INSERT INTO facts_fts (entity, attribute, value) VALUES (?, ?, ?)", triples
+        "INSERT INTO facts_fts (entity, attribute, value, valid_from, valid_to) "
+        "VALUES (?, ?, ?, ?, ?)",
+        triples,
     )
 
 
-def delete_facts(con: sqlite3.Connection, triples: Sequence[Tuple[str, str, str]]) -> None:
-    """Delete matching rows from facts_fts. Does not commit -- see insert_facts."""
+def delete_facts(
+    con: sqlite3.Connection,
+    triples: Sequence[Tuple[str, str, str, Optional[str], Optional[str]]],
+) -> None:
+    """Delete matching CURRENT rows from facts_fts (valid_to IS NULL only).
+    Does not commit -- see insert_facts. Historical rows for the same
+    (entity, attribute, value) from an earlier lifecycle are never touched
+    by a retract -- only the live, open-ended assertion is removed."""
     if not triples:
         return
     con.executemany(
-        "DELETE FROM facts_fts WHERE entity = ? AND attribute = ? AND value = ?", triples
+        "DELETE FROM facts_fts WHERE entity = ? AND attribute = ? AND value = ? "
+        "AND valid_to IS NULL",
+        [(e, a, v) for e, a, v, _vf, _vt in triples],
     )
 
 
@@ -218,18 +233,22 @@ def query_facts(path: str, text: str, top_n: int, boost: float) -> List[List[str
     return [row for _, row in scored[:top_n]]
 
 
-def rebuild_index(path: str, facts: Sequence[Tuple[str, str, str]]) -> None:
-    """Full rebuild: drop and recreate facts_fts, then bulk-insert facts.
+def rebuild_index(
+    path: str,
+    facts: Sequence[Tuple[str, str, str, Optional[str], Optional[str]]],
+) -> None:
+    """Full rebuild: drop and recreate facts_fts + index_meta, bulk-insert
+    facts, and stamp the 'backfilled' sentinel -- all inside one atomic
+    transaction. Used for backfill (index file missing, schema-only from a
+    racing write, wrong schema_version, or corruption recovery).
 
-    Used for backfill (index file missing -- fresh install, pre-existing
-    graph, or corruption recovery). The whole drop+create+insert sequence
-    runs inside one explicit transaction (BEGIN IMMEDIATE ... COMMIT) so a
-    concurrently-racing rebuild from another process can't interleave and
-    produce duplicate rows -- CREATE VIRTUAL TABLE IF NOT EXISTS alone only
-    makes that one statement atomic, not the 3-statement sequence as a
-    whole. isolation_level=None puts the connection in true autocommit
-    mode so Python's own implicit transaction management doesn't conflict
-    with the explicit BEGIN IMMEDIATE.
+    The whole drop+create+insert sequence runs inside one explicit transaction
+    (BEGIN IMMEDIATE ... COMMIT) so a concurrently-racing rebuild from another
+    process can't interleave and produce duplicate rows -- CREATE VIRTUAL TABLE
+    IF NOT EXISTS alone only makes that one statement atomic, not the
+    multi-statement sequence as a whole. isolation_level=None puts the
+    connection in true autocommit mode so Python's own implicit transaction
+    management doesn't conflict with the explicit BEGIN IMMEDIATE.
 
     PRAGMA journal_mode=WAL does not reliably honor busy_timeout's
     retry-and-wait behavior in SQLite (a documented quirk, not something
@@ -238,6 +257,9 @@ def rebuild_index(path: str, facts: Sequence[Tuple[str, str, str]]) -> None:
     outer retry loop below handles that, mirroring this codebase's existing
     exponential-backoff pattern for minigraf's own lock contention
     (mcp_server.py's _LOCK_RETRY_MAX/_LOCK_RETRY_BASE).
+
+    Each fact is (entity, attribute, value, valid_from, valid_to);
+    valid_to=None for current facts, an ISO timestamp for historical ones.
     """
     attempts = 6
     base_delay = 0.02
@@ -249,8 +271,17 @@ def rebuild_index(path: str, facts: Sequence[Tuple[str, str, str]]) -> None:
             con.execute(f"PRAGMA mmap_size={_MMAP_SIZE}")
             con.execute("BEGIN IMMEDIATE")
             con.execute("DROP TABLE IF EXISTS facts_fts")
+            con.execute("DROP TABLE IF EXISTS index_meta")
             con.execute(_SCHEMA_SQL)  # NOT ensure_schema() -- see its docstring
+            con.execute(_META_SCHEMA_SQL)
             insert_facts(con, facts)
+            con.execute(
+                "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', ?)",
+                (_SCHEMA_VERSION,),
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('backfilled', '1')"
+            )
             con.execute("COMMIT")
             return
         except sqlite3.OperationalError as e:

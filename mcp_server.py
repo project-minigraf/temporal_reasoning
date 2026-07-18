@@ -3063,7 +3063,7 @@ def _parse_facts_block(facts_str: str) -> List[Tuple[str, str, str]]:
 
 def _index_write(
     action: str,
-    triples: List[Tuple[str, str, str]],
+    triples: List[Tuple[str, str, str, Optional[str], Optional[str]]],
     index_con: Optional[Any] = None,
 ) -> None:
     """Apply an insert or delete to the fact index, never raising -- index
@@ -3116,7 +3116,9 @@ def _transact(
     raw = _db_execute(db, f"(transact {{{opts}}} {datalog_facts})")
     if valid_to is None:
         triples = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
-        _index_write("insert", triples, index_con=index_con)
+        # Convert 3-tuples to 5-tuples by adding valid_from and valid_to
+        five_tuples = [(e, a, v, valid_from, None) for e, a, v in triples]
+        _index_write("insert", five_tuples, index_con=index_con)
     return raw
 
 
@@ -3130,7 +3132,9 @@ def _retract(
     index_triples from the fact index (same decoupling as _transact)."""
     raw = _db_execute(db, f"(retract {datalog_facts})")
     triples = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
-    _index_write("delete", triples, index_con=index_con)
+    # Convert 3-tuples to 5-tuples (retracts always delete current rows where valid_to IS NULL)
+    five_tuples = [(e, a, v, None, None) for e, a, v in triples]
+    _index_write("delete", five_tuples, index_con=index_con)
     return raw
 
 
@@ -4503,12 +4507,14 @@ def _rebuild_index_from_graph() -> None:
     facts_raw = _db_execute(
         db, f'(query [:find ?e ?a ?v :valid-at "{now}" :where [?e ?a ?v]])'
     )
-    triples = [
-        (ident_map.get(str(e), str(e)), str(a), str(v))
+    # Convert to 5-tuples (entity, attribute, value, valid_from, valid_to)
+    # Backfilled facts are current (valid_to=None), using now as valid_from
+    five_tuples = [
+        (ident_map.get(str(e), str(e)), str(a), str(v), now, None)
         for e, a, v in json.loads(facts_raw).get("results", [])
     ]
     path = fact_index.index_path_for(_graph_path or _get_graph_path())
-    fact_index.rebuild_index(path, triples)
+    fact_index.rebuild_index(path, five_tuples)
 
 
 def handle_memory_prepare_turn(user_message: str) -> str:
