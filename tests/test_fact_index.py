@@ -116,6 +116,32 @@ def test_rebuild_index_stamps_backfilled_sentinel(tmp_path):
         con.close()
 
 
+def test_rebuild_index_recovers_a_corrupted_file(tmp_path):
+    """A corrupted (non-SQLite) index file must self-heal: rebuild_index
+    should not raise, and the resulting file must be a valid, fully
+    backfilled index. sqlite3.DatabaseError ("file is not a database") is
+    a distinct failure mode from the lock/busy OperationalError the retry
+    loop already handles -- both are subclasses of sqlite3.DatabaseError,
+    but only OperationalError is a transient contention condition; a
+    corrupted file needs the file removed and the sequence restarted from
+    scratch, not just retried in place."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    with open(path, "wb") as f:
+        f.write(b"not a real sqlite file at all, just garbage bytes")
+
+    fact_index.rebuild_index(path, [(":decision/x", ":description", "hello", None, None)])
+
+    assert fact_index.needs_backfill(path) is False
+    con = fact_index.open_reader(path)
+    try:
+        rows = con.execute(
+            "SELECT entity, attribute, value FROM facts_fts WHERE entity = ':decision/x'"
+        ).fetchall()
+        assert rows == [(":decision/x", ":description", "hello")]
+    finally:
+        con.close()
+
+
 def test_needs_backfill_true_for_v1_index_file_no_meta_table(tmp_path):
     """Hand-build a v1-shaped file (facts_fts only, no index_meta at all) --
     simulates an index file created before this schema-v2 migration shipped."""

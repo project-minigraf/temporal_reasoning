@@ -303,5 +303,17 @@ def rebuild_index(
             if attempt == attempts - 1:
                 raise
             time.sleep(base_delay * (2 ** attempt))
+        except sqlite3.DatabaseError:
+            # Any other DatabaseError (OperationalError is handled above and
+            # never reaches here) means the file itself is corrupted -- e.g.
+            # "file is not a database", "malformed disk image". This is not
+            # a transient lock/busy condition, so retrying in place can
+            # never succeed; the only recovery is to remove the corrupted
+            # file and let the next attempt recreate it from scratch via the
+            # same drop+create+insert sequence above.
+            if attempt == attempts - 1:
+                raise
+            if os.path.exists(path):
+                os.remove(path)
         finally:
             con.close()
