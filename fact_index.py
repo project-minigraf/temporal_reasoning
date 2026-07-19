@@ -26,7 +26,21 @@ _SCHEMA_SQL = (
     "tokenize='unicode61')"
 )
 _META_SCHEMA_SQL = "CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT)"
-_SCHEMA_VERSION = "2"
+# A real (non-virtual) companion table, not part of facts_fts itself -- FTS5
+# virtual tables support neither UNIQUE constraints nor upserts, so exact-row
+# dedup for insert_facts (see #152) needs a B-tree-indexed table to check
+# against instead of an O(n) scan over facts_fts. entity/attribute/value/
+# valid_from/valid_to together are the dedup key; valid_from and valid_to are
+# COALESCEd to '' on write because SQL's default UNIQUE semantics treat NULL
+# as never equal to itself, which would otherwise let every current fact
+# (valid_to=None) dodge the constraint entirely.
+_DEDUP_SCHEMA_SQL = (
+    "CREATE TABLE IF NOT EXISTS facts_dedup ("
+    "entity TEXT NOT NULL, attribute TEXT NOT NULL, value TEXT NOT NULL, "
+    "valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, "
+    "UNIQUE(entity, attribute, value, valid_from, valid_to))"
+)
+_SCHEMA_VERSION = "3"
 
 
 def index_path_for(graph_path: str) -> str:
@@ -61,9 +75,22 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     transaction early and reintroduce the non-atomicity race rebuild_index's
     retry loop exists to prevent. rebuild_index() inlines both schema
     statements instead (_SCHEMA_SQL, _META_SCHEMA_SQL).
+
+    Code-review note on #152's facts_dedup addition: against an existing v2
+    index file (pre-dating facts_dedup), this function creates facts_dedup
+    empty (IF NOT EXISTS) but does NOT bump schema_version (INSERT OR IGNORE
+    is a no-op once the key exists) and does NOT backfill facts_dedup from
+    facts_fts's existing rows. A write against such a file before its next
+    read-triggered rebuild_index() (see needs_backfill(), whose only caller
+    that acts on a True result is the read-path handle_memory_prepare_turn)
+    can therefore append one more duplicate for a key that was already
+    duplicated pre-fix -- bounded, not the original unbounded-growth bug,
+    and self-healing once a read path triggers a real rebuild, but not
+    something open_writer()/ensure_schema() close on their own.
     """
     con.execute(_SCHEMA_SQL)
     con.execute(_META_SCHEMA_SQL)
+    con.execute(_DEDUP_SCHEMA_SQL)
     con.execute(
         "INSERT OR IGNORE INTO index_meta (key, value) VALUES ('schema_version', ?)",
         (_SCHEMA_VERSION,),
@@ -144,18 +171,47 @@ def insert_facts(
     con: sqlite3.Connection,
     triples: Sequence[Tuple[str, str, str, Optional[str], Optional[str]]],
 ) -> None:
-    """Insert rows into facts_fts. Does not commit -- caller controls the
-    transaction boundary (immediate for single-fact writes, batched per
-    ingestion-commit for git ingestion). Each row is
-    (entity, attribute, value, valid_from, valid_to); valid_to=None means a
-    current (open-ended) fact, a real ISO timestamp means historical."""
+    """Insert rows into facts_fts, skipping any exact (entity, attribute,
+    value, valid_from, valid_to) 5-tuple that's already indexed (#152).
+    Does not commit -- caller controls the transaction boundary (immediate
+    for single-fact writes, batched per ingestion-commit for git ingestion).
+    Each row is (entity, attribute, value, valid_from, valid_to);
+    valid_to=None means a current (open-ended) fact, a real ISO timestamp
+    means historical.
+
+    Minigraf's own graph is idempotent under re-transacting an identical
+    fact with the same validity window -- no new graph fact is created --
+    but this used to be a plain INSERT with no corresponding guard, so
+    re-transacting an already-current fact (e.g. _watermark_update's
+    :entity-type/:ident/:description triples, re-asserted on every ingested
+    commit) appended a fresh duplicate row on every call. facts_dedup (a
+    real B-tree-indexed table facts_fts itself can't provide, being an FTS5
+    virtual table with no UNIQUE/upsert support) makes each row's write
+    conditional on genuinely not having been written before, one row at a
+    time so INSERT OR IGNORE's per-statement rowcount reliably says whether
+    that exact row was new (executemany's rowcount is not per-row reliable
+    across sqlite3 driver versions). A distinct valid_from for the same
+    (entity, attribute, value) is deliberately NOT deduped -- it's a
+    genuinely distinct fact, mirroring minigraf's own graph semantics."""
     if not triples:
         return
-    con.executemany(
-        "INSERT INTO facts_fts (entity, attribute, value, valid_from, valid_to) "
-        "VALUES (?, ?, ?, ?, ?)",
-        triples,
-    )
+    for entity, attribute, value, valid_from, valid_to in triples:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO facts_dedup "
+            "(entity, attribute, value, valid_from, valid_to) VALUES (?, ?, ?, ?, ?)",
+            (
+                entity, attribute, value,
+                valid_from if valid_from is not None else "",
+                valid_to if valid_to is not None else "",
+            ),
+        )
+        if cur.rowcount == 0:
+            continue
+        con.execute(
+            "INSERT INTO facts_fts (entity, attribute, value, valid_from, valid_to) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (entity, attribute, value, valid_from, valid_to),
+        )
 
 
 def delete_facts(
@@ -165,12 +221,27 @@ def delete_facts(
     """Delete matching CURRENT rows from facts_fts (valid_to IS NULL only).
     Does not commit -- see insert_facts. Historical rows for the same
     (entity, attribute, value) from an earlier lifecycle are never touched
-    by a retract -- only the live, open-ended assertion is removed."""
+    by a retract -- only the live, open-ended assertion is removed.
+
+    Also clears the matching facts_dedup row(s) (valid_to = '', the same
+    normalized-NULL sentinel insert_facts writes) -- code-review finding on
+    #152: leaving a stale facts_dedup row after a retract would make a later
+    insert_facts call for the exact same (entity, attribute, value,
+    valid_from) silently no-op, since the dedup guard can't distinguish
+    "already indexed and still live" from "was indexed once, since
+    retracted." Deliberately not scoped to a specific valid_from, matching
+    facts_fts's own DELETE above -- delete_facts doesn't know which
+    valid_from the now-deleted current row had either."""
     if not triples:
         return
     con.executemany(
         "DELETE FROM facts_fts WHERE entity = ? AND attribute = ? AND value = ? "
         "AND valid_to IS NULL",
+        [(e, a, v) for e, a, v, _vf, _vt in triples],
+    )
+    con.executemany(
+        "DELETE FROM facts_dedup WHERE entity = ? AND attribute = ? AND value = ? "
+        "AND valid_to = ''",
         [(e, a, v) for e, a, v, _vf, _vt in triples],
     )
 
@@ -295,8 +366,16 @@ def rebuild_index(
             # substrings currently checked).
             con.execute("DROP TABLE IF EXISTS facts_fts")
             con.execute("DROP TABLE IF EXISTS index_meta")
+            # facts_dedup must be dropped and recreated in lockstep with
+            # facts_fts, not just left alone -- insert_facts's dedup guard
+            # keys off facts_dedup, so a stale row surviving from a PRIOR
+            # rebuild would make it wrongly skip inserting that same fact
+            # into the just-emptied facts_fts below (#152 regression test:
+            # test_rebuild_index_resets_dedup_state_across_rebuilds).
+            con.execute("DROP TABLE IF EXISTS facts_dedup")
             con.execute(_SCHEMA_SQL)  # NOT ensure_schema() -- see its docstring
             con.execute(_META_SCHEMA_SQL)
+            con.execute(_DEDUP_SCHEMA_SQL)
             insert_facts(con, facts)
             con.execute(
                 "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', ?)",
