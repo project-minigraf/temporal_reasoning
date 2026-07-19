@@ -3098,17 +3098,33 @@ def _index_write(
 
 def _open_index_writer_safe(path: str) -> Optional[Any]:
     """Open the batched fact-index writer connection used by _run_ingestion,
-    never raising (#150). A failure here (disk full, corrupted file,
-    permissions) degrades to per-triple index writes instead of aborting the
-    whole ingestion run: downstream call sites already accept
-    index_con=None and fall back to _index_write's own open+commit+close
-    path, which is independently fault-isolated per call.
+    never raising (#150). Retries lock contention with the same blocking
+    backoff _open_db_at_with_retry uses (_LOCK_RETRY_MAX/_LOCK_RETRY_BASE) --
+    the eager startup backfill (#147) can hold fact_index.rebuild_index()'s
+    write transaction open for a whole historical rescan, and giving up on
+    the first "database is locked" would otherwise silently downgrade this
+    entire ingestion run's fact-index writes to the slow per-triple path for
+    no reason beyond a transient startup race. Only safe off the asyncio
+    event-loop thread (blocking time.sleep) -- always invoked via
+    write_executor, never inline on the loop.
+
+    Any other failure (disk full, corrupted file, permissions) degrades
+    immediately to per-triple index writes instead of aborting the whole
+    ingestion run: downstream call sites already accept index_con=None and
+    fall back to _index_write's own open+commit+close path, which is
+    independently fault-isolated per call.
     """
-    try:
-        return fact_index.open_writer(path)
-    except Exception as e:
-        print(f"[fact_index] open_writer failed: {e}", file=sys.stderr)
-        return None
+    delay = _LOCK_RETRY_BASE
+    for attempt in range(_LOCK_RETRY_MAX):
+        try:
+            return fact_index.open_writer(path)
+        except Exception as e:
+            if not _is_lock_error(e) or attempt == _LOCK_RETRY_MAX - 1:
+                print(f"[fact_index] open_writer failed: {e}", file=sys.stderr)
+                return None
+            time.sleep(delay)
+            delay *= 2
+    return None  # unreachable -- loop above always returns
 
 
 def _commit_index_writer_safe(index_con: Optional[Any]) -> None:
