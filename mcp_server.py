@@ -5589,7 +5589,8 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str, index_con: Optional[A
     Called once after the commit walk. All tags are re-checked on every run so
     newly created tags pointing to previously ingested commits are picked up
     -- but each attribute is only retracted+re-transacted when its VALUE
-    actually changed, mirroring _watermark_update's retract-then-reassert.
+    actually changed (unlike _watermark_update's unconditional retract-then-
+    reassert, this skips the write entirely when nothing changed).
     Minigraf is NOT idempotent at the graph level for re-transacting the same
     (entity, attribute, value) under a different valid-from: it creates a
     second, genuinely live duplicate fact rather than a no-op (#156).

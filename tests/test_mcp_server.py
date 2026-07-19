@@ -978,6 +978,21 @@ class TestIngestTagsGraphLevelIdempotency:
         raw = mcp_server._db_execute(real_db, '(query [:find ?v :where [:tag/v1-0-0 :date ?v]])')
         assert json.loads(raw)["results"] == [["2026-01-03T00:00:00Z"]]
 
+    def test_moved_tag_retracts_stale_commit_ref_and_keeps_single_live_fact(self, real_db, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "a" * 40, "2026-01-01T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-01T00:00:00.000Z")
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "b" * 40, "2026-01-01T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-02T00:00:00.000Z")
+        raw = mcp_server._db_execute(real_db, '(query [:find ?v :where [:tag/v1-0-0 :tagged-commit ?v]])')
+        assert json.loads(raw)["results"] == [[f":commit/{'b' * 12}"]]
+
     def test_new_tag_pointing_to_previously_ingested_commit_still_ingests(self, real_db, tmp_path, monkeypatch):
         import mcp_server
         monkeypatch.setattr(
