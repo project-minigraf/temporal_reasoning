@@ -4596,7 +4596,16 @@ async def _run_startup_backfill() -> None:
     UserPromptSubmit hook's short-lived, 5-second-timeout-bound process: a
     slow rescan there trips the timeout and retry-storms on every subsequent
     turn instead of ever completing.
+
+    Releases the graph's file lock (_db = None) once done, unconditionally --
+    mirroring call_tool's own finally block -- so the prepare_hook subprocess
+    can still acquire it between turns. Without this, a rebuild triggered
+    here would leave the persistent server process holding the lock open
+    indefinitely (never reset the way a single call_tool invocation is),
+    reproducing this issue's own failure mode -- a hook unable to get the
+    lock in time -- by lock contention instead of a slow rescan.
     """
+    global _db
     path = fact_index.index_path_for(_graph_path or _get_graph_path())
     loop = asyncio.get_running_loop()
     try:
@@ -4606,6 +4615,8 @@ async def _run_startup_backfill() -> None:
                 await loop.run_in_executor(backfill_executor, _rebuild_index_from_graph)
     except Exception as e:
         print(f"[fact_index] startup backfill failed: {e}", file=sys.stderr)
+    finally:
+        _db = None
 
 
 def handle_memory_prepare_turn(user_message: str) -> str:

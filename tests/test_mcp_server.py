@@ -7595,6 +7595,53 @@ class TestMainAutoIngestLockCheck:
         await asyncio.wait_for(main_task, timeout=2)
 
 
+class TestRunStartupBackfillDbLockRelease:
+    @pytest.mark.asyncio
+    async def test_releases_db_lock_after_triggered_rebuild(self, real_db):
+        """Code-review finding on #147: every other _db-touching call site in
+        this file releases the graph's file lock afterward (call_tool's
+        finally, _run_ingestion's per-commit resets) so the prepare_hook
+        subprocess can acquire it between turns. _run_startup_backfill must
+        do the same -- otherwise the persistent server process holds the
+        lock open indefinitely once eager backfill runs once, reproducing
+        this issue's own failure mode (a hook can't get the lock in time) by
+        a different mechanism than the one it fixes."""
+        import mcp_server
+        import fact_index
+        import os
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        if os.path.exists(index_path):
+            os.remove(index_path)
+
+        assert mcp_server._db is not None  # real_db fixture already opened it
+
+        await mcp_server._run_startup_backfill()
+
+        assert mcp_server._db is None
+
+    @pytest.mark.asyncio
+    async def test_releases_db_lock_even_when_no_rebuild_needed(self, real_db):
+        """Same release discipline must hold on the no-op path (index already
+        backfilled) -- matches call_tool's finally, which resets _db
+        unconditionally after every tool call regardless of whether that
+        specific call touched it."""
+        import mcp_server
+        import fact_index
+
+        # Seed an already-complete index so needs_backfill() is False and
+        # _rebuild_index_from_graph (hence get_db()) is never invoked.
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        fact_index.rebuild_index(index_path, [])
+        assert fact_index.needs_backfill(index_path) is False
+
+        assert mcp_server._db is not None  # real_db fixture already opened it
+
+        await mcp_server._run_startup_backfill()
+
+        assert mcp_server._db is None
+
+
 class TestMainStartupBackfill:
     @pytest.mark.asyncio
     async def test_kicks_off_backfill_when_needed(self, monkeypatch, tmp_path):
