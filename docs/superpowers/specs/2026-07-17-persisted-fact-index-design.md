@@ -140,7 +140,15 @@ today's one-document-per-fact-row `FactIndex`.
 ### Write path — the choke point
 
 Every write to the graph must also update the index, incrementally, so the
-index never drifts and never needs a rescan under normal operation. A fully
+index never drifts and never needs a rescan under normal operation.
+**Correction (#152):** this "never drifts" claim was inaccurate as originally
+implemented — `insert_facts` was a plain `INSERT` with no dedup guard, so
+re-transacting an already-current fact through this same choke point (e.g.
+`_watermark_update`'s per-commit `:entity-type`/`:ident`/`:description`
+triples) appended a duplicate row every time. Fixed by making `insert_facts`
+conditional on a companion `facts_dedup` table keyed on the exact
+`(entity, attribute, value, valid_from, valid_to)` 5-tuple — see
+`fact_index.insert_facts`'s docstring. A fully
 exhaustive pass — every `_db_execute(db, ...)` call site in the file, not
 filtered by any same-line pattern (an earlier, quote-agnostic-but-still-
 same-line-anchored grep pass missed calls where the Datalog string is built

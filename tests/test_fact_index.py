@@ -51,7 +51,7 @@ def test_open_writer_stamps_schema_version_but_not_backfilled(tmp_path):
         version = con.execute(
             "SELECT value FROM index_meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("2",)
+        assert version == ("3",)
         backfilled = con.execute(
             "SELECT value FROM index_meta WHERE key = 'backfilled'"
         ).fetchone()
@@ -105,6 +105,110 @@ def test_delete_facts_only_deletes_current_rows(tmp_path):
         fact_index.close_writer(con)
 
 
+# ---------------------------------------------------------------------------
+# #152 -- insert_facts must be idempotent on an exact (entity, attribute,
+# value, valid_from, valid_to) match, not a plain unconditional INSERT.
+# ---------------------------------------------------------------------------
+
+
+def test_insert_facts_is_idempotent_for_current_fact(tmp_path):
+    """Re-transacting the same already-current fact (e.g. _watermark_update's
+    :entity-type/:ident/:description triples, re-asserted on every ingested
+    commit) must not append a second facts_fts row for it."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        triple = (":decision/x", ":description", "hello", "2026-01-01T00:00:00.000Z", None)
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        rows = con.execute("SELECT * FROM facts_fts WHERE entity = ':decision/x'").fetchall()
+        assert len(rows) == 1
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_insert_facts_is_idempotent_for_historical_fact(tmp_path):
+    """The same dedup guard applies to a historical (valid_to set) row."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        triple = (
+            ":module/foo", ":description", "the foo module",
+            "2024-01-01T00:00:00.000Z", "2024-06-01T00:00:00.000Z",
+        )
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        rows = con.execute("SELECT * FROM facts_fts WHERE entity = ':module/foo'").fetchall()
+        assert len(rows) == 1
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_insert_facts_is_idempotent_with_null_valid_from(tmp_path):
+    """valid_from=None is a real input shape used elsewhere in this suite
+    (and by rebuild_index callers) -- the dedup key must handle it, not just
+    the more common non-null valid_from case."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        triple = (":decision/x", ":description", "hello", None, None)
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        rows = con.execute("SELECT * FROM facts_fts WHERE entity = ':decision/x'").fetchall()
+        assert len(rows) == 1
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_insert_facts_keeps_distinct_valid_from_as_separate_rows(tmp_path):
+    """Dedup is scoped to the exact 5-tuple only -- the same (entity,
+    attribute, value) re-asserted with a genuinely different valid_from is a
+    distinct fact (mirrors minigraf's own graph semantics, confirmed
+    directly: re-transacting with a different valid_from is NOT idempotent
+    at the graph level either) and must not be collapsed."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        fact_index.insert_facts(con, [(":tag/v1", ":name", "v1", "2026-01-01T00:00:00.000Z", None)])
+        con.commit()
+        fact_index.insert_facts(con, [(":tag/v1", ":name", "v1", "2026-02-01T00:00:00.000Z", None)])
+        con.commit()
+        rows = con.execute("SELECT valid_from FROM facts_fts WHERE entity = ':tag/v1'").fetchall()
+        assert len(rows) == 2
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_insert_facts_dedup_persists_across_writer_reopen(tmp_path):
+    """The dedup guard must survive a close/reopen of the writer connection
+    -- the real-world case is separate ingestion runs, each opening a fresh
+    connection to the same on-disk index file."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    triple = (":ingestion/watermark", ":ident", ":ingestion/watermark", "2026-01-01T00:00:00.000Z", None)
+    con1 = fact_index.open_writer(path)
+    fact_index.insert_facts(con1, [triple])
+    fact_index.close_writer(con1)
+
+    con2 = fact_index.open_writer(path)
+    fact_index.insert_facts(con2, [triple])
+    fact_index.close_writer(con2)
+
+    con3 = fact_index.open_reader(path)
+    try:
+        rows = con3.execute(
+            "SELECT * FROM facts_fts WHERE entity = ':ingestion/watermark'"
+        ).fetchall()
+        assert len(rows) == 1
+    finally:
+        con3.close()
+
+
 def test_rebuild_index_stamps_backfilled_sentinel(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     fact_index.rebuild_index(path, [(":decision/x", ":description", "hello", None, None)])
@@ -151,6 +255,27 @@ def test_needs_backfill_true_for_v1_index_file_no_meta_table(tmp_path):
     con.execute(
         "CREATE VIRTUAL TABLE facts_fts USING fts5(entity, attribute, value, tokenize='unicode61')"
     )
+    con.commit()
+    con.close()
+    assert fact_index.needs_backfill(path) is True
+
+
+def test_needs_backfill_true_for_pre_dedup_schema_v2_file(tmp_path):
+    """A schema-v2 index file (backfilled, but predating facts_dedup / #152)
+    must be flagged for rebuild -- schema_version mismatch is what forces
+    the rebuild that creates facts_dedup and repopulates it, rather than an
+    old writer connection silently reusing a v2 file that lacks the table
+    insert_facts' dedup guard now depends on."""
+    import sqlite3 as _sqlite3
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = _sqlite3.connect(path)
+    con.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(entity, attribute, value, "
+        "valid_from UNINDEXED, valid_to UNINDEXED, tokenize='unicode61')"
+    )
+    con.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('schema_version', '2')")
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('backfilled', '1')")
     con.commit()
     con.close()
     assert fact_index.needs_backfill(path) is True
@@ -431,6 +556,25 @@ def test_rebuild_index_replaces_existing_data(tmp_path):
     finally:
         con.close()
     assert rows == [(":decision/new",)]
+
+
+def test_rebuild_index_resets_dedup_state_across_rebuilds(tmp_path):
+    """A rebuild must clear whatever dedup bookkeeping insert_facts uses --
+    otherwise a second rebuild reinserting the exact same fact (identical
+    5-tuple, e.g. re-running a full backfill against an unchanged graph)
+    would see it as "already indexed" from the first rebuild's dedup state
+    and skip inserting it into the freshly emptied facts_fts, leaving the
+    index with zero rows for a fact that's actually present."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    triple = (":decision/x", ":description", "hello world", None, None)
+    fact_index.rebuild_index(path, [triple])
+    fact_index.rebuild_index(path, [triple])
+    con = fact_index.open_reader(path)
+    try:
+        rows = con.execute("SELECT entity FROM facts_fts").fetchall()
+    finally:
+        con.close()
+    assert rows == [(":decision/x",)]
 
 
 def test_rebuild_index_empty_facts(tmp_path):
