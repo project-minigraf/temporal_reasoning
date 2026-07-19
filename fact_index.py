@@ -75,6 +75,18 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     transaction early and reintroduce the non-atomicity race rebuild_index's
     retry loop exists to prevent. rebuild_index() inlines both schema
     statements instead (_SCHEMA_SQL, _META_SCHEMA_SQL).
+
+    Code-review note on #152's facts_dedup addition: against an existing v2
+    index file (pre-dating facts_dedup), this function creates facts_dedup
+    empty (IF NOT EXISTS) but does NOT bump schema_version (INSERT OR IGNORE
+    is a no-op once the key exists) and does NOT backfill facts_dedup from
+    facts_fts's existing rows. A write against such a file before its next
+    read-triggered rebuild_index() (see needs_backfill(), whose only caller
+    that acts on a True result is the read-path handle_memory_prepare_turn)
+    can therefore append one more duplicate for a key that was already
+    duplicated pre-fix -- bounded, not the original unbounded-growth bug,
+    and self-healing once a read path triggers a real rebuild, but not
+    something open_writer()/ensure_schema() close on their own.
     """
     con.execute(_SCHEMA_SQL)
     con.execute(_META_SCHEMA_SQL)
@@ -209,12 +221,27 @@ def delete_facts(
     """Delete matching CURRENT rows from facts_fts (valid_to IS NULL only).
     Does not commit -- see insert_facts. Historical rows for the same
     (entity, attribute, value) from an earlier lifecycle are never touched
-    by a retract -- only the live, open-ended assertion is removed."""
+    by a retract -- only the live, open-ended assertion is removed.
+
+    Also clears the matching facts_dedup row(s) (valid_to = '', the same
+    normalized-NULL sentinel insert_facts writes) -- code-review finding on
+    #152: leaving a stale facts_dedup row after a retract would make a later
+    insert_facts call for the exact same (entity, attribute, value,
+    valid_from) silently no-op, since the dedup guard can't distinguish
+    "already indexed and still live" from "was indexed once, since
+    retracted." Deliberately not scoped to a specific valid_from, matching
+    facts_fts's own DELETE above -- delete_facts doesn't know which
+    valid_from the now-deleted current row had either."""
     if not triples:
         return
     con.executemany(
         "DELETE FROM facts_fts WHERE entity = ? AND attribute = ? AND value = ? "
         "AND valid_to IS NULL",
+        [(e, a, v) for e, a, v, _vf, _vt in triples],
+    )
+    con.executemany(
+        "DELETE FROM facts_dedup WHERE entity = ? AND attribute = ? AND value = ? "
+        "AND valid_to = ''",
         [(e, a, v) for e, a, v, _vf, _vt in triples],
     )
 

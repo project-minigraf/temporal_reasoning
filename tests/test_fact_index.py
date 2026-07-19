@@ -209,6 +209,32 @@ def test_insert_facts_dedup_persists_across_writer_reopen(tmp_path):
         con3.close()
 
 
+def test_insert_facts_after_delete_is_not_silently_swallowed(tmp_path):
+    """Code-review finding on #152: delete_facts must also clear the
+    matching facts_dedup row, not just the facts_fts row -- otherwise a
+    retract followed by a re-assert that happens to reuse the exact same
+    valid_from (a general-purpose possibility via handle_minigraf_transact/
+    handle_minigraf_retract, even if today's specific retract-then-reassert
+    callers in mcp_server.py don't hit it) would see insert_facts treat the
+    row as "already indexed" from the now-deleted assertion and silently
+    skip re-inserting it -- the fact stays live in the graph but vanishes
+    from the index forever, until the next full rebuild_index()."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        triple = (":decision/x", ":description", "hello", "2026-01-01T00:00:00.000Z", None)
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        fact_index.delete_facts(con, [triple])
+        con.commit()
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        rows = con.execute("SELECT * FROM facts_fts WHERE entity = ':decision/x'").fetchall()
+        assert len(rows) == 1
+    finally:
+        fact_index.close_writer(con)
+
+
 def test_rebuild_index_stamps_backfilled_sentinel(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     fact_index.rebuild_index(path, [(":decision/x", ":description", "hello", None, None)])
