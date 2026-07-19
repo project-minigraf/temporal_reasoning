@@ -38,10 +38,10 @@
     {
       "id": 5,
       "category": "cross-layer",
-      "question": "Genuine single-query cross-layer join: how many fact_index.py :type/function entities were introduced BEFORE the :decision/persisted-fact-index decision's own :db/valid-from (a synthetic decision seeded at 2026-07-17T04:00:00Z, before fact_index.py existed)? The query binds the decision's :db/valid-from as an output variable and filters structural facts by comparing each one's own :db/valid-from against it -- removing the seed makes the query return nothing, since ?dvf could never bind.",
+      "question": "Genuine single-query cross-layer join: how many fact_index.py :type/function entities were introduced BEFORE the :decision/persisted-fact-index decision's own :db/valid-from (a synthetic decision seeded at 2026-07-17T04:00:00Z, before fact_index.py existed)? The query binds the decision's :db/valid-from as an output variable and filters structural facts by comparing each one's own :db/valid-from against it. Note: this entry's own expected answer (0) is not discriminating on its own -- if the seed were silently missing, ?dvf would never bind and count-distinct over the resulting empty join would ALSO return 0, not an error. Entry 6 (12 vs. a silent-failure 0) is the one that actually proves the join fired; run both together.",
       "seed": "[[:decision/persisted-fact-index :entity-type :type/decision] [:decision/persisted-fact-index :description \"Persist the fact index as a SQLite FTS5 table instead of an in-memory index\"]]",
       "seed_valid_from": "2026-07-17T04:00:00Z",
-      "seed_note": "Synthetic -- no agent-authored decision datom naturally exists tied to this repo's real history. Seeded explicitly so this question is answerable; not a claim the correlation is organically real. See design doc's 'Cross-layer question caveat'.",
+      "seed_note": "Synthetic -- no agent-authored decision datom naturally exists tied to this repo's real history. Seeded explicitly so this question is answerable; not a claim the correlation is organically real. See design doc's 'Cross-layer question caveat'. Entry 6 has no seed of its own -- it depends on this entry running first in the same run_query_benchmark.py session so the decision fact already exists in the graph; the two entries are order-dependent, not independently runnable.",
       "datalog": "[:find (count-distinct ?fn) :any-valid-time :where [:decision/persisted-fact-index :db/valid-from ?dvf] [?fn :entity-type :type/function] [?fn :file \"fact_index.py\"] [?fn :db/valid-from ?fvf] [(< ?fvf ?dvf)]]",
       "expected": [[0]],
       "baseline_cmd": "git log --oneline --diff-filter=A -- fact_index.py"
@@ -49,7 +49,7 @@
     {
       "id": 6,
       "category": "cross-layer",
-      "question": "The complementary half of entry 5's single-query join: how many fact_index.py :type/function entities were introduced AFTER the same decision's :db/valid-from? Same query shape as entry 5 with the comparison direction flipped ([(> ?fvf ?dvf)] instead of [(< ?fvf ?dvf)]) -- genuinely joins against :decision/persisted-fact-index in one query, not two separate :valid-at-bounded queries diffed externally.",
+      "question": "The complementary half of entry 5's single-query join: how many fact_index.py :type/function entities were introduced AFTER the same decision's :db/valid-from? Same query shape as entry 5 with the comparison direction flipped ([(> ?fvf ?dvf)] instead of [(< ?fvf ?dvf)]) -- genuinely joins against :decision/persisted-fact-index in one query, not two separate :valid-at-bounded queries diffed externally. This is the entry with real discriminating power: if the seed (transacted by entry 5, which must run first) were silently missing, ?dvf would never bind and this query would return 0 instead of the expected 12 -- unlike entry 5, whose own expected value is already 0.",
       "datalog": "[:find (count-distinct ?fn) :any-valid-time :where [:decision/persisted-fact-index :db/valid-from ?dvf] [?fn :entity-type :type/function] [?fn :file \"fact_index.py\"] [?fn :db/valid-from ?fvf] [(> ?fvf ?dvf)]]",
       "expected": [[12]],
       "baseline_cmd": "git show 3f30610f49a4:fact_index.py | grep -c '^def '"

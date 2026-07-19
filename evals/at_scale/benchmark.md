@@ -7,8 +7,12 @@ The "cross-layer" ground-truth category (entries 5-6) is a genuine single-query
 graph-level join: it binds the seeded decision's own `:db/valid-from` as an output
 variable via minigraf's `:db/valid-from`/`:db/valid-to` pseudo-attributes, then
 filters structural facts by comparing each one's own `:db/valid-from` against it
-in the same query (`[(< ?fvf ?dvf)]` / `[(> ?fvf ?dvf)]`). Removing the seed makes
-either query return nothing, since `?dvf` could never bind. This capability exists
+in the same query (`[(< ?fvf ?dvf)]` / `[(> ?fvf ?dvf)]`). If the seed decision
+fact were silently missing, `?dvf` would never bind and `count-distinct` over the
+resulting empty join returns `0`, not an error -- entry 5's own expected answer is
+already `0`, so it can't distinguish a working join from a silently broken one on
+its own; entry 6 (expects `12`, degrades to `0` if the join breaks) is the one
+that actually proves the join fired. Run both together. This capability exists
 in minigraf and is already used internally by `mcp_server.py` (`_preload_known_deps`,
 `_rebuild_index_from_graph`), but is not yet documented in `SKILL.md` — see #165.
 An earlier version of this note incorrectly claimed no such mechanism existed and
@@ -63,3 +67,14 @@ that was wrong and has been corrected here.
 | 4 | dependency-impact | PASS | 14.1ms | 6.1ms |
 | 5 | cross-layer | PASS | 571.3ms | 6.0ms |
 | 6 | cross-layer | PASS | 551.7ms | 2.9ms |
+
+## Query Correctness Run — 20260719T184747Z
+
+| ID | Category | Result | minigraf latency | baseline latency |
+|---|---|---|---|---|
+| 1 | point-in-time | PASS | 6.8ms | 3.1ms |
+| 2 | delta | SKIPPED (manual diff) | 0.0ms | 0.0ms |
+| 3 | regression-tracing | PASS | 1.8ms | 8.0ms |
+| 4 | dependency-impact | PASS | 14.5ms | 5.3ms |
+| 5 | cross-layer | PASS | 568.4ms | 6.2ms |
+| 6 | cross-layer | PASS | 549.6ms | 2.9ms |
