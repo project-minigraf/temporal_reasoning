@@ -23,6 +23,7 @@ result = query("[:find ?d :where [?e :decision/description ?d]]")
 - `install.py` - Setup script (runs weekly updates)
 - `docs/testing-conventions.md` - Real-backend-only test conventions for `tests/test_mcp_server.py`
 - `hooks/claude-code.json` - Claude Code MCP + auto-memory hook config
+- `evals/at_scale/` - at-scale ingestion + query-correctness benchmark tier (real repo history, observational, see its own `benchmark.md`)
 
 ## Graph Storage
 

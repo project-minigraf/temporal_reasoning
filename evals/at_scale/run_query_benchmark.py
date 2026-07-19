@@ -50,7 +50,7 @@ async def run_query_benchmark(
                 f'(transact {{:valid-from "{entry["seed_valid_from"]}"}} {entry["seed"]})'
             )
 
-        if "expected" not in entry:
+        if entry.get("skip_scoring"):
             # Multi-query manual-diff entries (see the entry's "note") are
             # documented, not scored -- no single query/expected pair exists.
             results.append({
