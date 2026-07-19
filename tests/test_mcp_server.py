@@ -934,6 +934,84 @@ class TestBookkeepingWritesFactIndex:
         assert results
 
 
+class TestIngestTagsGraphLevelIdempotency:
+    """#156: minigraf itself is not idempotent when re-transacting the same
+    (entity, attribute, value) under a different valid-from -- it creates a
+    second live duplicate fact, not a no-op. _ingest_tags re-runs on every
+    ingestion, so it must diff against the tag's current live facts and only
+    retract+re-transact attributes whose value actually changed."""
+
+    def test_unchanged_tag_not_duplicated_on_second_run(self, real_db, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "a" * 40, "2026-01-01T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-01T00:00:00.000Z")
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-02T00:00:00.000Z")
+        raw = mcp_server._db_execute(real_db, '(query [:find (count ?v) :where [:tag/v1-0-0 :name ?v]])')
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_unchanged_tag_second_run_writes_nothing(self, real_db, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "a" * 40, "2026-01-01T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-01T00:00:00.000Z")
+        with execute_spy() as calls:
+            mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-02T00:00:00.000Z")
+        assert not any(c.startswith("(transact") or c.startswith("(retract") for c in calls)
+
+    def test_changed_tag_value_retracts_stale_and_keeps_single_live_fact(self, real_db, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "a" * 40, "2026-01-01T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-01T00:00:00.000Z")
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "a" * 40, "2026-01-03T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-02T00:00:00.000Z")
+        raw = mcp_server._db_execute(real_db, '(query [:find ?v :where [:tag/v1-0-0 :date ?v]])')
+        assert json.loads(raw)["results"] == [["2026-01-03T00:00:00Z"]]
+
+    def test_moved_tag_retracts_stale_commit_ref_and_keeps_single_live_fact(self, real_db, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "a" * 40, "2026-01-01T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-01T00:00:00.000Z")
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "b" * 40, "2026-01-01T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-02T00:00:00.000Z")
+        raw = mcp_server._db_execute(real_db, '(query [:find ?v :where [:tag/v1-0-0 :tagged-commit ?v]])')
+        assert json.loads(raw)["results"] == [[f":commit/{'b' * 12}"]]
+
+    def test_new_tag_pointing_to_previously_ingested_commit_still_ingests(self, real_db, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [("v1.0.0", "a" * 40, "2026-01-01T00:00:00Z")],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-01T00:00:00.000Z")
+        monkeypatch.setattr(
+            mcp_server, "_git_tags",
+            lambda repo_path: [
+                ("v1.0.0", "a" * 40, "2026-01-01T00:00:00Z"),
+                ("v1.1.0", "b" * 40, "2026-01-02T00:00:00Z"),
+            ],
+        )
+        mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-02T00:00:00.000Z")
+        raw = mcp_server._db_execute(real_db, '(query [:find ?v :where [:tag/v1-1-0 :name ?v]])')
+        assert json.loads(raw)["results"] == [["v1.1.0"]]
+
+
 class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, real_db):
         import mcp_server

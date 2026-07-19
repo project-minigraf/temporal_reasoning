@@ -5578,12 +5578,28 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     )
 
 
+# Tag attributes whose value is a keyword reference, not an EDN string literal
+# -- everything else in _ingest_tags' triples is string-valued.
+_TAG_KEYWORD_ATTRS = frozenset({":entity-type", ":tagged-commit"})
+
+
 def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str, index_con: Optional[Any] = None) -> None:
     """Ingest git tags as :tag/<slug> entities with :tagged-commit references.
 
-    Called once after the commit walk. All tags are re-ingested on every run
-    so newly created tags pointing to previously ingested commits are picked up.
-    Re-transacting identical facts is idempotent in Minigraf.
+    Called once after the commit walk. All tags are re-checked on every run so
+    newly created tags pointing to previously ingested commits are picked up
+    -- but each attribute is only retracted+re-transacted when its VALUE
+    actually changed (unlike _watermark_update's unconditional retract-then-
+    reassert, this skips the write entirely when nothing changed).
+    Minigraf is NOT idempotent at the graph level for re-transacting the same
+    (entity, attribute, value) under a different valid-from: it creates a
+    second, genuinely live duplicate fact rather than a no-op (#156).
+    Blindly re-transacting every tag's full triple set on every run therefore
+    accumulates unbounded duplicate facts for every unchanged tag; diffing
+    against the tag's current live facts first avoids that. This does not
+    retroactively collapse duplicates a pre-fix run already created (a stale
+    duplicate value matches the desired value trivially, so it's left alone)
+    -- only new duplication going forward is prevented, by design/scope.
     """
     try:
         tags = _git_tags(repo_path)
@@ -5595,16 +5611,36 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str, index_con: Optional[A
             slug = re.sub(r"[^a-z0-9]+", "-", tag_name.lower()).strip("-")
             tag_ident = f":tag/{slug}"
             commit_ident = f":commit/{commit_hash[:12]}"
-            triples = [
-                f"[{tag_ident} :entity-type :type/tag]",
-                f'[{tag_ident} :name "{_edn_escape(tag_name)}"]',
-                f'[{tag_ident} :ident "{tag_ident}"]',
-                f'[{tag_ident} :description "git tag {_edn_escape(tag_name)}"]',
-                f"[{tag_ident} :tagged-commit {commit_ident}]",
-            ]
+
+            desired: Dict[str, str] = {
+                ":entity-type": ":type/tag",
+                ":name": tag_name,
+                ":ident": tag_ident,
+                ":description": f"git tag {tag_name}",
+                ":tagged-commit": commit_ident,
+            }
             if date_raw:
-                triples.append(f'[{tag_ident} :date "{_edn_escape(date_raw)}"]')
-            _transact(db, "[" + " ".join(triples) + "]", run_ts_iso, index_con=index_con)
+                desired[":date"] = date_raw
+
+            current_raw = _db_execute(db, f"(query [:find ?a ?v :where [{tag_ident} ?a ?v]])")
+            current: Dict[str, str] = dict(json.loads(current_raw).get("results", []))
+
+            def _edn(attr: str, value: str) -> str:
+                return value if attr in _TAG_KEYWORD_ATTRS else f'"{_edn_escape(value)}"'
+
+            to_retract: List[str] = []
+            to_transact: List[str] = []
+            for attr, value in desired.items():
+                if current.get(attr) == value:
+                    continue  # already correct -- skip to avoid creating a duplicate live fact (#156)
+                if attr in current:
+                    to_retract.append(f"[{tag_ident} {attr} {_edn(attr, current[attr])}]")
+                to_transact.append(f"[{tag_ident} {attr} {_edn(attr, value)}]")
+
+            if to_retract:
+                _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+            if to_transact:
+                _transact(db, "[" + " ".join(to_transact) + "]", run_ts_iso, index_con=index_con)
         except Exception:
             pass  # non-fatal per tag
 
