@@ -101,6 +101,9 @@ _ingest_progress: Dict[str, Any] = {
 }
 _shutdown_requested = asyncio.Event()
 
+# Startup fact-index backfill task (#147)
+_backfill_task: Optional[asyncio.Task] = None
+
 # PID of our immediate supervisor (e.g. `uvx`), recorded at launch. `uvx`
 # does not forward its own death to the spawned server — no signal, no stdin
 # EOF — so a dead supervisor just reparents us (typically to PID 1 or a
@@ -4582,6 +4585,29 @@ def _rebuild_index_from_graph() -> None:
     fact_index.rebuild_index(path, triples)
 
 
+async def _run_startup_backfill() -> None:
+    """Eagerly check-and-run the fact-index backfill from the long-lived
+    server process at startup (#147), mirroring main()'s auto-start-ingestion
+    pattern -- offloaded to a worker thread so the (potentially slow, full
+    graph rescan) work never blocks the stdio handshake.
+
+    Without this, backfill only ever ran lazily inside
+    handle_memory_prepare_turn, which is very often invoked from the
+    UserPromptSubmit hook's short-lived, 5-second-timeout-bound process: a
+    slow rescan there trips the timeout and retry-storms on every subsequent
+    turn instead of ever completing.
+    """
+    path = fact_index.index_path_for(_graph_path or _get_graph_path())
+    loop = asyncio.get_running_loop()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as backfill_executor:
+            needs = await loop.run_in_executor(backfill_executor, fact_index.needs_backfill, path)
+            if needs:
+                await loop.run_in_executor(backfill_executor, _rebuild_index_from_graph)
+    except Exception as e:
+        print(f"[fact_index] startup backfill failed: {e}", file=sys.stderr)
+
+
 def handle_memory_prepare_turn(user_message: str) -> str:
     """Query the persisted fact index for facts relevant to the user message,
     including labeled historical (retracted/superseded) facts -- the index
@@ -6922,7 +6948,7 @@ async def _orphan_watchdog() -> None:
 
 
 async def main() -> None:
-    global _server_ref, _ingest_task, _ingest_progress, _launch_ppid
+    global _server_ref, _ingest_task, _ingest_progress, _launch_ppid, _backfill_task
     _server_ref = server
     _launch_ppid = os.getppid()
     # Auto-start incremental ingest on server startup so ingestion begins
@@ -6949,6 +6975,13 @@ async def main() -> None:
             _ingest_progress["status"] = "starting"
             cwd = str(Path.cwd())
             _ingest_task = asyncio.create_task(_run_ingestion(cwd, _default_git_branch(cwd)))
+
+        # Eager fact-index backfill (#147): also gated on MINIGRAF_NO_AUTO_INGEST
+        # since it's the same kind of background write to on-disk state that a
+        # deterministic eval sandbox wants to opt out of, alongside ingestion.
+        # Independent of the live-lock-holder check above -- unlike ingestion,
+        # this doesn't race another process for the graph's write lock.
+        _backfill_task = asyncio.create_task(_run_startup_backfill())
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -6997,6 +7030,11 @@ async def main() -> None:
                 await asyncio.wait_for(_ingest_task, timeout=30)
             except asyncio.TimeoutError:
                 _ingest_task.cancel()
+        if _backfill_task is not None and not _backfill_task.done():
+            try:
+                await asyncio.wait_for(_backfill_task, timeout=30)
+            except asyncio.TimeoutError:
+                _backfill_task.cancel()
 
 
 def run() -> None:
