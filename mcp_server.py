@@ -3043,7 +3043,7 @@ def handle_minigraf_query(datalog: str) -> Dict[str, Any]:
 
 
 _FACTS_TRIPLE_PATTERN = re.compile(
-    r'\[(\:[^\s\]]+)\s+(\:[^\s\]]+)\s+("(?:[^"\\]|\\.)*"|\:[^\s\]]+)\]'
+    r'\[(\:[^\s\]]+)\s+(\:[^\s\]]+)\s+("(?:[^"\\]|\\.)*"|\:[^\s\]]+|-?\d+(?:\.\d+)?)\]'
 )
 
 
@@ -3052,9 +3052,12 @@ def _parse_facts_block(facts_str: str) -> List[Tuple[str, str, str]]:
     block or a single triple string -- scans for all matches rather than
     requiring a strict split, so it works on both shapes uniformly (mirrors
     _parse_transact_facts' existing regex-scan approach, extended to also
-    capture keyword-valued triples, which schema validation intentionally
-    skips but the index must not). Value is unquoted for string-valued
-    triples, kept as-is (a keyword or entity reference) otherwise.
+    capture keyword-valued and bare-numeric-valued triples, which schema
+    validation intentionally skips but the index must not). Value is
+    unquoted for string-valued triples, kept as-is (a keyword, number, or
+    entity reference) otherwise. #uuid/#inst-tagged values still aren't
+    captured -- pass index_triples explicitly if one of those needs to be
+    searchable.
     """
     triples = []
     for m in _FACTS_TRIPLE_PATTERN.finditer(facts_str):

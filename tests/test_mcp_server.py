@@ -816,6 +816,25 @@ class TestParseFactsBlock:
         import mcp_server
         assert mcp_server._parse_facts_block("[]") == []
 
+    def test_numeric_valued_triple(self):
+        import mcp_server
+        result = mcp_server._parse_facts_block(
+            "[:ingestion/last-run-at :total-ingested 42]"
+        )
+        assert result == [(":ingestion/last-run-at", ":total-ingested", "42")]
+
+    def test_negative_and_float_valued_triples(self):
+        import mcp_server
+        block = (
+            "[[:decision/x :offset -3] "
+            "[:decision/x :score 1.5]]"
+        )
+        result = mcp_server._parse_facts_block(block)
+        assert result == [
+            (":decision/x", ":offset", "-3"),
+            (":decision/x", ":score", "1.5"),
+        ]
+
 
 class TestTransactRetractChokePoint:
     def test_transact_writes_to_index(self, real_db, tmp_path):
