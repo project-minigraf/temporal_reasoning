@@ -65,3 +65,34 @@ def append_ingestion_report(metrics: dict[str, Any], report_path: Path) -> None:
 
     with report_path.open("a") as f:
         f.write("\n".join(lines))
+
+
+def append_query_report(results: list[dict[str, Any]], report_path: Path) -> None:
+    """Append a dated query-correctness section to report_path, creating it
+    with the shared header first if it doesn't exist yet."""
+    if not report_path.exists():
+        report_path.write_text(_REPORT_HEADER)
+
+    lines = [
+        "",
+        f"## Query Correctness Run — {_utc_timestamp()}",
+        "",
+        "| ID | Category | Result | minigraf latency | baseline latency |",
+        "|---|---|---|---|---|",
+    ]
+    for r in results:
+        if r["passed"] is None:
+            status = "SKIPPED (manual diff)"
+        elif r["passed"]:
+            status = "PASS"
+        else:
+            status = f"FAIL (expected `{r['expected']}`, got `{r['actual']}`)"
+        lines.append(
+            f"| {r['id']} | {r['category']} | {status} | "
+            f"{r['minigraf_latency_seconds']*1000:.1f}ms | "
+            f"{r['baseline_latency_seconds']*1000:.1f}ms |"
+        )
+    lines.append("")
+
+    with report_path.open("a") as f:
+        f.write("\n".join(lines))

@@ -1,6 +1,6 @@
 import json
 
-from evals.at_scale.report import append_ingestion_report, write_json_result
+from evals.at_scale.report import append_ingestion_report, append_query_report, write_json_result
 
 SAMPLE_METRICS = {
     "repo_path": "/tmp/repo", "branch": "HEAD", "commits_ingested": 2,
@@ -46,3 +46,32 @@ class TestAppendIngestionReport:
         append_ingestion_report(SAMPLE_METRICS, report_path)
         assert len(report_path.read_text()) > first_len
         assert report_path.read_text().count("## Ingestion Run") == 2
+
+
+SAMPLE_QUERY_RESULTS = [
+    {
+        "id": 1, "category": "point-in-time", "passed": True,
+        "actual": [[8]], "expected": [[8]],
+        "minigraf_latency_seconds": 0.003, "baseline_latency_seconds": 0.015,
+    },
+    {
+        "id": 2, "category": "delta", "passed": None,
+        "actual": None, "expected": None,
+        "minigraf_latency_seconds": 0.0, "baseline_latency_seconds": 0.0,
+    },
+]
+
+
+class TestAppendQueryReport:
+    def test_creates_report_with_header_if_missing(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_query_report(SAMPLE_QUERY_RESULTS, report_path)
+        assert report_path.read_text().startswith("# At-Scale Code-Graph Benchmark")
+
+    def test_reports_pass_fail_and_skipped(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_query_report(SAMPLE_QUERY_RESULTS, report_path)
+        text = report_path.read_text()
+        assert "## Query Correctness Run" in text
+        assert "PASS" in text
+        assert "SKIPPED (manual diff)" in text
