@@ -63,6 +63,58 @@ class TestCheckMcpServerImportable:
             assert install.check_mcp_server_importable() is False
 
 
+class TestPyprojectPyModules:
+    def test_parses_declared_modules(self):
+        modules = install._pyproject_py_modules()
+        assert "fact_index" in modules
+        assert "mcp_server" in modules
+
+    def test_returns_empty_list_when_file_missing(self, monkeypatch):
+        monkeypatch.setattr(install, "REPO_DIR", "/nonexistent/path/xyz")
+        assert install._pyproject_py_modules() == []
+
+
+class TestCheckEditableInstallCurrent:
+    def test_returns_true_when_no_editable_install_present(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1)  # pip show: not installed
+            assert install.check_editable_install_current() is True
+        assert mock_run.call_count == 1
+
+    def test_returns_true_when_editable_install_resolves_all_modules(self, monkeypatch):
+        monkeypatch.setattr(install, "_pyproject_py_modules", lambda: ["fact_index"])
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # pip show: present
+                MagicMock(returncode=0),  # import probe: resolves fine
+            ]
+            assert install.check_editable_install_current() is True
+        assert mock_run.call_count == 2
+
+    def test_refreshes_and_succeeds_when_mapping_has_drifted(self, monkeypatch):
+        monkeypatch.setattr(install, "_pyproject_py_modules", lambda: ["fact_index"])
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # pip show: present
+                MagicMock(returncode=1),  # import probe: drifted (stale MAPPING)
+                MagicMock(returncode=0),  # pip install -e .: succeeds
+                MagicMock(returncode=0),  # import probe again: now resolves
+            ]
+            assert install.check_editable_install_current() is True
+        assert mock_run.call_count == 4
+
+    def test_returns_false_when_refresh_does_not_fix_it(self, monkeypatch):
+        monkeypatch.setattr(install, "_pyproject_py_modules", lambda: ["fact_index"])
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0),  # pip show: present
+                MagicMock(returncode=1),  # import probe: drifted
+                MagicMock(returncode=0),  # pip install -e .: succeeds
+                MagicMock(returncode=1),  # import probe again: still broken
+            ]
+            assert install.check_editable_install_current() is False
+
+
 class TestSetupMcpJson:
     def test_uses_git_ingestion_extra(self, tmp_path):
         install.setup_mcp_json(str(tmp_path))
@@ -176,6 +228,7 @@ class TestMainHarnessGating:
         monkeypatch.setattr(install, "check_mcp_package", lambda: True)
         monkeypatch.setattr(install, "check_tree_sitter_packages", lambda: True)
         monkeypatch.setattr(install, "check_mcp_server_importable", lambda: True)
+        monkeypatch.setattr(install, "check_editable_install_current", lambda: True)
 
     def test_non_claude_harness_skips_claude_specific_setup(self, monkeypatch, tmp_path):
         self._patch_common(monkeypatch)

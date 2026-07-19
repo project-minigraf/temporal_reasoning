@@ -19,6 +19,8 @@ Usage:
 import sys
 import subprocess
 import os
+import re
+import tempfile
 import importlib.util
 from datetime import datetime, timezone
 
@@ -214,6 +216,78 @@ def check_mcp_server_importable():
         return True
     stderr = result.stderr.decode(errors="replace").strip()
     print(f"✗ Cannot import mcp_server: {stderr}")
+    return False
+
+
+def _pyproject_py_modules() -> list:
+    """Parse the `py-modules` list from pyproject.toml's [tool.setuptools] table.
+
+    Regex parse rather than a TOML library dependency — the value is always a
+    flat array of quoted strings, matching this project's other lightweight
+    config-parsing (e.g. _plugin_version).
+    """
+    path = os.path.join(REPO_DIR, "pyproject.toml")
+    try:
+        with open(path) as f:
+            content = f.read()
+    except IOError:
+        return []
+    match = re.search(r"py-modules\s*=\s*\[([^\]]*)\]", content)
+    if not match:
+        return []
+    return re.findall(r'"([^"]+)"', match.group(1))
+
+
+def _editable_install_present() -> bool:
+    """Return True if the venv already has an editable install of this package."""
+    result = subprocess.run(
+        [VENV_PYTHON, "-m", "pip", "show", "temporal-reasoning"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def check_editable_install_current() -> bool:
+    """Verify an existing editable install resolves every top-level module
+    declared in pyproject.toml from outside REPO_DIR, refreshing it if not.
+
+    setuptools' editable-install finder bakes a module-name -> path MAPPING at
+    `pip install -e .` time. Pulling changes that add a new top-level module
+    (e.g. fact_index, added by #118) doesn't update an already-baked mapping —
+    the module then only resolves when the importing process's cwd happens to
+    be REPO_DIR, which is why mcp_server and the hooks (which add REPO_DIR to
+    sys.path themselves) are unaffected but any other out-of-repo entry point
+    would silently break (see issue #151). Skipped entirely if no editable
+    install exists yet — this only heals drift in installs that already
+    opted in, it doesn't create one.
+    """
+    if not _editable_install_present():
+        print("✓ No editable install of temporal-reasoning found — nothing to check")
+        return True
+
+    modules = _pyproject_py_modules()
+    if not modules:
+        print("✓ No py-modules declared — nothing to check")
+        return True
+
+    def _probe() -> bool:
+        result = subprocess.run(
+            [VENV_PYTHON, "-c", "; ".join(f"import {m}" for m in modules)],
+            capture_output=True,
+            cwd=tempfile.gettempdir(),
+        )
+        return result.returncode == 0
+
+    if _probe():
+        print(f"✓ Editable install up to date ({', '.join(modules)})")
+        return True
+
+    print("  Editable install predates a new top-level module — refreshing...")
+    if _venv_pip_install("-e", REPO_DIR, timeout=120) and _probe():
+        print("✓ Editable install refreshed")
+        return True
+
+    print("✗ Could not refresh editable install — re-run `pip install -e .` in the venv manually")
     return False
 
 
@@ -746,6 +820,7 @@ def main(target_dir: str = "", harness: str = "claude-code") -> None:
         ("mcp package", check_mcp_package),
         ("tree-sitter language packages", check_tree_sitter_packages),
         ("MCP server", check_mcp_server_importable),
+        ("editable install freshness", check_editable_install_current),
     ]
 
     results = []
