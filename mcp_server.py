@@ -3096,6 +3096,43 @@ def _index_write(
         print(f"[fact_index] {action} failed: {e}", file=sys.stderr)
 
 
+def _open_index_writer_safe(path: str) -> Optional[Any]:
+    """Open the batched fact-index writer connection used by _run_ingestion,
+    never raising (#150). A failure here (disk full, corrupted file,
+    permissions) degrades to per-triple index writes instead of aborting the
+    whole ingestion run: downstream call sites already accept
+    index_con=None and fall back to _index_write's own open+commit+close
+    path, which is independently fault-isolated per call.
+    """
+    try:
+        return fact_index.open_writer(path)
+    except Exception as e:
+        print(f"[fact_index] open_writer failed: {e}", file=sys.stderr)
+        return None
+
+
+def _commit_index_writer_safe(index_con: Optional[Any]) -> None:
+    """Commit the batched fact-index connection, never raising (#150)."""
+    if index_con is None:
+        return
+    try:
+        index_con.commit()
+    except Exception as e:
+        print(f"[fact_index] commit failed: {e}", file=sys.stderr)
+
+
+def _close_index_writer_safe(index_con: Optional[Any]) -> None:
+    """Close the batched fact-index connection, never raising (#150) -- a
+    failure here must not mask an otherwise-successful ingestion run as an
+    error."""
+    if index_con is None:
+        return
+    try:
+        fact_index.close_writer(index_con)
+    except Exception as e:
+        print(f"[fact_index] close_writer failed: {e}", file=sys.stderr)
+
+
 def _transact(
     db: Any,
     datalog_facts: str,
@@ -6055,7 +6092,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # and per-triple commits would be dominated by fsync overhead at
         # that scale.
         index_path = fact_index.index_path_for(_graph_path or _get_graph_path())
-        index_con = await loop.run_in_executor(write_executor, fact_index.open_writer, index_path)
+        index_con = await loop.run_in_executor(write_executor, _open_index_writer_safe, index_path)
 
         try:
             # Extraction (git show + tree-sitter parse + triple construction) runs
@@ -6496,7 +6533,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                         await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason, index_con)
                         await loop.run_in_executor(write_executor, _db_checkpoint, db)
-                        await loop.run_in_executor(write_executor, index_con.commit)
+                        await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
 
                     finally:
                         _db = None  # release file lock between commits
@@ -6527,7 +6564,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # whole span, undoing this fix's own purpose in its teardown.
                 # Routing it through write_executor keeps the wait off the
                 # event-loop thread, same as every other blocking call above.
-                await loop.run_in_executor(write_executor, fact_index.close_writer, index_con)
+                await loop.run_in_executor(write_executor, _close_index_writer_safe, index_con)
                 await loop.run_in_executor(write_executor, executor.shutdown)
 
             if completed_all:

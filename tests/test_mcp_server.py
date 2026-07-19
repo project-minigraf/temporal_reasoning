@@ -7006,6 +7006,78 @@ class TestRunIngestionBatchedIndexWrites:
         assert len(commit_calls) == 3
 
 
+class TestRunIngestionIndexFaultIsolation:
+    """#150: the batched fact-index connection's three call sites in
+    _run_ingestion (open_writer, the per-commit commit(), close_writer) must
+    each degrade gracefully like every per-triple _index_write call already
+    does -- a failure there must never abort the whole ingestion run, since
+    "index maintenance never blocks a graph write" is a stated invariant
+    everywhere else in this module (see _index_write's own docstring and
+    TestBookkeepingWritesFactIndex.test_transact_index_write_failure_does_not_raise
+    for the single-write equivalent of this same guarantee)."""
+
+    @pytest.mark.asyncio
+    async def test_open_writer_failure_does_not_abort_ingestion(self, real_db, git_repo, monkeypatch, capsys):
+        import mcp_server
+        import fact_index
+
+        monkeypatch.setattr(fact_index, "open_writer", lambda path: (_ for _ in ()).throw(OSError("disk full")))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+        assert "open_writer failed" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_commit_failure_does_not_abort_ingestion(self, real_db, git_repo, monkeypatch, capsys):
+        import mcp_server
+        import fact_index
+
+        original_open_writer = fact_index.open_writer
+
+        class FailingCommitConnection:
+            def __init__(self, con):
+                self._con = con
+            def __getattr__(self, name):
+                return getattr(self._con, name)
+            def commit(self):
+                raise OSError("disk full")
+
+        def failing_commit_open_writer(path):
+            return FailingCommitConnection(original_open_writer(path))
+
+        monkeypatch.setattr(fact_index, "open_writer", failing_commit_open_writer)
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+        assert "commit failed" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_close_writer_failure_does_not_abort_ingestion(self, real_db, git_repo, monkeypatch, capsys):
+        import mcp_server
+        import fact_index
+
+        monkeypatch.setattr(fact_index, "close_writer", lambda con: (_ for _ in ()).throw(OSError("disk full")))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+        assert "close_writer failed" in capsys.readouterr().err
+
+
 class TestRunIngestionParentEdgeFactIndex:
     @pytest.mark.asyncio
     async def test_parent_edge_is_searchable_via_fact_index(self, real_db, git_repo, monkeypatch):
