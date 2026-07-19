@@ -1,0 +1,52 @@
+name: At-Scale Benchmark (nightly)
+
+# Runs the at-scale code-graph benchmark tier (evals/at_scale/, issue #120) against
+# this repo's own history every night. Purpose: catch runtime failures in the
+# ingestion/query-benchmark harness itself (crashes, hangs, broken assumptions as
+# this repo's real history grows) -- not benchmark-number regressions. The tier is
+# deliberately observational (see evals/at_scale/benchmark.md), so this workflow
+# does not gate on or compare any metric; it only fails if either script exits
+# non-zero. A failed scheduled run notifies via GitHub's own default workflow
+# failure notifications -- no extra alerting is wired up here.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"  # 03:00 UTC daily
+  workflow_dispatch: {}  # allows manual runs to verify the workflow itself
+
+permissions:
+  contents: read
+
+jobs:
+  at-scale-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          # Both benchmarks need real git history: the ingestion benchmark walks
+          # this repo's full commit log, and the query benchmark ingests through
+          # a pinned historical commit (evals/at_scale/query_ground_truth.json's
+          # pinned_commit) that a shallow (depth-1) clone would not even contain.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,git-ingestion]"
+
+      - name: Add project to PYTHONPATH
+        run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
+
+      - name: Run ingestion benchmark
+        run: python -m evals.at_scale.run_ingestion_benchmark --repo-path . --branch HEAD
+
+      - name: Run query-correctness benchmark
+        if: always()
+        run: python -m evals.at_scale.run_query_benchmark --repo-path .

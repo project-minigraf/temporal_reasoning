@@ -142,7 +142,12 @@ async def run_ingestion_benchmark(
     return result
 
 
-def main() -> None:
+def _exit_code(metrics: dict[str, Any]) -> int:
+    """Return 1 if ingestion ended in an error state, else 0."""
+    return 1 if metrics.get("final_status") == "error" else 0
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Run the at-scale ingestion benchmark (#120).")
     parser.add_argument("--repo-path", default=".")
     parser.add_argument("--branch", default=None)
@@ -168,7 +173,8 @@ def main() -> None:
     print(json.dumps(metrics, indent=2))
     print(f"\nWrote {json_path}")
     print(f"Appended to {report_path}")
+    return _exit_code(metrics)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

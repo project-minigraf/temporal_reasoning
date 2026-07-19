@@ -4,7 +4,27 @@ import subprocess as _subprocess
 
 import pytest
 
-from evals.at_scale.run_query_benchmark import run_query_benchmark
+from evals.at_scale.run_query_benchmark import _exit_code, run_query_benchmark
+
+
+class TestExitCode:
+    def test_zero_when_all_scored_entries_pass(self):
+        results = [
+            {"id": 1, "passed": True},
+            {"id": 2, "passed": None},
+            {"id": 3, "passed": True},
+        ]
+        assert _exit_code(results) == 0
+
+    def test_nonzero_when_any_entry_fails(self):
+        results = [
+            {"id": 1, "passed": True},
+            {"id": 2, "passed": False},
+        ]
+        assert _exit_code(results) == 1
+
+    def test_zero_for_empty_results(self):
+        assert _exit_code([]) == 0
 
 
 @pytest.fixture
