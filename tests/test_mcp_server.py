@@ -7006,6 +7006,152 @@ class TestRunIngestionBatchedIndexWrites:
         assert len(commit_calls) == 3
 
 
+class TestOpenIndexWriterSafeRetry:
+    """#150 follow-up (code review): a transient "database is locked" from
+    fact_index.open_writer must be retried, not treated as a permanent
+    failure on the first attempt -- the eager startup backfill (#147) can
+    hold rebuild_index()'s write transaction open across this exact race
+    window, and giving up immediately would silently downgrade a whole
+    ingestion run to per-triple index writes for no reason beyond a
+    transient race clearing a moment later."""
+
+    def test_retries_lock_error_then_succeeds(self, tmp_path, monkeypatch):
+        import mcp_server
+        import fact_index
+
+        index_path = str(tmp_path / "test.fts.sqlite3")
+        real_open_writer = fact_index.open_writer
+        call_count = {"n": 0}
+
+        def flaky_open_writer(path):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_open_writer(path)
+
+        monkeypatch.setattr(fact_index, "open_writer", flaky_open_writer)
+        sleep_calls = []
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda d: sleep_calls.append(d))
+
+        con = mcp_server._open_index_writer_safe(index_path)
+
+        assert con is not None
+        con.close()
+        assert call_count["n"] == 2
+        assert len(sleep_calls) == 1
+
+    def test_gives_up_after_exhausting_retries_on_persistent_lock_error(self, tmp_path, monkeypatch, capsys):
+        import mcp_server
+        import fact_index
+
+        index_path = str(tmp_path / "test.fts.sqlite3")
+        monkeypatch.setattr(
+            fact_index, "open_writer",
+            lambda path: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+        )
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda d: None)
+
+        con = mcp_server._open_index_writer_safe(index_path)
+
+        assert con is None
+        assert "open_writer failed" in capsys.readouterr().err
+
+    def test_non_lock_error_is_not_retried(self, tmp_path, monkeypatch, capsys):
+        import mcp_server
+        import fact_index
+
+        index_path = str(tmp_path / "test.fts.sqlite3")
+        call_count = {"n": 0}
+
+        def failing_open_writer(path):
+            call_count["n"] += 1
+            raise OSError("disk full")
+
+        monkeypatch.setattr(fact_index, "open_writer", failing_open_writer)
+
+        def fail_if_called(_delay):
+            raise AssertionError("time.sleep() must not be called for a non-lock error")
+        monkeypatch.setattr(mcp_server.time, "sleep", fail_if_called)
+
+        con = mcp_server._open_index_writer_safe(index_path)
+
+        assert con is None
+        assert call_count["n"] == 1
+        assert "open_writer failed" in capsys.readouterr().err
+
+
+class TestRunIngestionIndexFaultIsolation:
+    """#150: the batched fact-index connection's three call sites in
+    _run_ingestion (open_writer, the per-commit commit(), close_writer) must
+    each degrade gracefully like every per-triple _index_write call already
+    does -- a failure there must never abort the whole ingestion run, since
+    "index maintenance never blocks a graph write" is a stated invariant
+    everywhere else in this module (see _index_write's own docstring and
+    TestBookkeepingWritesFactIndex.test_transact_index_write_failure_does_not_raise
+    for the single-write equivalent of this same guarantee)."""
+
+    @pytest.mark.asyncio
+    async def test_open_writer_failure_does_not_abort_ingestion(self, real_db, git_repo, monkeypatch, capsys):
+        import mcp_server
+        import fact_index
+
+        monkeypatch.setattr(fact_index, "open_writer", lambda path: (_ for _ in ()).throw(OSError("disk full")))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+        assert "open_writer failed" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_commit_failure_does_not_abort_ingestion(self, real_db, git_repo, monkeypatch, capsys):
+        import mcp_server
+        import fact_index
+
+        original_open_writer = fact_index.open_writer
+
+        class FailingCommitConnection:
+            def __init__(self, con):
+                self._con = con
+            def __getattr__(self, name):
+                return getattr(self._con, name)
+            def commit(self):
+                raise OSError("disk full")
+
+        def failing_commit_open_writer(path):
+            return FailingCommitConnection(original_open_writer(path))
+
+        monkeypatch.setattr(fact_index, "open_writer", failing_commit_open_writer)
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+        assert "commit failed" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_close_writer_failure_does_not_abort_ingestion(self, real_db, git_repo, monkeypatch, capsys):
+        import mcp_server
+        import fact_index
+
+        monkeypatch.setattr(fact_index, "close_writer", lambda con: (_ for _ in ()).throw(OSError("disk full")))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+        assert "close_writer failed" in capsys.readouterr().err
+
+
 class TestRunIngestionParentEdgeFactIndex:
     @pytest.mark.asyncio
     async def test_parent_edge_is_searchable_via_fact_index(self, real_db, git_repo, monkeypatch):
