@@ -1185,6 +1185,56 @@ class TestAgentStrategy:
         ))
         assert queried["results"] == [["Kafka"]]
 
+    def test_does_not_bypass_schema_validation_on_raw_sampled_datalog(self, real_db, monkeypatch):
+        """#146: the agent-sampling strategy must not hand the sampled
+        model's raw text straight to _transact -- that path runs no schema
+        validation at all (unlike every other write path), so a
+        prompt-injected model response (e.g. from a poisoned commit message
+        reflected back into conversation_delta) could plant arbitrary
+        attributes/entity shapes straight into the graph. It must go through
+        the same parse-and-re-serialize path as the LLM strategy, which
+        rejects any entity carrying an attribute outside MINIGRAF_SCHEMA."""
+        import mcp_server
+        import asyncio as _asyncio
+
+        async def fake_request(conversation_delta, canonical_section):
+            return (
+                '[[:decision/x :description "use redis"] '
+                '[:decision/x :totally-not-a-real-attr "malicious payload"]]'
+            )
+
+        monkeypatch.setattr(mcp_server, "_request_agent_memory_block_async", fake_request)
+        monkeypatch.setattr(mcp_server, "_query_canonical_entities", lambda: "")
+        result = _asyncio.run(mcp_server._agent_extract_and_transact("let's use redis"))
+
+        assert result["ok"] is True
+        evil = json.loads(real_db.execute(
+            '(query [:find ?v :where [:decision/x :totally-not-a-real-attr ?v]])'
+        ))
+        assert evil["results"] == []
+
+    def test_auto_tags_entity_type_and_ident_without_manual_triples(self, real_db, monkeypatch):
+        """#153: once routed through _transact_extracted_facts, the agent
+        strategy no longer needs the model to hand-emit :entity-type/:ident
+        companion triples itself (_AGENT_SAMPLING_PROMPT never asked it to) --
+        auto-tagging kicks in the same way it already does for the heuristic
+        and LLM strategies."""
+        import mcp_server
+        import asyncio as _asyncio
+
+        async def fake_request(conversation_delta, canonical_section):
+            return '[[:decision/use-redis :description "use Redis for caching"]]'
+
+        monkeypatch.setattr(mcp_server, "_request_agent_memory_block_async", fake_request)
+        monkeypatch.setattr(mcp_server, "_query_canonical_entities", lambda: "")
+        result = _asyncio.run(mcp_server._agent_extract_and_transact("let's use redis"))
+
+        assert result["ok"] is True
+        ident = json.loads(real_db.execute(
+            '(query [:find ?i :where [:decision/use-redis :ident ?i]])'
+        ))
+        assert ident["results"] == [[":decision/use-redis"]]
+
 
 class TestAliasEnrichment:
     def test_llm_strategy_alias_bridges_a_lexically_disjoint_query(self, real_db, monkeypatch):
@@ -1208,22 +1258,19 @@ class TestAliasEnrichment:
         assert ":decision/use-redis" in context
 
     def test_agent_strategy_alias_bridges_a_lexically_disjoint_query(self, real_db, monkeypatch):
-        """Unlike the LLM strategy, _agent_extract_and_transact transacts the
-        agent's raw Datalog block directly (no _transact_extracted_facts pass,
-        no auto :entity-type/:ident tagging) -- so, matching the existing
-        precedent in TestConversationalMemoryFactIndex.test_agent_extract_and_transact_indexes,
-        the fake response must supply :entity-type/:ident itself for the entity
-        to be ident-resolvable (vs. falling back to its raw UUID) after the
-        mandatory first-call index backfill."""
+        """Like the LLM strategy, _agent_extract_and_transact routes the
+        agent's Datalog block through _transact_extracted_facts (#146/#153),
+        which auto-tags :entity-type/:ident -- so the entity stays
+        ident-resolvable (vs. falling back to its raw UUID) after the
+        mandatory first-call index backfill even though the fake response
+        below doesn't supply those companion triples itself."""
         import mcp_server
         import asyncio as _asyncio
 
         async def fake_request(conversation_delta, canonical_section):
             return (
                 '[[:decision/use-redis :description "use Redis for the caching layer"] '
-                '[:decision/use-redis :alias "in-memory data store, key-value cache, caching backend"] '
-                '[:decision/use-redis :entity-type :type/decision] '
-                '[:decision/use-redis :ident ":decision/use-redis"]]'
+                '[:decision/use-redis :alias "in-memory data store, key-value cache, caching backend"]]'
             )
 
         monkeypatch.setattr(mcp_server, "_request_agent_memory_block_async", fake_request)
@@ -1257,13 +1304,34 @@ class TestConversationalMemoryFactIndex:
         results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/x" for r in results)
 
+    def test_transact_extracted_facts_escapes_quotes_in_value(self, real_db):
+        """#146: a value containing an embedded double-quote must not be able
+        to close the Datalog string literal early and splice in extra facts
+        -- values here can originate from LLM-produced text (the LLM
+        extraction strategy) which is not constrained to a safe character
+        set the way heuristic-extracted values are."""
+        import mcp_server
+        malicious = 'use redis"] [:decision/evil :pwned "yes'
+        stored = mcp_server._transact_extracted_facts([
+            {"entity": ":decision/x", "entity_type": "decision", "attribute": ":description", "value": malicious},
+        ])
+        assert stored == 1
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/x :description ?d]])'
+        ))
+        assert queried["results"] == [[malicious]]
+        evil = json.loads(real_db.execute(
+            '(query [:find ?v :where [:decision/evil :pwned ?v]])'
+        ))
+        assert evil["results"] == []
+
     def test_agent_extract_and_transact_indexes(self, real_db, monkeypatch):
         import mcp_server
         import fact_index
         import asyncio as _asyncio
 
         async def fake_request(conversation_delta, canonical_section):
-            return '[[:decision/x :description "use redis"] [:decision/x :entity-type :type/decision] [:decision/x :ident ":decision/x"]]'
+            return '[[:decision/x :description "use redis"]]'
 
         monkeypatch.setattr(mcp_server, "_request_agent_memory_block_async", fake_request)
         monkeypatch.setattr(mcp_server, "_query_canonical_entities", lambda: "")

@@ -4720,14 +4720,15 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
             # transaction. :ident stores the keyword ident as a string value so that
             # handle_minigraf_audit and _query_canonical_entities can surface it for
             # display without knowing the UUID (audits retract via #uuid "..." syntax).
+            escaped_value = _edn_escape(value)
             if entity_type:
                 triples = (
-                    f'[{entity} {attribute} "{value}"]'
+                    f'[{entity} {attribute} "{escaped_value}"]'
                     f' [{entity} :entity-type :type/{entity_type}]'
                     f' [{entity} :ident "{entity}"]'
                 )
             else:
-                triples = f'[{entity} {attribute} "{value}"]'
+                triples = f'[{entity} {attribute} "{escaped_value}"]'
             _transact(db, "[" + triples + "]", now_z)
             stored += 1
         except MiniGrafError:
@@ -4980,13 +4981,13 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
         valid_at, datalog = _parse_valid_at_hint(raw_facts)
         if not datalog or datalog == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "agent"}
+        # Route through _transact_extracted_facts (same as the LLM strategy)
+        # rather than transacting the sampled model's raw text directly --
+        # that raw text is unconstrained model output (an injection surface,
+        # see #146) and skips schema validation entirely (#153).
         _refresh_if_stale()
-        db = get_db()
-        _transact(db, datalog, valid_at)
-        _db_checkpoint(db)
-        _update_mtime()
-        # Approximate: count "[:" occurrences as a proxy for triple count.
-        stored_count = datalog.count("[:")
+        parsed = _parse_transact_facts(datalog)
+        stored_count = _transact_extracted_facts(parsed, valid_from=valid_at)
         return {"ok": True, "stored_count": stored_count, "strategy": "agent"}
     except Exception as e:
         return {"ok": False, "error": str(e), "strategy": "agent"}
