@@ -78,8 +78,17 @@ async def run_ingestion_benchmark(
 
     start = time.perf_counter()
     ingest_task = asyncio.create_task(mcp_server._run_ingestion(repo_path, resolved_branch))
-    status_latencies, query_latencies = await _poll_during_ingestion(ingest_task, poll_interval)
-    await ingest_task
+    try:
+        status_latencies, query_latencies = await _poll_during_ingestion(ingest_task, poll_interval)
+        await ingest_task
+    except BaseException:
+        if not ingest_task.done():
+            ingest_task.cancel()
+            try:
+                await ingest_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        raise
     wall_clock = time.perf_counter() - start
 
     commits_ingested = mcp_server._ingest_progress["processed"]
