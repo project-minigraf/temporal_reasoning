@@ -7595,6 +7595,217 @@ class TestMainAutoIngestLockCheck:
         await asyncio.wait_for(main_task, timeout=2)
 
 
+class TestRunStartupBackfillDbLockRelease:
+    @pytest.mark.asyncio
+    async def test_releases_db_lock_after_triggered_rebuild(self, real_db):
+        """Code-review finding on #147: every other _db-touching call site in
+        this file releases the graph's file lock afterward (call_tool's
+        finally, _run_ingestion's per-commit resets) so the prepare_hook
+        subprocess can acquire it between turns. _run_startup_backfill must
+        do the same -- otherwise the persistent server process holds the
+        lock open indefinitely once eager backfill runs once, reproducing
+        this issue's own failure mode (a hook can't get the lock in time) by
+        a different mechanism than the one it fixes."""
+        import mcp_server
+        import fact_index
+        import os
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        if os.path.exists(index_path):
+            os.remove(index_path)
+
+        assert mcp_server._db is not None  # real_db fixture already opened it
+
+        await mcp_server._run_startup_backfill()
+
+        assert mcp_server._db is None
+
+    @pytest.mark.asyncio
+    async def test_releases_db_lock_even_when_no_rebuild_needed(self, real_db):
+        """Same release discipline must hold on the no-op path (index already
+        backfilled) -- matches call_tool's finally, which resets _db
+        unconditionally after every tool call regardless of whether that
+        specific call touched it."""
+        import mcp_server
+        import fact_index
+
+        # Seed an already-complete index so needs_backfill() is False and
+        # _rebuild_index_from_graph (hence get_db()) is never invoked.
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        fact_index.rebuild_index(index_path, [])
+        assert fact_index.needs_backfill(index_path) is False
+
+        assert mcp_server._db is not None  # real_db fixture already opened it
+
+        await mcp_server._run_startup_backfill()
+
+        assert mcp_server._db is None
+
+
+class TestMainStartupBackfill:
+    @pytest.mark.asyncio
+    async def test_kicks_off_backfill_when_needed(self, monkeypatch, tmp_path):
+        """#147: main() must eagerly check-and-run the fact-index backfill in
+        a background task at startup, mirroring the auto-start-ingestion
+        pattern, instead of leaving it to the first lazy
+        handle_memory_prepare_turn call -- which can run inside a short-lived,
+        5-second-timeout-bound UserPromptSubmit hook process and retry-storm
+        on a large graph."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+
+        async def fake_run_ingestion(repo_path, branch):
+            await asyncio.wait(
+                {
+                    asyncio.create_task(mcp_server._shutdown_requested.wait()),
+                    asyncio.create_task(asyncio.Event().wait()),
+                },
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
+        monkeypatch.setattr(mcp_server.fact_index, "needs_backfill", lambda path: True)
+        rebuild_called = asyncio.Event()
+
+        def fake_rebuild():
+            rebuild_called.set()
+
+        monkeypatch.setattr(mcp_server, "_rebuild_index_from_graph", fake_rebuild)
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+        mcp_server._backfill_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+
+        assert mcp_server._backfill_task is not None
+        await asyncio.wait_for(rebuild_called.wait(), timeout=2)
+
+        mcp_server._shutdown_requested.set()
+        await asyncio.wait_for(main_task, timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_skips_rebuild_when_already_backfilled(self, monkeypatch, tmp_path):
+        """No unnecessary full rescan when the index is already complete."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+
+        async def fake_run_ingestion(repo_path, branch):
+            await asyncio.wait(
+                {
+                    asyncio.create_task(mcp_server._shutdown_requested.wait()),
+                    asyncio.create_task(asyncio.Event().wait()),
+                },
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
+        needs_backfill_checked = asyncio.Event()
+
+        def fake_needs_backfill(path):
+            needs_backfill_checked.set()
+            return False
+
+        monkeypatch.setattr(mcp_server.fact_index, "needs_backfill", fake_needs_backfill)
+        rebuild_called = False
+
+        def fake_rebuild():
+            nonlocal rebuild_called
+            rebuild_called = True
+
+        monkeypatch.setattr(mcp_server, "_rebuild_index_from_graph", fake_rebuild)
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+        mcp_server._backfill_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+        await asyncio.wait_for(needs_backfill_checked.wait(), timeout=2)
+        await asyncio.wait_for(mcp_server._backfill_task, timeout=2)
+
+        assert rebuild_called is False
+
+        mcp_server._shutdown_requested.set()
+        await asyncio.wait_for(main_task, timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_skips_backfill_when_auto_ingest_disabled(self, monkeypatch, tmp_path):
+        """MINIGRAF_NO_AUTO_INGEST=1 (used by eval sandboxes) must also
+        suppress the eager backfill task, not just ingestion -- both are
+        background writes to on-disk state that a deterministic sandbox
+        wants to opt out of together."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        monkeypatch.setenv("MINIGRAF_NO_AUTO_INGEST", "1")
+        checked = False
+
+        def fake_needs_backfill(path):
+            nonlocal checked
+            checked = True
+            return True
+
+        monkeypatch.setattr(mcp_server.fact_index, "needs_backfill", fake_needs_backfill)
+        mcp_server._shutdown_requested = asyncio.Event()
+        mcp_server._ingest_task = None
+        mcp_server._backfill_task = None
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield (object(), object())
+
+        monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+        run_started = asyncio.Event()
+
+        async def fake_run(read_stream, write_stream, init_opts):
+            run_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server.server, "run", fake_run)
+
+        main_task = asyncio.create_task(mcp_server.main())
+        await run_started.wait()
+
+        assert mcp_server._backfill_task is None
+        assert checked is False
+
+        mcp_server._shutdown_requested.set()
+        await asyncio.wait_for(main_task, timeout=2)
+
+
 class TestOrphanWatchdog:
     @pytest.mark.asyncio
     async def test_sets_shutdown_when_ppid_changes(self, monkeypatch):
