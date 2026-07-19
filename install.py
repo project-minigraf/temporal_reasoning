@@ -318,10 +318,12 @@ def setup_mcp_json(target_dir: str) -> bool:
       is required so uvx's ephemeral venv actually has the tree-sitter
       packages code-structure extraction depends on (see issue #93 — a bare
       `uvx temporal-reasoning` resolves none of them, silently disabling
-      code-structure extraction). rank-bm25 is a core (non-optional) dependency
-      so handle_memory_prepare_turn always has the cached, indexed BM25 path
-      available instead of falling back to the unindexed, O(graph-size)
-      heuristic scan on every turn (see issues #96, #117).
+      code-structure extraction). handle_memory_prepare_turn queries a
+      persisted SQLite FTS5 index (fact_index.py) instead of scanning the
+      graph on every turn -- FTS5 is compiled into stdlib sqlite3 on every
+      mainstream Python build this project targets, so unlike the rank-bm25
+      cache it replaced, there is no missing-dependency fallback path to
+      keep working (see issues #96, #117, #118).
     - Only MINIGRAF_GRAPH_PATH is set here; ANTHROPIC_API_KEY and
       MINIGRAF_EXTRACTION_STRATEGY belong in .claude/settings.local.json so
       they are available to hook subprocesses as well as the MCP server.

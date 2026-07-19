@@ -26,7 +26,6 @@ classifiers = [
 dependencies = [
     "minigraf>=1.2.1",
     "mcp>=1.27.0",
-    "rank-bm25",
 ]
 
 [project.scripts]
@@ -51,7 +50,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["mcp_server", "report_issue"]
+py-modules = ["mcp_server", "report_issue", "fact_index"]
 
 [tool.ruff]
 line-length = 100

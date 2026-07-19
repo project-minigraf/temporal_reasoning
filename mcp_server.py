@@ -27,13 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from minigraf import MiniGrafDb, MiniGrafError
-
-try:
-    from rank_bm25 import BM25Okapi as _BM25Okapi
-    _BM25_AVAILABLE = True
-except ImportError:
-    _BM25Okapi = None  # type: ignore[assignment,misc]
-    _BM25_AVAILABLE = False
+import fact_index
 
 # ---------------------------------------------------------------------------
 # Session-scoped rules — registered once at startup, cached in RuleRegistry
@@ -61,8 +55,8 @@ _db: Optional[MiniGrafDb] = None
 
 # Serializes every native call into the shared MiniGrafDb handle across the
 # threads that can touch it concurrently: the event-loop thread (call_tool
-# handlers), the ingestion write_executor thread, IndexCache._rebuild's
-# background thread, and worker threads used for preload/lock-retry. minigraf's
+# handlers), the ingestion write_executor thread, and worker threads used
+# for preload/lock-retry. minigraf's
 # own sidecar .lock file only guarantees single-process exclusivity — it says
 # nothing about concurrent calls into one already-open handle from multiple
 # threads within this same process. Without this, two threads racing a
@@ -90,8 +84,8 @@ _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
 # Extended retry budget for the one-time startup/manual-trigger lock
 # acquisition only (_load_ingestion_preload_state) — separate from
 # _LOCK_RETRY_MAX/_LOCK_RETRY_BASE above, which gate synchronous
-# per-request paths (call_tool, IndexCache rebuild) where long blocking
-# would be harmful. This path runs on a dedicated worker thread and can
+# per-request paths (call_tool) where long blocking would be harmful.
+# This path runs on a dedicated worker thread and can
 # afford to be patient enough to survive a typical orphan-process cleanup
 # window (SIGTERM grace period before SIGKILL) instead of giving up in
 # ~1.55s and entering a permanent "error" state (#106).
@@ -2884,10 +2878,10 @@ def _try_open_with_self_heal(path: str) -> MiniGrafDb:
 def _open_db_at_with_retry(path: str) -> MiniGrafDb:
     """Open MiniGrafDb at path, retrying with blocking backoff on lock contention.
 
-    Only safe off the asyncio event-loop thread (e.g. IndexCache's background
-    rebuild thread): the backoff uses time.sleep(), which would otherwise
-    freeze the single-threaded event loop for the whole retry budget — see
-    _ensure_db_async for the event-loop-safe equivalent (issue #99).
+    Only safe off the asyncio event-loop thread: the backoff uses
+    time.sleep(), which would otherwise freeze the single-threaded event
+    loop for the whole retry budget — see _ensure_db_async for the
+    event-loop-safe equivalent (issue #99).
     """
     delay = _LOCK_RETRY_BASE
     last_exc: Optional[Exception] = None
@@ -2977,12 +2971,14 @@ def get_db() -> MiniGrafDb:
     (call_tool, _run_ingestion) always await _ensure_db_async() first, so _db
     is already populated by the time they reach this function.
 
-    Reads the module-level _db global into a local exactly once. IndexCache's
-    background rebuild thread also calls this function, concurrently with
-    call_tool()'s finally block resetting _db to None — reading the global a
-    second time for the return would let that reset race in between the
-    None-check and the return, yielding None even though _db was live at call
-    time (issue #122).
+    Reads the module-level _db global into a local exactly once. A
+    background thread calling this function concurrently with call_tool()'s
+    finally block resetting _db to None — reading the global a second time
+    for the return would let that reset race in between the None-check and
+    the return, yielding None even though _db was live at call time (issue
+    #122; the original background caller that surfaced this, IndexCache's
+    rebuild thread, was deleted in #118, but the exactly-once read remains a
+    general defensive guarantee against any future background caller).
     """
     db = _db
     if db is None:
@@ -3043,6 +3039,118 @@ def handle_minigraf_query(datalog: str) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
+_FACTS_TRIPLE_PATTERN = re.compile(
+    r'\[(\:[^\s\]]+)\s+(\:[^\s\]]+)\s+("(?:[^"\\]|\\.)*"|\:[^\s\]]+)\]'
+)
+
+
+def _parse_facts_block(facts_str: str) -> List[Tuple[str, str, str]]:
+    """Parse every [entity attribute value] triple out of a Datalog facts
+    block or a single triple string -- scans for all matches rather than
+    requiring a strict split, so it works on both shapes uniformly (mirrors
+    _parse_transact_facts' existing regex-scan approach, extended to also
+    capture keyword-valued triples, which schema validation intentionally
+    skips but the index must not). Value is unquoted for string-valued
+    triples, kept as-is (a keyword or entity reference) otherwise.
+    """
+    triples = []
+    for m in _FACTS_TRIPLE_PATTERN.finditer(facts_str):
+        entity, attribute, raw_value = m.groups()
+        value = raw_value[1:-1] if raw_value.startswith('"') else raw_value
+        triples.append((entity, attribute, value))
+    return triples
+
+
+def _index_write(
+    action: str,
+    triples: List[Tuple[str, str, str, Optional[str], Optional[str]]],
+    index_con: Optional[Any] = None,
+) -> None:
+    """Apply an insert or delete to the fact index, never raising -- index
+    maintenance must never block a graph write. action is 'insert' or 'delete'. When
+    index_con is provided, writes onto it without committing (caller controls
+    the transaction boundary — used by ingestion's batching). Otherwise opens
+    a connection, writes, commits, and closes immediately.
+    """
+    if not triples:
+        return
+    try:
+        if index_con is not None:
+            (fact_index.insert_facts if action == "insert" else fact_index.delete_facts)(
+                index_con, triples
+            )
+            return
+        path = fact_index.index_path_for(_graph_path or _get_graph_path())
+        con = fact_index.open_writer(path)
+        try:
+            (fact_index.insert_facts if action == "insert" else fact_index.delete_facts)(
+                con, triples
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception as e:
+        print(f"[fact_index] {action} failed: {e}", file=sys.stderr)
+
+
+def _transact(
+    db: Any,
+    datalog_facts: str,
+    valid_from: str,
+    valid_to: Optional[str] = None,
+    index_triples: Optional[List[Tuple[str, str, str]]] = None,
+    index_con: Optional[Any] = None,
+) -> str:
+    """Execute (transact {opts} datalog_facts) against minigraf, then write
+    index_triples into the fact index -- ALWAYS, not just when valid_to is
+    None. A current (valid_to=None) transact is indexed as a live row; a
+    bounded transact is indexed as a historical row carrying its window,
+    which is the actual entry point into retracted/superseded graph regions
+    (see the design doc). This is the one behavior change from the base
+    branch's _transact: previously bounded transacts were skipped entirely.
+
+    index_triples defaults to auto-parsing datalog_facts via
+    _parse_facts_block() (which returns 3-tuples (entity, attribute, value)
+    -- the window is appended here, not inside that function, since
+    _parse_facts_block has no way to know valid_from/valid_to); pass
+    index_triples explicitly when the Datalog string's own entity reference
+    isn't the searchable identity (e.g. handle_minigraf_audit's #uuid-tagged
+    retracts, whose index_triples must use the resolved keyword ident
+    instead) -- in that case pass 3-tuples too, the window is still appended
+    here uniformly.
+    """
+    opts = f':valid-from "{valid_from}"'
+    if valid_to is not None:
+        opts += f' :valid-to "{valid_to}"'
+    raw = _db_execute(db, f"(transact {{{opts}}} {datalog_facts})")
+    triples_3 = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
+    triples_5 = [(e, a, v, valid_from, valid_to) for e, a, v in triples_3]
+    _index_write("insert", triples_5, index_con=index_con)
+    return raw
+
+
+def _retract(
+    db: Any,
+    datalog_facts: str,
+    index_triples: Optional[List[Tuple[str, str, str]]] = None,
+    index_con: Optional[Any] = None,
+) -> str:
+    """Execute (retract datalog_facts) against minigraf, then delete the
+    matching CURRENT row from the fact index (same decoupling as _transact
+    -- index_triples overrides auto-derivation when the Datalog entity
+    reference isn't the searchable identity). delete_facts only ever
+    targets valid_to IS NULL rows, so historical rows from an earlier
+    lifecycle of the same (entity, attribute, value) are untouched -- pass
+    None, None for the window here unconditionally, since a retract only
+    ever means "remove the live assertion."
+    """
+    raw = _db_execute(db, f"(retract {datalog_facts})")
+    triples_3 = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
+    triples_5 = [(e, a, v, None, None) for e, a, v in triples_3]
+    _index_write("delete", triples_5, index_con=index_con)
+    return raw
+
+
 def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     """Transact facts into the graph. reason is required.
 
@@ -3063,13 +3171,12 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     _refresh_if_stale()
     db = get_db()
     try:
-        raw = _db_execute(db, f'(transact {{:valid-from "{_now_utc_ms()}"}} {facts})')
+        raw = _transact(db, facts, _now_utc_ms())
         _db_checkpoint(db)
         _update_mtime()
         result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
-            _index_cache.invalidate()
         return result
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
@@ -3082,13 +3189,12 @@ def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
     _refresh_if_stale()
     db = get_db()
     try:
-        raw = _db_execute(db, f"(retract {facts})")
+        raw = _retract(db, facts)
         _db_checkpoint(db)
         _update_mtime()
         result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
-            _index_cache.invalidate()
         return result
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
@@ -3219,8 +3325,13 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
                                 retract_triples.append(
                                     f'[#uuid "{entity_uuid}" {a} "{escaped}"]'
                                 )
-                        retract_expr = f"(retract [{' '.join(retract_triples)}])"
-                        _db_execute(db, retract_expr)
+                        retract_facts = "[" + " ".join(retract_triples) + "]"
+                        index_triples = [
+                            (kw_ident, ":entity-type", f":type/{entity_type}"),
+                        ] + [
+                            (kw_ident, a, v) for a, v in attr_rows if isinstance(v, str)
+                        ]
+                        _retract(db, retract_facts, index_triples=index_triples)
                         _db_checkpoint(db)
                         _update_mtime()
                         retracted += 1
@@ -3250,10 +3361,13 @@ _STOP_WORDS = frozenset(
 
 _MIN_ENTITY_LEN = 4
 
-# Each entity triggers one unindexed, O(graph-size) `contains?` scan in
-# _handle_memory_prepare_turn_heuristic (see issue #96). Cap the count so a
-# long user message can't turn one hook invocation into an unbounded number
-# of full-graph scans.
+# Historical (issue #96): bounded how many unindexed, O(graph-size)
+# `contains?` scans a single hook invocation could trigger in
+# handle_memory_prepare_turn's old heuristic implementation, which was
+# deleted in #118 in favor of querying the persisted FTS5 fact index
+# (fact_index.query_facts) -- that path has no per-entity scan to bound, so
+# this constant is currently unused. Left in place rather than deleted here
+# since removing it is outside this cleanup's scope.
 _MAX_HEURISTIC_ENTITIES = int(os.environ.get("MINIGRAF_PREPARE_MAX_ENTITIES", "8"))
 
 
@@ -3968,12 +4082,13 @@ def _ingest_transact(
     triples: List[str],
     commit_ts_iso: str,
     reason: str,
+    index_con: Optional[Any] = None,
 ) -> None:
     """Transact code-structure facts with :valid-from set to the commit timestamp."""
     if not triples:
         return
     facts_str = "[" + " ".join(triples) + "]"
-    _db_execute(db, f'(transact {{:valid-from "{commit_ts_iso}"}} {facts_str})')
+    _transact(db, facts_str, commit_ts_iso, index_con=index_con)
 
 
 def _ingest_close(
@@ -3982,6 +4097,7 @@ def _ingest_close(
     original_ts_iso: str,
     commit_ts_iso: str,
     reason: str,
+    index_con: Optional[Any] = None,
 ) -> None:
     """Close a fact's valid window at the deletion commit timestamp.
 
@@ -3989,8 +4105,13 @@ def _ingest_close(
     1. Retract each original open-ended fact so it vanishes from current-time
        queries (retract has no temporal options, so this removes the unbounded
        assertion from the live view while keeping it in transaction history).
+       This is also the step that removes the fact from the live index.
     2. Re-transact the same facts with explicit :valid-from + :valid-to so the
-       historical valid window is preserved for point-in-time queries.
+       historical valid window is preserved for point-in-time queries. This
+       half is bounded (valid_to is not None) but IS indexed too, as a
+       historical row carrying its window -- this is what makes a closed
+       entity's facts recoverable through the fact index as a labeled entry
+       point into history, instead of just vanishing.
 
     Triples are retracted one-by-one to avoid EAVT collision on :contains edges
     (Minigraf's pending index omits value bytes, so batching multiple
@@ -4000,13 +4121,12 @@ def _ingest_close(
         return
     for triple in triples:
         try:
-            _db_execute(db, f"(retract [{triple}])")
+            _retract(db, f"[{triple}]", index_con=index_con)
         except Exception:
             pass  # best-effort: original may not exist if preload was incomplete
     facts_str = "[" + " ".join(triples) + "]"
-    _db_execute(
-        db,
-        f'(transact {{:valid-from "{original_ts_iso}" :valid-to "{commit_ts_iso}"}} {facts_str})',
+    _transact(
+        db, facts_str, original_ts_iso, valid_to=commit_ts_iso, index_con=index_con,
     )
 
 
@@ -4041,31 +4161,34 @@ def _count_commit_entities(db: Any) -> int:
     return int(results[0][0]) if results else 0
 
 
-def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str) -> None:
+def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str, index_con: Optional[Any] = None) -> None:
     """Record the last successfully ingested commit hash in the graph."""
     existing = _watermark_query(db)
     if existing:
-        _db_execute(db, f'(retract [[:ingestion/watermark :hash "{existing}"]])')
-    _db_execute(
+        _retract(db, f'[[:ingestion/watermark :hash "{existing}"]]', index_con=index_con)
+    _transact(
         db,
-        f'(transact {{:valid-from "{commit_ts_iso}"}} '
         f'[[:ingestion/watermark :entity-type :type/ingestion] '
         f'[:ingestion/watermark :ident ":ingestion/watermark"] '
         f'[:ingestion/watermark :description "git ingestion watermark"] '
-        f'[:ingestion/watermark :hash "{commit_hash}"]])',
+        f'[:ingestion/watermark :hash "{commit_hash}"]]',
+        commit_ts_iso,
+        index_con=index_con,
     )
 
 
-def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int) -> None:
+def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int, index_con: Optional[Any] = None) -> None:
     """Record the wall-clock time, final commit hash, and cumulative ingested count."""
-    _db_execute(
+    _transact(
         db,
-        f'(transact [[:ingestion/last-run-at :entity-type :type/ingestion] '
+        f'[[:ingestion/last-run-at :entity-type :type/ingestion] '
         f'[:ingestion/last-run-at :ident ":ingestion/last-run-at"] '
         f'[:ingestion/last-run-at :description "last ingestion run timestamp"] '
         f'[:ingestion/last-run-at :last-run-at "{run_at}"] '
         f'[:ingestion/last-run-at :last-commit "{commit_hash}"] '
-        f'[:ingestion/last-run-at :total-ingested {total_ingested}]])',
+        f'[:ingestion/last-run-at :total-ingested {total_ingested}]]',
+        run_at,
+        index_con=index_con,
     )
 
 
@@ -4290,12 +4413,24 @@ def _extract_entities(text: str) -> List[str]:
 
 
 def _format_facts(results: List[List[str]]) -> str:
-    """Format a list of [attr, val] or [e, attr, val] rows as a readable block."""
+    """Format fact-index rows as a readable block. Each row is
+    [entity, attribute, value] (2-tuple attr/val rows from other callers) or
+    [entity, attribute, value, valid_from, valid_to] (5-element fact-index
+    rows). A historical row (valid_to present and non-None) is labeled with
+    its validity window so the agent has the entity ident + window it needs
+    to follow up with a precise :as-of/:valid-at Datalog query."""
     if not results:
         return ""
     lines = []
     for row in results:
-        lines.append("  " + " | ".join(str(v) for v in row))
+        if len(row) == 5:
+            entity, attribute, value, valid_from, valid_to = row
+            base = f"  {entity} | {attribute} | {value}"
+            if valid_to is not None:
+                base += f"  [was valid {valid_from} → {valid_to}]"
+            lines.append(base)
+        else:
+            lines.append("  " + " | ".join(str(v) for v in row))
     return "\n".join(lines)
 
 
@@ -4350,228 +4485,130 @@ def _build_query_clauses(user_message: str) -> str:
     return f':valid-at "{_now_utc_ms()}"'
 
 
-# ---------------------------------------------------------------------------
-# BM25 index — semantic retrieval primitives
-# ---------------------------------------------------------------------------
+def _rebuild_index_from_graph() -> None:
+    """One-time full rebuild: rescan the graph's full history (not just the
+    current-valid snapshot) and write it into a fresh fact_index table, with
+    each fact's validity window preserved -- this is what makes a closed/
+    retracted entity's facts recoverable as labeled historical entries after
+    an index file is lost or was never built. This is the only place a full
+    Datalog rescan happens post-launch (everywhere else is incremental via
+    _transact/_retract) -- triggered by fact_index.needs_backfill().
 
-_MEMORY_PREFIXES = (":decision/", ":preference/", ":constraint/", ":dependency/")
+    Uses two separate queries rather than one combined query, deliberately:
+    a query combining a bound clause ([?e :ident ?ident]) with a free clause
+    sharing the same entity variable ([?e ?a ?v]) is a strictly riskier
+    Datalog shape to depend on than it looks -- its join semantics for a
+    shared free variable aren't something this codebase documents or tests
+    elsewhere, unlike a plain single-purpose lookup query. Concretely,
+    against a stale minigraf==1.1.1 (older than this project's pinned
+    minigraf>=1.2.1 floor, but observed installed on one dev machine's
+    non-project Python), that combined-clause query collapsed to returning
+    only the single triple that satisfied the bound clause, discarding
+    every other fact the entity had -- not reproduced under the pinned
+    1.2.1. The two-query form removes the dependency on that join shape
+    either way, at the cost of one extra query on this rarely-run path.
+    _preload_known_entities never combines the two: it always names every
+    attribute explicitly (?path, ?desc, ?date) instead of using a free
+    [?e ?a ?v] clause, so matching its clause *ordering* alone (which this
+    function's first draft did) doesn't carry over the same safety
+    guarantee -- the free-vs-named-clause distinction is what actually
+    matters, not just where :ident appears in the :where list.
 
-# Entity-type names (without the ":type/" prefix) for the same memory-fact
-# categories as _MEMORY_PREFIXES — used to scope the heuristic fallback's
-# broad scan (see _handle_memory_prepare_turn_heuristic) to just the facts
-# a user records via memory_finalize_turn, not the entire code graph.
-_MEMORY_ENTITY_TYPES = tuple(p.strip(":/") for p in _MEMORY_PREFIXES)
+    The fix: query 1 builds a UUID -> keyword-ident lookup table using ONLY
+    the bound clause (no free clause combined). Query 2 is the bare, already
+    independently-verified-correct full scan (see #141's root-cause note:
+    binding ?e directly yields minigraf's internal UUID, not the keyword
+    ident). Substituting the ident where known (falling back to the raw
+    UUID otherwise) in Python gives full fact content for every entity,
+    idented or not -- unlike a dropped fact, an entity recovered under its
+    raw UUID just isn't boost-eligible (never starts with a
+    fact_index._MEMORY_PREFIXES keyword), which accurately reflects that its
+    true keyword ident is unrecoverable from the graph alone once written
+    without an explicit :ident fact.
 
+    Query 1 now also adds :any-valid-time so a HISTORICAL entity's ident can
+    still be recovered during backfill: without it, only currently-idented
+    entities would resolve, and a closed/removed entity's historical rows
+    would fall back to their raw UUID instead of the correct ident, even
+    though the entity itself was idented before it was closed. This doesn't
+    reintroduce the free-vs-named-clause risk documented above -- it only
+    changes which facts are visible to the bound-only lookup, not its join
+    shape.
 
-def _tokenize(text: str) -> List[str]:
-    """Split text on non-alphanumeric chars, lowercase, filter empties.
+    Query 2 now also projects each fact's validity window via minigraf's
+    :db/valid-from/:db/valid-to pseudo-attributes, combined with a free
+    [?e ?a ?v] clause and :any-valid-time (to see retracted/historical facts
+    at all, not just current ones). This exact combination -- pseudo-attrs
+    joined to a FREE clause, not a named one like _preload_known_deps uses
+    -- was not previously exercised anywhere in this codebase and was
+    spike-tested directly against the real, pinned minigraf>=1.2.1 before
+    being relied on here (see the 2026-07-18 design doc): confirmed correct
+    per-fact window binding (no collapse/cross-contamination) and confirmed
+    :any-valid-time does not duplicate a retracted-then-bounded-re-transacted
+    fact as a ghost row alongside its historical replacement.
 
-    Works on raw fact values and keyword idents alike:
-      ":decision/use-redis" → ["decision", "use", "redis"]
-      "use Redis for caching" → ["use", "redis", "for", "caching"]
-    """
-    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
-
-
-class FactIndex:
-    """Immutable BM25 snapshot over a set of graph facts.
-
-    Each fact row [e, a, v] is tokenised as a single document.
-    Memory facts (entity idents with a known memory prefix) receive
-    a configurable score multiplier at query time.
-    """
-
-    def __init__(self, facts: List[List], boost: float = 2.0) -> None:
-        self._boost = boost
-        docs = [_tokenize(" ".join(str(x) for x in row)) for row in facts]
-        # Filter out rows whose full text produces no tokens
-        valid = [
-            (row, doc, any(str(row[0]).startswith(p) for p in _MEMORY_PREFIXES))
-            for row, doc in zip(facts, docs)
-            if doc
-        ]
-        if not valid or _BM25Okapi is None:
-            self._bm25 = None
-            self._facts: List[List] = []
-            self._is_memory: List[bool] = []
-            self._docs: List[List[str]] = []
-            return
-        rows, valid_docs, memory_flags = zip(*valid)
-        self._facts = list(rows)
-        self._is_memory = list(memory_flags)
-        self._docs: List[List[str]] = list(valid_docs)
-        self._bm25 = _BM25Okapi(self._docs)
-
-    def query(self, text: str, top_n: int = 50) -> List[List]:
-        """Return up to top_n facts ranked by BM25 score (memory boost applied).
-
-        Facts with no token overlap with the query are excluded. Returns []
-        if the index is empty or no query tokens appear in any indexed fact.
-        """
-        if self._bm25 is None or not self._facts:
-            return []
-        tokens = _tokenize(text)
-        if not tokens:
-            return []
-        raw_scores = self._bm25.get_scores(tokens).tolist()
-        # Identify docs with any token overlap.
-        # BM25Okapi can return negative scores in small corpora (negative IDF),
-        # so we detect overlap via a per-token presence check rather than relying on score > 0.
-        token_set = set(tokens)
-        has_overlap = [bool(token_set & set(doc)) for doc in self._docs]
-        overlapping_scores = [raw_scores[i] for i in range(len(raw_scores)) if has_overlap[i]]
-        if not overlapping_scores:
-            return []
-        # Shift so minimum overlapping score is 1.0 — ensures boost always raises
-        # memory facts in rank, even when BM25 produces negative IDF in small corpora.
-        shift = max(0.0, 1.0 - min(overlapping_scores))
-        scores = [raw_scores[i] + shift for i in range(len(raw_scores))]
-        for i, is_mem in enumerate(self._is_memory):
-            if is_mem:
-                scores[i] *= self._boost
-        ranked = sorted(
-            [(scores[i], self._facts[i]) for i in range(len(self._facts)) if has_overlap[i]],
-            key=lambda x: x[0],
-            reverse=True,
-        )
-        return [row for _, row in ranked[:top_n]]
-
-
-class IndexCache:
-    """Module-level singleton managing the live BM25 FactIndex.
-
-    Rebuilds asynchronously in a background thread. Serves the stale index
-    during rebuilds; returns None before the first successful rebuild.
-    Invalidation is idempotent while a rebuild is in progress.
-    """
-
-    def __init__(self) -> None:
-        self._current: Optional[FactIndex] = None
-        self._rebuilding: bool = False
-        self._lock = threading.Lock()
-
-    def get(self) -> Optional[FactIndex]:
-        """Return the current index (may be stale or None)."""
-        return self._current
-
-    def invalidate(self) -> None:
-        """Trigger an async rebuild if one is not already running."""
-        if self._rebuilding:
-            return
-        self._rebuilding = True
-        t = threading.Thread(target=self._rebuild, daemon=True)
-        t.start()
-
-    def _rebuild(self) -> None:
-        """Fetch all currently-valid facts from the DB and swap the index."""
-        try:
-            db = get_db()
-            boost = float(os.environ.get("MINIGRAF_MEMORY_BOOST", "2.0"))
-            raw = _db_execute(
-                db, f'(query [:find ?e ?a ?v :valid-at "{_now_utc_ms()}" :where [?e ?a ?v]])'
-            )
-            facts = json.loads(raw).get("results", [])
-            new_index = FactIndex(facts, boost=boost)
-            with self._lock:
-                self._current = new_index
-        except Exception as e:
-            print(f"[IndexCache] rebuild failed: {e}", file=sys.stderr)
-        finally:
-            self._rebuilding = False
-
-
-_index_cache = IndexCache()
-
-
-def _handle_memory_prepare_turn_heuristic(user_message: str) -> str:
-    """Heuristic fallback for handle_memory_prepare_turn.
-
-    Used when rank_bm25 is unavailable. Queries the graph using substring
-    token matching (contains?) for entities extracted from the user message,
-    falling back to a broad scan when no targeted results are found.
-
-    For current-state queries, uses :valid-at with the current UTC ms timestamp
-    (via _build_query_clauses) so facts whose valid window includes right now
-    are returned. For historical queries where an explicit ISO date is detected
-    in the user message, :valid-at is set to that date (midnight UTC).
+    A row's ?vt equal to _VALID_TIME_FOREVER_MS means still-open (current,
+    valid_to=None in the index); any other value means historical
+    (valid_to=ISO(?vt)). ms->ISO conversion reuses the exact pattern
+    _preload_known_deps already uses, rather than duplicating it.
     """
     db = get_db()
-    scan_limit = int(os.environ.get("MINIGRAF_PREPARE_SCAN_LIMIT", "50"))
-    temporal_clauses = _build_query_clauses(user_message)
+    ident_raw = _db_execute(
+        db, '(query [:find ?e ?ident :any-valid-time :where [?e :ident ?ident]])'
+    )
+    ident_map = {e: ident for e, ident in json.loads(ident_raw).get("results", [])}
 
-    entities = _extract_entities(user_message)[:_MAX_HEURISTIC_ENTITIES]
-    collected: List[List[str]] = []
-    seen: set = set()
-
-    for entity in entities:
-        try:
-            raw = _db_execute(
-                db, f'(query [:find ?a ?v {temporal_clauses} :where [?e ?a ?v] [(contains? ?v "{entity}")]])'
+    facts_raw = _db_execute(
+        db,
+        "(query [:find ?e ?a ?v ?vf ?vt :any-valid-time "
+        ":where [?e ?a ?v] [?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])",
+    )
+    triples = []
+    for e, a, v, vf_ms, vt_ms in json.loads(facts_raw).get("results", []):
+        entity = ident_map.get(str(e), str(e))
+        vf_iso = (
+            datetime.datetime.fromtimestamp(int(vf_ms) / 1000, datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        )
+        if int(vt_ms) == _VALID_TIME_FOREVER_MS:
+            vt_iso = None
+        else:
+            vt_iso = (
+                datetime.datetime.fromtimestamp(int(vt_ms) / 1000, datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
             )
-            data = json.loads(raw)
-            for row in data.get("results", []):
-                key = tuple(row)
-                if key not in seen:
-                    seen.add(key)
-                    collected.append(row)
-        except (MiniGrafError, json.JSONDecodeError):
-            continue
-
-    if not collected:
-        # Broad fallback scan — bounded to memory-fact entity types (decision/
-        # preference/constraint/dependency) rather than the whole graph. An
-        # unscoped [?e ?a ?v] scan pulls every code-structure and commit fact
-        # git ingestion has ever added too — on a real repo that dwarfs the
-        # handful of manually recorded memory facts and was the source of an
-        # 80s/7GB blowup on a 21k-commit graph (issue #117).
-        for entity_type in _MEMORY_ENTITY_TYPES:
-            if len(collected) >= scan_limit:
-                break
-            try:
-                raw = _db_execute(
-                    db,
-                    f"(query [:find ?e ?a ?v {temporal_clauses} "
-                    f":where [?e :entity-type :type/{entity_type}] [?e ?a ?v]])",
-                )
-                data = json.loads(raw)
-                for row in data.get("results", []):
-                    key = tuple(row)
-                    if key not in seen:
-                        seen.add(key)
-                        collected.append(row)
-            except (MiniGrafError, json.JSONDecodeError):
-                continue
-        collected = collected[:scan_limit]
-
-    if not collected:
-        return ""
-
-    block = _format_facts(collected)
-    return f"Relevant memory context:\n{block}"
+        triples.append((entity, str(a), str(v), vf_iso, vt_iso))
+    path = fact_index.index_path_for(_graph_path or _get_graph_path())
+    fact_index.rebuild_index(path, triples)
 
 
 def handle_memory_prepare_turn(user_message: str) -> str:
-    """Query graph for facts relevant to the user message.
+    """Query the persisted fact index for facts relevant to the user message,
+    including labeled historical (retracted/superseded) facts -- the index
+    is the entry point into history, the bi-temporal graph is the archive.
 
-    Uses BM25-ranked retrieval over a cached FactIndex when rank_bm25 is
-    available. Falls back to the heuristic (substring token) implementation
-    when rank_bm25 is not installed.
-
-    Returns a formatted context block string for injection as additionalContext,
-    or an empty string if no relevant facts are found.
-
-    Callers on the event-loop thread (call_tool) must await _ensure_db_async()
-    first — the heuristic fallback's get_db() assumes _db is already open so
-    it never falls back to its own blocking retry (issue #99).
+    Returns a formatted context block string for injection as
+    additionalContext, or an empty string if no relevant facts are found.
+    Proactively checks fact_index.needs_backfill() before querying (fresh
+    install, pre-existing graph, corruption recovery, or a write that raced
+    ahead of the first read all leave the index in a needs-backfill state --
+    see the 2026-07-18 design doc for why file-existence alone is not a
+    reliable signal).
     """
-    if not _BM25_AVAILABLE:
-        return _handle_memory_prepare_turn_heuristic(user_message)
-
     scan_limit = int(os.environ.get("MINIGRAF_PREPARE_SCAN_LIMIT", "50"))
-    index = _index_cache.get()
-    if index is None:
+    boost = float(os.environ.get("MINIGRAF_MEMORY_BOOST", "2.0"))
+    historical_discount = float(os.environ.get("MINIGRAF_HISTORICAL_DISCOUNT", "0.5"))
+    path = fact_index.index_path_for(_graph_path or _get_graph_path())
+    try:
+        if fact_index.needs_backfill(path):
+            _rebuild_index_from_graph()
+        results = fact_index.query_facts(
+            path, user_message, top_n=scan_limit, boost=boost,
+            historical_discount=historical_discount,
+        )
+    except Exception as e:
+        print(f"[fact_index] prepare_turn failed: {e}", file=sys.stderr)
         return ""
-    results = index.query(user_message, top_n=scan_limit)
     if not results:
         return ""
     return f"Relevant memory context:\n{_format_facts(results)}"
@@ -4642,18 +4679,39 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
     valid_from: override the :valid-from timestamp (ISO 8601). If None, defaults
     to the current UTC time. Pass a past date to backdate facts (e.g. from
     LLM-annotated '; valid-at: YYYY-MM-DD' hints).
+
+    Validation is done per-entity, not per-fact: facts are grouped by entity
+    before validation so that sibling facts for the same entity (e.g. a
+    :description triple and a separate :alias triple, which is how Datalog
+    triples and this function's own extraction prompts always shape
+    multi-attribute entities) are checked together. An entity with
+    :description present anywhere in its group passes the required-attribute
+    check even though any single triple examined in isolation would look
+    incomplete; an entity with no :description anywhere in the batch is still
+    correctly rejected. (Validating fact-by-fact instead of entity-by-entity
+    was a latent bug: it silently dropped every optional-attribute-only fact
+    -- :alias, :rationale, :date -- whenever it arrived as its own triple
+    rather than bundled into the same dict as :description.)
     """
     _refresh_if_stale()
     db = get_db()
     stored = 0
+
+    entity_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for fact in facts:
+        entity_groups.setdefault(fact["entity"], []).append(fact)
+    invalid_entities = {
+        entity for entity, group in entity_groups.items() if _validate_facts(group)
+    }
+
     for fact in facts:
         entity = fact["entity"]
         entity_type = fact.get("entity_type", "")
         attribute = fact["attribute"]
         value = fact["value"]
-        # Schema validation — closed-world: skip invalid facts.
-        violations = _validate_facts([fact])
-        if violations:
+        # Schema validation — closed-world: skip facts belonging to any entity
+        # whose full fact group (across this batch) has violations.
+        if entity in invalid_entities:
             continue
         now_z = valid_from or _now_utc_ms()
         try:
@@ -4670,7 +4728,7 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
                 )
             else:
                 triples = f'[{entity} {attribute} "{value}"]'
-            _db_execute(db, f'(transact {{:valid-from "{now_z}"}} [{triples}])')
+            _transact(db, "[" + triples + "]", now_z)
             stored += 1
         except MiniGrafError:
             continue
@@ -4700,6 +4758,13 @@ No other attributes are valid.
 
 IMPORTANT — entity resolution: if a reference matches an existing canonical ident or alias above,
 reuse that exact ident. Only mint a new ident if the entity is genuinely new.
+
+IMPORTANT — alias generation: for each NEWLY-minted entity (not one you're reusing an
+existing ident for), also emit an :alias fact with 2-5 comma-separated alternative
+terms, synonyms, or broader concepts a developer might later use to refer to it —
+e.g. for a decision to use Redis, `:alias "in-memory data store, key-value cache,
+caching backend"`. Retrieval is purely lexical (exact word match), so these aliases
+are what let a later, differently-worded query still find this fact.
 
 IMPORTANT — bi-temporality: this database is bi-temporal. Facts have both a transaction time
 (when they were recorded) and a valid time (when they were true in the world). When the conversation
@@ -4869,6 +4934,11 @@ Canonical ident form: lowercase, hyphens only — :decision/redis not :decision/
 Use these attributes: :description (required), :rationale (optional), :date (optional), :alias (optional).
 No other attributes are valid. If an entity matches an existing ident or alias, reuse it exactly.
 
+For each newly-minted entity, also emit an :alias fact with 2-5 comma-separated
+alternative terms or broader concepts someone might use to refer to it later —
+retrieval is purely lexical, so this is what lets a differently-worded query still
+find the fact.
+
 Format:
 [[:entity/ident :attribute "value"]]
 
@@ -4912,7 +4982,7 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
             return {"ok": True, "stored_count": 0, "strategy": "agent"}
         _refresh_if_stale()
         db = get_db()
-        _db_execute(db, f'(transact {{:valid-from "{valid_at}"}} {datalog})')
+        _transact(db, datalog, valid_at)
         _db_checkpoint(db)
         _update_mtime()
         # Approximate: count "[:" occurrences as a proxy for triple count.
@@ -5507,7 +5577,7 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     )
 
 
-def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
+def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str, index_con: Optional[Any] = None) -> None:
     """Ingest git tags as :tag/<slug> entities with :tagged-commit references.
 
     Called once after the commit walk. All tags are re-ingested on every run
@@ -5533,7 +5603,7 @@ def _ingest_tags(db: Any, repo_path: str, run_ts_iso: str) -> None:
             ]
             if date_raw:
                 triples.append(f'[{tag_ident} :date "{_edn_escape(date_raw)}"]')
-            _db_execute(db, f'(transact {{:valid-from "{run_ts_iso}"}} [{" ".join(triples)}])')
+            _transact(db, "[" + " ".join(triples) + "]", run_ts_iso, index_con=index_con)
         except Exception:
             pass  # non-fatal per tag
 
@@ -5900,6 +5970,19 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # the extraction pool's own shutdown has already been submitted to it.
         write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
+        # Single fact-index write connection for the whole ingestion run,
+        # opened on write_executor's one worker thread and never touched from
+        # any other thread thereafter (sqlite3 connections are thread-affine
+        # by default) -- every use below is itself routed through
+        # write_executor, so all access stays on the thread that created it.
+        # Committed once per source-commit (matching the existing
+        # _db_checkpoint(db) cadence just below), not once per triple: large
+        # repositories can cross 1M facts well before ingestion completes,
+        # and per-triple commits would be dominated by fsync overhead at
+        # that scale.
+        index_path = fact_index.index_path_for(_graph_path or _get_graph_path())
+        index_con = await loop.run_in_executor(write_executor, fact_index.open_writer, index_path)
+
         try:
             # Extraction (git show + tree-sitter parse + triple construction) runs
             # in real OS processes, not threads (#116): tree-sitter's C parse holds
@@ -5910,8 +5993,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # to parse, exactly the symptom #116 reports. An explicit "spawn"
             # context is used rather than the platform default ("fork" on Linux)
             # because worker processes are created lazily as commits are submitted
-            # below, by which point write_executor's thread and IndexCache's
-            # background rebuild thread (see #122) may already be alive in this
+            # below, by which point write_executor's thread (and potentially other
+            # background threads -- see #122) may already be alive in this
             # process — forking with other threads running risks inheriting a
             # lock one of them held at the instant of fork, which would deadlock
             # forever in the child. spawn starts each worker from a clean
@@ -6298,40 +6381,48 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         contains_triples = [t for t in add_triples if ":contains" in t]
                         other_triples = [t for t in add_triples if ":contains" not in t]
                         await loop.run_in_executor(
-                            write_executor, _ingest_transact, db, other_triples, commit_ts_iso, reason
+                            write_executor, _ingest_transact, db, other_triples, commit_ts_iso, reason, index_con
                         )
                         for ct in contains_triples:
                             await loop.run_in_executor(
-                                write_executor, _ingest_transact, db, [ct], commit_ts_iso, reason
+                                write_executor, _ingest_transact, db, [ct], commit_ts_iso, reason, index_con
                             )
                         # :depends-on triples transacted individually — same EAVT collision risk
                         # as :contains when multiple deps share the same source module
                         for dt in dep_add_triples:
                             await loop.run_in_executor(
-                                write_executor, _ingest_transact, db, [dt], commit_ts_iso, reason
+                                write_executor, _ingest_transact, db, [dt], commit_ts_iso, reason, index_con
                             )
                         for close_triples, orig_ts in close_items:
                             await loop.run_in_executor(
-                                write_executor, _ingest_close, db, close_triples, orig_ts, commit_ts_iso, reason
+                                write_executor, _ingest_close, db, close_triples, orig_ts, commit_ts_iso, reason, index_con
                             )
 
                         # Ingest :parent edges — one transact per parent to avoid EAVT
                         # collision for merge commits (which have two parent hashes).
+                        # Routed through _transact (not a raw _db_execute call) so the
+                        # edge also lands in the persisted fact index -- see #118 review
+                        # finding: this call site used to build its own raw (transact
+                        # ...) string and bypass the index choke point entirely.
                         try:
                             for parent_hash in _git_parent_hashes(repo_path, commit_hash):
                                 parent_ident = f":commit/{parent_hash[:12]}"
                                 await loop.run_in_executor(
                                     write_executor,
-                                    _db_execute,
+                                    _transact,
                                     db,
-                                    f'(transact {{:valid-from "{commit_ts_iso}"}} '
-                                    f'[[{commit_ident} :parent {parent_ident}]])',
+                                    f'[[{commit_ident} :parent {parent_ident}]]',
+                                    commit_ts_iso,
+                                    None,
+                                    None,
+                                    index_con,
                                 )
                         except Exception:
                             pass  # non-fatal; parent edges are best-effort
 
-                        await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason)
+                        await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason, index_con)
                         await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                        await loop.run_in_executor(write_executor, index_con.commit)
 
                     finally:
                         _db = None  # release file lock between commits
@@ -6339,6 +6430,20 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
+
+                # Call _ingest_tags and _last_run_write before closing index_con
+                # so they use the batched connection instead of opening new ones
+                if completed_all:
+                    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                    db = await _ensure_db_async()
+                    try:
+                        await loop.run_in_executor(write_executor, _ingest_tags, db, repo_path, now, index_con)
+                        await loop.run_in_executor(
+                            write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"], index_con
+                        )
+                        await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                    finally:
+                        _db = None
             finally:
                 # ProcessPoolExecutor.shutdown(wait=True) blocks joining the
                 # worker OS processes — measured ~90ms even for a pool that
@@ -6348,22 +6453,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # whole span, undoing this fix's own purpose in its teardown.
                 # Routing it through write_executor keeps the wait off the
                 # event-loop thread, same as every other blocking call above.
+                await loop.run_in_executor(write_executor, fact_index.close_writer, index_con)
                 await loop.run_in_executor(write_executor, executor.shutdown)
 
             if completed_all:
-                now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                db = await _ensure_db_async()
-                try:
-                    await loop.run_in_executor(write_executor, _ingest_tags, db, repo_path, now)
-                    await loop.run_in_executor(
-                        write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"]
-                    )
-                    await loop.run_in_executor(write_executor, _db_checkpoint, db)
-                finally:
-                    _db = None
-
                 _ingest_progress["status"] = "complete"
-                _index_cache.invalidate()
             else:
                 _ingest_progress["status"] = "stopped"
         finally:

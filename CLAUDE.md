@@ -30,6 +30,13 @@ Default: `memory.graph` in the current working directory.
 
 Override: `MINIGRAF_GRAPH_PATH=/custom/path python ...`
 
+Memory retrieval index: `<graph_path>.fts.sqlite3` alongside the graph file.
+
+Override: `MINIGRAF_INDEX_PATH=/custom/path`
+
+The fact index is bi-temporal: it includes historical (retracted/superseded) facts
+alongside current ones, labeled with their validity window.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.

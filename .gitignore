@@ -17,6 +17,9 @@ build/
 .agents/
 *.graph
 *.graph.lock
+*.fts.sqlite3
+*.fts.sqlite3-shm
+*.fts.sqlite3-wal
 .mcp.json
 
 # Claude Code session state

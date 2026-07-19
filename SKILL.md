@@ -528,7 +528,26 @@ Full Datalog grammar: https://github.com/project-minigraf/minigraf/wiki/Datalog-
 
 ## Graph Storage
 
-Default: `memory.graph` in the current working directory. Run all commands from the same project root to ensure consistent graph access.
+Default: `memory.graph` in the current working directory. Run all commands from the same project root to ensure consistent graph access. Override with `MINIGRAF_GRAPH_PATH=/custom/path`.
+
+Memory retrieval uses a persisted SQLite FTS5 fact index alongside the graph, at `<graph_path>.fts.sqlite3` by default. Override with `MINIGRAF_INDEX_PATH=/custom/path`.
+
+Memory context returned by `memory_prepare_turn` can include historical facts (things
+that were true in the past but have since changed or been removed) alongside current
+ones — historical entries are labeled with their validity window, e.g. `[was valid
+2024-06-01 → 2025-01-15]`. Follow up with a precise `:as-of`/`:valid-at` query against
+the graph directly for the full picture at that point in time.
+
+Retrieval is purely lexical (exact word/token match, not semantic similarity) — write
+fact descriptions and `:alias` values that name both the concept and the specific
+technology/term someone might search for later (e.g. a decision described only as "use
+Redis" won't be found by a query for "caching layer" unless an alias bridges them).
+
+Tuning env vars: `MINIGRAF_PREPARE_SCAN_LIMIT` (default 50, max facts returned),
+`MINIGRAF_MEMORY_BOOST` (default 2.0, ranking boost for decision/preference/constraint/
+dependency facts over git-ingested code structure), `MINIGRAF_HISTORICAL_DISCOUNT`
+(default 0.5, ranking discount for historical facts relative to current ones — values
+below 1.0 demote history, 1.0 is neutral).
 
 ## Dependencies
 
