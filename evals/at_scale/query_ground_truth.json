@@ -29,10 +29,10 @@
     {
       "id": 4,
       "category": "dependency-impact",
-      "question": "Which module(s) depend on fact_index.py?",
-      "datalog": "[:find ?m :where [?m :depends-on :module/fact-index-py] [?m :entity-type :type/module]]",
-      "expected": [[":module/mcp-server-py"]],
-      "baseline_cmd": "grep -l '^import fact_index' *.py"
+      "question": "Which module(s) depend on fact_index.py as of the pinned commit (3f30610f49a4)?",
+      "datalog": "[:find ?mi :where [?m :depends-on :module/fact-index-py] [?m :entity-type :type/module] [?m :ident ?mi]]",
+      "expected": [[":module/tests-test-fact-index-py"]],
+      "baseline_cmd": "git grep -l '^import fact_index' 3f30610f49a4 -- '*.py'"
     },
     {
       "id": 5,
