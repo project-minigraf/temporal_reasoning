@@ -56,6 +56,7 @@ async def run_ingestion_benchmark(
     branch: Optional[str],
     graph_path: Path,
     poll_interval: float = 0.5,
+    compare_ignore: bool = False,
 ) -> dict[str, Any]:
     """Run a full git ingestion against repo_path into an isolated graph at
     graph_path, measuring wall-clock, throughput, peak RSS, final graph/index
@@ -99,7 +100,7 @@ async def run_ingestion_benchmark(
     graph_size_bytes = os.path.getsize(graph_path) if graph_path.exists() else 0
     index_size_bytes = os.path.getsize(index_path) if os.path.exists(index_path) else 0
 
-    return {
+    result = {
         "repo_path": repo_path,
         "branch": resolved_branch,
         "commits_ingested": commits_ingested,
@@ -113,19 +114,49 @@ async def run_ingestion_benchmark(
         "final_status": final_status,
     }
 
+    if compare_ignore:
+        no_ignore_graph_path = graph_path.parent / f"{graph_path.stem}-no-ignore{graph_path.suffix}"
+        original_patterns = mcp_server._DEFAULT_IGNORE_PATTERNS
+        mcp_server._DEFAULT_IGNORE_PATTERNS = ()
+        try:
+            mcp_server._db = None
+            mcp_server._graph_path = None
+            mcp_server.open_db(str(no_ignore_graph_path))
+            mcp_server._ingest_progress = {
+                "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+                "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+            }
+            await mcp_server._run_ingestion(repo_path, resolved_branch)
+        finally:
+            mcp_server._DEFAULT_IGNORE_PATTERNS = original_patterns
+
+        without_ignore_size = (
+            os.path.getsize(no_ignore_graph_path) if no_ignore_graph_path.exists() else 0
+        )
+        result["ignore_comparison"] = {
+            "with_ignore_graph_size_bytes": graph_size_bytes,
+            "without_ignore_graph_size_bytes": without_ignore_size,
+            "delta_bytes": without_ignore_size - graph_size_bytes,
+        }
+
+    return result
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the at-scale ingestion benchmark (#120).")
     parser.add_argument("--repo-path", default=".")
     parser.add_argument("--branch", default=None)
     parser.add_argument("--poll-interval", type=float, default=0.5)
+    parser.add_argument("--compare-ignore", action="store_true")
     args = parser.parse_args()
 
     import tempfile
     with tempfile.TemporaryDirectory(prefix="minigraf-at-scale-") as tmpdir:
         graph_path = Path(tmpdir) / "bench.graph"
         metrics = asyncio.run(
-            run_ingestion_benchmark(args.repo_path, args.branch, graph_path, args.poll_interval)
+            run_ingestion_benchmark(
+                args.repo_path, args.branch, graph_path, args.poll_interval, args.compare_ignore
+            )
         )
     print(json.dumps(metrics, indent=2))
 

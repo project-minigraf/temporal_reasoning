@@ -58,3 +58,25 @@ class TestRunIngestionBenchmark:
         # something _run_ingestion can walk without raising.
         metrics = await run_ingestion_benchmark(str(git_repo), None, graph_path, poll_interval=0.05)
         assert metrics["commits_ingested"] == 2
+
+
+class TestCompareIgnore:
+    @pytest.mark.asyncio
+    async def test_ignore_comparison_present_when_requested(self, git_repo, tmp_path):
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05, compare_ignore=True
+        )
+        assert "ignore_comparison" in metrics
+        comp = metrics["ignore_comparison"]
+        assert comp["with_ignore_graph_size_bytes"] > 0
+        assert comp["without_ignore_graph_size_bytes"] > 0
+        assert comp["delta_bytes"] == (
+            comp["without_ignore_graph_size_bytes"] - comp["with_ignore_graph_size_bytes"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_ignore_comparison_absent_by_default(self, git_repo, tmp_path):
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
+        assert "ignore_comparison" not in metrics
