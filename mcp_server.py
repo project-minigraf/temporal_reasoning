@@ -3420,15 +3420,6 @@ _STOP_WORDS = frozenset(
 
 _MIN_ENTITY_LEN = 4
 
-# Historical (issue #96): bounded how many unindexed, O(graph-size)
-# `contains?` scans a single hook invocation could trigger in
-# handle_memory_prepare_turn's old heuristic implementation, which was
-# deleted in #118 in favor of querying the persisted FTS5 fact index
-# (fact_index.query_facts) -- that path has no per-entity scan to bound, so
-# this constant is currently unused. Left in place rather than deleted here
-# since removing it is outside this cleanup's scope.
-_MAX_HEURISTIC_ENTITIES = int(os.environ.get("MINIGRAF_PREPARE_MAX_ENTITIES", "8"))
-
 
 def _canonical_ident(entity_type: str, value: str) -> str:
     """Slug-canonicalize a value into a Minigraf keyword ident.
@@ -4493,22 +4484,6 @@ def _format_facts(results: List[List[str]]) -> str:
     return "\n".join(lines)
 
 
-_HISTORICAL_SIGNALS = re.compile(
-    r"\b(last\s+\w+|yesterday|before|earlier|as\s+of|at\s+the\s+time|back\s+when|previously)\b",
-    re.IGNORECASE,
-)
-# Note: "last <word>" is a broad pattern — "last resort", "last mile", etc. will match.
-# Without an explicit ISO date in the message, _build_query_clauses falls back to the
-# current UTC timestamp regardless, so false positives cause no harm in practice.
-_DATE_PATTERN = re.compile(
-    r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})\b"
-)
-
-
-def _is_historical_query(user_message: str) -> bool:
-    return bool(_HISTORICAL_SIGNALS.search(user_message))
-
-
 def _now_utc_ms() -> str:
     """Return current UTC time as an ISO 8601 string with millisecond precision and Z suffix.
 
@@ -4517,31 +4492,6 @@ def _now_utc_ms() -> str:
     e.g. "2026-05-02T15:44:52.184Z"
     """
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-
-def _build_query_clauses(user_message: str) -> str:
-    """
-    Return temporal clauses to append to a Datalog query.
-
-    For current-state queries use :valid-at with the current UTC timestamp
-    (millisecond precision). This correctly finds all facts whose valid window
-    includes right now — including facts transacted earlier the same second —
-    while excluding expired/retracted facts and future-dated facts.
-
-    For historical queries where an explicit ISO date is detected in the user
-    message, use :valid-at with that date (resolves to midnight UTC on that
-    date — intentional for point-in-time historical semantics).
-
-    minigraf :valid-at accepts: ISO 8601 date ("YYYY-MM-DD" → midnight UTC)
-    or UTC datetime with Z suffix ("YYYY-MM-DDTHH:MM:SS.mmmZ").
-    Timezone offsets are not supported; :any-valid-time disables filtering.
-    """
-    if _is_historical_query(user_message):
-        date_match = _DATE_PATTERN.search(user_message)
-        if date_match:
-            valid_at = date_match.group(1)
-            return f':valid-at "{valid_at}"'
-    return f':valid-at "{_now_utc_ms()}"'
 
 
 def _rebuild_index_from_graph() -> None:
