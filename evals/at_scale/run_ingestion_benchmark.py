@@ -158,7 +158,16 @@ def main() -> None:
                 args.repo_path, args.branch, graph_path, args.poll_interval, args.compare_ignore
             )
         )
+
+    from evals.at_scale.report import append_ingestion_report, write_json_result
+
+    results_dir = REPO_ROOT / "evals" / "at_scale" / "results"
+    report_path = REPO_ROOT / "evals" / "at_scale" / "benchmark.md"
+    json_path = write_json_result(metrics, results_dir)
+    append_ingestion_report(metrics, report_path)
     print(json.dumps(metrics, indent=2))
+    print(f"\nWrote {json_path}")
+    print(f"Appended to {report_path}")
 
 
 if __name__ == "__main__":
