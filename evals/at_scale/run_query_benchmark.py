@@ -89,7 +89,16 @@ async def run_query_benchmark(
     return results
 
 
-def main() -> None:
+def _exit_code(results: list[dict[str, Any]]) -> int:
+    """Return 1 if any scored entry failed (passed is False), else 0.
+
+    Unscored entries (passed is None, e.g. manual-diff-only delta entries)
+    never affect the exit code -- only an explicit False does.
+    """
+    return 1 if any(r.get("passed") is False for r in results) else 0
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Run the at-scale query benchmark (#120).")
     parser.add_argument("--repo-path", default=".")
     parser.add_argument(
@@ -111,7 +120,8 @@ def main() -> None:
     append_query_report(results, report_path)
     print(json.dumps(results, indent=2))
     print(f"\nAppended to {report_path}")
+    return _exit_code(results)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

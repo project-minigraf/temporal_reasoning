@@ -3,7 +3,18 @@ import subprocess as _subprocess
 
 import pytest
 
-from evals.at_scale.run_ingestion_benchmark import run_ingestion_benchmark
+from evals.at_scale.run_ingestion_benchmark import _exit_code, run_ingestion_benchmark
+
+
+class TestExitCode:
+    def test_zero_when_status_complete(self):
+        assert _exit_code({"final_status": "complete"}) == 0
+
+    def test_nonzero_when_status_error(self):
+        assert _exit_code({"final_status": "error"}) == 1
+
+    def test_zero_when_status_missing(self):
+        assert _exit_code({}) == 0
 
 
 @pytest.fixture
