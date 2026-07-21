@@ -4221,7 +4221,10 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
     written exactly once rather than accumulating a duplicate per commit
     (minigraf is not idempotent at the graph level for re-transacting the same
     (entity, attribute, value) under a different valid-from -- see #156). :hash
-    always changes, so it keeps its unconditional retract-then-reassert.
+    always changes, so it keeps its unconditional retract-then-reassert. Does
+    NOT retroactively collapse duplicates a pre-fix run already created -- a
+    duplicate row whose value trivially matches desired is left alone, same
+    bounded/self-healing-by-omission scoping as _ingest_tags' own #156 fix.
     """
     current_raw = _db_execute(db, "(query [:find ?a ?v :where [:ingestion/watermark ?a ?v]])")
     current: Dict[str, str] = dict(json.loads(current_raw).get("results", []))

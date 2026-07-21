@@ -1070,6 +1070,21 @@ class TestWatermarkUpdateGraphLevelIdempotency:
         )
         assert json.loads(raw)["results"] == [["hash2"]]
 
+    def test_changed_constant_value_retracts_stale_and_keeps_single_live_fact(self, real_db):
+        import mcp_server
+        mcp_server._watermark_update(real_db, "hash1", "2026-01-01T00:00:00.000Z", "commit 1")
+        mcp_server._retract(real_db, '[[:ingestion/watermark :description "git ingestion watermark"]]')
+        mcp_server._transact(
+            real_db,
+            '[[:ingestion/watermark :description "stale description"]]',
+            "2026-01-02T00:00:00.000Z",
+        )
+        mcp_server._watermark_update(real_db, "hash2", "2026-01-03T00:00:00.000Z", "commit 2")
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?v :where [:ingestion/watermark :description ?v]])"
+        )
+        assert json.loads(raw)["results"] == [["git ingestion watermark"]]
+
 
 class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, real_db):
