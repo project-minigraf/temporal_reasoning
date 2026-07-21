@@ -3718,12 +3718,18 @@ def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
     (most commonly, manual conflict-resolution edits). Ordinary clean merges
     don't need special handling here -- every underlying change is already
     reachable via the individual non-merge commits `_git_commits`' plain
-    `git log` walk visits regardless -- so this branches to
-    _git_diff_tree_combined_raw only for actual merge commits, leaving the
-    single-parent (overwhelmingly common) path above untouched.
+    `git log` walk visits regardless.
+
+    Rather than checking parent count up front (an extra `git log -1`
+    subprocess call on every single commit, working against this function's
+    single-subprocess-call design goal for the overwhelmingly common
+    single-parent case), the plain diff-tree call always runs first; a
+    parent-count check (and the _git_diff_tree_combined_raw fallback it
+    guards) only happens on the rare path where it comes back empty -- which
+    is exactly the signal ("root or single-parent commit truly touched
+    nothing" vs. "this is a merge commit, plain diff-tree always returns
+    nothing regardless of content") this needs to distinguish.
     """
-    if len(_git_parent_hashes(repo_path, commit_hash)) > 1:
-        return _git_diff_tree_combined_raw(repo_path, commit_hash)
     result = _subprocess.run(
         ["git", "diff-tree", "--no-commit-id", "-r", "-M", "--raw", "--root", commit_hash],
         cwd=repo_path, capture_output=True, text=True, check=True,
@@ -3746,6 +3752,8 @@ def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
         else:
             old_path, path = "", rest
         entries.append((status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity))
+    if not entries and len(_git_parent_hashes(repo_path, commit_hash)) > 1:
+        return _git_diff_tree_combined_raw(repo_path, commit_hash)
     return entries
 
 
@@ -3779,6 +3787,17 @@ def _git_diff_tree_combined_raw(repo_path: str, commit_hash: str) -> List[tuple]
     for a merge, and the exact old-side content only feeds this codebase's
     best-effort rename-matching heuristic (_extract_commit's
     old_entity_nodes), not the fact-extraction this issue is about.
+
+    Known residual gap (verified, not yet fixed -- see #185's follow-up):
+    --cc only reports a path when it differs from EVERY parent, so content
+    that exists on exactly one parent's side and is discarded entirely at
+    the merge (final tree matches the OTHER parent, which never had it)
+    never appears here either -- e.g. a submodule added on a feature branch
+    but dropped while resolving the merge leaves its `:pinned-commit` fact
+    open forever, since neither plain diff-tree nor --cc ever reports the
+    removal. Distinct root cause from the content-authored-at-merge case
+    this function fixes (that content is genuinely new; this content is
+    genuinely gone), so deliberately out of scope here.
     """
     result = _subprocess.run(
         ["git", "diff-tree", "--cc", "--no-commit-id", "-r", "--raw", "--root", commit_hash],

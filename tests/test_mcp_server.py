@@ -4802,6 +4802,28 @@ class TestGitDiffTreeRawMergeCommits:
         entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
         assert entries == []
 
+    def test_single_parent_commit_pays_no_extra_parent_hash_lookup(self, git_repo, monkeypatch):
+        """The merge-commit branch must not cost the (overwhelming) common
+        single-parent case an extra subprocess call -- _git_parent_hashes
+        should only be consulted when the plain diff-tree call itself came
+        back empty, not unconditionally up front."""
+        import mcp_server
+
+        base_run = mcp_server._subprocess.run
+        call_count = {"n": 0}
+
+        def counting_run(cmd, *args, **kwargs):
+            if cmd[:2] == ["git", "log"] and "--format=%P" in cmd:
+                call_count["n"] += 1
+            return base_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server._subprocess, "run", counting_run)
+
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        mcp_server._git_diff_tree_raw(str(git_repo), commits[0][0])
+
+        assert call_count["n"] == 0, "expected zero _git_parent_hashes calls for an ordinary non-empty commit"
+
 
 class TestIsIgnoredPath:
     def test_directory_pattern_matches_nested_path(self):
@@ -5087,6 +5109,54 @@ class TestParseGitmodules:
 
 
 class TestExtractCommit:
+    def test_merge_commit_conflict_resolution_content_produces_facts(self, tmp_path):
+        """See #185: a plain diff-tree call sees nothing at all for a merge
+        commit, so before the fix this returned zero results even though a
+        real function was introduced only at the merge point."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "m.py").write_text("def base():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "-b", "feature"], cwd=repo, check=True, capture_output=True)
+        (repo / "m.py").write_text("def base():\n    pass\n\ndef from_feature():\n    pass\n")
+        _subprocess.run(["git", "commit", "-am", "feature adds fn"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+        (repo / "m.py").write_text("def base():\n    pass\n\ndef from_main():\n    pass\n")
+        _subprocess.run(["git", "commit", "-am", "main adds fn"], cwd=repo, check=True, capture_output=True)
+
+        merge_result = _subprocess.run(
+            ["git", "merge", "feature", "--no-ff", "-m", "merge feature"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        assert merge_result.returncode != 0, "expected a real conflict on the shared file"
+
+        (repo / "m.py").write_text(
+            "def base():\n    pass\n\ndef from_main():\n    pass\n\n"
+            "def from_feature():\n    pass\n\ndef merge_authored():\n    pass\n"
+        )
+        _subprocess.run(["git", "add", "m.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--no-edit"], cwd=repo, check=True, capture_output=True)
+
+        merge_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(repo), merge_hash)
+
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "M"
+        assert file_path == "m.py"
+        assert "merge_authored" in extracted["functions"]
+
     def test_added_file_returns_extracted_dict(self, git_repo):
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
