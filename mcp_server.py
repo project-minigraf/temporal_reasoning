@@ -4212,19 +4212,48 @@ def _count_commit_entities(db: Any) -> int:
 
 
 def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str, index_con: Optional[Any] = None) -> None:
-    """Record the last successfully ingested commit hash in the graph."""
-    existing = _watermark_query(db)
-    if existing:
-        _retract(db, f'[[:ingestion/watermark :hash "{existing}"]]', index_con=index_con)
-    _transact(
-        db,
-        f'[[:ingestion/watermark :entity-type :type/ingestion] '
-        f'[:ingestion/watermark :ident ":ingestion/watermark"] '
-        f'[:ingestion/watermark :description "git ingestion watermark"] '
-        f'[:ingestion/watermark :hash "{commit_hash}"]]',
-        commit_ts_iso,
-        index_con=index_con,
-    )
+    """Record the last successfully ingested commit hash in the graph.
+
+    Called once per COMMIT (not once per run) inside _run_ingestion's main loop.
+    :entity-type/:ident/:description are constant and never change after the
+    first call -- diffed against the entity's current live values first, and
+    only retracted+re-transacted when the value actually changed, so they are
+    written exactly once rather than accumulating a duplicate per commit
+    (minigraf is not idempotent at the graph level for re-transacting the same
+    (entity, attribute, value) under a different valid-from -- see #156). :hash
+    always changes, so it keeps its unconditional retract-then-reassert. Does
+    NOT retroactively collapse duplicates a pre-fix run already created -- a
+    duplicate row whose value trivially matches desired is left alone, same
+    bounded/self-healing-by-omission scoping as _ingest_tags' own #156 fix.
+    """
+    current_raw = _db_execute(db, "(query [:find ?a ?v :where [:ingestion/watermark ?a ?v]])")
+    current: Dict[str, str] = dict(json.loads(current_raw).get("results", []))
+
+    def _edn(attr: str, value: str) -> str:
+        return value if attr == ":entity-type" else f'"{_edn_escape(value)}"'
+
+    constants = {
+        ":entity-type": ":type/ingestion",
+        ":ident": ":ingestion/watermark",
+        ":description": "git ingestion watermark",
+    }
+
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    for attr, value in constants.items():
+        if current.get(attr) == value:
+            continue  # already correct -- skip to avoid creating a duplicate live fact (#156)
+        if attr in current:
+            to_retract.append(f"[:ingestion/watermark {attr} {_edn(attr, current[attr])}]")
+        to_transact.append(f"[:ingestion/watermark {attr} {_edn(attr, value)}]")
+
+    if ":hash" in current:
+        to_retract.append(f"[:ingestion/watermark :hash {_edn(':hash', current[':hash'])}]")
+    to_transact.append(f"[:ingestion/watermark :hash {_edn(':hash', commit_hash)}]")
+
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
 
 
 def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int, index_con: Optional[Any] = None) -> None:
