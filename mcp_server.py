@@ -3711,7 +3711,19 @@ def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
     Supersedes running diff-tree a second time just to detect gitlinks:
     --raw already carries file mode (needed to spot submodule paths, mode
     160000) in the same subprocess invocation _extract_commit already makes.
+
+    Merge commits (#185): plain `git diff-tree --raw` (no -m/-c/--cc) is
+    documented git behavior to emit NOTHING for a commit with more than one
+    parent, even when real content was authored at the merge point itself
+    (most commonly, manual conflict-resolution edits). Ordinary clean merges
+    don't need special handling here -- every underlying change is already
+    reachable via the individual non-merge commits `_git_commits`' plain
+    `git log` walk visits regardless -- so this branches to
+    _git_diff_tree_combined_raw only for actual merge commits, leaving the
+    single-parent (overwhelmingly common) path above untouched.
     """
+    if len(_git_parent_hashes(repo_path, commit_hash)) > 1:
+        return _git_diff_tree_combined_raw(repo_path, commit_hash)
     result = _subprocess.run(
         ["git", "diff-tree", "--no-commit-id", "-r", "-M", "--raw", "--root", commit_hash],
         cwd=repo_path, capture_output=True, text=True, check=True,
@@ -3734,6 +3746,67 @@ def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
         else:
             old_path, path = "", rest
         entries.append((status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity))
+    return entries
+
+
+def _git_diff_tree_combined_raw(repo_path: str, commit_hash: str) -> List[tuple]:
+    """Combined-diff (`--cc`) raw parse, used only for merge commits (#185).
+
+    `--cc`'s combined-diff format already restricts its output to paths whose
+    content differs from EVERY parent -- exactly the "genuinely authored at
+    the merge point" set this exists to recover. A file that matches at
+    least one parent unchanged never appears here, which is what keeps this
+    safe for the common "both sides touched different files" clean-merge
+    case (reports nothing) and the "both sides touched the same file in
+    non-overlapping, auto-merged hunks" case (reports the file, since its
+    merged content differs from both individual parents, same as a manual
+    conflict resolution would).
+
+    Combined raw lines carry one leading ':' and one mode/sha per parent
+    (plus one more of each for the merge result itself), e.g. for an
+    ordinary 2-parent merge:
+    "::100644 100644 100644 <sha1> <sha2> <sha_new> MM\tpath". Rename/copy
+    detection doesn't apply in combined-diff mode, so there is always
+    exactly one tab-separated path field -- old_path is always "" and
+    similarity is always None, matching _git_diff_tree_raw's non-rename rows.
+
+    status is derived from the mode columns rather than the trailing status
+    letters (which are one char per parent, e.g. "MM", and don't collapse
+    cleanly to _git_diff_tree_raw's single-char contract): new_mode all
+    zeros means "D"; every old_mode all zeros means "A" (the path exists in
+    none of the parents); otherwise "M". old_mode/old_sha are taken from the
+    first parent only -- combined diff has no single unambiguous "old" side
+    for a merge, and the exact old-side content only feeds this codebase's
+    best-effort rename-matching heuristic (_extract_commit's
+    old_entity_nodes), not the fact-extraction this issue is about.
+    """
+    result = _subprocess.run(
+        ["git", "diff-tree", "--cc", "--no-commit-id", "-r", "--raw", "--root", commit_hash],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    entries = []
+    for line in result.stdout.strip().splitlines():
+        if not line.startswith(":"):
+            continue
+        meta, sep, path = line.partition("\t")
+        if not sep:
+            continue
+        n_parents = len(meta) - len(meta.lstrip(":"))
+        fields = meta[n_parents:].split(" ")
+        if len(fields) != 2 * n_parents + 3:
+            continue
+        old_modes = fields[:n_parents]
+        new_mode = fields[n_parents]
+        old_shas = fields[n_parents + 1: 2 * n_parents + 1]
+        new_sha = fields[2 * n_parents + 1]
+        zero_mode = "0" * len(new_mode)
+        if new_mode == zero_mode:
+            status = "D"
+        elif all(m == zero_mode for m in old_modes):
+            status = "A"
+        else:
+            status = "M"
+        entries.append((status, old_modes[0], new_mode, old_shas[0], new_sha, path, "", None))
     return entries
 
 
