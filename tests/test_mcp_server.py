@@ -1086,6 +1086,83 @@ class TestWatermarkUpdateGraphLevelIdempotency:
         assert json.loads(raw)["results"] == [["git ingestion watermark"]]
 
 
+class TestLastRunWriteGraphLevelIdempotency:
+    """#186: same failure shape as #156/#187 (TestIngestTagsGraphLevelIdempotency /
+    TestWatermarkUpdateGraphLevelIdempotency), but in _last_run_write, called once
+    per completed ingestion RUN. It used to unconditionally re-transact all six
+    attributes on every call with no retract-before-reassert at all -- not even
+    :hash's partial protection in _watermark_update -- so after the second
+    completed run the singleton :ingestion/last-run-at entity carried multiple
+    live values per attribute simultaneously."""
+
+    def test_constant_attrs_not_duplicated_across_runs(self, real_db):
+        import mcp_server
+        mcp_server._last_run_write(real_db, "hash1", "2026-01-01T00:00:00.000Z", 10)
+        mcp_server._last_run_write(real_db, "hash2", "2026-01-02T00:00:00.000Z", 25)
+        mcp_server._last_run_write(real_db, "hash3", "2026-01-03T00:00:00.000Z", 40)
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?a ?v :where [:ingestion/last-run-at ?a ?v]])"
+        )
+        results = json.loads(raw)["results"]
+        # :entity-type, :ident, :description, :last-run-at, :last-commit,
+        # :total-ingested -- one live value each, not a cross-product of 3 runs.
+        assert len(results) == 6
+
+    def test_second_run_skips_rewriting_unchanged_constant_attrs(self, real_db):
+        import mcp_server
+        mcp_server._last_run_write(real_db, "hash1", "2026-01-01T00:00:00.000Z", 10)
+        with execute_spy() as calls:
+            mcp_server._last_run_write(real_db, "hash2", "2026-01-02T00:00:00.000Z", 25)
+        writes = [c for c in calls if c.startswith("(transact") or c.startswith("(retract")]
+        # Only :last-run-at/:last-commit/:total-ingested's retract+reassert
+        # should fire -- nothing for the unchanged :entity-type/:ident/:description.
+        assert len(writes) == 2
+        assert not any(":entity-type" in c or ":ident" in c or ":description" in c for c in writes)
+
+    def test_last_run_at_and_last_commit_stay_paired_after_third_run(self, real_db):
+        """Direct reproduction of #186: before the fix, :last-run-at and
+        :last-commit each accumulated one live value per run, so an
+        :any-valid-time join across both attributes returned a 3x3
+        cross-product -- rows[0] could pair one run's timestamp with a
+        DIFFERENT run's commit hash. After the fix, only the current run's
+        own pair should be live."""
+        import mcp_server
+        mcp_server._last_run_write(real_db, "hashA_run1", "2026-01-01T00:00:00.000Z", 10)
+        mcp_server._last_run_write(real_db, "hashB_run2", "2026-01-02T00:00:00.000Z", 25)
+        mcp_server._last_run_write(real_db, "hashC_run3_LATEST", "2026-01-03T00:00:00.000Z", 40)
+
+        raw = mcp_server._db_execute(
+            real_db,
+            "(query [:find ?t ?h :any-valid-time "
+            ":where [:ingestion/last-run-at :last-run-at ?t] "
+            "[:ingestion/last-run-at :last-commit ?h]])",
+        )
+        results = json.loads(raw)["results"]
+        assert results == [["2026-01-03T00:00:00.000Z", "hashC_run3_LATEST"]]
+
+    def test_total_ingested_reflects_latest_run_not_first(self, real_db):
+        import mcp_server
+        mcp_server._last_run_write(real_db, "hashA", "2026-01-01T00:00:00.000Z", 10)
+        mcp_server._last_run_write(real_db, "hashB", "2026-01-02T00:00:00.000Z", 25)
+        mcp_server._last_run_write(real_db, "hashC", "2026-01-03T00:00:00.000Z", 40)
+        assert mcp_server._total_ingested_query(real_db) == 40
+
+    def test_changed_constant_value_retracts_stale_and_keeps_single_live_fact(self, real_db):
+        import mcp_server
+        mcp_server._last_run_write(real_db, "hash1", "2026-01-01T00:00:00.000Z", 10)
+        mcp_server._retract(real_db, '[[:ingestion/last-run-at :description "last ingestion run timestamp"]]')
+        mcp_server._transact(
+            real_db,
+            '[[:ingestion/last-run-at :description "stale description"]]',
+            "2026-01-02T00:00:00.000Z",
+        )
+        mcp_server._last_run_write(real_db, "hash2", "2026-01-03T00:00:00.000Z", 25)
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?v :where [:ingestion/last-run-at :description ?v]])"
+        )
+        assert json.loads(raw)["results"] == [["last ingestion run timestamp"]]
+
+
 class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, real_db):
         import mcp_server
@@ -4459,6 +4536,27 @@ class TestMinigrafIngestStatus:
         }
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["total_ingested"] is None
+
+    def test_last_run_at_and_last_commit_stay_paired_across_multiple_runs(self, real_db):
+        """Regression test for #186: handle_minigraf_ingest_status's
+        :any-valid-time query used to return an arbitrary row from a
+        cross-product of every run's (timestamp, hash) pair -- so a real
+        timestamp could come back paired with a completely different run's
+        commit hash. After the #186 fix, only the latest run's own pair
+        should be reported."""
+        import mcp_server
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        mcp_server._last_run_write(real_db, "hashA_run1", "2026-01-01T00:00:00.000Z", 10)
+        mcp_server._last_run_write(real_db, "hashB_run2", "2026-01-02T00:00:00.000Z", 25)
+        mcp_server._last_run_write(real_db, "hashC_run3_LATEST", "2026-01-03T00:00:00.000Z", 40)
+
+        result = mcp_server.handle_minigraf_ingest_status()
+
+        assert result["last_run_at"] == "2026-01-03T00:00:00.000Z"
+        assert result["last_commit"] == "hashC_run3_LATEST"
 
 
 class TestCodeIdent:
