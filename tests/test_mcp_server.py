@@ -4708,6 +4708,123 @@ class TestGitDiffTreeRaw:
         assert statuses == {"A", "D"}
 
 
+class TestGitDiffTreeRawMergeCommits:
+    """See #185: plain `git diff-tree --raw` (no -m/-c/--cc) always emits
+    nothing for a merge commit -- this is documented git behavior. Content
+    authored genuinely at the merge point (e.g. manual conflict-resolution
+    edits) was silently and permanently dropped as a result.
+    """
+
+    def _init_repo(self, repo):
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def test_merge_commit_with_conflict_resolution_content_is_captured(self, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+
+        (repo / "langs.py").write_text("LANGS = {\n    'python': 1,\n}\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "-b", "feature"], cwd=repo, check=True, capture_output=True)
+        (repo / "langs.py").write_text("LANGS = {\n    'python': 1,\n    'rust': 2,\n}\n")
+        _subprocess.run(["git", "commit", "-am", "add rust"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+        (repo / "langs.py").write_text("LANGS = {\n    'python': 1,\n    'go': 3,\n}\n")
+        _subprocess.run(["git", "commit", "-am", "add go"], cwd=repo, check=True, capture_output=True)
+
+        merge_result = _subprocess.run(
+            ["git", "merge", "feature", "--no-ff", "-m", "merge feature"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        assert merge_result.returncode != 0, "expected a real conflict on the shared lines"
+
+        # Hand-resolve with content present in NEITHER parent (kotlin) --
+        # this is the "genuinely authored at the merge point" case #185 is about.
+        (repo / "langs.py").write_text(
+            "LANGS = {\n    'python': 1,\n    'rust': 2,\n    'go': 3,\n    'kotlin': 4,\n}\n"
+        )
+        _subprocess.run(["git", "add", "langs.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--no-edit"], cwd=repo, check=True, capture_output=True)
+
+        merge_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
+
+        entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
+        assert path == "langs.py"
+        assert status == "M"
+        assert old_path == ""
+        content = mcp_server._git_blob_content(str(repo), new_sha)
+        assert b"kotlin" in content
+
+    def test_clean_non_conflicting_merge_reports_no_entries(self, tmp_path):
+        """Each side touches its own file only -- every changed byte is already
+        reachable via the individual non-merge commits `_git_commits` walks, so
+        the merge commit itself should contribute nothing new."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+
+        (repo / "base.py").write_text("x = 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "-b", "feature"], cwd=repo, check=True, capture_output=True)
+        (repo / "feature_only.py").write_text("y = 2\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add feature file"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+        (repo / "main_only.py").write_text("z = 3\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add main file"], cwd=repo, check=True, capture_output=True)
+
+        merge_result = _subprocess.run(
+            ["git", "merge", "feature", "--no-ff", "-m", "merge feature"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        assert merge_result.returncode == 0, "expected a clean, non-conflicting merge"
+
+        merge_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
+
+        entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
+        assert entries == []
+
+    def test_single_parent_commit_pays_no_extra_parent_hash_lookup(self, git_repo, monkeypatch):
+        """The merge-commit branch must not cost the (overwhelming) common
+        single-parent case an extra subprocess call -- _git_parent_hashes
+        should only be consulted when the plain diff-tree call itself came
+        back empty, not unconditionally up front."""
+        import mcp_server
+
+        base_run = mcp_server._subprocess.run
+        call_count = {"n": 0}
+
+        def counting_run(cmd, *args, **kwargs):
+            if cmd[:2] == ["git", "log"] and "--format=%P" in cmd:
+                call_count["n"] += 1
+            return base_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server._subprocess, "run", counting_run)
+
+        commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
+        mcp_server._git_diff_tree_raw(str(git_repo), commits[0][0])
+
+        assert call_count["n"] == 0, "expected zero _git_parent_hashes calls for an ordinary non-empty commit"
+
+
 class TestIsIgnoredPath:
     def test_directory_pattern_matches_nested_path(self):
         import mcp_server
@@ -4992,6 +5109,54 @@ class TestParseGitmodules:
 
 
 class TestExtractCommit:
+    def test_merge_commit_conflict_resolution_content_produces_facts(self, tmp_path):
+        """See #185: a plain diff-tree call sees nothing at all for a merge
+        commit, so before the fix this returned zero results even though a
+        real function was introduced only at the merge point."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "m.py").write_text("def base():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "-b", "feature"], cwd=repo, check=True, capture_output=True)
+        (repo / "m.py").write_text("def base():\n    pass\n\ndef from_feature():\n    pass\n")
+        _subprocess.run(["git", "commit", "-am", "feature adds fn"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+        (repo / "m.py").write_text("def base():\n    pass\n\ndef from_main():\n    pass\n")
+        _subprocess.run(["git", "commit", "-am", "main adds fn"], cwd=repo, check=True, capture_output=True)
+
+        merge_result = _subprocess.run(
+            ["git", "merge", "feature", "--no-ff", "-m", "merge feature"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        assert merge_result.returncode != 0, "expected a real conflict on the shared file"
+
+        (repo / "m.py").write_text(
+            "def base():\n    pass\n\ndef from_main():\n    pass\n\n"
+            "def from_feature():\n    pass\n\ndef merge_authored():\n    pass\n"
+        )
+        _subprocess.run(["git", "add", "m.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--no-edit"], cwd=repo, check=True, capture_output=True)
+
+        merge_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(str(repo), merge_hash)
+
+        assert len(results) == 1
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "M"
+        assert file_path == "m.py"
+        assert "merge_authored" in extracted["functions"]
+
     def test_added_file_returns_extracted_dict(self, git_repo):
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
