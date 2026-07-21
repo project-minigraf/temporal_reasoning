@@ -1031,6 +1031,46 @@ class TestIngestTagsGraphLevelIdempotency:
         assert json.loads(raw)["results"] == [["v1.1.0"]]
 
 
+class TestWatermarkUpdateGraphLevelIdempotency:
+    """#187: same failure shape as #156 (TestIngestTagsGraphLevelIdempotency), but in
+    _watermark_update -- called once per COMMIT rather than once per run. Only :hash
+    was ever retracted before reassertion; :entity-type/:ident/:description are
+    constant values that never change after the first call, but were unconditionally
+    re-transacted under a fresh valid-from on every commit, each creating a second
+    genuinely live duplicate fact (minigraf is not idempotent at the graph level for
+    that -- see #156)."""
+
+    def test_constant_attrs_not_duplicated_across_commits(self, real_db):
+        import mcp_server
+        mcp_server._watermark_update(real_db, "hash1", "2026-01-01T00:00:00.000Z", "commit 1")
+        mcp_server._watermark_update(real_db, "hash2", "2026-01-02T00:00:00.000Z", "commit 2")
+        mcp_server._watermark_update(real_db, "hash3", "2026-01-03T00:00:00.000Z", "commit 3")
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?a ?v :where [:ingestion/watermark ?a ?v]])"
+        )
+        results = json.loads(raw)["results"]
+        assert len(results) == 4  # :entity-type, :ident, :description, :hash -- one each
+
+    def test_second_commit_skips_rewriting_unchanged_constant_attrs(self, real_db):
+        import mcp_server
+        mcp_server._watermark_update(real_db, "hash1", "2026-01-01T00:00:00.000Z", "commit 1")
+        with execute_spy() as calls:
+            mcp_server._watermark_update(real_db, "hash2", "2026-01-02T00:00:00.000Z", "commit 2")
+        writes = [c for c in calls if c.startswith("(transact") or c.startswith("(retract")]
+        # Only :hash's retract+reassert should fire -- nothing for the unchanged constants.
+        assert len(writes) == 2
+        assert not any(":entity-type" in c or ":ident" in c or ":description" in c for c in writes)
+
+    def test_hash_still_updates_to_single_live_fact(self, real_db):
+        import mcp_server
+        mcp_server._watermark_update(real_db, "hash1", "2026-01-01T00:00:00.000Z", "commit 1")
+        mcp_server._watermark_update(real_db, "hash2", "2026-01-02T00:00:00.000Z", "commit 2")
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?v :where [:ingestion/watermark :hash ?v]])"
+        )
+        assert json.loads(raw)["results"] == [["hash2"]]
+
+
 class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, real_db):
         import mcp_server
