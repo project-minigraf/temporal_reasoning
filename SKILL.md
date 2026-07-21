@@ -452,14 +452,72 @@ Once ingestion is complete, query code structure with `:valid-at` for point-in-t
  :where (reachable :module/src-auth-py ?d) [?d :description ?dep]]
 ```
 
-Cross-layer queries joining code structure with agent decisions:
+Cross-layer queries joining code structure with agent decisions — a genuine single-query
+join, not two queries diffed externally. Every fact carries its own bi-temporal validity
+window, bindable via `:db/valid-from ?vf` / `:db/valid-to ?vt` pseudo-attributes (see
+"Querying a fact's own valid-time window" below). This lets you compare *when* a decision
+became valid against *when* a structural fact was introduced, in one query:
+
+```datalog
+; How many functions in fact_index.py were introduced after the
+; :decision/persisted-fact-index decision took effect?
+[:find (count-distinct ?fn) :any-valid-time
+ :where [:decision/persisted-fact-index :db/valid-from ?dvf]
+        [?fn :entity-type :type/function]
+        [?fn :file "fact_index.py"]
+        [?fn :db/valid-from ?fvf]
+        [(> ?fvf ?dvf)]]
+```
+
+For cases with no shared comparison variable (e.g. "list everything that changed" rather
+than "count facts relative to a specific fact's valid-from"), running two `:valid-at`-bounded
+queries and diffing the rows client-side is still the simplest approach:
 ```datalog
 ; What dependency changes happened after a specific date?
-; Run two queries and diff:
 ; Q1 (before): [:find ?m ?d :valid-at "2024-12-01" :where [?e :depends-on ?f] [?e :description ?m] [?f :description ?d]]
 ; Q2 (after):  [:find ?m ?d :valid-at "2026-05-26" :where [?e :depends-on ?f] [?e :description ?m] [?f :description ?d]]
 ; Rows in Q2 absent from Q1 = new dependencies since the date
 ```
+
+### Querying a fact's own valid-time window
+
+Any fact can project its own bi-temporal validity window into a query as bindable output
+variables, via the `:db/valid-from` / `:db/valid-to` pseudo-attributes — usable anywhere a
+normal query variable is (including in comparison predicates, joins, and `:find`).
+
+```datalog
+; Named-clause form — most common
+[:find ?vf ?vt :any-valid-time
+ :where [:decision/use-redis :db/valid-from ?vf] [:decision/use-redis :db/valid-to ?vt]]
+
+; Free-clause form — binds every fact's window, not just one attribute's
+[:find ?e ?a ?v ?vf ?vt :any-valid-time
+ :where [?e ?a ?v] [?e :db/valid-from ?vf] [?e :db/valid-to ?vt]]
+```
+
+- `:any-valid-time` is required on the query — a plain or `:valid-at`-bounded query hard-errors
+  on `:db/valid-from`/`:db/valid-to`.
+- `?vf`/`?vt` bind as integers (ms since epoch), not ISO strings.
+- `?vt` equal to the "still open" sentinel `9223372036854775807` (`(1 << 63) - 1`, i64::MAX)
+  means the fact is current/never closed; any other value is a historical close time. Add
+  `[(= ?vt 9223372036854775807)]` to restrict results to open facts only — `:any-valid-time`
+  alone also returns already-closed historical facts.
+- **Clause order matters.** A pseudo-attribute clause binds to whichever EAV clause on the
+  *same entity variable* most recently precedes it — not necessarily the clause you intend.
+  Put the attribute clause you want the window for immediately before the two pseudo-attribute
+  clauses:
+  ```datalog
+  ; Binds ?vf to the :depends-on fact's own valid-from (correct — :depends-on is
+  ; the immediately preceding clause on ?src):
+  [?src :ident ?srci] [?src :depends-on ?dep] [?src :db/valid-from ?vf] [?src :db/valid-to ?vt]
+
+  ; Binds ?vf to the :ident fact's valid-from instead — wrong, if what you wanted
+  ; was :depends-on's window:
+  [?src :depends-on ?dep] [?src :ident ?srci] [?src :db/valid-from ?vf] [?src :db/valid-to ?vt]
+  ```
+
+This is what makes a genuine single-query cross-layer join possible — see the example in
+"Code Structure Query Examples" above.
 
 ## Quick Reference
 
@@ -471,6 +529,7 @@ Cross-layer queries joining code structure with agent decisions:
 - `:as-of N` — state at transaction N
 - `:valid-at "2024-01-01"` — facts valid at date
 - `:any-valid-time` — ignore valid-time filter
+- `:db/valid-from ?vf` / `:db/valid-to ?vt` — bind a fact's own validity window as query variables (requires `:any-valid-time`); see "Querying a fact's own valid-time window"
 
 ### Filter predicates (on values)
 - `(starts-with? ?v "text")` — value begins with text
