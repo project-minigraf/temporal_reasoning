@@ -262,4 +262,5 @@ See [`evals/benchmark.md`](evals/benchmark.md) for full results and per-eval bre
 - **Phase 3** — MCP server, per-turn auto-memory hooks ✓
 - **Phase 4** — Entity normalization, schema-aware extraction, minigraf_audit ✓
 - **Phase 5** — Code structure ingestion from git history, minigraf_ingest_git ✓
+- **Phase 5.5** — Ingestion hardening: rename tracking, vendored-path ignore, async startup, persisted on-disk retrieval index ✓ (see [ROADMAP.md](ROADMAP.md) for at-scale re-validation status)
 - **Phase 6** — Observability and trust for automatic memory (planned)
