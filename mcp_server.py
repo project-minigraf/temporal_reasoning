@@ -3944,6 +3944,14 @@ def _edn_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+_EDN_ESCAPE_SEQUENCE = re.compile(r'\\(.)')
+
+
+def _edn_unescape(s: str) -> str:
+    """Reverse _edn_escape: \\\" -> \" and \\\\ -> \\ in a captured EDN string body."""
+    return _EDN_ESCAPE_SEQUENCE.sub(lambda m: m.group(1), s)
+
+
 def _git_file_content(repo_path: str, commit_hash: str, file_path: str) -> bytes:
     """Return raw bytes of a file at the given commit."""
     result = _subprocess.run(
@@ -4629,16 +4637,16 @@ def _parse_transact_facts(facts_str: str) -> List[Dict[str, Any]]:
     like :type/decision are skipped — they are internal type tags, not
     user-authored facts subject to schema validation.
     """
-    pattern = r'\[(\:[^\s\]]+)\s+(\:[^\s\]]+)\s+"([^"]+)"\]'
+    pattern = r'\[(\:[^\s\]]+)\s+(\:[^\s\]]+)\s+"((?:[^"\\]|\\.)+)"\]'
     result = []
     for match in re.finditer(pattern, facts_str):
-        entity, attribute, value = match.groups()
+        entity, attribute, raw_value = match.groups()
         entity_type = entity.split("/")[0].lstrip(":") if "/" in entity else ""
         result.append({
             "entity": entity,
             "entity_type": entity_type,
             "attribute": attribute,
-            "value": value,
+            "value": _edn_unescape(raw_value),
         })
     return result
 
@@ -5029,6 +5037,9 @@ Canonical ident form: lowercase, hyphens only — :decision/redis not :decision/
 Use these attributes: :description (required), :rationale (optional), :date (optional), :alias (optional).
 No other attributes are valid.
 
+IMPORTANT — quoting: if a value itself contains a double-quote character, escape it as \\" so
+it doesn't end the string literal early — e.g. :description "she called it \\"the fix\\"".
+
 IMPORTANT — entity resolution: if a reference matches an existing canonical ident or alias above,
 reuse that exact ident. Only mint a new ident if the entity is genuinely new.
 
@@ -5206,6 +5217,9 @@ Canonical ident form: lowercase, hyphens only — :decision/redis not :decision/
 {canonical_entities_section}
 Use these attributes: :description (required), :rationale (optional), :date (optional), :alias (optional).
 No other attributes are valid. If an entity matches an existing ident or alias, reuse it exactly.
+
+If a value itself contains a double-quote character, escape it as \\" so it doesn't end the
+string literal early — e.g. :description "she called it \\"the fix\\"".
 
 For each newly-minted entity, also emit an :alias fact with 2-5 comma-separated
 alternative terms or broader concepts someone might use to refer to it later —
