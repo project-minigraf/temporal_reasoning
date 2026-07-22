@@ -796,7 +796,7 @@ def register_plugin_with_claude() -> bool:
     return True
 
 
-def main(target_dir: str = "", harness: str = "claude-code") -> None:
+def main(target_dir: str = "", harness: str = "claude-code", update_ok: bool = True) -> None:
     print("=" * 50)
     print("Temporal Reasoning Skill Setup")
     print("=" * 50)
@@ -830,7 +830,7 @@ def main(target_dir: str = "", harness: str = "claude-code") -> None:
         print()
 
     if harness != "claude-code":
-        ok = all(results)
+        ok = all(results) and update_ok
         print("=" * 50)
         print("✓ Setup complete!" if ok else "✗ Setup incomplete — fix errors above")
         print("=" * 50)
@@ -857,7 +857,7 @@ def main(target_dir: str = "", harness: str = "claude-code") -> None:
     plugin_ok = register_plugin_with_claude()
     print()
 
-    if all(results) and mcp_ok and settings_json_ok and settings_ok and plugin_ok:
+    if all(results) and mcp_ok and settings_json_ok and settings_ok and plugin_ok and update_ok:
         print("=" * 50)
         print("✓ Setup complete!")
         print("=" * 50)
@@ -886,8 +886,9 @@ if __name__ == "__main__":
         print(f"Installing into: {target_dir}")
 
     if force or should_update():
-        update_skill(target_dir, harness)
+        update_ok = update_skill(target_dir, harness)
     else:
         _sync_files(target_dir, harness)
+        update_ok = True
 
-    main(target_dir, harness)
+    main(target_dir, harness, update_ok=update_ok)

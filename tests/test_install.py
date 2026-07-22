@@ -265,3 +265,41 @@ class TestMainHarnessGating:
         settings_json.assert_called_once_with(str(tmp_path))
         settings_local.assert_called_once_with(str(tmp_path))
         register.assert_called_once()
+
+    def test_update_failure_marks_setup_incomplete_for_claude_code(self, monkeypatch, tmp_path, capsys):
+        self._patch_common(monkeypatch)
+        monkeypatch.setattr(install, "setup_mcp_json", lambda *_: True)
+        monkeypatch.setattr(install, "setup_claude_settings_json", lambda *_: True)
+        monkeypatch.setattr(install, "setup_claude_settings", lambda *_: True)
+        monkeypatch.setattr(install, "register_plugin_with_claude", lambda: True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            install.main(str(tmp_path), "claude-code", update_ok=False)
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "Setup incomplete" in out
+        assert "Setup complete!" not in out
+
+    def test_update_failure_marks_setup_incomplete_for_non_claude_harness(self, monkeypatch, tmp_path, capsys):
+        self._patch_common(monkeypatch)
+
+        with pytest.raises(SystemExit) as exc_info:
+            install.main(str(tmp_path), "opencode", update_ok=False)
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "Setup incomplete" in out
+        assert "Setup complete!" not in out
+
+    def test_update_ok_true_still_completes_normally(self, monkeypatch, tmp_path, capsys):
+        self._patch_common(monkeypatch)
+        monkeypatch.setattr(install, "setup_mcp_json", lambda *_: True)
+        monkeypatch.setattr(install, "setup_claude_settings_json", lambda *_: True)
+        monkeypatch.setattr(install, "setup_claude_settings", lambda *_: True)
+        monkeypatch.setattr(install, "register_plugin_with_claude", lambda: True)
+
+        install.main(str(tmp_path), "claude-code", update_ok=True)
+
+        out = capsys.readouterr().out
+        assert "Setup complete!" in out
