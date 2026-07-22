@@ -1686,6 +1686,16 @@ class TestAliasEnrichment:
         assert "alias" in mcp_server._AGENT_SAMPLING_PROMPT.lower()
         assert "synonym" in mcp_server._AGENT_SAMPLING_PROMPT.lower() or "alternative term" in mcp_server._AGENT_SAMPLING_PROMPT.lower()
 
+    def test_llm_extraction_prompt_instructs_quote_escaping(self):
+        """#181: an unescaped embedded quote in an extracted value truncates
+        the Datalog string literal, silently dropping the whole fact."""
+        import mcp_server
+        assert '\\"' in mcp_server._LLM_EXTRACTION_PROMPT
+
+    def test_agent_sampling_prompt_instructs_quote_escaping(self):
+        import mcp_server
+        assert '\\"' in mcp_server._AGENT_SAMPLING_PROMPT
+
 
 class TestConversationalMemoryFactIndex:
     def test_transact_extracted_facts_indexes(self, real_db):
@@ -1734,6 +1744,27 @@ class TestConversationalMemoryFactIndex:
         index_path = fact_index.index_path_for(mcp_server._graph_path)
         results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/x" for r in results)
+
+    def test_agent_extract_and_transact_preserves_embedded_quote(self, real_db, monkeypatch):
+        """#181: a sampled fact whose value contains an embedded double-quote
+        (a realistic shape -- the model quoting a phrase verbatim) must not be
+        silently dropped by _parse_transact_facts on the way to
+        _transact_extracted_facts."""
+        import mcp_server
+        import asyncio as _asyncio
+
+        async def fake_request(conversation_delta, canonical_section):
+            return r'[[:decision/x :description "he said \"hello\" to me"]]'
+
+        monkeypatch.setattr(mcp_server, "_request_agent_memory_block_async", fake_request)
+        monkeypatch.setattr(mcp_server, "_query_canonical_entities", lambda: "")
+        result = _asyncio.run(mcp_server._agent_extract_and_transact("greeting"))
+        assert result["ok"] is True
+        assert result["stored_count"] == 1
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/x :description ?d]])'
+        ))
+        assert queried["results"] == [['he said "hello" to me']]
 
 
 class TestMcpToolWiring:
@@ -2146,6 +2177,31 @@ class TestParseTransactFacts:
         assert len(facts) == 1
         assert facts[0]["entity_type"] == "service"
         assert facts[0]["entity"] == ":service/auth"
+
+    def test_handles_embedded_escaped_quote_in_value(self):
+        import mcp_server
+        facts = mcp_server._parse_transact_facts(
+            r'[[:decision/x :description "he said \"hello\" to me"]]'
+        )
+        assert len(facts) == 1
+        assert facts[0]["value"] == 'he said "hello" to me'
+
+    def test_handles_embedded_escaped_backslash_in_value(self):
+        import mcp_server
+        facts = mcp_server._parse_transact_facts(
+            r'[[:decision/x :description "path is C:\\temp"]]'
+        )
+        assert len(facts) == 1
+        assert facts[0]["value"] == r"path is C:\temp"
+
+    def test_does_not_drop_later_triples_after_quoted_value(self):
+        import mcp_server
+        facts = mcp_server._parse_transact_facts(
+            r'[[:decision/x :description "he said \"hi\""]'
+            r' [:decision/x :rationale "fast"]]'
+        )
+        assert len(facts) == 2
+        assert facts[1]["value"] == "fast"
 
 
 class TestMinigrafTransactSchema:
