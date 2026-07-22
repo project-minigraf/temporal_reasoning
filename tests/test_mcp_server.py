@@ -2651,6 +2651,71 @@ class TestMinigrafAudit:
         )
         assert queried["results"] == []
 
+    def test_type_query_failure_is_logged_and_reported_as_skipped(self, real_db, capsys):
+        """#179: a real failure fetching an entity-type's UUIDs must not look
+        like a clean, empty audit -- it must be logged to stderr and surfaced
+        in the returned "skipped" list so a caller can tell the difference."""
+        import mcp_server
+        real_query = mcp_server.handle_minigraf_query
+        calls = {"n": 0}
+
+        def flaky_query(datalog):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated real backend failure on type fetch")
+            return real_query(datalog)
+
+        mcp_server.handle_minigraf_query = flaky_query
+        try:
+            result = mcp_server.handle_minigraf_audit()
+        finally:
+            mcp_server.handle_minigraf_query = real_query
+
+        assert result["ok"] is True
+        assert result["audited"] == 0
+        assert len(result["skipped"]) == 1
+        assert result["skipped"][0]["stage"] == "type_query"
+        assert result["skipped"][0]["entity_type"] == "decision"
+        err = capsys.readouterr().err
+        assert "[minigraf_audit] type query failed for decision" in err
+
+    def test_attr_query_failure_is_logged_and_reported_as_skipped(self, real_db, capsys):
+        """#179: a real failure fetching one entity's attributes must not
+        silently exclude that entity from the audit forever -- it must be
+        logged and surfaced in "skipped", and must not abort auditing the
+        rest of the entities."""
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            '[:decision/redis :description "use Redis"]]',
+            reason="setup",
+        )
+
+        real_query = mcp_server.handle_minigraf_query
+        calls = {"n": 0}
+
+        def flaky_query(datalog):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("simulated real backend failure on attr fetch")
+            return real_query(datalog)
+
+        mcp_server.handle_minigraf_query = flaky_query
+        try:
+            result = mcp_server.handle_minigraf_audit()
+        finally:
+            mcp_server.handle_minigraf_query = real_query
+
+        assert result["ok"] is True
+        assert result["audited"] == 1
+        assert result["retracted"] == 0
+        assert len(result["skipped"]) == 1
+        assert result["skipped"][0]["stage"] == "attr_query"
+        assert result["skipped"][0]["entity_type"] == "decision"
+        err = capsys.readouterr().err
+        assert "[minigraf_audit] attr query failed for" in err
+
 
 class TestPhase5Schema:
     def test_module_entity_passes_validation(self):
