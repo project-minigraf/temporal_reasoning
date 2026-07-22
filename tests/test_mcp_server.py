@@ -1105,6 +1105,24 @@ class TestParseFactsBlock:
             ),
         ]
 
+    def test_string_value_with_embedded_escaped_quote_is_unescaped(self):
+        import mcp_server
+        result = mcp_server._parse_facts_block(
+            r'[:decision/x :description "he said \"hello\" to me"]'
+        )
+        assert result == [
+            (":decision/x", ":description", 'he said "hello" to me'),
+        ]
+
+    def test_string_value_with_escaped_backslash_is_unescaped(self):
+        import mcp_server
+        result = mcp_server._parse_facts_block(
+            r'[:decision/x :path "C:\\Users\\x"]'
+        )
+        assert result == [
+            (":decision/x", ":path", r"C:\Users\x"),
+        ]
+
 
 class TestTransactRetractChokePoint:
     def test_transact_writes_to_index(self, real_db, tmp_path):

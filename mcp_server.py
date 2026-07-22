@@ -3316,11 +3316,11 @@ _TAGGED_LITERAL_PATTERN = re.compile(r'#(?:uuid|inst)\s+"([^"\\]*)"')
 
 def _unwrap_facts_block_token(raw: str) -> str:
     """Strip quoting/tagging from a captured entity or value token: a quoted
-    string loses its quotes, a #uuid/#inst "..." literal loses the tag and
-    keeps the raw UUID/timestamp text, anything else (keyword, number) is
-    kept as-is."""
+    string loses its quotes and has its EDN escaping reversed (\\" -> ",
+    \\\\ -> \\), a #uuid/#inst "..." literal loses the tag and keeps the raw
+    UUID/timestamp text, anything else (keyword, number) is kept as-is."""
     if raw.startswith('"'):
-        return raw[1:-1]
+        return _edn_unescape(raw[1:-1])
     m = _TAGGED_LITERAL_PATTERN.match(raw)
     if m:
         return m.group(1)
