@@ -3593,6 +3593,7 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
     audited = 0
     retracted = 0
     all_violations: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
 
     as_of_clause = f":as-of {as_of} " if as_of is not None else ""
 
@@ -3605,7 +3606,12 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
         try:
             type_result = handle_minigraf_query(type_query)
             type_rows = type_result.get("results", [])
-        except Exception:
+        except Exception as e:
+            print(
+                f"[minigraf_audit] type query failed for {entity_type}: {e}",
+                file=sys.stderr,
+            )
+            skipped.append({"entity_type": entity_type, "stage": "type_query", "error": str(e)})
             continue
 
         for row in type_rows:
@@ -3625,7 +3631,18 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
             try:
                 attr_result = handle_minigraf_query(attr_query)
                 attr_rows = attr_result.get("results", [])
-            except Exception:
+            except Exception as e:
+                print(
+                    f"[minigraf_audit] attr query failed for {entity_uuid} "
+                    f"({entity_type}): {e}",
+                    file=sys.stderr,
+                )
+                skipped.append({
+                    "entity": entity_uuid,
+                    "entity_type": entity_type,
+                    "stage": "attr_query",
+                    "error": str(e),
+                })
                 continue
 
             # Extract keyword ident from the stored :ident datom for reporting.
@@ -3699,6 +3716,7 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
         "audited": audited,
         "retracted": retracted,
         "violations": all_violations,
+        "skipped": skipped,
     }
 
 
