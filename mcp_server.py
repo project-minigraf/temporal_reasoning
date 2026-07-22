@@ -6729,6 +6729,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         await loop.run_in_executor(write_executor, _db_checkpoint, db)
                         await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
 
+                    except Exception as e:
+                        # Ordinary per-commit write failure (malformed EDN, a
+                        # transient constraint violation, ...) -- isolate it to
+                        # this one commit rather than aborting every commit
+                        # still pending, matching this function's own
+                        # documented "fail only the one commit" contract and
+                        # the extraction-phase isolation above. Opening the DB
+                        # itself (_ensure_db_async, just above this try) is
+                        # deliberately NOT covered here -- that failure is
+                        # unrecoverable for every remaining commit too, so it
+                        # still propagates to the outer handler.
+                        print(
+                            f"[_run_ingestion] skipping commit {commit_hash} "
+                            f"({subject!r}): write failed: {e}",
+                            file=sys.stderr,
+                        )
                     finally:
                         _db = None  # release file lock between commits
                         db = None   # drop local reference too — see note above

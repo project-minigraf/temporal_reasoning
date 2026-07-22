@@ -7429,6 +7429,46 @@ class TestRunIngestionCommitFaultIsolation:
         subjects = {r[2] for r in results if r[1] == ":subject"}
         assert "add models" in subjects
 
+    @pytest.mark.asyncio
+    async def test_write_phase_failure_for_one_commit_is_skipped_not_fatal(
+        self, real_db, git_repo, monkeypatch, capsys
+    ):
+        """The issue's own suggested fix asked to wrap "the whole per-commit
+        body," not just the extraction await -- a failure in the DB-writing
+        section (e.g. _watermark_update raising) must be isolated the same
+        way as an extraction failure, not just abort the whole run because
+        it happens to occur past the extraction step."""
+        import mcp_server
+        import fact_index
+
+        real_watermark_update = mcp_server._watermark_update
+        calls = []
+
+        def failing_once_watermark_update(db, commit_hash, commit_ts_iso, reason, index_con=None):
+            calls.append(commit_hash)
+            if len(calls) == 1:
+                raise RuntimeError("simulated write failure")
+            return real_watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
+
+        monkeypatch.setattr(mcp_server, "_watermark_update", failing_once_watermark_update)
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2  # git_repo's 2 real commits
+        assert "write failed" in capsys.readouterr().err
+
+        # Second commit (models.py) still got ingested despite the first
+        # commit's write-phase failure -- proves isolation, not just that
+        # the run avoided "error" status.
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "models", top_n=50, boost=2.0, historical_discount=1.0)
+        subjects = {r[2] for r in results if r[1] == ":subject"}
+        assert "add models" in subjects
+
 
 class TestRunIngestionBatchedIndexWrites:
     @pytest.mark.asyncio
