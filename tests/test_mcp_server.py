@@ -7361,6 +7361,115 @@ class TestRunIngestion:
         assert mcp_server._ingest_progress["processed"] == 21717  # 21715 + 2 commits
 
 
+class TestRunIngestionCommitFaultIsolation:
+    """#189: an ordinary extraction failure for a single commit (bad git
+    ref, unreadable blob, unsupported syntax) must fail only that one
+    commit, not the whole run -- _run_ingestion's own docstring already
+    claims this contract ("Ordinary exceptions ... are unaffected and still
+    fail only the one commit as before"), but the `await fut` in the main
+    pipeline loop had no try/except around it, so any exception raised
+    inside _extract_commit (running in a worker process) propagated all the
+    way to the outer `except Exception` handler and flipped the whole run
+    to status "error", leaving every commit after the bad one unprocessed."""
+
+    @pytest.mark.asyncio
+    async def test_unreadable_commit_is_skipped_not_fatal(self, real_db, git_repo, monkeypatch, capsys):
+        import mcp_server
+
+        real_git_commits = mcp_server._git_commits
+
+        def poisoned_git_commits(repo_path, watermark_hash, branch="HEAD"):
+            # Inject a commit hash that was never actually created in this
+            # repo -- git diff-tree on it fails exactly like a
+            # shallow-clone-missing-object or a repo mutated concurrently
+            # with a long-running ingestion (force-push / `git gc --prune`).
+            commits = real_git_commits(repo_path, watermark_hash, branch)
+            poisoned = commits[:1] + [("deadbeef" * 5, "2026-01-01T00:00:00Z", "x@x.com", "POISONED")] + commits[1:]
+            return poisoned
+
+        monkeypatch.setattr(mcp_server, "_git_commits", poisoned_git_commits)
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        # 2 real commits from git_repo + 1 skipped poisoned commit
+        assert mcp_server._ingest_progress["processed"] == 3
+        assert "deadbeef" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_commits_after_the_bad_one_are_still_ingested(self, real_db, git_repo, monkeypatch):
+        import mcp_server
+        import fact_index
+
+        real_git_commits = mcp_server._git_commits
+
+        def poisoned_git_commits(repo_path, watermark_hash, branch="HEAD"):
+            commits = real_git_commits(repo_path, watermark_hash, branch)
+            poisoned = [commits[0], ("deadbeef" * 5, "2026-01-01T00:00:00Z", "x@x.com", "POISONED")] + commits[1:]
+            return poisoned
+
+        monkeypatch.setattr(mcp_server, "_git_commits", poisoned_git_commits)
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        # git_repo's second (post-poison) commit adds models.py -- proves
+        # ingestion continued past the bad commit instead of aborting. Read
+        # via the persisted fact index (not the in-memory graph db directly)
+        # since real_db's MiniGrafDb.open() patch hands back a brand-new
+        # isolated store on every reopen -- _run_ingestion reopens the db
+        # between commits, so only index/DB-external assertions survive.
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "models", top_n=50, boost=2.0, historical_discount=1.0)
+        subjects = {r[2] for r in results if r[1] == ":subject"}
+        assert "add models" in subjects
+
+    @pytest.mark.asyncio
+    async def test_write_phase_failure_for_one_commit_is_skipped_not_fatal(
+        self, real_db, git_repo, monkeypatch, capsys
+    ):
+        """The issue's own suggested fix asked to wrap "the whole per-commit
+        body," not just the extraction await -- a failure in the DB-writing
+        section (e.g. _watermark_update raising) must be isolated the same
+        way as an extraction failure, not just abort the whole run because
+        it happens to occur past the extraction step."""
+        import mcp_server
+        import fact_index
+
+        real_watermark_update = mcp_server._watermark_update
+        calls = []
+
+        def failing_once_watermark_update(db, commit_hash, commit_ts_iso, reason, index_con=None):
+            calls.append(commit_hash)
+            if len(calls) == 1:
+                raise RuntimeError("simulated write failure")
+            return real_watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
+
+        monkeypatch.setattr(mcp_server, "_watermark_update", failing_once_watermark_update)
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2  # git_repo's 2 real commits
+        assert "write failed" in capsys.readouterr().err
+
+        # Second commit (models.py) still got ingested despite the first
+        # commit's write-phase failure -- proves isolation, not just that
+        # the run avoided "error" status.
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "models", top_n=50, boost=2.0, historical_discount=1.0)
+        subjects = {r[2] for r in results if r[1] == ":subject"}
+        assert "add models" in subjects
+
+
 class TestRunIngestionBatchedIndexWrites:
     @pytest.mark.asyncio
     async def test_ingestion_commits_index_once_per_commit_not_per_triple(self, real_db, git_repo, monkeypatch):

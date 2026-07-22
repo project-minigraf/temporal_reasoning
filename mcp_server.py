@@ -7,6 +7,7 @@ Sole interface to the minigraf .graph file via the MiniGrafDb Python binding.
 """
 import asyncio
 import concurrent.futures
+import concurrent.futures.process
 import configparser
 import contextlib
 import datetime
@@ -6316,7 +6317,32 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # ingestion run — including the many existing tests that drive
                     # _run_ingestion through a real ProcessPoolExecutor worker — would
                     # otherwise fail with "too many values to unpack".
-                    extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
+                    try:
+                        extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
+                    except concurrent.futures.process.BrokenProcessPool:
+                        # The whole worker pool died (OOM kill, native segfault) --
+                        # every other pending future in the sliding window is
+                        # equally poisoned, so this is not isolable to one commit
+                        # (see this function's docstring). Propagate to the outer
+                        # handler as before.
+                        raise
+                    except Exception as e:
+                        # Ordinary extraction failure (bad git ref, unreadable
+                        # blob, unsupported syntax) -- isolate it to this one
+                        # commit instead of aborting the whole run, matching this
+                        # function's own documented "fail only the one commit"
+                        # contract and the per-file try/except _extract_commit
+                        # already uses one level down for content-fetch failures.
+                        print(
+                            f"[_run_ingestion] skipping unreadable commit {commit_hash} "
+                            f"({subject!r}): {e}",
+                            file=sys.stderr,
+                        )
+                        submit_next()
+                        _ingest_progress["current_commit"] = commit_hash
+                        _ingest_progress["processed"] += 1
+                        await asyncio.sleep(0)  # yield to event loop
+                        continue
                     submit_next()
 
                     last_hash = commit_hash
@@ -6703,6 +6729,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         await loop.run_in_executor(write_executor, _db_checkpoint, db)
                         await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
 
+                    except Exception as e:
+                        # Ordinary per-commit write failure (malformed EDN, a
+                        # transient constraint violation, ...) -- isolate it to
+                        # this one commit rather than aborting every commit
+                        # still pending, matching this function's own
+                        # documented "fail only the one commit" contract and
+                        # the extraction-phase isolation above. Opening the DB
+                        # itself (_ensure_db_async, just above this try) is
+                        # deliberately NOT covered here -- that failure is
+                        # unrecoverable for every remaining commit too, so it
+                        # still propagates to the outer handler.
+                        print(
+                            f"[_run_ingestion] skipping commit {commit_hash} "
+                            f"({subject!r}): write failed: {e}",
+                            file=sys.stderr,
+                        )
                     finally:
                         _db = None  # release file lock between commits
                         db = None   # drop local reference too — see note above
