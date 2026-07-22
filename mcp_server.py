@@ -3042,9 +3042,25 @@ def handle_minigraf_query(datalog: str) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
+_TAGGED_LITERAL = r'#(?:uuid|inst)\s+"[^"\\]*"'
 _FACTS_TRIPLE_PATTERN = re.compile(
-    r'\[(\:[^\s\]]+)\s+(\:[^\s\]]+)\s+("(?:[^"\\]|\\.)*"|\:[^\s\]]+|-?\d+(?:\.\d+)?)\]'
+    r'\[(\:[^\s\]]+|' + _TAGGED_LITERAL + r')\s+(\:[^\s\]]+)\s+'
+    r'("(?:[^"\\]|\\.)*"|\:[^\s\]]+|-?\d+(?:\.\d+)?|' + _TAGGED_LITERAL + r')\]'
 )
+_TAGGED_LITERAL_PATTERN = re.compile(r'#(?:uuid|inst)\s+"([^"\\]*)"')
+
+
+def _unwrap_facts_block_token(raw: str) -> str:
+    """Strip quoting/tagging from a captured entity or value token: a quoted
+    string loses its quotes, a #uuid/#inst "..." literal loses the tag and
+    keeps the raw UUID/timestamp text, anything else (keyword, number) is
+    kept as-is."""
+    if raw.startswith('"'):
+        return raw[1:-1]
+    m = _TAGGED_LITERAL_PATTERN.match(raw)
+    if m:
+        return m.group(1)
+    return raw
 
 
 def _parse_facts_block(facts_str: str) -> List[Tuple[str, str, str]]:
@@ -3055,15 +3071,23 @@ def _parse_facts_block(facts_str: str) -> List[Tuple[str, str, str]]:
     capture keyword-valued and bare-numeric-valued triples, which schema
     validation intentionally skips but the index must not). Value is
     unquoted for string-valued triples, kept as-is (a keyword, number, or
-    entity reference) otherwise. #uuid/#inst-tagged values still aren't
-    captured -- pass index_triples explicitly if one of those needs to be
-    searchable.
+    entity reference) otherwise. #uuid/#inst-tagged entity references and
+    values are also captured, with the tag stripped and the raw UUID/
+    timestamp text kept as the indexed entity/value (#177) -- this is not
+    a keyword ident, so entity identity in the index can fragment across a
+    keyword-tagged create and a later #uuid-tagged update of the same
+    graph entity; pass index_triples explicitly (see handle_minigraf_audit)
+    when a resolved keyword ident is available and identity consistency
+    matters more than a mechanical capture.
     """
     triples = []
     for m in _FACTS_TRIPLE_PATTERN.finditer(facts_str):
         entity, attribute, raw_value = m.groups()
-        value = raw_value[1:-1] if raw_value.startswith('"') else raw_value
-        triples.append((entity, attribute, value))
+        triples.append((
+            _unwrap_facts_block_token(entity),
+            attribute,
+            _unwrap_facts_block_token(raw_value),
+        ))
     return triples
 
 
