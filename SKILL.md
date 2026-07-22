@@ -111,7 +111,7 @@ Canonical ident form: lowercase, hyphens only — `:decision/redis` not `:decisi
 Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`, `:module/`, `:function/`, `:class/`, `:variable/`, `:field/` (code structure — auto-ingested); `:commit/`, `:tag/`, `:ingestion/` are system-only (written by `minigraf_ingest_git`), do not write to them directly
 Required attribute on all types: `:description`
 Optional attributes: `:rationale`, `:date`, `:alias`
-String-valued attributes are capped at 4096 characters (override via `MINIGRAF_MAX_FACT_VALUE_LENGTH`); a longer value is a schema violation and the whole fact is rejected — summarize before storing, don't paste large blocks of raw text.
+String-valued attributes are capped at 4096 characters (override via `MINIGRAF_MAX_FACT_VALUE_LENGTH`); a longer value is a schema violation and the whole `minigraf_transact` call is rejected — summarize before storing, don't paste large blocks of raw text.
 
 Run `minigraf_audit` periodically or after a session with heavy writes to detect and retract any schema violations.
 

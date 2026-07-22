@@ -2501,6 +2501,28 @@ class TestMinigrafAudit:
         assert "retracted" in result
         assert "violations" in result
 
+    def test_oversized_value_is_flagged_and_retracted(self, real_db):
+        """#183 audit-side coverage: an oversized :description written directly
+        (bypassing minigraf_transact's own _validate_facts guard) is caught and
+        retracted by minigraf_audit's shared _validate_facts call."""
+        import mcp_server
+        big_value = "x" * (mcp_server._MAX_FACT_VALUE_LENGTH + 1)
+        real_db.execute(
+            '(transact {} [[:decision/redis :entity-type :type/decision] '
+            '[:decision/redis :ident ":decision/redis"] '
+            f'[:decision/redis :description "{big_value}"]])'
+        )
+
+        result = mcp_server.handle_minigraf_audit()
+
+        assert result["ok"] is True
+        assert result["retracted"] == 1
+        assert len(result["violations"]) == 1
+        remaining = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert remaining["results"] == []
+
     def test_audit_retract_removes_from_fact_index_by_keyword_ident(self, real_db):
         """The Datalog retract uses #uuid literals (audit's own design,
         so it can retract without a keyword-to-UUID lookup), but the entity
