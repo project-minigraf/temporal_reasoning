@@ -332,6 +332,12 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "calls": set(),
     },
     "elixir": {
+        # Vestigial/unused for functions & classes: defmodule/def/defp all
+        # parse as generic "call" nodes in the real grammar, not as their own
+        # node types, so _walk_ast/_collect_entity_nodes special-case
+        # lang_name == "elixir" entirely and never consult these two sets
+        # (see #170). "imports" is still consulted only indirectly, via the
+        # same elixir-specific branch's fallback to _extract_import_name.
         "functions": {"def", "defp"},
         "classes": {"defmodule"},
         "imports": {"call"},
@@ -529,6 +535,53 @@ def _elixir_module_name(node) -> Optional[str]:
     return None
 
 
+def _elixir_call_target_text(node) -> Optional[str]:
+    """Return an Elixir `call` node's target identifier text (e.g. "def",
+    "defmodule", "foo"), or None if the target isn't a plain identifier
+    (e.g. a dotted call like IO.puts)."""
+    target = node.child_by_field_name("target")
+    if target is not None and target.type == "identifier":
+        return target.text.decode("utf-8")
+    return None
+
+
+def _elixir_defmodule_name(node) -> Optional[str]:
+    """Return the dotted module name from a `defmodule` call node's
+    `arguments` (the `alias` node's text, e.g. "Foo.Bar")."""
+    arguments = next((c for c in node.children if c.type == "arguments"), None)
+    if arguments is None:
+        return None
+    alias_node = next((c for c in arguments.children if c.type == "alias"), None)
+    return alias_node.text.decode("utf-8") if alias_node is not None else None
+
+
+def _elixir_def_function_name(node) -> Optional[str]:
+    """Return the function name from a `def`/`defp` call node's `arguments`.
+
+    `def bar do` -> arguments' sole named child is a bare `identifier` (no
+    parens, zero-arg). `def bar(x, y) do` -> arguments' sole named child is a
+    `call` node (the parenthesized parameter list itself parses as a nested
+    call expression) whose own target identifier is the function name. A
+    guard clause (`def bar(x) when x > 0 do`) wraps that call one level
+    deeper in a `binary_operator` chain (`field:operator` text "when") --
+    descend its `field:left` to reach the same call node.
+    """
+    arguments = next((c for c in node.children if c.type == "arguments"), None)
+    if arguments is None:
+        return None
+    target = next(iter(arguments.named_children), None)
+    while target is not None:
+        if target.type == "identifier":
+            return target.text.decode("utf-8")
+        if target.type == "call":
+            return _elixir_call_target_text(target)
+        if target.type == "binary_operator":
+            target = target.child_by_field_name("left")
+            continue
+        return None
+    return None
+
+
 def _extract_import_name(node, lang_name: str) -> List[str]:
     """Extract top-level module names from an import node (may return multiple)."""
     names: List[str] = []
@@ -721,7 +774,33 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
     rather than duplicating every _LANG_NODE_TYPES entry — the TSX grammar is
     a strict superset of TypeScript's node types for the constructs this
     module cares about (functions, classes, imports, calls).
+
+    Elixir bypasses the generic node_types-driven dispatch below entirely:
+    `defmodule`/`def`/`defp`/`alias`/`import`/`use`/`require` (and every
+    ordinary function call) all parse as the *same* generic `call` node type
+    in the real tree-sitter-elixir grammar — there is no dedicated
+    `defmodule`/`def`/`defp` node type to match against, the way
+    `_LANG_NODE_TYPES["elixir"]` used to assume (#170). Disambiguation
+    requires inspecting the call's target identifier text instead.
     """
+    if lang_name == "elixir":
+        if node.type == "call":
+            target_text = _elixir_call_target_text(node)
+            if target_text == "defmodule":
+                name = _elixir_defmodule_name(node)
+                if name:
+                    results["classes"].append(name)
+            elif target_text in ("def", "defp"):
+                name = _elixir_def_function_name(node)
+                if name:
+                    results["functions"].append(name)
+            else:
+                names = _extract_import_name(node, lang_name)
+                results["imports"].extend(names)
+        for child in node.children:
+            _walk_ast(child, results, lang_name)
+        return
+
     node_types = _LANG_NODE_TYPES.get("typescript" if lang_name == "tsx" else lang_name)
     if node_types is None:
         return
@@ -2366,14 +2445,8 @@ def _extract_elixir_globals_and_fields(root_node: Any) -> Dict[str, Any]:
 
     def walk(node: Any) -> None:
         if node.type == "call":
-            target = node.child_by_field_name("target")
-            if target is not None and target.type == "identifier" and target.text == b"defmodule":
-                arguments = next((c for c in node.children if c.type == "arguments"), None)
-                module_name = ""
-                if arguments is not None:
-                    alias_node = next((c for c in arguments.children if c.type == "alias"), None)
-                    if alias_node is not None:
-                        module_name = alias_node.text.decode("utf-8")
+            if _elixir_call_target_text(node) == "defmodule":
+                module_name = _elixir_defmodule_name(node) or ""
                 do_block = next((c for c in node.children if c.type == "do_block"), None)
                 if do_block is not None:
                     for member in do_block.children:
@@ -2731,8 +2804,27 @@ def _collect_entity_nodes(root_node: Any, lang_name: str) -> Dict[str, Dict[str,
     are collected here; Task 26 extends this for globals/fields once those
     categories exist.
     """
-    node_types = _LANG_NODE_TYPES.get("typescript" if lang_name == "tsx" else lang_name)
     result: Dict[str, Dict[str, Any]] = {"function": {}, "class": {}}
+
+    if lang_name == "elixir":
+        def walk_elixir(node: Any) -> None:
+            if node.type == "call":
+                target_text = _elixir_call_target_text(node)
+                if target_text == "defmodule":
+                    name = _elixir_defmodule_name(node)
+                    if name:
+                        result["class"][name] = node
+                elif target_text in ("def", "defp"):
+                    name = _elixir_def_function_name(node)
+                    if name:
+                        result["function"][name] = node
+            for child in node.children:
+                walk_elixir(child)
+
+        walk_elixir(root_node)
+        return result
+
+    node_types = _LANG_NODE_TYPES.get("typescript" if lang_name == "tsx" else lang_name)
     if node_types is None:
         return result
 

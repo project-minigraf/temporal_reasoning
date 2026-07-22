@@ -4353,6 +4353,93 @@ class TestElixirGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestElixirFunctionsAndClasses:
+    """Regression tests for #170: defmodule/def/defp all parse as generic
+    `call` nodes in the real tree-sitter-elixir grammar, not as dedicated
+    `defmodule`/`def`/`defp` node types the way `_LANG_NODE_TYPES["elixir"]`
+    assumed -- so no Elixir function or module was ever extracted via the
+    generic _walk_ast/_collect_entity_nodes dispatch."""
+
+    def _parser(self):
+        import tree_sitter_elixir
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_elixir.language()))
+
+    def test_walk_ast_extracts_module_and_functions(self):
+        import mcp_server
+        source = (
+            b"defmodule Foo.Bar do\n"
+            b"  def pub_fn(x) do\n"
+            b"    x\n"
+            b"  end\n\n"
+            b"  defp priv_fn do\n"
+            b"    :ok\n"
+            b"  end\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "elixir")
+        assert results["classes"] == ["Foo.Bar"]
+        assert sorted(results["functions"]) == ["priv_fn", "pub_fn"]
+
+    def test_walk_ast_def_with_guard_clause(self):
+        # `def bar(x) when x > 0 do` wraps the parenthesized call in a
+        # binary_operator ("when") chain -- the name is nested one level
+        # deeper than a plain `def bar(x) do`.
+        import mcp_server
+        source = b"defmodule Foo do\n  def bar(x) when x > 0 do\n    x\n  end\nend\n"
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "elixir")
+        assert results["functions"] == ["bar"]
+
+    def test_walk_ast_zero_arg_def_without_parens(self):
+        import mcp_server
+        source = b"defmodule Foo do\n  def bar do\n    :ok\n  end\nend\n"
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "elixir")
+        assert results["functions"] == ["bar"]
+
+    def test_walk_ast_imports_still_extracted_alongside_functions(self):
+        # alias/import/use/require must keep working now that functions and
+        # classes are pulled out of the generic call-node dispatch.
+        import mcp_server
+        source = b"defmodule Foo do\n  alias MyApp.Router\n\n  def bar do\n    :ok\n  end\nend\n"
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "elixir")
+        assert results["imports"] == ["MyApp.Router"]
+        assert results["functions"] == ["bar"]
+        assert results["classes"] == ["Foo"]
+
+    def test_collect_entity_nodes_extracts_module_and_functions(self):
+        import mcp_server
+        source = b"defmodule Foo do\n  def bar do\n    :ok\n  end\nend\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._collect_entity_nodes(tree.root_node, "elixir")
+        assert "bar" in result["function"]
+        assert "Foo" in result["class"]
+
+    def test_extract_from_source_end_to_end(self):
+        pytest.importorskip("tree_sitter_elixir")
+        import mcp_server
+        source = (
+            b"defmodule Foo.Bar do\n"
+            b"  alias MyApp.Router\n\n"
+            b"  def bar do\n"
+            b"    :ok\n"
+            b"  end\n"
+            b"end\n"
+        )
+        parser = mcp_server._get_parser("mymod.ex")
+        result = mcp_server._extract_from_source(source, parser, "mymod.ex")
+        assert result["classes"] == ["Foo.Bar"]
+        assert result["functions"] == ["bar"]
+        assert result["imports"] == ["MyApp.Router"]
+
+
 class TestMatchCandidatePair:
     def _parse(self, source: str):
         import mcp_server
@@ -7004,15 +7091,21 @@ class TestFieldClassContainment:
         assert f"[{class_ident} :contains {field_ident}]" not in triples
         assert result["field_class_map"] == {}
 
-    def test_elixir_module_attribute_falls_back_to_module_only(self):
+    def test_elixir_module_attribute_gets_both_contains_and_class_edge(self):
+        # Before #170, defmodule was never extracted as a class (its "call"
+        # node type was mismatched against a bogus "defmodule" node-type
+        # entry in _LANG_NODE_TYPES), so this same repro fell back to
+        # module-only containment. Now that #170 fixes _extract_from_source
+        # to actually extract "Foo" as a class, this is just the ordinary
+        # real-class-field case, matching
+        # test_real_class_field_gets_both_contains_and_class_edge above.
         import mcp_server
         parser = self._parser("tree_sitter_elixir", "elixir")
         extracted = mcp_server._extract_from_source(
             b"defmodule Foo do\n  @attr 1\nend\n", parser, "foo.ex",
         )
-        # Confirm the reproduction from issues.md: field extracted, no class.
         assert extracted["fields"] == [("attr", "Foo", True)]
-        assert extracted["classes"] == []
+        assert extracted["classes"] == ["Foo"]
         result = mcp_server._precompute_file_triples(
             "foo.ex", extracted, ":commit/c1", {}, segment_index=None,
         )
@@ -7021,9 +7114,9 @@ class TestFieldClassContainment:
         class_ident = mcp_server._code_ident("class", "foo.ex", "Foo")
         _, _, triples = result["field_entries"][0]
         assert f"[{module_ident} :contains {field_ident}]" in triples
-        assert all(":class " not in t for t in triples)
-        assert f"[{class_ident} :contains {field_ident}]" not in triples
-        assert result["field_class_map"] == {}
+        assert f"[{class_ident} :contains {field_ident}]" in triples
+        assert f"[{field_ident} :class {class_ident}]" in triples
+        assert result["field_class_map"] == {field_ident: class_ident}
 
     def test_haskell_newtype_field_falls_back_to_module_only(self):
         import mcp_server
