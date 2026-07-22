@@ -2075,6 +2075,33 @@ class TestValidateFacts:
                       "attribute": ":description", "value": "test"}]
             assert mcp_server._validate_facts(facts) == [], f"Failed for {etype}"
 
+    def test_oversized_string_value_rejected(self):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description",
+                  "value": "x" * (mcp_server._MAX_FACT_VALUE_LENGTH + 1)}]
+        violations = mcp_server._validate_facts(facts)
+        assert len(violations) == 1
+        assert "length" in violations[0].lower() or "size" in violations[0].lower()
+
+    def test_value_at_max_length_is_accepted(self):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description",
+                  "value": "x" * mcp_server._MAX_FACT_VALUE_LENGTH}]
+        assert mcp_server._validate_facts(facts) == []
+
+    def test_oversized_optional_attribute_rejected(self):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description", "value": "use Redis"},
+                 {"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":rationale",
+                  "value": "x" * (mcp_server._MAX_FACT_VALUE_LENGTH + 1)}]
+        violations = mcp_server._validate_facts(facts)
+        assert len(violations) == 1
+        assert ":rationale" in violations[0]
+
 
 class TestHeuristicNormalization:
     def test_ident_uses_canonical_slug(self):
@@ -2138,6 +2165,19 @@ class TestTransactExtractedFactsSchema:
             '(query [:find ?d :where [:service/auth :description ?d]])'
         ))
         assert auth["results"] == []
+
+    def test_oversized_value_is_skipped(self, real_db):
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description",
+                  "value": "x" * (mcp_server._MAX_FACT_VALUE_LENGTH + 1)}]
+        stored = mcp_server._transact_extracted_facts(facts)
+
+        assert stored == 0
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == []
 
     def test_transact_extracted_facts_does_not_drop_sibling_optional_attributes(self, real_db):
         """Regression test for a real bug: _transact_extracted_facts used to
@@ -2290,6 +2330,21 @@ class TestMinigrafTransactSchema:
             '(query [:find ?d :where [:decision/redis :description ?d]])'
         ))
         assert queried["results"] == [["use Redis"]]
+
+    def test_rejects_oversized_value(self, real_db):
+        import mcp_server
+        big_value = "x" * (mcp_server._MAX_FACT_VALUE_LENGTH + 1)
+        result = mcp_server.handle_minigraf_transact(
+            f'[[:decision/redis :description "{big_value}"]]',
+            reason="test"
+        )
+
+        assert result["ok"] is False
+        assert "schema" in result["error"].lower() or "violation" in result["error"].lower()
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == []
 
     def test_keyword_only_transact_bypasses_schema_validation(self, real_db):
         import mcp_server
