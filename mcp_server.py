@@ -640,7 +640,54 @@ def _extract_import_name(node, lang_name: str) -> List[str]:
 
 
 def _extract_call_name(node, lang_name: str) -> Optional[str]:
-    """Extract the function name from a call node (best-effort, identifiers only)."""
+    """Extract the function name from a call node (best-effort, identifiers only).
+
+    The callee's field name and node type are not universal across grammars:
+      - JS/TS/Rust/C/C++/Go/C#/Scala: field "function", type "identifier" (default case below).
+      - Java (method_invocation): callee field is named "name", not "function".
+      - Kotlin/Swift (call_expression): no field name at all — callee is the
+        first named child (an identifier/simple_identifier).
+      - PHP (function_call_expression): field is "function" but the node type
+        there is "name", not "identifier".
+      - Haskell (apply): field is "function" but the node type is "variable",
+        and calls with 2+ arguments curry into nested apply nodes
+        (`f x y` -> apply(function=apply(function=variable f, argument=x), argument=y)),
+        so the callee sits at the bottom of the leftward "function"-field chain.
+    """
+    if lang_name == "java":
+        fn = node.child_by_field_name("name")
+        if fn and fn.type == "identifier":
+            return fn.text.decode("utf-8")
+        return None
+    if lang_name in ("kotlin", "swift"):
+        children = node.named_children
+        if children and children[0].type in ("identifier", "simple_identifier"):
+            return children[0].text.decode("utf-8")
+        return None
+    if lang_name == "php":
+        fn = node.child_by_field_name("function")
+        if fn and fn.type == "name":
+            return fn.text.decode("utf-8")
+        return None
+    if lang_name == "haskell":
+        # A curried call `f x y` nests as apply(function=apply(function=variable
+        # f, argument=x), argument=y) -- _walk_ast visits every "apply" node in
+        # that chain, so without this check each inner link would independently
+        # walk back down to the same innermost callee, reporting one call as
+        # many. Only the outermost apply (the one NOT itself sitting in a
+        # parent apply's "function" field) should emit.
+        parent = node.parent
+        if parent is not None and parent.type == "apply" and parent.child_by_field_name("function") == node:
+            return None
+        current = node
+        while current.type == "apply":
+            fn = current.child_by_field_name("function")
+            if fn is None:
+                return None
+            if fn.type == "variable":
+                return fn.text.decode("utf-8")
+            current = fn
+        return None
     fn = node.child_by_field_name("function")
     if fn and fn.type == "identifier":
         return fn.text.decode("utf-8")
