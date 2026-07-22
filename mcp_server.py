@@ -344,7 +344,7 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         # lang_name == "elixir" entirely and never consult these two sets
         # (see #170). "imports" is still consulted only indirectly, via the
         # same elixir-specific branch's fallback to _extract_import_name.
-        "functions": {"def", "defp"},
+        "functions": {"def", "defp", "defmacro", "defmacrop", "defguard", "defguardp", "defdelegate"},
         "classes": {"defmodule"},
         "imports": {"call"},
         "calls": set(),
@@ -562,15 +562,20 @@ def _elixir_defmodule_name(node) -> Optional[str]:
 
 
 def _elixir_def_function_name(node) -> Optional[str]:
-    """Return the function name from a `def`/`defp` call node's `arguments`.
+    """Return the function name from a def/defmacro/defguard/defdelegate-family
+    call node's `arguments` (`def`, `defp`, `defmacro`, `defmacrop`, `defguard`,
+    `defguardp`, `defdelegate` -- all parse to this identical `call` shape, #205).
 
-    `def bar do` -> arguments' sole named child is a bare `identifier` (no
-    parens, zero-arg). `def bar(x, y) do` -> arguments' sole named child is a
+    `def bar do` -> arguments' first named child is a bare `identifier` (no
+    parens, zero-arg). `def bar(x, y) do` -> arguments' first named child is a
     `call` node (the parenthesized parameter list itself parses as a nested
     call expression) whose own target identifier is the function name. A
-    guard clause (`def bar(x) when x > 0 do`) wraps that call one level
-    deeper in a `binary_operator` chain (`field:operator` text "when") --
-    descend its `field:left` to reach the same call node.
+    guard clause (`def bar(x) when x > 0 do`, or any `defguard`/`defguardp`,
+    which always carries one) wraps that call one level deeper in a
+    `binary_operator` chain (`field:operator` text "when") -- descend its
+    `field:left` to reach the same call node. `defdelegate qux(x), to: Other`
+    has a second named child (the `to:` keyword pair) that's ignored since
+    only the first named child is inspected.
     """
     arguments = next((c for c in node.children if c.type == "arguments"), None)
     if arguments is None:
@@ -809,12 +814,14 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
     module cares about (functions, classes, imports, calls).
 
     Elixir bypasses the generic node_types-driven dispatch below entirely:
-    `defmodule`/`def`/`defp`/`alias`/`import`/`use`/`require` (and every
-    ordinary function call) all parse as the *same* generic `call` node type
-    in the real tree-sitter-elixir grammar — there is no dedicated
-    `defmodule`/`def`/`defp` node type to match against, the way
-    `_LANG_NODE_TYPES["elixir"]` used to assume (#170). Disambiguation
-    requires inspecting the call's target identifier text instead.
+    `defmodule`/`def`/`defp`/`defmacro`/`defmacrop`/`defguard`/`defguardp`/
+    `defdelegate`/`alias`/`import`/`use`/`require` (and every ordinary
+    function call) all parse as the *same* generic `call` node type in the
+    real tree-sitter-elixir grammar — there is no dedicated `defmodule`/`def`/
+    `defp` node type to match against, the way `_LANG_NODE_TYPES["elixir"]`
+    used to assume (#170, extended to the macro/guard/delegate forms in #205).
+    Disambiguation requires inspecting the call's target identifier text
+    instead.
     """
     if lang_name == "elixir":
         if node.type == "call":
@@ -823,7 +830,10 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
                 name = _elixir_defmodule_name(node)
                 if name:
                     results["classes"].append(name)
-            elif target_text in ("def", "defp"):
+            elif target_text in (
+                "def", "defp", "defmacro", "defmacrop",
+                "defguard", "defguardp", "defdelegate",
+            ):
                 name = _elixir_def_function_name(node)
                 if name:
                     results["functions"].append(name)
@@ -2891,7 +2901,10 @@ def _collect_entity_nodes(root_node: Any, lang_name: str) -> Dict[str, Dict[str,
                     name = _elixir_defmodule_name(node)
                     if name:
                         result["class"][name] = node
-                elif target_text in ("def", "defp"):
+                elif target_text in (
+                    "def", "defp", "defmacro", "defmacrop",
+                    "defguard", "defguardp", "defdelegate",
+                ):
                     name = _elixir_def_function_name(node)
                     if name:
                         result["function"][name] = node
