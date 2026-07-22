@@ -769,6 +769,45 @@ class TestMinigrafTransact:
         results = fact_index.query_facts(index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[1] == ":status" and r[2] == "reviewed" for r in results)
 
+    def test_checkpoint_failure_after_successful_write_still_reports_ok(self, tmp_path, monkeypatch):
+        """#176: the graph write (and fact-index write) already happened by
+        the time _db_checkpoint runs -- a checkpoint-only failure must not be
+        reported as ok:False, since a caller retrying on a false failure uses
+        a fresh valid_from and creates a real duplicate live datom (per
+        #156's finding that differing valid_from isn't idempotent at the
+        graph level). Manufactures a real permission failure (chmod the
+        containing directory read-only, so minigraf's WAL-deletion step
+        during checkpoint fails for real) rather than faking the exception."""
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        mcp_server._db = None
+        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
+
+        real_checkpoint = mcp_server._db_checkpoint
+
+        def failing_checkpoint(db):
+            os.chmod(tmp_path, 0o555)
+            try:
+                real_checkpoint(db)
+            finally:
+                os.chmod(tmp_path, 0o755)
+
+        monkeypatch.setattr(mcp_server, "_db_checkpoint", failing_checkpoint)
+
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/y :description "should-persist"]]', reason="test"
+        )
+
+        assert result["ok"] is True
+        assert "warning" in result
+
+        monkeypatch.setattr(mcp_server, "_db_checkpoint", real_checkpoint)
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?d :where [:decision/y :description ?d]]'
+        )
+        assert queried["results"] == [["should-persist"]]
+
 
 class TestMinigrafRetract:
     def test_requires_reason(self, real_db):
@@ -833,6 +872,43 @@ class TestMinigrafRetract:
         index_path = fact_index.index_path_for(mcp_server._graph_path)
         results = fact_index.query_facts(index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
+
+    def test_checkpoint_failure_after_successful_write_still_reports_ok(self, tmp_path, monkeypatch):
+        """#176 retract-side mirror: the retract itself already happened by
+        the time _db_checkpoint runs, so a checkpoint-only failure must not
+        be reported as ok:False."""
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        mcp_server._db = None
+        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/old :description "deprecated"]]', reason="setup"
+        )
+
+        real_checkpoint = mcp_server._db_checkpoint
+
+        def failing_checkpoint(db):
+            os.chmod(tmp_path, 0o555)
+            try:
+                real_checkpoint(db)
+            finally:
+                os.chmod(tmp_path, 0o755)
+
+        monkeypatch.setattr(mcp_server, "_db_checkpoint", failing_checkpoint)
+
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/old :description "deprecated"]]', reason="gone"
+        )
+
+        assert result["ok"] is True
+        assert "warning" in result
+
+        monkeypatch.setattr(mcp_server, "_db_checkpoint", real_checkpoint)
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?d :where [:decision/old :description ?d]]'
+        )
+        assert queried["results"] == []
 
 
 class TestParseFactsBlock:
@@ -2281,6 +2357,43 @@ class TestMinigrafAudit:
         index_path = fact_index.index_path_for(mcp_server._graph_path)
         results = fact_index.query_facts(index_path, "decision bad", top_n=10, boost=2.0, historical_discount=1.0)
         assert not any(r[0] == ":decision/bad" for r in results)
+
+    def test_checkpoint_failure_after_retract_still_counts_and_persists(self, tmp_path, monkeypatch):
+        """#176 audit-side mirror: the per-entity retract (graph + fact
+        index) already happened by the time _db_checkpoint runs inside the
+        audit loop -- a checkpoint-only failure must not silently under-count
+        `retracted`, since the retraction is already durably applied."""
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        mcp_server._db = None
+        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/bad :entity-type :type/decision] '
+            '[:decision/bad :ident ":decision/bad"]]',
+            reason="setup",
+        )
+
+        real_checkpoint = mcp_server._db_checkpoint
+
+        def failing_checkpoint(db):
+            os.chmod(tmp_path, 0o555)
+            try:
+                real_checkpoint(db)
+            finally:
+                os.chmod(tmp_path, 0o755)
+
+        monkeypatch.setattr(mcp_server, "_db_checkpoint", failing_checkpoint)
+
+        result = mcp_server.handle_minigraf_audit()
+
+        assert result["retracted"] == 1
+
+        monkeypatch.setattr(mcp_server, "_db_checkpoint", real_checkpoint)
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :entity-type :type/decision]]'
+        )
+        assert queried["results"] == []
 
 
 class TestPhase5Schema:

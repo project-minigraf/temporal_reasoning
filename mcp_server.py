@@ -3007,6 +3007,25 @@ def _db_checkpoint(db: Any) -> None:
         db.checkpoint()
 
 
+def _checkpoint_after_write(db: Any, tool_name: str, result: Dict[str, Any]) -> None:
+    """Checkpoint after a transact/retract that has already applied its graph
+    and fact-index write. A checkpoint failure here must not flip an
+    already-successful write's result to ok:False (#176) -- the caller would
+    reasonably retry, and a retry uses a fresh valid_from, which creates a
+    genuine duplicate live datom rather than a no-op (per #156's finding that
+    minigraf only treats an identical (entity, attribute, value, valid_from)
+    tuple as idempotent). Mutates result in place, adding a "warning" key
+    when the checkpoint fails and the write itself succeeded.
+    """
+    try:
+        _db_checkpoint(db)
+        _update_mtime()
+    except MiniGrafError as e:
+        print(f"[{tool_name}] checkpoint failed after successful write: {e}", file=sys.stderr)
+        if result.get("ok"):
+            result["warning"] = f"checkpoint failed after write succeeded: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Result parsing
 # ---------------------------------------------------------------------------
@@ -3256,14 +3275,13 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     db = get_db()
     try:
         raw = _transact(db, facts, _now_utc_ms())
-        _db_checkpoint(db)
-        _update_mtime()
-        result = _parse_tx_result(raw)
-        if result["ok"]:
-            result["reason"] = reason
-        return result
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
+    result = _parse_tx_result(raw)
+    if result["ok"]:
+        result["reason"] = reason
+    _checkpoint_after_write(db, "minigraf_transact", result)
+    return result
 
 
 def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
@@ -3274,14 +3292,13 @@ def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
     db = get_db()
     try:
         raw = _retract(db, facts)
-        _db_checkpoint(db)
-        _update_mtime()
-        result = _parse_tx_result(raw)
-        if result["ok"]:
-            result["reason"] = reason
-        return result
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
+    result = _parse_tx_result(raw)
+    if result["ok"]:
+        result["reason"] = reason
+    _checkpoint_after_write(db, "minigraf_retract", result)
+    return result
 
 
 def handle_minigraf_rule(rule: str) -> Dict[str, Any]:
@@ -3416,11 +3433,23 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
                             (kw_ident, a, v) for a, v in attr_rows if isinstance(v, str)
                         ]
                         _retract(db, retract_facts, index_triples=index_triples)
-                        _db_checkpoint(db)
-                        _update_mtime()
+                    except Exception as e:
+                        print(f"[minigraf_audit] retract failed for {kw_ident}: {e}", file=sys.stderr)
+                    else:
+                        # The retract (graph + fact index) already applied above --
+                        # count it regardless of whether the checkpoint that follows
+                        # succeeds (#176), and never let a checkpoint failure raise
+                        # out of this loop and abort the rest of the audit.
                         retracted += 1
-                    except Exception:
-                        pass
+                        try:
+                            _db_checkpoint(db)
+                            _update_mtime()
+                        except Exception as e:
+                            print(
+                                f"[minigraf_audit] checkpoint failed after retracting "
+                                f"{kw_ident}: {e}",
+                                file=sys.stderr,
+                            )
 
     return {
         "ok": True,
