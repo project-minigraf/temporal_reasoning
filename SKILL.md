@@ -775,6 +775,8 @@ All functions return `{"ok": bool, ...}`. Common errors:
 - `as_of requires :as-of clause` — include `:as-of N` in query
 - `reason is required for all writes` — provide non-empty reason
 
+`minigraf_transact`/`minigraf_retract` may return `{"ok": true, ..., "warning": "..."}` if the write itself succeeded but a subsequent internal checkpoint failed (e.g. a disk/permissions error). The fact is durably written — do not retry, since a retry uses a fresh timestamp and creates a duplicate.
+
 If an error persists after checking syntax and installation, use `minigraf_report_issue` to file a structured bug report with the failing query and error message:
 
 ```python
