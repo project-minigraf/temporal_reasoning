@@ -4045,6 +4045,12 @@ def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
     is exactly the signal ("root or single-parent commit truly touched
     nothing" vs. "this is a merge commit, plain diff-tree always returns
     nothing regardless of content") this needs to distinguish.
+
+    On that merge path, _git_diff_tree_merge_missed_removals additionally
+    supplements --cc's own output with content genuinely discarded at the
+    merge (#191) -- present on exactly one parent's side and dropped
+    entirely during conflict resolution, which --cc's combined-diff
+    semantics can never surface (see that function's docstring).
     """
     result = _subprocess.run(
         ["git", "diff-tree", "--no-commit-id", "-r", "-M", "--raw", "--root", commit_hash],
@@ -4068,8 +4074,15 @@ def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
         else:
             old_path, path = "", rest
         entries.append((status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity))
-    if not entries and len(_git_parent_hashes(repo_path, commit_hash)) > 1:
-        return _git_diff_tree_combined_raw(repo_path, commit_hash)
+    if not entries:
+        parent_hashes = _git_parent_hashes(repo_path, commit_hash)
+        if len(parent_hashes) > 1:
+            cc_entries = _git_diff_tree_combined_raw(repo_path, commit_hash)
+            cc_paths = {e[5] for e in cc_entries}
+            missed_removals = _git_diff_tree_merge_missed_removals(
+                repo_path, commit_hash, parent_hashes, cc_paths
+            )
+            return cc_entries + missed_removals
     return entries
 
 
@@ -4104,16 +4117,13 @@ def _git_diff_tree_combined_raw(repo_path: str, commit_hash: str) -> List[tuple]
     best-effort rename-matching heuristic (_extract_commit's
     old_entity_nodes), not the fact-extraction this issue is about.
 
-    Known residual gap (verified, not yet fixed -- see #185's follow-up):
-    --cc only reports a path when it differs from EVERY parent, so content
-    that exists on exactly one parent's side and is discarded entirely at
-    the merge (final tree matches the OTHER parent, which never had it)
-    never appears here either -- e.g. a submodule added on a feature branch
-    but dropped while resolving the merge leaves its `:pinned-commit` fact
-    open forever, since neither plain diff-tree nor --cc ever reports the
-    removal. Distinct root cause from the content-authored-at-merge case
-    this function fixes (that content is genuinely new; this content is
-    genuinely gone), so deliberately out of scope here.
+    Residual gap (--cc only reports a path when it differs from EVERY
+    parent, so content that exists on exactly one parent's side and is
+    discarded entirely at the merge -- final tree matches the OTHER parent,
+    which never had it -- never appears here) is covered by a separate
+    supplement, `_git_diff_tree_merge_missed_removals`, called from
+    `_git_diff_tree_raw` right after this function for every merge commit.
+    See #191 and that function's docstring.
     """
     result = _subprocess.run(
         ["git", "diff-tree", "--cc", "--no-commit-id", "-r", "--raw", "--root", commit_hash],
@@ -4142,6 +4152,92 @@ def _git_diff_tree_combined_raw(repo_path: str, commit_hash: str) -> List[tuple]
         else:
             status = "M"
         entries.append((status, old_modes[0], new_mode, old_shas[0], new_sha, path, "", None))
+    return entries
+
+
+def _git_diff_tree_merge_missed_removals(
+    repo_path: str, commit_hash: str, parent_hashes: List[str], already_reported_paths: Set[str],
+) -> List[tuple]:
+    """Recover paths whose content was discarded entirely while resolving a
+    merge (#191) -- present on exactly one parent's side, absent from the
+    merge's own final tree, and therefore invisible to both the plain
+    diff-tree call (always empty for any merge commit) and `--cc`'s combined
+    diff (which only reports a path when it differs from EVERY parent -- a
+    path absent from the final tree AND absent from some other parent
+    matches that other parent trivially, so --cc excludes it too; see
+    _git_diff_tree_combined_raw's docstring).
+
+    Only ever called as a supplement to _git_diff_tree_combined_raw's output
+    for a merge commit, with that output's paths passed in as
+    already_reported_paths so a path --cc already reported (e.g. a genuine
+    full removal, differing from every parent) is never double-counted.
+
+    For each parent Pi, diffing the merge commit directly against Pi's own
+    tree (mirroring what `-m` reports for that parent) surfaces every path
+    Pi had that the merge's final tree lacks, as an ordinary "D" row. Most of
+    these are NOT this issue's bug: the overwhelmingly common case is a path
+    that already existed back at the merge-base too, and was deleted by an
+    ordinary single-parent commit on some OTHER parent's own lineage --
+    `_git_commits`' plain walk already visited that commit directly and
+    reported the same "D" there, so re-reporting it here would double-close
+    an already-closed fact. The distinguishing test: was this path already
+    absent at the merge-base between Pi and every other parent? If so, the
+    removal is old news, already handled by that ordinary commit -- skip it.
+    Only a path that did NOT exist at any other-parent merge-base (i.e. it
+    was born strictly after the branches diverged, entirely on Pi's side,
+    and the merge simply never incorporated it) is the
+    never-recorded-elsewhere case #191 is about.
+
+    An octopus merge (>2 parents) is handled the same way, checking each
+    candidate path's history against every OTHER parent individually -- a
+    path only counts as genuinely new if it's absent at the merge-base with
+    ALL of them, not just one.
+    """
+    entries: List[tuple] = []
+    seen = set(already_reported_paths)
+    for i, parent in enumerate(parent_hashes):
+        other_parents = [p for j, p in enumerate(parent_hashes) if j != i]
+        if not other_parents:
+            continue
+        result = _subprocess.run(
+            ["git", "diff-tree", "--no-commit-id", "-r", "-M", "--raw", parent, commit_hash],
+            cwd=repo_path, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.strip().splitlines():
+            if not line.startswith(":"):
+                continue
+            meta, sep, path = line.partition("\t")
+            if not sep:
+                continue
+            fields = meta[1:].split(" ")
+            if len(fields) < 5:
+                continue
+            old_mode, new_mode, old_sha, new_sha, status_field = fields[0], fields[1], fields[2], fields[3], fields[4]
+            if status_field[0] != "D" or path in seen:
+                continue
+            existed_elsewhere_at_divergence = False
+            for other in other_parents:
+                mb = _subprocess.run(
+                    ["git", "merge-base", parent, other],
+                    cwd=repo_path, capture_output=True, text=True,
+                )
+                base = mb.stdout.strip() if mb.returncode == 0 else ""
+                if not base:
+                    existed_elsewhere_at_divergence = True  # no common ancestor -- be conservative
+                    break
+                check = _subprocess.run(
+                    ["git", "cat-file", "-e", f"{base}:{path}"],
+                    cwd=repo_path, capture_output=True,
+                )
+                if check.returncode == 0:
+                    existed_elsewhere_at_divergence = True
+                    break
+            if existed_elsewhere_at_divergence:
+                continue
+            seen.add(path)
+            entries.append(("D", old_mode, new_mode, old_sha, new_sha, path, "", None))
     return entries
 
 

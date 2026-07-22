@@ -5850,6 +5850,82 @@ class TestGitDiffTreeRawMergeCommits:
 
         assert call_count["n"] == 0, "expected zero _git_parent_hashes calls for an ordinary non-empty commit"
 
+    def test_content_discarded_entirely_at_merge_is_recovered(self, tmp_path):
+        """See #191: a file added on ONE branch only, never touched on the
+        other, whose content is deliberately dropped while resolving the
+        merge -- the final tree matches the branch that never had the file
+        at all. Neither plain diff-tree nor --cc report anything for this
+        commit (both documented as the residual gap in #185's fix), so
+        without the new supplement this file's facts would never close."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+
+        (repo / "base.py").write_text("x = 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "-b", "side"], cwd=repo, check=True, capture_output=True)
+        (repo / "dropped.py").write_text("y = 2\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add dropped.py"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+        # main never touches dropped.py -- clean merge, then hand-remove the
+        # file before completing the merge commit.
+        _subprocess.run(["git", "merge", "side", "--no-ff", "--no-commit"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "rm", "-f", "dropped.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "merge side, drop dropped.py"], cwd=repo, check=True, capture_output=True)
+
+        merge_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
+
+        entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
+        assert len(entries) == 1
+        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
+        assert path == "dropped.py"
+        assert status == "D"
+
+    def test_deletion_already_handled_by_ordinary_commit_is_not_double_reported(self, tmp_path):
+        """Regression guard: a file that existed before the branches diverged,
+        deleted by an ORDINARY single-parent commit on one lineage and left
+        untouched on the other, is a plain clean merge -- `_git_commits`'
+        walk already visited the deleting commit directly and reported its
+        "D" there. The new per-parent supplement must recognize the path was
+        already absent at the merge-base and NOT report it a second time."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        self._init_repo(repo)
+
+        (repo / "shared.py").write_text("x = 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "-b", "side"], cwd=repo, check=True, capture_output=True)
+        (repo / "side_only.py").write_text("y = 2\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add side_only.py"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "rm", "-f", "shared.py"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "remove shared.py"], cwd=repo, check=True, capture_output=True)
+
+        merge_result = _subprocess.run(
+            ["git", "merge", "side", "--no-ff", "-m", "merge side"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        assert merge_result.returncode == 0, "expected a clean, non-conflicting merge"
+
+        merge_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
+
+        entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
+        assert entries == [], "shared.py's removal was already reported by the ordinary deleting commit"
+
 
 class TestIsIgnoredPath:
     def test_directory_pattern_matches_nested_path(self):
@@ -11895,6 +11971,60 @@ class TestRunIngestionGitlinks:
             "removed submodule's :path must be closed (issue #137)"
 
         mcp_server._db = None  # release the real file lock for subsequent tests
+
+    @pytest.mark.asyncio
+    async def test_submodule_discarded_entirely_at_merge_closes_pinned_commit(self, tmp_path):
+        """Issue #191's exact repro: a submodule added on `side` (never touched
+        by `main`), then removed entirely while resolving the merge -- the
+        final tree matches `main`, which never had the submodule at all.
+        Pre-fix, neither plain diff-tree nor --cc ever report this removal,
+        so the :pinned-commit fact opened by the add commit stayed open
+        forever even though the submodule doesn't exist in the repo from the
+        merge commit onward. Verified against the REAL minigraf backend.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "base.py").write_text("x = 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+        _subprocess.run(["git", "checkout", "-b", "side"], cwd=repo, check=True, capture_output=True)
+        sub_hash = self._add_submodule_commit(repo, path="modules/lib", name="lib")
+
+        _subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+        # main never touches modules/lib -- clean merge, then hand-remove the
+        # submodule (and .gitmodules) before completing the merge commit.
+        _subprocess.run(["git", "merge", "side", "--no-ff", "--no-commit"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "rm", "-f", "modules/lib", ".gitmodules"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(
+            ["git", "commit", "-m", "merge side, drop submodule during resolution"],
+            cwd=repo, check=True, capture_output=True,
+        )
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+
+            def count(attr, value):
+                raw = real_execute(db, f"(query [:find ?e :where [?e {attr} {value}]])")
+                return len(json.loads(raw).get("results", []))
+
+            assert count(":pinned-commit", f'"{sub_hash}"') == 0, \
+                "pinned-commit must be closed once the submodule is discarded at the merge (#191)"
+            assert count(":entity-type", ":type/external-dependency") == 0, \
+                "the submodule's external-dependency entity must be closed too"
+        finally:
+            mcp_server._db = None
 
 
 class TestSubmoduleDependencyLinking:
