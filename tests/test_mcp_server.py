@@ -4903,6 +4903,77 @@ class TestMatchRenamedEntities:
         assert len(matches) == n
         assert elapsed < 12.0, f"600x600 matcher took {elapsed:.2f}s (expected ~5s; cubic regression?)"
 
+    def test_cross_file_short_body_not_matched_without_relationship(self):
+        """#174: two unrelated entities (different file_groups keys) with a
+        short, plausible-boilerplate identical body must NOT be confirmed as
+        a rename just because nothing else distinguishes them — this is the
+        issue's own repro (a trivial one-line getter-shaped body, 57
+        normalized chars, comfortably clears the old single 20-char floor but
+        must not clear the higher cross-file bar)."""
+        import mcp_server
+        old = self._parse_fn("def compute_alpha(self):\n    return self.identifier_value + 1\n")
+        new = self._parse_fn("def compute_beta(self):\n    return self.identifier_value + 1\n")
+        removed = {"function": [("compute_alpha", old)]}
+        added = {"function": [("compute_beta", new)]}
+        matches = mcp_server._match_renamed_entities(
+            removed, added, file_groups={id(old): "fileA.py", id(new): "fileB.py"}
+        )
+        assert matches == []
+
+    def test_same_file_group_short_body_still_matched(self):
+        """The exact same short body/pair as above, but sharing ONE file
+        group (e.g. a same-path "M" edit or a git-confirmed "R" rename) —
+        the lower, pre-#174 floor still applies since there's real evidence
+        of a file-level relationship."""
+        import mcp_server
+        old = self._parse_fn("def compute_alpha(self):\n    return self.identifier_value + 1\n")
+        new = self._parse_fn("def compute_beta(self):\n    return self.identifier_value + 1\n")
+        removed = {"function": [("compute_alpha", old)]}
+        added = {"function": [("compute_beta", new)]}
+        matches = mcp_server._match_renamed_entities(
+            removed, added, file_groups={id(old): "fileA.py", id(new): "fileA.py"}
+        )
+        projected = [(c, o, n) for c, o, _, n, _ in matches]
+        assert projected == [("function", "compute_alpha", "compute_beta")]
+
+    def test_cross_file_long_body_still_matched(self):
+        """A genuinely moved function between two unrelated files is still
+        detected when its body clears the higher cross-file bar — the
+        legitimate case #174's fix must not regress."""
+        import mcp_server
+        old = self._parse_fn(
+            "def moveMe(x, y, z):\n"
+            "    total = x * 2 + y * 3 + z * 5\n"
+            "    adjusted = total + 7\n"
+            "    return adjusted\n"
+        )
+        new = self._parse_fn(
+            "def movedNow(x, y, z):\n"
+            "    total = x * 2 + y * 3 + z * 5\n"
+            "    adjusted = total + 7\n"
+            "    return adjusted\n"
+        )
+        removed = {"function": [("moveMe", old)]}
+        added = {"function": [("movedNow", new)]}
+        matches = mcp_server._match_renamed_entities(
+            removed, added, file_groups={id(old): "fileA.py", id(new): "fileB.py"}
+        )
+        projected = [(c, o, n) for c, o, _, n, _ in matches]
+        assert projected == [("function", "moveMe", "movedNow")]
+
+    def test_file_groups_none_preserves_pre_174_behavior(self):
+        """Callers with no file information at all (file_groups=None, the
+        default — every other test in this class) are unaffected by #174:
+        the single, lower _MIN_MATCH_BODY_LEN floor still applies."""
+        import mcp_server
+        old = self._parse_fn("def compute_alpha(self):\n    return self.identifier_value + 1\n")
+        new = self._parse_fn("def compute_beta(self):\n    return self.identifier_value + 1\n")
+        removed = {"function": [("compute_alpha", old)]}
+        added = {"function": [("compute_beta", new)]}
+        matches = mcp_server._match_renamed_entities(removed, added)
+        projected = [(c, o, n) for c, o, _, n, _ in matches]
+        assert projected == [("function", "compute_alpha", "compute_beta")]
+
 
 class TestCollectEntityNodes:
     def test_collects_function_and_class_nodes_by_name(self):
@@ -6216,6 +6287,35 @@ class TestExtractCommitRename:
         assert old_path == "old_name.py"
         assert "login" in extracted["functions"]
 
+    def test_rename_status_short_body_still_matched_at_low_floor(self, tmp_path):
+        """#174: a git-confirmed "R" rename must keep matching a renamed
+        function at the ORIGINAL, lower _MIN_MATCH_BODY_LEN floor, not the
+        higher _MIN_CROSS_FILE_MATCH_BODY_LEN bar reserved for genuinely
+        unrelated cross-file pairs — old_name.py/new_name.py share a real,
+        git-detected relationship here, unlike the unrelated-files case
+        above. `new_fn`'s body is deliberately short (well under the
+        cross-file floor) to prove the low floor, not the high one, is what
+        applies."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text("def old_fn(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        (repo / "new_name.py").write_text("def new_fn(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename file and function"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        status = results[0][0]
+        assert status == "R"  # sanity: git itself must have detected this as a rename
+        assert ("function", "old_name.py", "old_fn", "new_name.py", "new_fn") in renamed_pairs
+
     def test_non_rename_status_has_empty_old_path(self, git_repo):
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
@@ -6225,6 +6325,43 @@ class TestExtractCommitRename:
         assert old_path == ""
 
     def test_cross_file_move_produces_renamed_pair(self, tmp_path):
+        """`moveMe`'s body is deliberately longer than a trivial one-liner
+        (#174 raised the cross-file confidence bar to _MIN_CROSS_FILE_MATCH_BODY_LEN
+        precisely because a short body provides no real signal that fileA.py
+        and fileB.py are actually related — see
+        test_unrelated_same_shaped_entities_across_files_not_matched below for
+        the case this bar is meant to reject) — a real cross-file move with a
+        sufficiently distinctive body must still be detected."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        move_me_body = (
+            "def moveMe(x, y, z):\n"
+            "    total = x * 2 + y * 3 + z * 5\n"
+            "    adjusted = total + 7\n"
+            "    return adjusted\n"
+        )
+        (repo / "fileA.py").write_text("def stayHere(x):\n    return x + 1\n\n" + move_me_body)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        (repo / "fileA.py").write_text("def stayHere(x):\n    return x + 1\n")
+        (repo / "fileB.py").write_text(move_me_body)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "move function"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        assert ("function", "fileA.py", "moveMe", "fileB.py", "moveMe") in renamed_pairs
+
+    def test_unrelated_same_shaped_entities_across_files_not_matched(self, tmp_path):
+        """#174's own repro, reproduced end-to-end through _extract_commit:
+        two unrelated classes in two unrelated files, each with a trivial,
+        identically-shaped one-line method — nothing here indicates fileA.py
+        and fileB.py are actually related, so the matcher must not confirm a
+        false rename between compute_alpha and compute_beta."""
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -6232,18 +6369,29 @@ class TestExtractCommitRename:
         _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         (repo / "fileA.py").write_text(
-            "def stayHere(x):\n    return x + 1\n\ndef moveMe(x):\n    return x * 2 + 7\n"
+            "class Widget:\n"
+            "    def compute_alpha(self):\n"
+            "        return self.identifier_value + 1\n"
         )
+        (repo / "fileB.py").write_text("class Placeholder:\n    pass\n")
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
-        (repo / "fileA.py").write_text("def stayHere(x):\n    return x + 1\n")
-        (repo / "fileB.py").write_text("def moveMe(x):\n    return x * 2 + 7\n")
+        # fileA.py loses compute_alpha (an "M" edit, file still exists);
+        # fileB.py independently gains an unrelated compute_beta with the
+        # exact same trivial body (also an "M" edit) — git draws no
+        # connection between these two files at all.
+        (repo / "fileA.py").write_text("class Widget:\n    pass\n")
+        (repo / "fileB.py").write_text(
+            "class Placeholder:\n"
+            "    def compute_beta(self):\n"
+            "        return self.identifier_value + 1\n"
+        )
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-        _subprocess.run(["git", "commit", "-m", "move function"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "unrelated edits"], cwd=repo, check=True, capture_output=True)
 
         commits = mcp_server._git_commits(str(repo), watermark_hash=None)
         _, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
-        assert ("function", "fileA.py", "moveMe", "fileB.py", "moveMe") in renamed_pairs
+        assert renamed_pairs == []
 
     def test_cross_extension_rename_parses_old_blob_with_old_grammar(self, tmp_path, monkeypatch):
         """Reviewer finding 2 on Task 9 (47b962e): for status "R", `parser =

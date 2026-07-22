@@ -2640,6 +2640,16 @@ def _match_candidate_pair(
 
 _MAX_MATCH_ROUNDS = 10
 _MIN_MATCH_BODY_LEN = 20  # normalized chars; avoids matching trivial boilerplate stubs
+# A pair straddling two files with no established relationship (i.e. not the
+# same path, and not linked by a git-detected "R" rename — see file_groups in
+# _match_renamed_entities) is confirmed on structural equality alone, with no
+# corroborating evidence a real rename/move happened. That's a much weaker
+# signal than a same-file or git-confirmed-rename match, so it needs a much
+# larger body before two entities are unlikely to collide by coincidence
+# (#174 — a same-shaped one-line boilerplate stub/getter/repr in two unrelated
+# classes/files cleared the old single 20-char floor easily and was
+# confirmed as a false "rename").
+_MIN_CROSS_FILE_MATCH_BODY_LEN = 80
 # Above this total pool size (removed + added entries across all categories)
 # the matcher skips a commit entirely, mirroring git's own `-M` rename-limit
 # degradation: a missed rename is the accepted fallback, never an unbounded
@@ -2683,10 +2693,31 @@ def _match_renamed_entities(
     removed: Dict[str, List[Tuple[str, Any]]],
     added: Dict[str, List[Tuple[str, Any]]],
     unchanged_names: Optional[Set[str]] = None,
+    file_groups: Optional[Dict[int, str]] = None,
 ) -> List[Tuple[str, str, Any, str, Any]]:
     """Round-based rename matching across entity categories, scoped to a
     single commit's touched files (callers build removed/added from just
     that commit — see _extract_commit's use in Task 9).
+
+    file_groups (#174) is an optional {id(node): group_key} map used to tell
+    a genuinely file-related candidate pair from a purely coincidental
+    cross-file one. Two nodes share a group when they come from the same
+    path (an in-file "M" edit) or from the two sides of one git-detected "R"
+    rename (including a combined rename+move) — real, evidence-backed
+    relationships. Nodes from an unrelated "D" (whole file deleted) and "A"
+    (whole file added, different path) pair get distinct, never-equal group
+    keys, since git itself draws no connection between them. When a
+    candidate pair's groups differ, matching still proceeds but must clear
+    the higher _MIN_CROSS_FILE_MATCH_BODY_LEN bar rather than
+    _MIN_MATCH_BODY_LEN — cross-file matches remain possible (a function
+    really can move from one file to a wholly unrelated new one, since
+    that's simply invisible to git's own diff), just at a much narrower,
+    less coincidence-prone confidence threshold than same-file/git-rename
+    matches. file_groups is None for every standalone/test caller below
+    (no file information exists at that level) — the original single
+    _MIN_MATCH_BODY_LEN floor applies unchanged in that case, preserving
+    this function's pre-#174 behavior for callers that never had file
+    context to begin with.
 
     A rename confirmed in one category (e.g. a function) becomes available
     as a "tracked, confirmed-renamed" name for other not-yet-matched pairs
@@ -2778,6 +2809,15 @@ def _match_renamed_entities(
                 r_reserved_token = confirmed.get(r_match_name, r_match_name)
                 candidates = []
                 for a_name, a_node in a_list:
+                    if file_groups is not None:
+                        # #174: a pair with no established file relationship
+                        # (different group keys — see file_groups' docstring)
+                        # needs a much larger body before structural equality
+                        # alone is trusted as rename evidence.
+                        same_file_group = file_groups.get(id(r_node)) == file_groups.get(id(a_node))
+                        min_len = _MIN_MATCH_BODY_LEN if same_file_group else _MIN_CROSS_FILE_MATCH_BODY_LEN
+                        if len(r_text) < min_len:
+                            continue
                     a_match_name = _match_body_name(category, a_name)
                     a_reserved_token = confirmed.get(a_match_name, a_match_name)
                     # Exclude this specific pair's own old/new names from the
@@ -6263,6 +6303,18 @@ def _extract_commit(
     # two different removed entities in two different deleted files could
     # coincidentally share a name.
     node_origin: Dict[int, str] = {}  # id(node) -> file_path
+    # id(node) -> file-relationship group key, fed to _match_renamed_entities'
+    # file_groups param (#174). A "D" or plain "A" node's own path is unique
+    # to it (no other node shares that exact string), so it can never
+    # coincidentally group with an unrelated file's nodes; an "M" node's old
+    # and new sides share the same literal path already; an "R" pair's old
+    # and new sides get one synthetic shared key (their paths genuinely
+    # differ) so a git-confirmed rename/move still matches at the lower,
+    # same-file confidence bar. Distinct from node_origin (which always
+    # records the real path, for renamed_pairs' output) since D/A's own path
+    # must stay a valid, reportable file_path while still acting as a
+    # never-shared group key here.
+    node_group: Dict[int, str] = {}
     # Bare body-text names (see _match_body_name) present, with the SAME name,
     # on BOTH the old and new side of some touched file this commit — tracked
     # entities that survived unrenamed. Passed to _match_renamed_entities so a
@@ -6355,6 +6407,7 @@ def _extract_commit(
                 for name, node in old_entity_nodes[category].items():
                     removed_pool[category].append((name, node))
                     node_origin[id(node)] = old_lang_path
+                    node_group[id(node)] = old_lang_path
             results.append((status, file_path, None, None, ""))
             continue
 
@@ -6413,17 +6466,26 @@ def _extract_commit(
                 for name, node in new_entity_nodes[category].items():
                     added_pool[category].append((name, node))
                     node_origin[id(node)] = file_path
+                    node_group[id(node)] = file_path
         elif status == "R":
             # Ident changes for every entity in a renamed file, even ones
             # whose text is byte-identical — pool everything on both sides,
-            # not just the local diff (unlike "M" below).
+            # not just the local diff (unlike "M" below). Both sides share
+            # ONE synthetic group key (#174) — old_lang_path != file_path
+            # here, but git already confirmed this specific pair as a real
+            # rename/move, so they're linked at the lower, same-file
+            # confidence bar rather than treated as unrelated cross-file
+            # candidates.
+            rename_group = f"rename:{old_lang_path}->{file_path}"
             for category in ("function", "class", "variable", "field"):
                 for name, node in old_entity_nodes[category].items():
                     removed_pool[category].append((name, node))
                     node_origin[id(node)] = old_lang_path
+                    node_group[id(node)] = rename_group
                 for name, node in new_entity_nodes[category].items():
                     added_pool[category].append((name, node))
                     node_origin[id(node)] = file_path
+                    node_group[id(node)] = rename_group
         else:  # "M" — same path, only the local diff needs matching
             for category in ("function", "class", "variable", "field"):
                 old_names = set(old_entity_nodes[category].keys())
@@ -6432,12 +6494,14 @@ def _extract_commit(
                     node = old_entity_nodes[category][name]
                     removed_pool[category].append((name, node))
                     node_origin[id(node)] = old_lang_path
+                    node_group[id(node)] = old_lang_path
                 for name in new_names - old_names:
                     node = new_entity_nodes[category][name]
                     added_pool[category].append((name, node))
                     node_origin[id(node)] = file_path
+                    node_group[id(node)] = file_path
 
-    raw_matches = _match_renamed_entities(removed_pool, added_pool, unchanged_names)
+    raw_matches = _match_renamed_entities(removed_pool, added_pool, unchanged_names, file_groups=node_group)
     # raw_matches carries the matched node objects themselves (see Task 8's
     # _match_renamed_entities retrofit), so file paths can be recovered
     # directly via node_origin — no second pass or pre-mutation snapshot
