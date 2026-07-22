@@ -6033,8 +6033,11 @@ def _extract_commit(
         for "R" entries and "" for every other status (A/M/D) — kept as a fixed
         5th tuple element rather than variable arity so downstream consumers
         (_run_ingestion) can unpack uniformly.
-      gitlink_changes: _gitlink_changes' output — gitlink-involving rows, never fed
-        through the tree-sitter parser (gitlink paths never have a resolvable extension).
+      gitlink_changes: _gitlink_changes' output, filtered through ignore_patterns
+        (via _is_ignored_path) exactly like a regular file's path would be — an
+        ignored gitlink is dropped from the list entirely, before gitmodules_map
+        below is even considered. Never fed through the tree-sitter parser
+        (gitlink paths never have a resolvable extension).
       gitmodules_map: path -> {"name", "url"}, populated only when this commit has at
         least one gitlink "add" — avoids a wasted git-show call on the (overwhelmingly
         common) case of a commit that touches no submodules at all.
@@ -6269,7 +6272,10 @@ def _extract_commit(
             category, node_origin[id(old_node)], old_name, node_origin[id(new_node)], new_name,
         ))
 
-    gitlink_changes = _gitlink_changes(raw_entries)
+    gitlink_changes = [
+        (kind, sha, path) for kind, sha, path in _gitlink_changes(raw_entries)
+        if not _is_ignored_path(path, ignore_patterns)
+    ]
     gitmodules_map: Dict[str, Dict[str, str]] = {}
     if any(kind == "add" for kind, _, _ in gitlink_changes):
         gitmodules_map = _git_gitmodules_at(repo_path, commit_hash)
