@@ -176,7 +176,9 @@ When the MCP server is configured and hooks are enabled, memory is managed autom
 
 Extraction strategy is controlled by `MINIGRAF_EXTRACTION_STRATEGY` (env var):
 - `heuristic` (default) — regex signal detection, zero API calls
-- `llm` — Claude Haiku extracts facts; falls back to agent on API failure
+- `llm` — Claude Haiku extracts facts; falls back to heuristic on API failure. Runs on a worker
+  thread so a slow/hung provider doesn't stall other concurrent tool calls; the underlying
+  client's request timeout defaults to 30s, override via `MINIGRAF_LLM_TIMEOUT_SECONDS`.
 - `agent` — MCP sampling asks the connected agent to identify facts
 
 **Without hooks** (OpenCode, OpenClaw, or unconfigured): call the tools explicitly at the start and end of each turn.
