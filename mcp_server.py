@@ -4286,8 +4286,23 @@ def _total_ingested_query(db: Any) -> int:
     mid-way (e.g. by lock contention) leaves this stale even though further
     commits were durably persisted. Use _count_commit_entities for the true
     current count.
+
+    :any-valid-time is required here (not a design choice) -- valid-from is
+    the run's own timestamp, not real wall-clock time, so a plain query's
+    implicit "as of now" filter can miss facts whose valid-from lands after
+    the real current moment. But :any-valid-time also surfaces already-closed
+    historical rows from prior runs, so the :db/valid-to pseudo-attribute is
+    bound and filtered to the open-fact sentinel to select only the live
+    value -- otherwise, even after _last_run_write's #186 retract-before-
+    reassert fix, this could still nondeterministically return a stale run's
+    value depending on row order.
     """
-    raw = _db_execute(db, "(query [:find ?n :any-valid-time :where [:ingestion/last-run-at :total-ingested ?n]])")
+    raw = _db_execute(
+        db,
+        "(query [:find ?n :any-valid-time "
+        ":where [:ingestion/last-run-at :total-ingested ?n] "
+        "[:ingestion/last-run-at :db/valid-to ?vt] [(= ?vt 9223372036854775807)]])",
+    )
     results = json.loads(raw).get("results", [])
     return int(results[0][0]) if results else 0
 
@@ -4348,19 +4363,58 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
 
 
+_LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
+_LAST_RUN_NUMERIC_ATTRS = frozenset({":total-ingested"})
+
+
 def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int, index_con: Optional[Any] = None) -> None:
-    """Record the wall-clock time, final commit hash, and cumulative ingested count."""
-    _transact(
-        db,
-        f'[[:ingestion/last-run-at :entity-type :type/ingestion] '
-        f'[:ingestion/last-run-at :ident ":ingestion/last-run-at"] '
-        f'[:ingestion/last-run-at :description "last ingestion run timestamp"] '
-        f'[:ingestion/last-run-at :last-run-at "{run_at}"] '
-        f'[:ingestion/last-run-at :last-commit "{commit_hash}"] '
-        f'[:ingestion/last-run-at :total-ingested {total_ingested}]]',
-        run_at,
-        index_con=index_con,
-    )
+    """Record the wall-clock time, final commit hash, and cumulative ingested count.
+
+    Same graph-level non-idempotency (#156) as _watermark_update/_ingest_tags:
+    re-transacting the same (entity, attribute, value) under a fresh valid-from
+    creates a second genuinely live duplicate rather than a no-op -- this was
+    unconditionally re-transacting all six attributes on every completed run,
+    so after the second run the singleton :ingestion/last-run-at entity carried
+    multiple live values per attribute, and any-valid-time readers (e.g.
+    handle_minigraf_ingest_status) could pair one run's timestamp with a
+    different run's commit hash (#186). Diffs against the entity's current
+    live values first and only retracts+reasserts attributes that actually
+    changed -- :entity-type/:ident/:description are constant and written once;
+    :last-run-at/:last-commit/:total-ingested change every run and always
+    retract-then-reassert, same as :hash in _watermark_update.
+    """
+    desired: Dict[str, Any] = {
+        ":entity-type": ":type/ingestion",
+        ":ident": ":ingestion/last-run-at",
+        ":description": "last ingestion run timestamp",
+        ":last-run-at": run_at,
+        ":last-commit": commit_hash,
+        ":total-ingested": total_ingested,
+    }
+
+    current_raw = _db_execute(db, "(query [:find ?a ?v :where [:ingestion/last-run-at ?a ?v]])")
+    current: Dict[str, Any] = dict(json.loads(current_raw).get("results", []))
+
+    def _edn(attr: str, value: Any) -> str:
+        if attr in _LAST_RUN_KEYWORD_ATTRS:
+            return value
+        if attr in _LAST_RUN_NUMERIC_ATTRS:
+            return str(value)
+        return f'"{_edn_escape(value)}"'
+
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    for attr, value in desired.items():
+        if current.get(attr) == value:
+            continue  # already correct -- skip to avoid creating a duplicate live fact (#156)
+        if attr in current:
+            to_retract.append(f"[:ingestion/last-run-at {attr} {_edn(attr, current[attr])}]")
+        to_transact.append(f"[:ingestion/last-run-at {attr} {_edn(attr, value)}]")
+
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    if to_transact:
+        _transact(db, "[" + " ".join(to_transact) + "]", run_at, index_con=index_con)
 
 
 # System attributes written by _transact_extracted_facts alongside domain attributes.
@@ -6740,11 +6794,19 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
     if _ingest_progress["status"] != "running":
         try:
             db = get_db()
+            # :any-valid-time is needed since valid-from is the run's own
+            # timestamp, not real wall-clock time (see _total_ingested_query),
+            # but it also surfaces already-closed historical rows -- bind and
+            # filter :db/valid-to to the open-fact sentinel on each attribute
+            # so only the current run's own (?t, ?h) pair is returned, not a
+            # cross-product with a different historical run's value (#186).
             raw = _db_execute(
                 db,
                 "(query [:find ?t ?h :any-valid-time "
                 ":where [:ingestion/last-run-at :last-run-at ?t] "
-                "[:ingestion/last-run-at :last-commit ?h]])"
+                "[:ingestion/last-run-at :db/valid-to ?vt1] [(= ?vt1 9223372036854775807)] "
+                "[:ingestion/last-run-at :last-commit ?h] "
+                "[:ingestion/last-run-at :db/valid-to ?vt2] [(= ?vt2 9223372036854775807)]])"
             )
             rows = json.loads(raw).get("results", [])
             if rows:
