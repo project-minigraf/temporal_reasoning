@@ -386,7 +386,8 @@ def setup_mcp_json(target_dir: str) -> bool:
 
     - Creates the file if absent.
     - Merges into existing content if present (other servers are preserved).
-    - Always updates MINIGRAF_GRAPH_PATH to reflect the target project path.
+    - Always updates MINIGRAF_GRAPH_PATH and MINIGRAF_INDEX_PATH to reflect
+      the target project path.
     - Uses `uvx temporal-reasoning[git-ingestion]` so the published PyPI
       package is invoked directly — no local venv path baked in. `[git-ingestion]`
       is required so uvx's ephemeral venv actually has the tree-sitter
@@ -398,14 +399,16 @@ def setup_mcp_json(target_dir: str) -> bool:
       mainstream Python build this project targets, so unlike the rank-bm25
       cache it replaced, there is no missing-dependency fallback path to
       keep working (see issues #96, #117, #118).
-    - Only MINIGRAF_GRAPH_PATH is set here; ANTHROPIC_API_KEY and
-      MINIGRAF_EXTRACTION_STRATEGY belong in .claude/settings.local.json so
-      they are available to hook subprocesses as well as the MCP server.
+    - Only MINIGRAF_GRAPH_PATH and MINIGRAF_INDEX_PATH are set here;
+      ANTHROPIC_API_KEY and MINIGRAF_EXTRACTION_STRATEGY belong in
+      .claude/settings.local.json so they are available to hook subprocesses
+      as well as the MCP server.
     """
     import json
 
     mcp_json_path = os.path.join(target_dir, ".mcp.json")
     graph_path = os.path.join(target_dir, "memory.graph")
+    index_path = f"{graph_path}.fts.sqlite3"
 
     existing: dict = {}
     file_existed = os.path.exists(mcp_json_path)
@@ -422,6 +425,7 @@ def setup_mcp_json(target_dir: str) -> bool:
         "args": ["temporal-reasoning[git-ingestion]"],
         "env": {
             "MINIGRAF_GRAPH_PATH": graph_path,
+            "MINIGRAF_INDEX_PATH": index_path,
         },
     }
 
@@ -437,6 +441,7 @@ def setup_mcp_json(target_dir: str) -> bool:
     print(f"✓ {verb} {mcp_json_path}")
     print(f"    command = uvx temporal-reasoning[git-ingestion]")
     print(f"    MINIGRAF_GRAPH_PATH = {graph_path}")
+    print(f"    MINIGRAF_INDEX_PATH = {index_path}")
     return True
 
 

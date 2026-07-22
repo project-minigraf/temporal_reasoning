@@ -123,6 +123,13 @@ class TestSetupMcpJson:
         args = config["mcpServers"]["temporal-reasoning"]["args"]
         assert args == ["temporal-reasoning[git-ingestion]"]
 
+    def test_sets_index_path_alongside_graph_path(self, tmp_path):
+        install.setup_mcp_json(str(tmp_path))
+        with open(tmp_path / ".mcp.json") as f:
+            config = json.load(f)
+        env = config["mcpServers"]["temporal-reasoning"]["env"]
+        assert env["MINIGRAF_INDEX_PATH"] == f"{env['MINIGRAF_GRAPH_PATH']}.fts.sqlite3"
+
 
 class TestBuildPluginStub:
     def test_stub_mcp_json_uses_git_ingestion_extra(self, tmp_path, monkeypatch):
