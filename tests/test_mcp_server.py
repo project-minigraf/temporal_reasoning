@@ -994,6 +994,124 @@ class TestMinigrafRetract:
         assert queried["results"] == []
 
 
+class TestQueryIdent:
+    def test_returns_ident_when_present(self, real_db):
+        import mcp_server
+        real_db.execute('(transact {} [[:decision/x :ident ":decision/x"]])')
+        assert mcp_server._query_ident(real_db, ":decision/x") == ":decision/x"
+
+    def test_returns_none_when_absent(self, real_db):
+        import mcp_server
+        real_db.execute('(transact {} [[:decision/x :description "hello"]])')
+        assert mcp_server._query_ident(real_db, ":decision/x") is None
+
+    def test_returns_none_on_malformed_uuid_ref(self, real_db):
+        """A non-UUID string wrapped in #uuid "..." fails minigraf's EDN
+        parse with a MiniGrafError -- _query_ident must catch that and
+        return None, not raise (confirmed empirically: minigraf raises
+        MiniGrafError.Other(msg='Invalid UUID') for this input)."""
+        import mcp_server
+        assert mcp_server._query_ident(real_db, '#uuid "not-a-uuid"') is None
+
+    def test_resolves_via_uuid_tagged_ref(self, real_db):
+        import mcp_server
+        real_db.execute('(transact {} [[:decision/x :ident ":decision/x"]])')
+        queried = json.loads(real_db.execute(
+            '(query [:find ?e :where [?e :ident ":decision/x"]])'
+        ))
+        entity_uuid = queried["results"][0][0]
+        assert mcp_server._query_ident(real_db, f'#uuid "{entity_uuid}"') == ":decision/x"
+
+
+class TestUuidIdentBoostResolution:
+    """#194: a #uuid-tagged transact/retract against an entity that already
+    has an :ident fact must resolve to the keyword form for fact-index
+    purposes, so it stays eligible for fact_index._MEMORY_PREFIXES' BM25
+    boost."""
+
+    def test_transact_uuid_tagged_entity_resolves_to_ident_for_boost(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/x :description "hello"] [:decision/x :ident ":decision/x"]]',
+            reason="test",
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :description "hello"]]'
+        )
+        entity_uuid = queried["results"][0][0]
+
+        result = mcp_server.handle_minigraf_transact(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="test2"
+        )
+        assert result["ok"] is True
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(
+            index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
+        )
+        matching = [r for r in results if r[1] == ":status" and r[2] == "reviewed"]
+        assert matching
+        assert matching[0][0] == ":decision/x"
+
+    def test_transact_uuid_tagged_entity_without_ident_still_falls_back_to_uuid(self, real_db):
+        """No :ident fact anywhere for this entity -- must behave exactly
+        as before this change (index under the raw UUID), not raise or
+        drop the fact."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:module/auth :description "auth module"]]', reason="test"
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :description "auth module"]]'
+        )
+        entity_uuid = queried["results"][0][0]
+
+        result = mcp_server.handle_minigraf_transact(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="test2"
+        )
+        assert result["ok"] is True
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(
+            index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
+        )
+        matching = [r for r in results if r[1] == ":status" and r[2] == "reviewed"]
+        assert matching
+        assert matching[0][0] == entity_uuid
+
+    def test_retract_uuid_tagged_entity_removes_resolved_ident_row(self, real_db):
+        """Retract-side symmetry: the row _transact indexed under the
+        resolved keyword ident must actually be the row _retract deletes --
+        otherwise the delete targets a nonexistent raw-UUID row and leaves
+        a stale entry behind."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/x :description "hello"] [:decision/x :ident ":decision/x"]]',
+            reason="test",
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :description "hello"]]'
+        )
+        entity_uuid = queried["results"][0][0]
+        mcp_server.handle_minigraf_transact(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="test2"
+        )
+
+        result = mcp_server.handle_minigraf_retract(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="cleanup"
+        )
+        assert result["ok"] is True
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(
+            index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
+        )
+        assert results == []
+
+
 class TestParseTxResult:
     """#175: minigraf's real execute() output uses "transacted"/"retracted"
     keys, never "tx" -- _parse_tx_result must read the key that's actually

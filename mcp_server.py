@@ -3338,11 +3338,10 @@ def _parse_facts_block(facts_str: str) -> List[Tuple[str, str, str]]:
     entity reference) otherwise. #uuid/#inst-tagged entity references and
     values are also captured, with the tag stripped and the raw UUID/
     timestamp text kept as the indexed entity/value (#177) -- this is not
-    a keyword ident, so entity identity in the index can fragment across a
-    keyword-tagged create and a later #uuid-tagged update of the same
-    graph entity; pass index_triples explicitly (see handle_minigraf_audit)
-    when a resolved keyword ident is available and identity consistency
-    matters more than a mechanical capture.
+    a keyword ident, so a caller wanting identity-resolved output should use
+    _resolved_facts_triples() instead, which wraps this function and
+    resolves #uuid-tagged entities to their stored :ident when one exists
+    (#194).
     """
     triples = []
     for m in _FACTS_TRIPLE_PATTERN.finditer(facts_str):
@@ -3353,6 +3352,54 @@ def _parse_facts_block(facts_str: str) -> List[Tuple[str, str, str]]:
             _unwrap_facts_block_token(raw_value),
         ))
     return triples
+
+
+def _query_ident(db: Any, entity_ref: str) -> Optional[str]:
+    """Look up the :ident fact for entity_ref -- a bare keyword literal
+    (e.g. ':decision/x') or a #uuid "..."-tagged literal -- returning the
+    stored keyword ident string, or None if no :ident fact exists or the
+    query fails. Never raises: a caller resolving an entity for fact-index
+    purposes must fall back to the raw entity_ref on any failure, not break
+    a write that has already committed by the time this runs (#194).
+    """
+    try:
+        raw = _db_execute(db, f'(query [:find ?v :where [{entity_ref} :ident ?v]])')
+        result = _parse_query_result(raw)
+        if result.get("ok"):
+            for row in result.get("results", []):
+                if row and isinstance(row[0], str):
+                    return row[0]
+    except Exception as e:
+        print(f"[fact_index] ident lookup failed for {entity_ref}: {e}", file=sys.stderr)
+    return None
+
+
+def _resolved_facts_triples(facts_str: str, db: Any) -> List[Tuple[str, str, str]]:
+    """Parse facts_str via _parse_facts_block, then resolve any #uuid/#inst
+    -tagged entity (identified post-unwrap by not starting with ':') to its
+    stored keyword :ident via _query_ident, falling back to the raw
+    UUID/timestamp text when no :ident fact exists (#194) -- without this,
+    a fact transacted against a #uuid-tagged reference to an existing
+    memory-category entity indexes under the opaque UUID and never gets
+    fact_index._MEMORY_PREFIXES' BM25 boost, even though it's a fact about
+    that same entity. Resolutions are cached per call so a UUID referenced
+    by multiple triples in one transact/retract only queries once.
+
+    This is the default deriver _transact/_retract use when the caller
+    doesn't pass index_triples explicitly. A caller that already has a
+    resolved ident more cheaply available (see handle_minigraf_audit)
+    should keep passing index_triples to skip these queries entirely.
+    """
+    triples = _parse_facts_block(facts_str)
+    cache: Dict[str, Optional[str]] = {}
+    resolved = []
+    for entity, attribute, value in triples:
+        if not entity.startswith(":"):
+            if entity not in cache:
+                cache[entity] = _query_ident(db, f'#uuid "{entity}"')
+            entity = cache[entity] or entity
+        resolved.append((entity, attribute, value))
+    return resolved
 
 
 def _index_write(
@@ -3456,21 +3503,21 @@ def _transact(
     (see the design doc). This is the one behavior change from the base
     branch's _transact: previously bounded transacts were skipped entirely.
 
-    index_triples defaults to auto-parsing datalog_facts via
-    _parse_facts_block() (which returns 3-tuples (entity, attribute, value)
-    -- the window is appended here, not inside that function, since
-    _parse_facts_block has no way to know valid_from/valid_to); pass
-    index_triples explicitly when the Datalog string's own entity reference
-    isn't the searchable identity (e.g. handle_minigraf_audit's #uuid-tagged
-    retracts, whose index_triples must use the resolved keyword ident
-    instead) -- in that case pass 3-tuples too, the window is still appended
-    here uniformly.
+    index_triples defaults to auto-deriving via _resolved_facts_triples()
+    (which returns 3-tuples (entity, attribute, value), resolving any
+    #uuid-tagged entity to its stored :ident when one exists, #194 -- the
+    window is appended here, not inside that function, since it has no way
+    to know valid_from/valid_to); pass index_triples explicitly when a
+    caller already has a resolved keyword ident more cheaply available than
+    a fresh query would provide (e.g. handle_minigraf_audit, which already
+    fetched the entity's attributes including :ident) -- in that case pass
+    3-tuples too, the window is still appended here uniformly.
     """
     opts = f':valid-from "{valid_from}"'
     if valid_to is not None:
         opts += f' :valid-to "{valid_to}"'
     raw = _db_execute(db, f"(transact {{{opts}}} {datalog_facts})")
-    triples_3 = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
+    triples_3 = index_triples if index_triples is not None else _resolved_facts_triples(datalog_facts, db)
     triples_5 = [(e, a, v, valid_from, valid_to) for e, a, v in triples_3]
     _index_write("insert", triples_5, index_con=index_con)
     return raw
@@ -3484,15 +3531,16 @@ def _retract(
 ) -> str:
     """Execute (retract datalog_facts) against minigraf, then delete the
     matching CURRENT row from the fact index (same decoupling as _transact
-    -- index_triples overrides auto-derivation when the Datalog entity
-    reference isn't the searchable identity). delete_facts only ever
+    -- index_triples overrides auto-derivation (_resolved_facts_triples, which
+    resolves #uuid-tagged entities to their :ident when available, #194) when a
+    caller already has a resolved ident more cheaply available). delete_facts only ever
     targets valid_to IS NULL rows, so historical rows from an earlier
     lifecycle of the same (entity, attribute, value) are untouched -- pass
     None, None for the window here unconditionally, since a retract only
     ever means "remove the live assertion."
     """
     raw = _db_execute(db, f"(retract {datalog_facts})")
-    triples_3 = index_triples if index_triples is not None else _parse_facts_block(datalog_facts)
+    triples_3 = index_triples if index_triples is not None else _resolved_facts_triples(datalog_facts, db)
     triples_5 = [(e, a, v, None, None) for e, a, v in triples_3]
     _index_write("delete", triples_5, index_con=index_con)
     return raw
