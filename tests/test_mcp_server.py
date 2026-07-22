@@ -5805,6 +5805,48 @@ class TestExtractCommit:
         assert gitlink_changes == [("add", sub_hash, "vendor/lib")]
         assert gitmodules_map == {"vendor/lib": {"name": "lib", "url": "https://example.com/lib.git"}}
 
+    def test_gitlink_add_respects_ignore_patterns(self, tmp_path):
+        """#188: a gitlink path matching an ignore pattern must be excluded from
+        gitlink_changes exactly like a regular file would be — and must not
+        trigger the .gitmodules read either (gitmodules_map stays empty)."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        _subprocess.run(["git", "init"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--allow-empty", "-m", "e"], cwd=sub, check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=sub, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        (repo / ".gitmodules").write_text(
+            '[submodule "lib"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n'
+        )
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},vendor/lib"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "add", ".gitmodules"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, gitlink_changes, gitmodules_map, _renamed_pairs = mcp_server._extract_commit(
+            str(repo), commits[0][0], ignore_patterns=["vendor/"],
+        )
+
+        assert results == []
+        assert gitlink_changes == [], \
+            "gitlink under an ignored directory must be excluded, same as a regular ignored file"
+        assert gitmodules_map == {}, \
+            ".gitmodules must not be read at all once the only gitlink add is ignored"
+
     def test_segment_index_built_once_per_commit_not_per_file(self, git_repo_with_deps, monkeypatch):
         """#102: the tier 3a/3b index must be built once per commit and reused
         across every file's import resolution in that commit, not rebuilt per file."""
@@ -10645,6 +10687,72 @@ class TestGitIngestionPathIgnore:
             mcp_server._db = None
 
     @pytest.mark.asyncio
+    async def test_gitlink_under_default_ignored_directory_is_not_ingested(
+        self, tmp_path, monkeypatch
+    ):
+        """#188: a git submodule under a default-ignored directory (vendor/)
+        must not produce a :type/external-dependency entity, mirroring
+        test_default_ignored_directory_produces_no_code_entities above but for
+        the gitlink path, which previously bypassed ignore-pattern filtering
+        entirely."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        _subprocess.run(["git", "init"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=sub, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--allow-empty", "-m", "e"], cwd=sub, check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=sub, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        (repo / ".gitmodules").write_text(
+            '[submodule "lib"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n'
+        )
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},vendor/lib"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(["git", "add", ".gitmodules"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(repo / "memory.graph"))
+        mcp_server._ingest_progress = self._make_progress()
+
+        transact_calls: list = []
+        real_ingest_transact = mcp_server._ingest_transact
+
+        def capture_transact(db, triples, ts_iso, reason="", index_con=None):
+            transact_calls.extend(triples)
+            return real_ingest_transact(db, triples, ts_iso, reason, index_con=index_con)
+
+        monkeypatch.setattr(mcp_server, "_ingest_transact", capture_transact)
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+
+            ident = mcp_server._code_ident("module", "vendor/lib")
+            assert not any(ident in t for t in transact_calls), \
+                "gitlink under vendor/ must not be ingested, matching regular-file ignore behavior"
+
+            db = mcp_server.get_db()
+            real_execute = mcp_server._db_execute
+            results = json.loads(
+                real_execute(db, "(query [:find ?e :where [?e :entity-type :type/external-dependency]])")
+            ).get("results", [])
+            assert results == [], \
+                "no external-dependency entity should exist for a submodule under the ignored vendor/ directory"
+        finally:
+            mcp_server._db = None
+
+    @pytest.mark.asyncio
     async def test_import_into_ignored_path_becomes_external_dependency(
         self, tmp_path, monkeypatch
     ):
@@ -11012,7 +11120,7 @@ class TestRunIngestionGitlinks:
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
 
-    def _add_submodule_commit(self, repo, path="vendor/lib", name="lib", url="https://example.com/lib.git"):
+    def _add_submodule_commit(self, repo, path="modules/lib", name="lib", url="https://example.com/lib.git"):
         sub = repo.parent / f"{repo.name}-sub"
         _subprocess.run(["git", "init", "-q", str(sub)], check=True, capture_output=True)
         _subprocess.run(["git", "-C", str(sub), "config", "user.email", "t@t.com"], check=True, capture_output=True)
@@ -11056,7 +11164,7 @@ class TestRunIngestionGitlinks:
         try:
             await mcp_server._run_ingestion(str(repo), "HEAD")
 
-            ident = mcp_server._code_ident("module", "vendor/lib")
+            ident = mcp_server._code_ident("module", "modules/lib")
             assert any(f"[{ident} :entity-type :type/external-dependency]" in t for t in transact_calls)
             assert any(f'[{ident} :pinned-commit "{sub_hash}"]' in t for t in transact_calls)
             assert any(f'[{ident} :submodule-name "lib"]' in t for t in transact_calls)
@@ -11095,7 +11203,7 @@ class TestRunIngestionGitlinks:
             ["git", "-C", str(sub_dir), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
         ).stdout.strip()
         _subprocess.run(
-            ["git", "update-index", "--cacheinfo", f"160000,{second_sha},vendor/lib"],
+            ["git", "update-index", "--cacheinfo", f"160000,{second_sha},modules/lib"],
             cwd=repo, check=True, capture_output=True,
         )
         _subprocess.run(["git", "commit", "-m", "bump submodule"], cwd=repo, check=True, capture_output=True)
@@ -11119,7 +11227,7 @@ class TestRunIngestionGitlinks:
         try:
             await mcp_server._run_ingestion(str(repo), "HEAD")
 
-            ident = mcp_server._code_ident("module", "vendor/lib")
+            ident = mcp_server._code_ident("module", "modules/lib")
             assert any(f'[{ident} :pinned-commit "{first_sha}"]' in t for t in close_triples_seen)
 
             # Verified against the REAL backend via real bi-temporal queries:
@@ -11153,7 +11261,7 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         self._add_submodule_commit(repo)
 
-        _subprocess.run(["git", "rm", "-f", "vendor/lib"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "rm", "-f", "modules/lib"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "remove submodule"], cwd=repo, check=True, capture_output=True)
 
         mcp_server._db = None
@@ -11172,7 +11280,7 @@ class TestRunIngestionGitlinks:
         try:
             await mcp_server._run_ingestion(str(repo), "HEAD")
 
-            ident = mcp_server._code_ident("module", "vendor/lib")
+            ident = mcp_server._code_ident("module", "modules/lib")
             assert any(f'[{ident} :ident "{ident}"]' in t for t in close_triples_seen)
 
             # Verified against the REAL backend: the removed submodule's
@@ -11210,7 +11318,7 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         self._add_submodule_commit(repo)
-        _subprocess.run(["git", "rm", "-f", "vendor/lib"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "rm", "-f", "modules/lib"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "remove submodule"], cwd=repo, check=True, capture_output=True)
 
         # Real backend: real MiniGrafDb, real execute, real persistence.
@@ -11230,7 +11338,7 @@ class TestRunIngestionGitlinks:
 
         assert count(":entity-type", ":type/external-dependency") == 0, \
             "removed submodule's :entity-type must be closed (issue #137)"
-        assert count(":path", '"vendor/lib"') == 0, \
+        assert count(":path", '"modules/lib"') == 0, \
             "removed submodule's :path must be closed (issue #137)"
 
         mcp_server._db = None  # release the real file lock for subsequent tests
@@ -11238,7 +11346,7 @@ class TestRunIngestionGitlinks:
 
 class TestSubmoduleDependencyLinking:
     """Issue #112: a dependency-edge stub created from an unresolvable
-    include path (e.g. #include "vendor/libX/api.h") and the submodule's own
+    include path (e.g. #include "modules/libX/api.h") and the submodule's own
     entity (from .gitmodules / gitlink mode 160000) are computed via two
     different ident schemes — _canonical_ident("module", import_name) for the
     stub vs. _code_ident("module", path) for the submodule — so they land as
@@ -11252,7 +11360,7 @@ class TestSubmoduleDependencyLinking:
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
 
-    def _add_submodule_commit(self, repo, path="vendor/libX", name="libX", url="https://example.com/libX.git"):
+    def _add_submodule_commit(self, repo, path="modules/libX", name="libX", url="https://example.com/libX.git"):
         sub = repo.parent / f"{repo.name}-sub"
         _subprocess.run(["git", "init", "-q", str(sub)], check=True, capture_output=True)
         _subprocess.run(["git", "-C", str(sub), "config", "user.email", "t@t.com"], check=True, capture_output=True)
@@ -11282,7 +11390,7 @@ class TestSubmoduleDependencyLinking:
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
-        (repo / "consumer.py").write_text("import vendor.libX.api\n")
+        (repo / "consumer.py").write_text("import modules.libX.api\n")
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add consumer"], cwd=repo, check=True, capture_output=True)
 
@@ -11302,8 +11410,8 @@ class TestSubmoduleDependencyLinking:
             raw = real_execute(db, query)
             return json.loads(raw).get("results", [])
 
-        stub_ident = mcp_server._canonical_ident("module", "vendor.libX.api")
-        submodule_ident = mcp_server._code_ident("module", "vendor/libX")
+        stub_ident = mcp_server._canonical_ident("module", "modules.libX.api")
+        submodule_ident = mcp_server._code_ident("module", "modules/libX")
         assert rows(f"(query [:find ?v :where [{stub_ident} :resolves-to ?v]])") == [[submodule_ident]], \
             "unresolved-include stub must gain a :resolves-to edge to the submodule entity (issue #112)"
 
@@ -11324,7 +11432,7 @@ class TestSubmoduleDependencyLinking:
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         self._add_submodule_commit(repo)
 
-        (repo / "consumer.py").write_text("import vendor.libX.api\n")
+        (repo / "consumer.py").write_text("import modules.libX.api\n")
         _subprocess.run(["git", "add", "consumer.py"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add consumer"], cwd=repo, check=True, capture_output=True)
 
@@ -11341,8 +11449,8 @@ class TestSubmoduleDependencyLinking:
             raw = real_execute(db, query)
             return json.loads(raw).get("results", [])
 
-        stub_ident = mcp_server._canonical_ident("module", "vendor.libX.api")
-        submodule_ident = mcp_server._code_ident("module", "vendor/libX")
+        stub_ident = mcp_server._canonical_ident("module", "modules.libX.api")
+        submodule_ident = mcp_server._code_ident("module", "modules/libX")
         assert rows(f"(query [:find ?v :where [{stub_ident} :resolves-to ?v]])") == [[submodule_ident]], \
             "stub created after the submodule already exists must link immediately (issue #112)"
 
