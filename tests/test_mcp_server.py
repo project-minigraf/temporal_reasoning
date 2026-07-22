@@ -829,6 +829,17 @@ class TestMinigrafTransact:
         results = fact_index.query_facts(index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[1] == ":status" and r[2] == "reviewed" for r in results)
 
+    def test_reports_real_tx_id_not_unknown(self, real_db):
+        """#175: the real minigraf library returns a "transacted" key, never
+        "tx" -- a successful transact must report that real id, not the
+        literal string "unknown"."""
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="test"
+        )
+        assert result["ok"] is True
+        assert result["tx"] != "unknown"
+
     def test_checkpoint_failure_after_successful_write_still_reports_ok(self, tmp_path, monkeypatch):
         """#176: the graph write (and fact-index write) already happened by
         the time _db_checkpoint runs -- a checkpoint-only failure must not be
@@ -933,6 +944,18 @@ class TestMinigrafRetract:
         results = fact_index.query_facts(index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
 
+    def test_reports_real_tx_id_not_unknown(self, real_db):
+        """#175 retract-side mirror: the real minigraf library returns a
+        "retracted" key, never "tx"."""
+        import mcp_server
+        real_db.execute('(transact {} [[:decision/old :description "deprecated"]])')
+
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/old :description "deprecated"]]', reason="gone"
+        )
+        assert result["ok"] is True
+        assert result["tx"] != "unknown"
+
     def test_checkpoint_failure_after_successful_write_still_reports_ok(self, tmp_path, monkeypatch):
         """#176 retract-side mirror: the retract itself already happened by
         the time _db_checkpoint runs, so a checkpoint-only failure must not
@@ -969,6 +992,28 @@ class TestMinigrafRetract:
             '[:find ?d :where [:decision/old :description ?d]]'
         )
         assert queried["results"] == []
+
+
+class TestParseTxResult:
+    """#175: minigraf's real execute() output uses "transacted"/"retracted"
+    keys, never "tx" -- _parse_tx_result must read the key that's actually
+    there instead of always falling back to the literal string "unknown"."""
+
+    def test_reads_transacted_key(self):
+        import mcp_server
+        result = mcp_server._parse_tx_result('{"transacted":1784641334419}')
+        assert result == {"ok": True, "tx": "1784641334419"}
+
+    def test_reads_retracted_key(self):
+        import mcp_server
+        result = mcp_server._parse_tx_result('{"retracted":1784641334420}')
+        assert result == {"ok": True, "tx": "1784641334420"}
+
+    def test_invalid_json_still_reports_error(self):
+        import mcp_server
+        result = mcp_server._parse_tx_result("not json")
+        assert result["ok"] is False
+        assert "error" in result
 
 
 class TestParseFactsBlock:
