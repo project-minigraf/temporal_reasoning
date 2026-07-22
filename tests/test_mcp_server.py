@@ -11755,6 +11755,88 @@ class TestExtractImportName:
         assert "github.com/user/pkg" in result
 
 
+class TestExtractCallName:
+    """Unit tests for _extract_call_name — regression coverage for #173, where
+    the callee's field name / node type convention (field "function", type
+    "identifier") assumed by the default branch does not hold for Java,
+    Kotlin, Swift, PHP, or Haskell."""
+
+    def test_default_convention_still_works(self, tmp_path):
+        """Go's call_expression matches the generic field="function"/type="identifier"
+        convention this helper falls back to for every language without a
+        dedicated branch — must keep working unchanged."""
+        pytest.importorskip("tree_sitter_go")
+        import mcp_server
+        source = b"func bar() { doStuff(1, 2) }"
+        node = _parse_import_node("go", source, "call_expression", tmp_path)
+        assert mcp_server._extract_call_name(node, "go") == "doStuff"
+
+    def test_java_method_invocation(self, tmp_path):
+        pytest.importorskip("tree_sitter_java")
+        import mcp_server
+        source = b"class Foo { void bar() { doStuff(1, 2); } }"
+        node = _parse_import_node("java", source, "method_invocation", tmp_path)
+        assert mcp_server._extract_call_name(node, "java") == "doStuff"
+
+    def test_kotlin_call_expression_has_no_field_name(self, tmp_path):
+        pytest.importorskip("tree_sitter_kotlin")
+        import mcp_server
+        source = b"fun bar() { doStuff(1, 2) }"
+        node = _parse_import_node("kotlin", source, "call_expression", tmp_path)
+        assert mcp_server._extract_call_name(node, "kotlin") == "doStuff"
+
+    def test_swift_call_expression_has_no_field_name(self, tmp_path):
+        pytest.importorskip("tree_sitter_swift")
+        import mcp_server
+        source = b"func bar() { doStuff(1, 2) }"
+        node = _parse_import_node("swift", source, "call_expression", tmp_path)
+        assert mcp_server._extract_call_name(node, "swift") == "doStuff"
+
+    def test_php_function_call_expression_callee_type_is_name(self, tmp_path):
+        pytest.importorskip("tree_sitter_php")
+        import mcp_server
+        source = b"<?php\nfunction bar() { doStuff(1, 2); }"
+        node = _parse_import_node("php", source, "function_call_expression", tmp_path)
+        assert mcp_server._extract_call_name(node, "php") == "doStuff"
+
+    def test_haskell_single_arg_apply(self, tmp_path):
+        pytest.importorskip("tree_sitter_haskell")
+        import mcp_server
+        source = b"main = doStuff 1"
+        node = _parse_import_node("haskell", source, "apply", tmp_path)
+        assert mcp_server._extract_call_name(node, "haskell") == "doStuff"
+
+    def test_haskell_curried_multi_arg_apply_via_walk_ast_no_duplicates(self, tmp_path):
+        """A curried call `doStuff 1 2` nests as two "apply" nodes sharing the
+        same innermost callee. _walk_ast visits both (both match the "calls"
+        node type), so the inner one must suppress itself or the single call
+        site is reported twice."""
+        pytest.importorskip("tree_sitter_haskell")
+        import mcp_server
+        source = b"main = doStuff 1 2"
+        tmp_file = tmp_path / "test.hs"
+        tmp_file.write_bytes(source)
+        parser = mcp_server._get_parser(str(tmp_file))
+        tree = parser.parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "haskell")
+        assert results["calls"] == ["doStuff"]
+
+    def test_haskell_separately_nested_call_still_counted(self, tmp_path):
+        """A genuinely separate call passed as an argument (not a curry link
+        of the same call) must still be extracted independently."""
+        pytest.importorskip("tree_sitter_haskell")
+        import mcp_server
+        source = b"main = doStuff (helper 1) 2"
+        tmp_file = tmp_path / "test.hs"
+        tmp_file.write_bytes(source)
+        parser = mcp_server._get_parser(str(tmp_file))
+        tree = parser.parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "haskell")
+        assert sorted(results["calls"]) == ["doStuff", "helper"]
+
+
 def test_schema_has_renamed_from_and_to_on_code_entities():
     import mcp_server
     for entity_type in ("module", "function", "class", "variable", "field"):
