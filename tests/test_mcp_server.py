@@ -359,6 +359,66 @@ class TestGetDbLockRetry:
         )
 
 
+class TestClearStaleLockReverifiesCurrentHolder:
+    """Regression tests for #178: _clear_stale_lock must re-read the lock
+    file's *current* contents immediately before deleting it, and only
+    delete if it still names the PID it was asked to clear. Without this,
+    a lock file that changed hands between the original failed open (T0,
+    when holder_pid was extracted from the error) and this call (T1) would
+    be deleted out from under a new, live, legitimate holder just because
+    the *original* holder_pid happened to be dead."""
+
+    def test_does_not_delete_lock_now_held_by_a_different_live_process(self, tmp_path):
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        lock_path = graph_path + ".lock"
+
+        with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
+            pass  # holder opened, printed its PID, and is confirmed reaped/dead
+
+        # Simulate a new, live, legitimate holder having since acquired the
+        # lock at this same path (our own real PID stands in for "a
+        # different, live process").
+        new_holder_pid = os.getpid()
+        with open(lock_path, "w") as f:
+            f.write(str(new_holder_pid))
+
+        # Called with the stale holder_pid extracted from the earlier (T0)
+        # error, which is genuinely dead -- but the lock file no longer
+        # names that PID.
+        assert mcp_server._clear_stale_lock(graph_path, dead_pid) is False
+        assert os.path.exists(lock_path)
+        with open(lock_path) as f:
+            assert f.read().strip() == str(new_holder_pid)
+
+    def test_still_deletes_lock_that_still_names_the_dead_holder(self, tmp_path):
+        """Same-shape regression guard as the existing
+        test_self_heals_stale_lock_from_dead_pid, kept here alongside the
+        new re-verification test so the two behaviors (delete when still
+        stale, don't delete when reclaimed) are visible side by side."""
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+        lock_path = graph_path + ".lock"
+
+        with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
+            pass
+
+        with open(lock_path, "w") as f:
+            f.write(str(dead_pid))
+
+        assert mcp_server._clear_stale_lock(graph_path, dead_pid) is True
+        assert not os.path.exists(lock_path)
+
+    def test_missing_lock_file_returns_false(self, tmp_path):
+        """Another race shape: something else already removed the lock file
+        between the failed open and this call. No file to re-verify against
+        -- nothing to delete, must not raise."""
+        import mcp_server
+        graph_path = str(tmp_path / "t.graph")
+
+        assert mcp_server._clear_stale_lock(graph_path, 999999) is False
+
+
 class TestTryOpenWithSelfHealReuse:
     """Regression test for #107: minigraf_ingest_status incorrectly reported
     "Database is locked by another process" while minigraf_ingest_git was

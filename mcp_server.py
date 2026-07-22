@@ -2813,12 +2813,28 @@ def _pid_is_alive(pid: int) -> bool:
 def _clear_stale_lock(path: str, holder_pid: int) -> bool:
     """Remove path's lock file if its recorded holder process is no longer alive.
 
+    holder_pid is extracted from an earlier lock-contention error (at time
+    T0); by the time this runs (T1), the lock file may have already changed
+    hands to a different, live, legitimate holder. Re-reads the lock file's
+    *current* contents immediately before deleting and only proceeds if it
+    still names holder_pid, to avoid stripping a live holder of its lock
+    protection (#178). This narrows but does not eliminate the underlying
+    TOCTOU race -- a gap remains between this re-check and the os.remove.
+
     Returns True if a stale lock was removed.
     """
     if _pid_is_alive(holder_pid):
         return False  # holder still alive (or we lack permission to tell — leave it)
+    lock_path = path + ".lock"
     try:
-        os.remove(path + ".lock")
+        with open(lock_path) as f:
+            current_holder = f.read().strip()
+    except OSError:
+        return False  # no lock file (already cleared by someone else)
+    if current_holder != str(holder_pid):
+        return False  # reclaimed by a different holder since T0 — not ours to clear
+    try:
+        os.remove(lock_path)
         return True
     except OSError:
         return False
