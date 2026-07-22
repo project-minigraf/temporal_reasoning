@@ -4236,6 +4236,50 @@ class TestLuaGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestLuaFunctions:
+    """Regression tests for #171: named Lua function statements parse as
+    `function_declaration` in the real tree-sitter-lua grammar, not the
+    `function_definition` type `_LANG_NODE_TYPES["lua"]["functions"]` used
+    to assume -- so no Lua function was ever extracted via the generic
+    _walk_ast/_collect_entity_nodes dispatch."""
+
+    def _parser(self):
+        import tree_sitter_lua
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_lua.language()))
+
+    def test_walk_ast_extracts_top_level_function(self):
+        import mcp_server
+        tree = self._parser().parse(b"function foo()\n  return 1\nend\n")
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "lua")
+        assert results["functions"] == ["foo"]
+
+    def test_walk_ast_extracts_local_function(self):
+        import mcp_server
+        tree = self._parser().parse(b"local function bar()\n  return 2\nend\n")
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "lua")
+        assert results["functions"] == ["bar"]
+
+    def test_collect_entity_nodes_extracts_function(self):
+        import mcp_server
+        tree = self._parser().parse(b"function foo()\n  return 1\nend\n")
+        result = mcp_server._collect_entity_nodes(tree.root_node, "lua")
+        assert "foo" in result["function"]
+
+    def test_anonymous_function_expression_not_captured(self):
+        # `t.qux = function() end` parses its RHS as a `function_definition`
+        # node, which never carries a "name" field -- verified empirically --
+        # so it correctly surfaces no function name, same as an anonymous
+        # function expression in any other language.
+        import mcp_server
+        tree = self._parser().parse(b"t.qux = function()\n  return 4\nend\n")
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "lua")
+        assert results["functions"] == []
+
+
 class TestElixirGlobalsAndFields:
     def _parser(self):
         import tree_sitter_elixir

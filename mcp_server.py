@@ -326,7 +326,13 @@ _LANG_NODE_TYPES: Dict[str, Dict[str, set]] = {
         "calls": {"apply"},
     },
     "lua": {
-        "functions": {"function_definition"},
+        # Named function statements (`function foo() end`, `local function
+        # bar() end`, `function t.baz() end`, `function t:qux() end`) parse
+        # as "function_declaration" in the real tree-sitter-lua grammar, with
+        # a "name" field -- verified empirically (#171). "function_definition"
+        # is the anonymous `function() end` expression form and never carries
+        # a "name" field, so it can never surface a function name here.
+        "functions": {"function_declaration"},
         "classes": set(),
         "imports": {"function_call"},
         "calls": set(),
