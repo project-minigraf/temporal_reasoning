@@ -809,6 +809,31 @@ class TestMinigrafRetract:
         results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
 
+    def test_retract_uuid_tagged_entity_removes_from_fact_index(self, real_db):
+        """#177 retract-side mirror: a #uuid-tagged retract must remove the
+        row _transact indexed under the same raw UUID entity string."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/x :description "hello"]]', reason="test"
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :description "hello"]]'
+        )
+        entity_uuid = queried["results"][0][0]
+        mcp_server.handle_minigraf_transact(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="test2"
+        )
+
+        result = mcp_server.handle_minigraf_retract(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="cleanup"
+        )
+        assert result["ok"] is True
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0)
+        assert results == []
+
 
 class TestParseFactsBlock:
     def test_single_string_valued_triple(self):
@@ -883,6 +908,20 @@ class TestParseFactsBlock:
         )
         assert result == [
             (":decision/x", ":created-at", "2026-01-01T00:00:00.000Z"),
+        ]
+
+    def test_uuid_tagged_entity_and_value_in_same_triple(self):
+        import mcp_server
+        result = mcp_server._parse_facts_block(
+            '[#uuid "b14d54ed-41b3-5675-a334-26f9fbcba5fe" :resolves-to '
+            '#uuid "c25e65fe-52c4-6786-b445-37f0fcba6f6f"]'
+        )
+        assert result == [
+            (
+                "b14d54ed-41b3-5675-a334-26f9fbcba5fe",
+                ":resolves-to",
+                "c25e65fe-52c4-6786-b445-37f0fcba6f6f",
+            ),
         ]
 
 
