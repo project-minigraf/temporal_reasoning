@@ -7,6 +7,7 @@ Sole interface to the minigraf .graph file via the MiniGrafDb Python binding.
 """
 import asyncio
 import concurrent.futures
+import concurrent.futures.process
 import configparser
 import contextlib
 import datetime
@@ -6316,7 +6317,32 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # ingestion run — including the many existing tests that drive
                     # _run_ingestion through a real ProcessPoolExecutor worker — would
                     # otherwise fail with "too many values to unpack".
-                    extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
+                    try:
+                        extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
+                    except concurrent.futures.process.BrokenProcessPool:
+                        # The whole worker pool died (OOM kill, native segfault) --
+                        # every other pending future in the sliding window is
+                        # equally poisoned, so this is not isolable to one commit
+                        # (see this function's docstring). Propagate to the outer
+                        # handler as before.
+                        raise
+                    except Exception as e:
+                        # Ordinary extraction failure (bad git ref, unreadable
+                        # blob, unsupported syntax) -- isolate it to this one
+                        # commit instead of aborting the whole run, matching this
+                        # function's own documented "fail only the one commit"
+                        # contract and the per-file try/except _extract_commit
+                        # already uses one level down for content-fetch failures.
+                        print(
+                            f"[_run_ingestion] skipping unreadable commit {commit_hash} "
+                            f"({subject!r}): {e}",
+                            file=sys.stderr,
+                        )
+                        submit_next()
+                        _ingest_progress["current_commit"] = commit_hash
+                        _ingest_progress["processed"] += 1
+                        await asyncio.sleep(0)  # yield to event loop
+                        continue
                     submit_next()
 
                     last_hash = commit_hash
