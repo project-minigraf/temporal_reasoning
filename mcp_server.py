@@ -773,6 +773,33 @@ def _c_family_function_name(node) -> Optional[str]:
     return None
 
 
+def _go_struct_type_specs(node) -> List[Tuple[str, Any]]:
+    """Resolve (name, type_spec) pairs for struct types from a Go
+    `type_declaration` node.
+
+    Unlike most tree-sitter grammars, `type_declaration` has no `name` field
+    of its own -- it belongs to the nested `type_spec` child(ren), one level
+    down (#172). A grouped `type (\n A struct{...}\n B struct{...}\n)` block
+    keeps its `type_spec` children direct (no `type_spec_list` wrapper,
+    unlike grouped `var (...)`) -- verified empirically -- so a single
+    `type_declaration` node can carry more than one struct. Scoped to struct
+    types only, matching `_extract_go_globals_and_fields`'s existing scope
+    (a plain alias like `type MyInt int` has no fields to attribute, so it's
+    not treated as a class-equivalent entity here).
+    """
+    results: List[Tuple[str, Any]] = []
+    for type_spec in node.children:
+        if type_spec.type != "type_spec":
+            continue
+        struct_type = type_spec.child_by_field_name("type")
+        if struct_type is None or struct_type.type != "struct_type":
+            continue
+        name_node = type_spec.child_by_field_name("name")
+        if name_node:
+            results.append((name_node.text.decode("utf-8"), type_spec))
+    return results
+
+
 def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
     """Recursively extract code entities from a tree-sitter AST node.
 
@@ -823,10 +850,14 @@ def _walk_ast(node, results: Dict[str, List[str]], lang_name: str) -> None:
                 results["functions"].append(name)
 
     elif node.type in node_types.get("classes", set()):
-        name_node = node.child_by_field_name("name")
-        if name_node:
-            name = name_node.text.decode("utf-8")
-            results["classes"].append(name)
+        if lang_name == "go":
+            for name, _type_spec in _go_struct_type_specs(node):
+                results["classes"].append(name)
+        else:
+            name_node = node.child_by_field_name("name")
+            if name_node:
+                name = name_node.text.decode("utf-8")
+                results["classes"].append(name)
 
     elif node.type in node_types.get("imports", set()):
         names = _extract_import_name(node, lang_name)
@@ -2845,9 +2876,13 @@ def _collect_entity_nodes(root_node: Any, lang_name: str) -> Dict[str, Dict[str,
                 if name_node:
                     result["function"][name_node.text.decode("utf-8")] = node
         elif node.type in node_types.get("classes", set()):
-            name_node = node.child_by_field_name("name")
-            if name_node:
-                result["class"][name_node.text.decode("utf-8")] = node
+            if lang_name == "go":
+                for name, type_spec in _go_struct_type_specs(node):
+                    result["class"][name] = type_spec
+            else:
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    result["class"][name_node.text.decode("utf-8")] = node
         for child in node.children:
             walk(child)
 

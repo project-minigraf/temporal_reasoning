@@ -3265,6 +3265,77 @@ class TestRustGoCGlobalsAndFields:
         assert info["b"] == ("Foo", False)
 
 
+class TestGoStructClasses:
+    """Regression tests for #172: `type_declaration` has no `name` field of
+    its own in the real tree-sitter-go grammar -- it belongs to the nested
+    `type_spec` child, one level down. `_walk_ast`/`_collect_entity_nodes`'s
+    generic `node.child_by_field_name("name")` lookup on `type_declaration`
+    itself always returned None, so no Go struct/type was ever extracted as
+    a class via the generic dispatch (same failure mode as #170/#171)."""
+
+    def _parser(self):
+        import tree_sitter_go
+        from tree_sitter import Language, Parser
+        return Parser(Language(tree_sitter_go.language()))
+
+    def test_walk_ast_extracts_struct_type(self):
+        import mcp_server
+        source = b"package main\n\ntype Foo struct {\n\tField1 int\n}\n"
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "go")
+        assert results["classes"] == ["Foo"]
+
+    def test_walk_ast_extracts_all_specs_in_grouped_type_block(self):
+        # A grouped `type (...)` block keeps its type_spec children direct
+        # (no type_spec_list wrapper, unlike grouped var blocks) -- verified
+        # empirically -- so a single type_declaration node can carry more
+        # than one struct.
+        import mcp_server
+        source = (
+            b"package main\n\ntype (\n\tBar struct {\n\t\tX int\n\t}\n"
+            b"\tBaz struct {\n\t\tY int\n\t}\n)\n"
+        )
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "go")
+        assert results["classes"] == ["Bar", "Baz"]
+
+    def test_walk_ast_non_struct_type_alias_not_captured(self):
+        # `type MyInt int` has no fields to attribute, so it's not treated
+        # as a class-equivalent entity, matching
+        # _extract_go_globals_and_fields's existing struct-only scope.
+        import mcp_server
+        source = b"package main\n\ntype MyInt int\n"
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "go")
+        assert results["classes"] == []
+
+    def test_collect_entity_nodes_extracts_struct_type(self):
+        import mcp_server
+        source = b"package main\n\ntype Foo struct {\n\tField1 int\n}\n"
+        tree = self._parser().parse(source)
+        result = mcp_server._collect_entity_nodes(tree.root_node, "go")
+        assert "Foo" in result["class"]
+
+    def test_collect_entity_nodes_grouped_specs_have_distinct_bodies(self):
+        # Each name in a grouped type block must map to its OWN type_spec
+        # node, not the shared parent type_declaration -- otherwise two
+        # different structs in the same group would compare as having
+        # identical body text to the rename matcher.
+        import mcp_server
+        source = (
+            b"package main\n\ntype (\n\tBar struct {\n\t\tX int\n\t}\n"
+            b"\tBaz struct {\n\t\tY int\n\t}\n)\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._collect_entity_nodes(tree.root_node, "go")
+        assert result["class"]["Bar"].text != result["class"]["Baz"].text
+        assert b"Bar" in result["class"]["Bar"].text
+        assert b"Baz" in result["class"]["Baz"].text
+
+
 class TestJavaCSharpGlobalsAndFields:
     def _java_parser(self):
         import tree_sitter_java
