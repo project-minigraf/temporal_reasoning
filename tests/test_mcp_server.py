@@ -1622,6 +1622,93 @@ class TestLlmStrategy:
         assert queried["results"] == [["Kafka"]]
 
 
+class TestLlmStrategyEventLoopNonBlocking:
+    def test_slow_call_llm_does_not_block_concurrent_coroutine(self, real_db, monkeypatch):
+        """#180: a slow/hanging LLM provider call must not freeze the whole
+        asyncio event loop -- other coroutines (heartbeats, other tool calls)
+        need to keep making progress while _call_llm is in flight. Uses
+        absolute wall-clock enter/exit timestamps from the blocking call
+        itself (not a per-task relative clock, which can't distinguish "ticked
+        before the block started" from "ticked during it")."""
+        monkeypatch.setenv("MINIGRAF_EXTRACTION_STRATEGY", "llm")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        import mcp_server
+
+        call_times = {}
+
+        def slow_call_llm(model, prompt):
+            call_times["enter"] = time.monotonic()
+            time.sleep(0.3)
+            call_times["exit"] = time.monotonic()
+            return "[]"
+
+        monkeypatch.setattr(mcp_server, "_call_llm", slow_call_llm)
+
+        heartbeat_ticks = []
+
+        async def heartbeat():
+            for _ in range(20):
+                heartbeat_ticks.append(time.monotonic())
+                await asyncio.sleep(0.03)
+
+        async def run_both():
+            await asyncio.gather(
+                mcp_server.handle_memory_finalize_turn("User: test\nAgent: ok"),
+                heartbeat(),
+            )
+
+        asyncio.run(run_both())
+
+        assert "enter" in call_times and "exit" in call_times
+        overlapping = [
+            t for t in heartbeat_ticks if call_times["enter"] < t < call_times["exit"]
+        ]
+        assert overlapping, (
+            "no heartbeat ticks landed between the LLM call's enter/exit -- "
+            "the event loop was blocked for the full duration of the call "
+            "instead of yielding to other coroutines"
+        )
+
+    def test_call_llm_client_construction_sets_timeout(self, monkeypatch):
+        """A hung provider must not block indefinitely even inside the
+        executor thread -- both clients must be built with an explicit
+        timeout."""
+        import mcp_server
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        captured = {}
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        fake_anthropic_module = MagicMock()
+        fake_anthropic_module.Anthropic = FakeAnthropic
+        with patch.dict(sys.modules, {"anthropic": fake_anthropic_module}):
+            mcp_server._get_anthropic_client()
+
+        assert "timeout" in captured
+        assert captured["timeout"] is not None
+
+    def test_call_llm_openai_client_construction_sets_timeout(self, monkeypatch):
+        import mcp_server
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        captured = {}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        fake_openai_module = MagicMock()
+        fake_openai_module.OpenAI = FakeOpenAI
+        with patch.dict(sys.modules, {"openai": fake_openai_module}):
+            mcp_server._get_openai_client()
+
+        assert "timeout" in captured
+        assert captured["timeout"] is not None
+
+
 class TestAgentStrategy:
     def test_returns_ok_result(self, real_db, monkeypatch):
         import asyncio

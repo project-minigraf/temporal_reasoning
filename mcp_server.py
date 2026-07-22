@@ -5343,6 +5343,9 @@ Conversation:
 {conversation}"""
 
 
+_LLM_CLIENT_TIMEOUT_SECONDS = float(os.environ.get("MINIGRAF_LLM_TIMEOUT_SECONDS", "30"))
+
+
 def _get_anthropic_client():
     """Return an Anthropic client. Raises if anthropic package or API key is missing."""
     try:
@@ -5352,7 +5355,7 @@ def _get_anthropic_client():
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
-    return anthropic.Anthropic(api_key=api_key)
+    return anthropic.Anthropic(api_key=api_key, timeout=_LLM_CLIENT_TIMEOUT_SECONDS)
 
 
 _OPENAI_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4")
@@ -5371,7 +5374,7 @@ def _get_openai_client():
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
-    return openai.OpenAI(api_key=api_key)
+    return openai.OpenAI(api_key=api_key, timeout=_LLM_CLIENT_TIMEOUT_SECONDS)
 
 
 def _strip_code_fences(text: str) -> str:
@@ -5609,7 +5612,15 @@ async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]
         return {"ok": True, "stored_count": stored, "strategy": "heuristic"}
 
     if strategy == "llm":
-        result = _llm_extract_and_transact(conversation_delta)
+        # _llm_extract_and_transact makes a blocking network call (_call_llm);
+        # run it in a worker thread so it can't freeze the shared event loop
+        # for other concurrent tool calls (#180), mirroring the executor
+        # pattern already used for fact-index rebuild and git ingestion.
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as llm_executor:
+            result = await loop.run_in_executor(
+                llm_executor, _llm_extract_and_transact, conversation_delta
+            )
         if result["ok"]:
             return result
         # LLM failed — fall back to heuristic and surface a warning so the user
