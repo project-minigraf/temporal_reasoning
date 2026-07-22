@@ -3286,7 +3286,8 @@ def _parse_tx_result(raw_json: str) -> Dict[str, Any]:
     """Parse JSON returned by MiniGrafDb.execute() for a transact/retract command."""
     try:
         data = json.loads(raw_json)
-        return {"ok": True, "tx": str(data.get("tx", "unknown"))}
+        tx = data.get("transacted", data.get("retracted", data.get("tx", "unknown")))
+        return {"ok": True, "tx": str(tx)}
     except json.JSONDecodeError as e:
         return {"ok": False, "error": f"Unexpected result format: {e} — raw: {raw_json[:200]}"}
 
