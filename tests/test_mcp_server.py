@@ -910,10 +910,10 @@ class TestMinigrafRetract:
         import mcp_server
         import fact_index
         mcp_server.handle_minigraf_transact(
-            '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
+            '[[:service/use-redis :description "use redis for caching"]]', reason="test"
         )
         mcp_server.handle_minigraf_retract(
-            '[[:decision/use-redis :description "use redis for caching"]]', reason="cleanup"
+            '[[:service/use-redis :description "use redis for caching"]]', reason="cleanup"
         )
         index_path = fact_index.index_path_for(mcp_server._graph_path)
         results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0)
@@ -992,6 +992,209 @@ class TestMinigrafRetract:
             '[:find ?d :where [:decision/old :description ?d]]'
         )
         assert queried["results"] == []
+
+
+class TestQueryIdent:
+    def test_returns_ident_when_present(self, real_db):
+        import mcp_server
+        real_db.execute('(transact {} [[:decision/x :ident ":decision/x"]])')
+        assert mcp_server._query_ident(real_db, ":decision/x") == ":decision/x"
+
+    def test_returns_none_when_absent(self, real_db):
+        import mcp_server
+        real_db.execute('(transact {} [[:decision/x :description "hello"]])')
+        assert mcp_server._query_ident(real_db, ":decision/x") is None
+
+    def test_returns_none_on_malformed_uuid_ref(self, real_db):
+        """A non-UUID string wrapped in #uuid "..." fails minigraf's EDN
+        parse with a MiniGrafError -- _query_ident must catch that and
+        return None, not raise (confirmed empirically: minigraf raises
+        MiniGrafError.Other(msg='Invalid UUID') for this input)."""
+        import mcp_server
+        assert mcp_server._query_ident(real_db, '#uuid "not-a-uuid"') is None
+
+    def test_resolves_via_uuid_tagged_ref(self, real_db):
+        import mcp_server
+        real_db.execute('(transact {} [[:decision/x :ident ":decision/x"]])')
+        queried = json.loads(real_db.execute(
+            '(query [:find ?e :where [?e :ident ":decision/x"]])'
+        ))
+        entity_uuid = queried["results"][0][0]
+        assert mcp_server._query_ident(real_db, f'#uuid "{entity_uuid}"') == ":decision/x"
+
+
+class TestUuidIdentBoostResolution:
+    """#194: a #uuid-tagged transact/retract against an entity that already
+    has an :ident fact must resolve to the keyword form for fact-index
+    purposes, so it stays eligible for fact_index._MEMORY_PREFIXES' BM25
+    boost."""
+
+    def test_transact_uuid_tagged_entity_resolves_to_ident_for_boost(self, real_db):
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/x :description "hello"] [:decision/x :ident ":decision/x"]]',
+            reason="test",
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :description "hello"]]'
+        )
+        entity_uuid = queried["results"][0][0]
+
+        result = mcp_server.handle_minigraf_transact(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="test2"
+        )
+        assert result["ok"] is True
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(
+            index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
+        )
+        matching = [r for r in results if r[1] == ":status" and r[2] == "reviewed"]
+        assert matching
+        assert matching[0][0] == ":decision/x"
+
+    def test_transact_uuid_tagged_entity_without_ident_still_falls_back_to_uuid(self, real_db):
+        """No :ident fact anywhere for this entity -- must behave exactly
+        as before this change (index under the raw UUID), not raise or
+        drop the fact."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:module/auth :description "auth module"]]', reason="test"
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :description "auth module"]]'
+        )
+        entity_uuid = queried["results"][0][0]
+
+        result = mcp_server.handle_minigraf_transact(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="test2"
+        )
+        assert result["ok"] is True
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(
+            index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
+        )
+        matching = [r for r in results if r[1] == ":status" and r[2] == "reviewed"]
+        assert matching
+        assert matching[0][0] == entity_uuid
+
+    def test_retract_uuid_tagged_entity_removes_resolved_ident_row(self, real_db):
+        """Retract-side symmetry: the row _transact indexed under the
+        resolved keyword ident must actually be the row _retract deletes --
+        otherwise the delete targets a nonexistent raw-UUID row and leaves
+        a stale entry behind."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/x :description "hello"] [:decision/x :ident ":decision/x"]]',
+            reason="test",
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :description "hello"]]'
+        )
+        entity_uuid = queried["results"][0][0]
+        mcp_server.handle_minigraf_transact(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="test2"
+        )
+
+        result = mcp_server.handle_minigraf_retract(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="cleanup"
+        )
+        assert result["ok"] is True
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(
+            index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
+        )
+        assert results == []
+
+    def test_transact_auto_writes_ident_for_memory_prefix_entity(self, real_db):
+        """#194: a plain keyword-created decision entity must get a
+        self-referencing :ident fact so a later #uuid-tagged update against
+        it can resolve back to the keyword form for the BM25 boost."""
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="test"
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?v :where [:decision/cache :ident ?v]]'
+        )
+        assert queried["results"] == [[":decision/cache"]]
+
+    def test_transact_does_not_auto_ident_non_memory_prefix_entity(self, real_db):
+        """Scoped to fact_index._MEMORY_PREFIXES only -- an ordinary entity
+        like :service/auth must not get an auto-written :ident."""
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:service/auth :description "auth service"]]', reason="test"
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?v :where [:service/auth :ident ?v]]'
+        )
+        assert queried["results"] == []
+
+    def test_transact_ident_write_skipped_when_already_present(self, real_db):
+        """The existence-check query must actually gate the write -- once
+        :decision/cache has an :ident fact, a later transact against it
+        must not issue a second (transact ...) for :ident at all (avoids
+        the duplicate-history-row behavior confirmed in the design doc)."""
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="test"
+        )
+        with execute_spy() as calls:
+            mcp_server.handle_minigraf_transact(
+                '[[:decision/cache :status "reviewed"]]', reason="test2"
+            )
+        ident_transacts = [
+            c for c in calls if c.startswith("(transact") and ":ident" in c
+        ]
+        assert not ident_transacts
+
+    def test_transact_auto_ident_skipped_when_caller_already_wrote_one(self, real_db):
+        """If the caller's own facts block already sets :ident for this
+        entity, _ensure_memory_idents must not write a second, redundant
+        one at a different valid_from."""
+        import mcp_server
+        with execute_spy() as calls:
+            mcp_server.handle_minigraf_transact(
+                '[[:decision/cache :description "use Redis"] '
+                '[:decision/cache :ident ":decision/cache"]]',
+                reason="test",
+            )
+        ident_transacts = [c for c in calls if ":ident" in c]
+        assert len(ident_transacts) == 1
+
+    def test_uuid_tagged_update_against_auto_idented_decision_gets_boost(self, real_db):
+        """End-to-end #194 regression: an ordinary minigraf_transact-created
+        decision (no explicit :ident from the caller) must still resolve a
+        later #uuid-tagged update back to its keyword form, thanks to this
+        task's auto-:ident write plus Task 1's resolution at index time."""
+        import mcp_server
+        import fact_index
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis for caching"]]', reason="test"
+        )
+        queried = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :description "use Redis for caching"]]'
+        )
+        entity_uuid = queried["results"][0][0]
+
+        result = mcp_server.handle_minigraf_transact(
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="test2"
+        )
+        assert result["ok"] is True
+
+        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        results = fact_index.query_facts(
+            index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
+        )
+        matching = [r for r in results if r[1] == ":status" and r[2] == "reviewed"]
+        assert matching
+        assert matching[0][0] == ":decision/cache"
 
 
 class TestParseTxResult:
