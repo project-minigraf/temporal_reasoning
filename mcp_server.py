@@ -5011,7 +5011,11 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
                 triples = f'[{entity} {attribute} "{escaped_value}"]'
             _transact(db, "[" + triples + "]", now_z)
             stored += 1
-        except MiniGrafError:
+        except MiniGrafError as e:
+            print(
+                f"[_transact_extracted_facts] dropped fact for {entity} {attribute}: {e}",
+                file=sys.stderr,
+            )
             continue
     if stored:
         _db_checkpoint(db)
@@ -5156,20 +5160,52 @@ def _call_llm(model: str, prompt: str) -> str:
         return message.content[0].text
 
 
-def _parse_valid_at_hint(raw: str):
-    """Extract optional '; valid-at: YYYY-MM-DD' comment from model output.
+_VALID_AT_LINE_RE = re.compile(r"^;\s*valid-at:\s*", re.IGNORECASE)
 
-    Returns (valid_at, cleaned_datalog) where valid_at defaults to the current
-    UTC ms timestamp if no hint is present.
+# Tried in order; each is a full-string match (no unconverted trailing data),
+# so "2024-03-15T10:00:00Z" only matches the datetime formats, not the plain
+# date one. %z accepts a bare "Z" suffix as UTC since Python 3.7.
+_VALID_AT_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%dT%H:%M:%S",
+)
+
+
+def _parse_valid_at_hint(raw: str):
+    """Extract optional '; valid-at: <date>' comment from model output.
+
+    Accepts 'YYYY-MM-DD' (zero-padded or not) and full ISO 8601 datetimes,
+    normalizing any of them down to a plain 'YYYY-MM-DD' date. Returns
+    (valid_at, cleaned_datalog) where valid_at defaults to the current UTC
+    ms timestamp if no hint line is present. If a hint line is present but
+    its date is unparseable or calendar-invalid (e.g. "2024-13-45"), the
+    line is still stripped from the returned datalog and valid_at defaults
+    to now, but a warning is printed to stderr so that default is
+    distinguishable from "no hint given".
     """
     valid_at = _now_utc_ms()
     kept = []
     for line in raw.splitlines():
         stripped = line.strip()
-        if stripped.startswith("; valid-at:"):
-            date_str = stripped[len("; valid-at:"):].strip()
-            if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
-                valid_at = date_str
+        match = _VALID_AT_LINE_RE.match(stripped)
+        if match:
+            date_str = stripped[match.end():].strip()
+            parsed = None
+            for fmt in _VALID_AT_DATE_FORMATS:
+                try:
+                    parsed = datetime.datetime.strptime(date_str, fmt)
+                    break
+                except ValueError:
+                    continue
+            if parsed is not None:
+                valid_at = parsed.strftime("%Y-%m-%d")
+            else:
+                print(
+                    f"[valid-at] unparseable date hint {date_str!r}; "
+                    "defaulting valid-at to now",
+                    file=sys.stderr,
+                )
         else:
             kept.append(line)
     return valid_at, "\n".join(kept).strip()

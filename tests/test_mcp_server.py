@@ -1939,6 +1939,51 @@ class TestParseValidAtHint:
         valid_at, datalog = mcp_server._parse_valid_at_hint(raw)
         assert valid_at == "2025-06-30"
 
+    def test_accepts_non_zero_padded_date(self):
+        """#182: '2024-3-15' (no zero-padding) is a plausible LLM output and
+        must not silently fall back to now."""
+        import mcp_server
+        raw = '; valid-at: 2024-3-15\n[[:e :a "v"]]'
+        valid_at, datalog = mcp_server._parse_valid_at_hint(raw)
+        assert valid_at == "2024-03-15"
+
+    def test_accepts_full_iso_datetime_and_normalizes_to_date(self):
+        """#182: a full ISO-8601 datetime hint is normalized down to a date."""
+        import mcp_server
+        raw = '; valid-at: 2024-03-15T10:00:00Z\n[[:e :a "v"]]'
+        valid_at, datalog = mcp_server._parse_valid_at_hint(raw)
+        assert valid_at == "2024-03-15"
+
+    def test_accepts_hint_line_with_no_space_after_semicolon(self):
+        """#182: ';valid-at: ...' (no space after ';') must still be
+        recognized as a hint line and stripped from the returned datalog,
+        not left in place to corrupt it."""
+        import mcp_server
+        raw = ';valid-at: 2024-03-15\n[[:e :a "v"]]'
+        valid_at, datalog = mcp_server._parse_valid_at_hint(raw)
+        assert valid_at == "2024-03-15"
+        assert "valid-at" not in datalog
+        assert datalog == '[[:e :a "v"]]'
+
+    def test_calendar_invalid_date_falls_back_to_now_with_warning(self, capsys):
+        """#182: a regex-plausible but calendar-invalid date (month 13) must
+        not be passed through unvalidated -- it previously reached _transact
+        and caused the whole fact to be silently dropped downstream."""
+        import re
+        import mcp_server
+        raw = '; valid-at: 2024-13-45\n[[:e :a "v"]]'
+        valid_at, datalog = mcp_server._parse_valid_at_hint(raw)
+        assert re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z", valid_at)
+        assert "unparseable date hint" in capsys.readouterr().err
+
+    def test_unparseable_hint_warns_on_stderr(self, capsys):
+        """#182: an unparseable hint must be distinguishable from no hint at
+        all, via a warning printed to stderr."""
+        import mcp_server
+        raw = '; valid-at: not-a-date\n[[:e :a "v"]]'
+        mcp_server._parse_valid_at_hint(raw)
+        assert "unparseable date hint" in capsys.readouterr().err
+
 
 class TestCanonicalIdent:
     def test_lowercases_value(self):
@@ -2119,6 +2164,24 @@ class TestTransactExtractedFactsSchema:
         attrs = {a: v for a, v in result["results"]}
         assert attrs[":description"] == "use Redis"
         assert attrs[":alias"] == "in-memory store, key-value cache"
+
+    def test_minigraf_error_at_transact_time_logs_warning(self, real_db, capsys):
+        """#182: a fact that passes schema validation but is rejected by
+        minigraf itself at transact time (e.g. a calendar-invalid
+        :valid-from date) must not be silently swallowed -- it should be
+        distinguishable on stderr from "the extraction strategy found
+        nothing"."""
+        import mcp_server
+        facts = [{"entity": ":decision/redis", "entity_type": "decision",
+                  "attribute": ":description", "value": "use Redis"}]
+        stored = mcp_server._transact_extracted_facts(facts, valid_from="2024-13-45")
+
+        assert stored == 0
+        queried = json.loads(real_db.execute(
+            '(query [:find ?d :where [:decision/redis :description ?d]])'
+        ))
+        assert queried["results"] == []
+        assert "dropped fact for :decision/redis" in capsys.readouterr().err
 
     def test_entity_missing_description_entirely_is_still_rejected(self, real_db):
         """Confirms the per-entity-group fix doesn't loosen validation: an
