@@ -43,7 +43,7 @@ place, so there's nothing to resolve to.
 
 Two coordinated changes, both scoped to `mcp_server.py`.
 
-### Part 1 — auto-write `:ident` on memory-prefixed creates
+### Part 2 — auto-write `:ident` on memory-prefixed creates
 
 In `handle_minigraf_transact`, after the primary `_transact` call succeeds, scan the parsed facts
 (`_parse_facts_block(facts)`) for distinct keyword entities whose string starts with one of
@@ -60,7 +60,7 @@ Scope is deliberately narrow: only entities under the four memory prefixes get t
 Ordinary entities (services, components, git-ingested code entities) are unaffected — the latter
 already get an explicit `:ident` from ingestion's own code path.
 
-### Part 2 — resolve `#uuid`-tagged entities to `:ident` when indexing
+### Part 1 — resolve `#uuid`-tagged entities to `:ident` when indexing
 
 `_transact` and `_retract` currently derive fact-index rows from `_parse_facts_block(datalog_facts)`
 by default when the caller doesn't pass `index_triples` explicitly. Add:
@@ -102,13 +102,13 @@ retroactively clean up already-orphaned attributes).
 
 Per `docs/testing-conventions.md` (real `minigraf` backend via the `real_db` fixture, no mocks):
 
-- **Part 1:** transact a `:decision/x` fact, assert `[:find ?v :where [:decision/x :ident ?v]]`
-  returns `":decision/x"`. Transact a second fact against the same entity and assert the
-  `:any-valid-time` row count for `:decision/x :ident` stays at 1 (no duplicate history row).
-- **Part 1 scoping:** transact a non-memory-prefix entity (e.g. `:service/auth`) and assert no
-  `:ident` fact is auto-written for it.
-- **Part 2:** transact a keyword entity, query its raw UUID via a free `?e` clause, transact a
+- **Part 1:** transact a keyword entity, query its raw UUID via a free `?e` clause, transact a
   follow-up fact against `#uuid "<uuid>" ...`, then assert `fact_index.query_facts` returns that
   fact indexed under the keyword entity string (not the raw UUID) and that it receives the boost.
-- **Part 2 fallback:** a `#uuid`-tagged entity with no `:ident` anywhere still indexes under the
+- **Part 1 fallback:** a `#uuid`-tagged entity with no `:ident` anywhere still indexes under the
   raw UUID — no regression from current behavior for entities that were never idented at all.
+- **Part 2:** transact a `:decision/x` fact, assert `[:find ?v :where [:decision/x :ident ?v]]`
+  returns `":decision/x"`. Transact a second fact against the same entity and assert the
+  `:any-valid-time` row count for `:decision/x :ident` stays at 1 (no duplicate history row).
+- **Part 2 scoping:** transact a non-memory-prefix entity (e.g. `:service/auth`) and assert no
+  `:ident` fact is auto-written for it.
