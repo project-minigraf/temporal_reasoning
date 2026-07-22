@@ -2810,13 +2810,38 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _read_lock_holder_raw(path: str) -> Optional[str]:
+    """Read path's lock file and return its raw, unparsed contents, or None
+    if the lock file doesn't exist. Shared by _clear_stale_lock and
+    _live_lock_holder_pid, whose parsing/validation needs diverge past this
+    point (#106, #178)."""
+    try:
+        with open(path + ".lock") as f:
+            return f.read().strip()
+    except OSError:
+        return None  # no lock file
+
+
 def _clear_stale_lock(path: str, holder_pid: int) -> bool:
     """Remove path's lock file if its recorded holder process is no longer alive.
+
+    holder_pid is extracted from an earlier lock-contention error (at time
+    T0); by the time this runs (T1), the lock file may have already changed
+    hands to a different, live, legitimate holder. Re-reads the lock file's
+    *current* contents immediately before deleting and only proceeds if it
+    still names holder_pid, to avoid stripping a live holder of its lock
+    protection (#178). This narrows but does not eliminate the underlying
+    TOCTOU race -- a gap remains between this re-check and the os.remove.
 
     Returns True if a stale lock was removed.
     """
     if _pid_is_alive(holder_pid):
         return False  # holder still alive (or we lack permission to tell — leave it)
+    current_holder = _read_lock_holder_raw(path)
+    if current_holder is None:
+        return False  # no lock file (already cleared by someone else)
+    if current_holder != str(holder_pid):
+        return False  # reclaimed by a different holder since T0 — not ours to clear
     try:
         os.remove(path + ".lock")
         return True
@@ -2838,10 +2863,8 @@ def _live_lock_holder_pid(path: str) -> Optional[int]:
     logic (_try_open_with_self_heal, _ensure_db_async) still runs as the
     fallback if the race is lost anyway.
     """
-    try:
-        with open(path + ".lock") as f:
-            holder = f.read().strip()
-    except OSError:
+    holder = _read_lock_holder_raw(path)
+    if holder is None:
         return None  # no lock file
     if not holder.isdigit():
         return None
