@@ -3546,11 +3546,46 @@ def _retract(
     return raw
 
 
+def _ensure_memory_idents(db: Any, facts_str: str, valid_from: str) -> None:
+    """After a successful transact, write a self-referencing :ident fact for
+    any keyword entity in facts_str whose ident string starts with a
+    fact_index._MEMORY_PREFIXES category (:decision/, :preference/,
+    :constraint/, :dependency/) and doesn't already have one (#194) --
+    without this, an ordinary minigraf_transact-created decision/
+    preference/constraint/dependency entity has no way to resolve a later
+    #uuid-tagged reference back to its keyword form for the memory-fact
+    BM25 boost (see _resolved_facts_triples).
+
+    Query-gated, not unconditional: re-transacting an identical fact at a
+    different valid_from creates a new bi-temporal history row every time
+    (confirmed empirically; consistent with #156's finding documented in
+    _checkpoint_after_write) -- writing :ident on every call would bloat
+    history. Never raises: the caller's actual write has already committed
+    by the time this runs, and a failure here must not affect that result.
+    """
+    triples = _parse_facts_block(facts_str)
+    already_idented = {e for e, a, v in triples if a == ":ident"}
+    candidates = {
+        e for e, a, v in triples
+        if e.startswith(":") and e.startswith(fact_index._MEMORY_PREFIXES)
+    } - already_idented
+    for entity in sorted(candidates):
+        if _query_ident(db, entity) is not None:
+            continue
+        try:
+            _transact(db, f'[[{entity} :ident "{_edn_escape(entity)}"]]', valid_from)
+        except Exception as e:
+            print(f"[fact_index] auto-ident write failed for {entity}: {e}", file=sys.stderr)
+
+
 def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     """Transact facts into the graph. reason is required.
 
     :valid-at is set to the current UTC ms timestamp so every agent-initiated
     write has a recorded valid time, enabling correct bi-temporal queries.
+    On success, also ensures any memory-category entity (fact_index.
+    _MEMORY_PREFIXES) created by this call has a resolvable :ident fact --
+    see _ensure_memory_idents (#194).
     """
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for all writes"}
@@ -3565,13 +3600,15 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
             return {"ok": False, "error": f"schema violations: {'; '.join(violations)}"}
     _refresh_if_stale()
     db = get_db()
+    valid_from = _now_utc_ms()
     try:
-        raw = _transact(db, facts, _now_utc_ms())
+        raw = _transact(db, facts, valid_from)
     except MiniGrafError as e:
         return {"ok": False, "error": str(e)}
     result = _parse_tx_result(raw)
     if result["ok"]:
         result["reason"] = reason
+        _ensure_memory_idents(db, facts, valid_from)
     _checkpoint_after_write(db, "minigraf_transact", result)
     return result
 
