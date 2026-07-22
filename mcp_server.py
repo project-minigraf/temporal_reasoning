@@ -4483,6 +4483,11 @@ def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int,
 # They are invisible to schema validation and filtered from attr_facts in minigraf_audit.
 _SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})
 
+# Maximum length (characters) for a string-valued fact attribute. Bounds how much
+# raw text (e.g. LLM/agent-extracted conversation content) can be written into the
+# graph and the FTS5 fact index in a single fact.
+_MAX_FACT_VALUE_LENGTH = int(os.environ.get("MINIGRAF_MAX_FACT_VALUE_LENGTH", "4096"))
+
 MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
     "decision": {
         "required": {":description": str},
@@ -4617,6 +4622,15 @@ def _validate_facts(facts: List[Dict[str, Any]]) -> List[str]:
                 violations.append(
                     f"entity '{entity}' attribute '{attr}' has wrong type "
                     f"(expected {optional[attr].__name__}, got {type(value).__name__})"
+                )
+
+        # Bound string-valued attributes so a single fact can't inject an
+        # arbitrarily large value into the graph and FTS5 index.
+        for attr, value in attrs.items():
+            if isinstance(value, str) and len(value) > _MAX_FACT_VALUE_LENGTH:
+                violations.append(
+                    f"entity '{entity}' attribute '{attr}' value exceeds maximum "
+                    f"length ({len(value)} > {_MAX_FACT_VALUE_LENGTH} characters)"
                 )
 
         # Closed-world: unknown attributes are violations.
