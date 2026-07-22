@@ -6287,6 +6287,35 @@ class TestExtractCommitRename:
         assert old_path == "old_name.py"
         assert "login" in extracted["functions"]
 
+    def test_rename_status_short_body_still_matched_at_low_floor(self, tmp_path):
+        """#174: a git-confirmed "R" rename must keep matching a renamed
+        function at the ORIGINAL, lower _MIN_MATCH_BODY_LEN floor, not the
+        higher _MIN_CROSS_FILE_MATCH_BODY_LEN bar reserved for genuinely
+        unrelated cross-file pairs — old_name.py/new_name.py share a real,
+        git-detected relationship here, unlike the unrelated-files case
+        above. `new_fn`'s body is deliberately short (well under the
+        cross-file floor) to prove the low floor, not the high one, is what
+        applies."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text("def old_fn(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        (repo / "new_name.py").write_text("def new_fn(x):\n    return x + 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "rename file and function"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        status = results[0][0]
+        assert status == "R"  # sanity: git itself must have detected this as a rename
+        assert ("function", "old_name.py", "old_fn", "new_name.py", "new_fn") in renamed_pairs
+
     def test_non_rename_status_has_empty_old_path(self, git_repo):
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo), watermark_hash=None)
