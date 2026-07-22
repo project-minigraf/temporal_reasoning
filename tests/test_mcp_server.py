@@ -4769,6 +4769,69 @@ class TestElixirFunctionsAndClasses:
         assert result["functions"] == ["bar"]
         assert result["imports"] == ["MyApp.Router"]
 
+    def test_walk_ast_extracts_defmacro_and_defmacrop(self):
+        # Regression test for #205: defmacro/defmacrop parse as the same
+        # generic `call` node as def/defp (same bug class as #170) and were
+        # silently dropped because the elixir dispatch only matched
+        # ("def", "defp").
+        import mcp_server
+        source = (
+            b"defmodule Foo do\n"
+            b"  defmacro pub_macro(x) do\n"
+            b"    x\n"
+            b"  end\n\n"
+            b"  defmacrop priv_macro do\n"
+            b"    :ok\n"
+            b"  end\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "elixir")
+        assert sorted(results["functions"]) == ["priv_macro", "pub_macro"]
+
+    def test_walk_ast_extracts_defguard_and_defguardp(self):
+        # defguard/defguardp always carry a `when` guard clause, so the name
+        # is nested inside a binary_operator -- same shape _elixir_def_function_name
+        # already unwraps for `def bar(x) when x > 0 do`.
+        import mcp_server
+        source = (
+            b"defmodule Foo do\n"
+            b"  defguard is_pos(x) when x > 0\n\n"
+            b"  defguardp is_priv(x) when x > 0\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "elixir")
+        assert sorted(results["functions"]) == ["is_pos", "is_priv"]
+
+    def test_walk_ast_extracts_defdelegate(self):
+        # `defdelegate qux(x), to: Other` -- the arguments field's first
+        # named child is the `call` node for `qux(x)`; the trailing `to:`
+        # keyword pair is a second named child that must be ignored.
+        import mcp_server
+        source = b"defmodule Foo do\n  defdelegate qux(x), to: Other\nend\n"
+        tree = self._parser().parse(source)
+        results = {"functions": [], "classes": [], "imports": [], "calls": []}
+        mcp_server._walk_ast(tree.root_node, results, "elixir")
+        assert results["functions"] == ["qux"]
+
+    def test_collect_entity_nodes_extracts_defmacro_and_defguard(self):
+        import mcp_server
+        source = (
+            b"defmodule Foo do\n"
+            b"  defmacro bar(x) do\n"
+            b"    x\n"
+            b"  end\n\n"
+            b"  defguard is_pos(x) when x > 0\n"
+            b"end\n"
+        )
+        tree = self._parser().parse(source)
+        result = mcp_server._collect_entity_nodes(tree.root_node, "elixir")
+        assert "bar" in result["function"]
+        assert "is_pos" in result["function"]
+
 
 class TestMatchCandidatePair:
     def _parse(self, source: str):
