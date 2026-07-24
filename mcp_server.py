@@ -2950,11 +2950,13 @@ def _normalized_body_hash(node: Any) -> str:
     Joins the text of every leaf token (a node with no children) in
     document order, then hashes the result -- so a purely cosmetic reformat
     (e.g. this repo's own periodic clang-format sweeps) hashes identically
-    to the original, while any change to the token stream itself changes
+    to the original, while any change to the token text stream itself changes
     the hash. No per-language handling needed: leaf-token walking is
     generic across every tree-sitter grammar. Comment text is NOT stripped
     (see #221 design doc's Scope section) -- a comment-only edit still
-    counts as a body change in v1.
+    counts as a body change in v1. Note: tree structure/indentation changes
+    are not captured; in indentation-significant languages, a pure re-indentation
+    that changes semantics will hash identically (accepted v1 tradeoff).
     """
     leaves: List[bytes] = []
 

@@ -116,6 +116,12 @@ function.
   still count as churn. Comment-node identification is genuinely per-grammar fiddly work (the issue's
   own admission) and not required to fix the reformatting false-positive case this issue is
   primarily motivated by.
+- **No indentation-structure hashing.** Tree structure and indentation are not encoded in the hash;
+  only leaf-token text is captured. In indentation-significant languages (Python, Haskell, YAML),
+  a pure re-indentation can change semantics without changing the token stream, causing such
+  changes to hash identically and thus not be flagged as modifications (accepted v1 tradeoff;
+  such changes are rare and body-diff attribution remains strictly more correct than pre-#221
+  file-broadcast behavior).
 - **No backfill.** This repo's own already-ingested graph keeps its existing over-marked
   `:modified-in` edges from before this fix; they are not retroactively pruned. Per the sequencing
   already recorded in project memory, the backfill mechanism was folded into #222's shared
