@@ -1,7 +1,7 @@
 # Provisional/Authoritative Lineage Fact Model + Candidate-Diff Persistence — Design Spec
 
 **Issue:** #222 (Phase 2, sub-phase 2a of 4)
-**Date:** 2026-07-24 (revised same day after spec review — see "Revision" note)
+**Date:** 2026-07-24 (revised twice same day after spec review — see "Revision" note)
 
 ## Background
 
@@ -68,6 +68,29 @@ real against the code before this revision:
    bookkeeping — the same status phase 1's own `:type/ingest-interval`
    already has.
 
+A second review pass on that revision found one more High and one more
+Medium issue, both confirmed real and fixed in this version:
+
+5. **High** — the point-3 fix only fired *inside*
+   `_frontier_seed_from_watermark`, which `_frontier_load` only calls when
+   *both* frontier intervals are absent. A graph that already ran Phase 1
+   standalone before Phase 2a lands (exactly this project's own situation —
+   Phase 1 is merged and Phase 2a is not) already has
+   `:ingestion/frontier-low`, so that migration branch never runs for it and
+   `lineage-confirmed-through` stays unset forever, breaking the "complete
+   standalone predicate" property for precisely the graphs most likely to
+   need it. **Fixed** by decoupling the seeding from
+   `_frontier_seed_from_watermark` entirely: a new, self-contained
+   `_lineage_confirmed_through_migrate` catches up from
+   `:ingestion/frontier-low`'s *current* `:hi-hash` whenever
+   `lineage-confirmed-through` is unset — regardless of whether
+   `frontier-low` was just created this call or already existed from an
+   earlier run — called unconditionally from `_frontier_load` (see below).
+6. **Medium** — the audit-safety test only covered `:type/lineage-marker`,
+   not `:type/candidate-diff`, even though the schema/audit argument applies
+   to both equally. **Fixed** by adding a symmetric candidate-diff audit
+   test (see Testing).
+
 ## Scope (2a only)
 
 In scope:
@@ -88,9 +111,11 @@ In scope:
   enough for Stream 1's later correction sweep (2c) to confirm or reject a
   candidate via hash comparison, without re-invoking git-show + tree-sitter
   parsing.
-- A small addition to phase 1's already-merged `_frontier_seed_from_watermark`
-  to also seed the new lineage-confirmed-through watermark (see Revision
-  note #3) — the only change to existing code in this sub-phase.
+- A small addition to phase 1's already-merged `_frontier_load` to
+  unconditionally call a new self-contained catch-up function seeding
+  `lineage-confirmed-through` from `:ingestion/frontier-low`'s current
+  `:hi-hash` whenever the watermark is unset (see Revision notes #3 and
+  #5) — the only change to existing code in this sub-phase.
 
 Explicitly deferred: the actual reverse-walk diffing logic that decides
 what counts as a "candidate" (2b), the rename-spanning-the-gap resolution
@@ -185,15 +210,45 @@ def _lineage_confirmed_through_update(db, commit_hash, commit_ts_iso, index_con=
     _watermark_update's retract-only-if-changed pattern."""
 ```
 
-**Migration seeding (fixes Revision note #3):** phase 1's already-merged
-`_frontier_seed_from_watermark` (mcp_server.py) gains one addition: after
-seeding the `[C0, W]` frontier interval as authoritative, it also calls
-`_lineage_confirmed_through_update(db, watermark_hash, run_ts_iso,
-index_con=index_con)`. That region's lineage genuinely *is* fully
-confirmed — it was ingested by the original single-stream forward-only
-authoritative walk, so it needs no separate confirmation sweep. With this
-seeding, the watermark becomes a complete, standalone trust predicate with
-no special-casing: an entity's lineage is trustworthy exactly when
+**Migration seeding (fixes Revision notes #3 and #5):** rather than hooking
+into `_frontier_seed_from_watermark` (which only runs when *neither*
+frontier interval exists yet — missing the case where `:ingestion/
+frontier-low` already exists from an earlier Phase-1-only run, exactly this
+project's own current situation), 2a adds a wholly new, self-contained
+catch-up function:
+
+```python
+def _lineage_confirmed_through_migrate(db, run_ts_iso, index_con=None) -> None:
+    """One-time catch-up: if :ingestion/frontier-low exists (this graph has
+    an authoritative region, whether freshly migrated by
+    _frontier_seed_from_watermark just now or already established by an
+    earlier Phase-1-only run) but :ingestion/lineage-confirmed-through is
+    unset, seed the watermark from frontier-low's *current* :hi-hash --
+    that whole region was ingested by the original single-stream
+    forward-only authoritative walk, so it is already fully
+    lineage-confirmed. No-op if frontier-low doesn't exist yet, or
+    lineage-confirmed-through is already set (so later phases' own sweep
+    updates are never clobbered back to a stale value)."""
+    if _lineage_confirmed_through_query(db) is not None:
+        return
+    low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
+    if low_bounds is None:
+        return
+    _, hi_hash = low_bounds
+    _lineage_confirmed_through_update(db, hi_hash, run_ts_iso, index_con=index_con)
+```
+
+`_frontier_load` (phase 1, already merged) gains one addition: after its
+existing migration block runs (whether or not it actually did anything —
+the new function's own guards make it safe to call unconditionally), it
+calls `_lineage_confirmed_through_migrate(db, run_ts_iso, index_con=index_con)`.
+This covers both cases uniformly: a graph migrating for the first time
+*and* a graph that already migrated under Phase-1-only code before Phase 2a
+existed — in both, `frontier-low` already has *some* `:hi-hash` by the time
+this call happens, and that is always the correct trust boundary to seed
+from, regardless of how `frontier-low` got there. Once seeded, this
+watermark becomes a complete, standalone trust predicate with no
+special-casing: an entity's lineage is trustworthy exactly when
 `_lineage_is_provisional(entity)` is `False` **and** its `:introduced-by`
 commit's position is `<=` the position of `_lineage_confirmed_through_query`'s
 hash in the current linearization. (2a does not implement this composed
@@ -267,12 +322,18 @@ Following `docs/testing-conventions.md` (real backend, no mocked
   `_lineage_is_provisional`'s boolean) — this is the test that would have
   caught Revision note #2 if it had been run against the first draft's
   (incorrect) unconditional-transact implementation.
-- **Audit safety test**: mark an entity provisional, run
+- **Audit safety test (lineage marker)**: mark an entity provisional, run
   `handle_minigraf_audit()`, and assert the `:type/lineage-marker` entity
   (and, separately, a real `:type/function`/`:type/module` entity carrying
   ordinary schema-valid attributes alongside it) both survive unretracted —
   this directly verifies Revision note #1's fix, not just that the schema
   doesn't reject the write at transact time.
+- **Audit safety test (candidate-diff)**: persist a candidate-diff record,
+  run `handle_minigraf_audit()`, and assert the `:type/candidate-diff`
+  entity's facts survive unretracted — the schema/audit argument in this
+  spec applies equally to both new entity types (Revision note #6), and
+  this test is what proves it for the one that had no coverage in the
+  prior revision.
 - **Watermark round-trip**: mirrors phase 1's `_watermark_update`/
   `_watermark_query` tests — persist, re-query, update again, confirm only
   one live `:hash` fact exists via a `(count ...)` query.
@@ -285,7 +346,21 @@ Following `docs/testing-conventions.md` (real backend, no mocked
   only one live record; clear it; confirm a cleared record reads back as
   `None`, verified via both the accessor and a raw fact-count check that the
   underlying `:type/candidate-diff` entity's facts are actually gone.
-- **Migration seeding test**: run phase 1's migration path (`_frontier_load`
-  against a graph with only the old `:ingestion/watermark`) and assert
-  `_lineage_confirmed_through_query` now returns `W` (the watermark hash),
-  not `None` — this directly verifies Revision note #3's fix.
+- **Migration seeding test, fresh migration**: run phase 1's migration path
+  (`_frontier_load` against a graph with only the old `:ingestion/
+  watermark`) and assert `_lineage_confirmed_through_query` now returns `W`
+  (the watermark hash), not `None`.
+- **Migration seeding test, already-migrated graph**: seed a graph with
+  `:ingestion/frontier-low` already present (e.g. by calling `_frontier_load`
+  once already, simulating an earlier Phase-1-only run) and no
+  `lineage-confirmed-through` fact, then call `_frontier_load` again and
+  assert `_lineage_confirmed_through_query` now returns frontier-low's
+  `:hi-hash` — this is the test that would have caught Revision note #5:
+  it fails against the prior revision's `_frontier_seed_from_watermark`-only
+  fix, since that branch never runs when `frontier-low` already exists.
+- **Migration seeding idempotency**: call `_frontier_load` a third time
+  after the watermark is already seeded and assert (via raw count) it's
+  still exactly one live `:hash` fact, unchanged — confirms
+  `_lineage_confirmed_through_migrate`'s own guard prevents it from ever
+  clobbering a value phase 2c's real sweep has since advanced past the
+  original migration seed.
