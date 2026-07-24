@@ -6084,6 +6084,245 @@ class TestFrontierPersistClaim:
         ]
 
 
+class TestLineageProvisionalMarker:
+    def test_unmarked_entity_reads_as_authoritative(self, real_db):
+        import mcp_server
+        db = real_db
+        assert mcp_server._lineage_is_provisional(db, ":function/src-auth-py-login") is False
+
+    def test_mark_then_confirm_round_trip(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._lineage_mark_provisional(db, entity_ident, "2026-01-01T00:00:00Z")
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is True
+
+        mcp_server._lineage_confirm(db, entity_ident)
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is False
+
+    def test_confirm_already_authoritative_entity_is_a_noop(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        # Never marked -- confirming must not raise or create anything.
+        mcp_server._lineage_confirm(db, entity_ident)
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is False
+
+    def test_mark_provisional_is_idempotent(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._lineage_mark_provisional(db, entity_ident, "2026-01-01T00:00:00Z")
+        mcp_server._lineage_mark_provisional(db, entity_ident, "2026-01-01T00:00:01Z")
+
+        ident = mcp_server._lineage_marker_ident(entity_ident)
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?e) :where [{ident} :entity ?e]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_provisional_marker_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            db,
+            f'[[{entity_ident} :entity-type :type/function] '
+            f'[{entity_ident} :description "login"] '
+            f'[{entity_ident} :file "src/auth.py"]]',
+            "2026-01-01T00:00:00Z",
+        )
+
+        mcp_server._lineage_mark_provisional(db, entity_ident, "2026-01-01T00:00:00Z")
+        result = mcp_server.handle_minigraf_audit()
+
+        assert result["retracted"] == 0
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is True
+        raw = mcp_server._db_execute(
+            db, f'(query [:find (count ?d) :where [{entity_ident} :description ?d]])'
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+
+class TestLineageConfirmedThroughWatermark:
+    def test_unset_reads_as_none(self, real_db):
+        import mcp_server
+        assert mcp_server._lineage_confirmed_through_query(real_db) is None
+
+    def test_update_then_query_round_trip(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._lineage_confirmed_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+        mcp_server._lineage_confirmed_through_update(db, "h2", "2026-01-02T00:00:00Z")
+        assert mcp_server._lineage_confirmed_through_query(db) == "h2"
+
+    def test_update_does_not_duplicate_hash_fact(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._lineage_confirmed_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_confirmed_through_update(db, "h2", "2026-01-02T00:00:00Z")
+
+        ident = mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_entity_carries_expected_constants_and_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._lineage_confirmed_through_update(db, "h1", "2026-01-01T00:00:00Z")
+
+        ident = mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT
+        raw = mcp_server._db_execute(
+            db, f"(query [:find ?a ?v :where [{ident} ?a ?v]])"
+        )
+        attrs = dict(json.loads(raw)["results"])
+        assert attrs[":entity-type"] == ":type/ingestion"
+        assert attrs[":ident"] == ident
+        assert isinstance(attrs[":description"], str) and attrs[":description"]
+
+        result = mcp_server.handle_minigraf_audit()
+        assert result["retracted"] == 0
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+
+class TestLineageConfirmedThroughMigration:
+    def test_fresh_migration_seeds_from_watermark(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+    def test_already_migrated_graph_still_gets_watermark_seeded(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        # Simulate an earlier Phase-1-only run: frontier-low gets created,
+        # but lineage-confirmed-through (new in Phase 2a) doesn't exist yet.
+        mcp_server._frontier_seed_from_watermark(db, linearization, "2026-01-01T00:00:01Z")
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) is not None
+        assert mcp_server._lineage_confirmed_through_query(db) is None
+
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+    def test_repeated_load_does_not_duplicate_same_value(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+        mcp_server._frontier_load(db, linearization, "2026-01-03T00:00:00Z")
+
+        ident = mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_does_not_clobber_a_value_advanced_past_migration_boundary(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+        # Simulate phase 2c's real sweep having advanced past the original
+        # migration boundary.
+        mcp_server._lineage_confirmed_through_update(db, "h2", "2026-01-03T00:00:00Z")
+
+        mcp_server._frontier_load(db, linearization, "2026-01-04T00:00:00Z")
+
+        assert mcp_server._lineage_confirmed_through_query(db) == "h2"
+
+
+class TestCandidateDiff:
+    def test_read_absent_record_returns_none(self, real_db):
+        import mcp_server
+        assert mcp_server._candidate_diff_read(real_db, "a" * 40, ":function/foo") is None
+
+    def test_persist_then_read_round_trip(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+
+        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
+        # A different (commit, entity) pair must not resolve to this record.
+        assert mcp_server._candidate_diff_read(db, "b" * 40, entity_ident) is None
+        assert mcp_server._candidate_diff_read(db, commit_hash, ":function/other") is None
+
+    def test_persist_same_hash_twice_does_not_duplicate(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:01Z")
+
+        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :body-hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_persist_different_hash_updates_without_duplicating(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash2", "2026-01-01T00:00:01Z")
+
+        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash2"
+        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :body-hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_clear_removes_the_record(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+        mcp_server._candidate_diff_clear(db, commit_hash, entity_ident)
+
+        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) is None
+        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?e) :where [{ident} :entity ?e]])")
+        assert json.loads(raw)["results"] == [[0]]
+
+    def test_clear_absent_record_is_a_noop(self, real_db):
+        import mcp_server
+        db = real_db
+        # Must not raise.
+        mcp_server._candidate_diff_clear(db, "a" * 40, ":function/never-persisted")
+
+    def test_candidate_diff_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+        result = mcp_server.handle_minigraf_audit()
+
+        assert result["retracted"] == 0
+        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
+
+
 class TestGitCommitsTopoOrder:
     def test_orders_by_topology_not_committer_date(self, git_repo_diamond_clock_skewed):
         import mcp_server
