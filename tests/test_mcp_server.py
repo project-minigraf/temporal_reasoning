@@ -5978,6 +5978,15 @@ class TestFrontierLoad:
         assert second.intervals() == [
             frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE)
         ]
+        # Directly count raw facts -- _frontier_read_bounds's results[0]
+        # shortcut would silently collapse a duplicate live datom and hide a
+        # broken migration guard, so intervals() equality alone can't prove
+        # non-duplication.
+        raw = mcp_server._db_execute(
+            db,
+            "(query [:find (count ?lo) :where [:ingestion/frontier-low :lo-hash ?lo]])",
+        )
+        assert json.loads(raw)["results"] == [[1]]
 
     def test_no_watermark_no_intervals_yields_empty_allocator(self, real_db):
         import mcp_server
