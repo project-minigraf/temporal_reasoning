@@ -58,8 +58,6 @@ class FrontierAllocator:
 
     @property
     def gap_hi(self) -> int:
-        if self.total_positions == 0:
-            return -1
         last = self.total_positions - 1
         high = self._interval_covering(last)
         return high.lo_pos - 1 if high else last

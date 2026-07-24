@@ -30,24 +30,47 @@ def git_repo(tmp_path):
 
 
 @pytest.fixture
-def git_repo_clock_skewed(tmp_path):
-    """Child commit dated earlier than its parent -- topo order must still
-    place the parent first; date order would not."""
+def git_repo_diamond_clock_skewed(tmp_path):
+    """A fork+merge DAG where one forked branch's single commit is dated
+    EARLIER than its own parent (clock skew) -- unlike a linear chain (which
+    has no ordering ambiguity for any git log mode to resolve), this
+    fork+merge shape genuinely produces different output depending on
+    --topo-order. Verified empirically: plain `git log --reverse` (no
+    --topo-order) outputs C1 BEFORE P, a real topological violation (a
+    commit before its own parent), because C1's date is earlier than P's.
+    `--topo-order --reverse` correctly places P first.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
 
-    env_parent = {**os.environ, "GIT_COMMITTER_DATE": "2026-01-10T00:00:00", "GIT_AUTHOR_DATE": "2026-01-10T00:00:00"}
-    (repo / "a.py").write_text("x = 1\n")
-    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-    _subprocess.run(["git", "commit", "-m", "parent"], cwd=repo, check=True, capture_output=True, env=env_parent)
+    def commit(filename, content, message, date_iso):
+        (repo / filename).write_text(content)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        env = {**os.environ, "GIT_AUTHOR_DATE": date_iso, "GIT_COMMITTER_DATE": date_iso}
+        _subprocess.run(["git", "commit", "-m", message], cwd=repo, check=True, capture_output=True, env=env)
 
-    env_child = {**os.environ, "GIT_COMMITTER_DATE": "2026-01-01T00:00:00", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00"}
-    (repo / "b.py").write_text("y = 2\n")
-    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-    _subprocess.run(["git", "commit", "-m", "child"], cwd=repo, check=True, capture_output=True, env=env_child)
+    # P (root), dated Jan 3
+    commit("p.txt", "p\n", "P", "2026-01-03T00:00:00")
+    _subprocess.run(["git", "branch", "branch2"], cwd=repo, check=True, capture_output=True)
+
+    # C1: child of P, dated Jan 1 -- EARLIER than P (the skew)
+    commit("c1.txt", "c1\n", "C1", "2026-01-01T00:00:00")
+    _subprocess.run(["git", "branch", "branch1"], cwd=repo, check=True, capture_output=True)
+
+    # branch2: normal monotonically-increasing chain from P
+    _subprocess.run(["git", "checkout", "branch2"], cwd=repo, check=True, capture_output=True)
+    commit("c2a.txt", "c2a\n", "C2a", "2026-01-05T00:00:00")
+    commit("c2b.txt", "c2b\n", "C2b", "2026-01-06T00:00:00")
+    commit("c2tip.txt", "c2tip\n", "C2tip", "2026-01-07T00:00:00")
+
+    env = {**os.environ, "GIT_AUTHOR_DATE": "2026-01-08T00:00:00", "GIT_COMMITTER_DATE": "2026-01-08T00:00:00"}
+    _subprocess.run(
+        ["git", "merge", "--no-ff", "-m", "MG", "branch1"],
+        cwd=repo, check=True, capture_output=True, env=env,
+    )
 
     return repo
 
@@ -61,16 +84,18 @@ class TestBuildLinearization:
         linearization = frontier_registry.build_linearization(str(git_repo))
         assert linearization == list(reversed(newest_first))
 
-    def test_topo_order_survives_clock_skew(self, git_repo_clock_skewed):
-        linearization = frontier_registry.build_linearization(str(git_repo_clock_skewed))
+
+class TestBuildLinearizationTopoOrder:
+    def test_topo_order_survives_clock_skew(self, git_repo_diamond_clock_skewed):
+        linearization = frontier_registry.build_linearization(str(git_repo_diamond_clock_skewed))
         log_result = _subprocess.run(
             ["git", "log", "--topo-order", "--reverse", "--format=%H %s"],
-            cwd=git_repo_clock_skewed, capture_output=True, text=True, check=True,
+            cwd=git_repo_diamond_clock_skewed, capture_output=True, text=True, check=True,
         )
         lines = log_result.stdout.strip().splitlines()
         expected_hashes = [line.split(" ", 1)[0] for line in lines]
         expected_subjects = [line.split(" ", 1)[1] for line in lines]
-        assert expected_subjects == ["parent", "child"]
+        assert expected_subjects == ["P", "C2a", "C2b", "C2tip", "C1", "MG"]
         assert linearization == expected_hashes
 
 
