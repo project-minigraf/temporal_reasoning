@@ -6025,6 +6025,17 @@ class TestFrontierPersistClaim:
         mcp_server._frontier_persist_claim(db, linearization, 1, from_low=True, commit_ts_iso="2026-01-01T00:00:01Z")
 
         assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h1")
+        # Directly count raw facts -- _frontier_read_bounds's results[0]
+        # shortcut would not deterministically catch a skipped retract: if
+        # the stale :hi-hash datom were left live alongside the new one, the
+        # bounds tuple _frontier_read_bounds returns depends on the DB
+        # engine's internal fact-iteration order, which isn't guaranteed to
+        # be insertion order (see Task 3's review for the same masking risk).
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count ?hi) :where [{mcp_server._FRONTIER_LOW_IDENT} :hi-hash ?hi]])",
+        )
+        assert json.loads(raw)["results"] == [[1]]
 
     def test_claim_from_high_is_tracked_separately_from_low(self, real_db):
         import mcp_server
@@ -6037,6 +6048,16 @@ class TestFrontierPersistClaim:
 
         assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h0")
         assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT) == ("h2", "h3")
+        # Directly count raw facts for the bound that moved on the second
+        # high claim (:lo-hash on frontier-high, h3 -> h2) -- same masking
+        # risk as above: _frontier_read_bounds's results[0] shortcut would
+        # not deterministically catch a skipped retract leaving a stale
+        # :lo-hash datom live alongside the new one.
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count ?lo) :where [{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash ?lo]])",
+        )
+        assert json.loads(raw)["results"] == [[1]]
 
     def test_claim_persists_across_reopen(self, tmp_path):
         """Real file-backed DB, closed and reopened -- proves the claim
