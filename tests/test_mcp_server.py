@@ -6245,6 +6245,84 @@ class TestLineageConfirmedThroughMigration:
         assert mcp_server._lineage_confirmed_through_query(db) == "h2"
 
 
+class TestCandidateDiff:
+    def test_read_absent_record_returns_none(self, real_db):
+        import mcp_server
+        assert mcp_server._candidate_diff_read(real_db, "a" * 40, ":function/foo") is None
+
+    def test_persist_then_read_round_trip(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+
+        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
+        # A different (commit, entity) pair must not resolve to this record.
+        assert mcp_server._candidate_diff_read(db, "b" * 40, entity_ident) is None
+        assert mcp_server._candidate_diff_read(db, commit_hash, ":function/other") is None
+
+    def test_persist_same_hash_twice_does_not_duplicate(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:01Z")
+
+        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :body-hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_persist_different_hash_updates_without_duplicating(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash2", "2026-01-01T00:00:01Z")
+
+        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash2"
+        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :body-hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_clear_removes_the_record(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+        mcp_server._candidate_diff_clear(db, commit_hash, entity_ident)
+
+        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) is None
+        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?e) :where [{ident} :entity ?e]])")
+        assert json.loads(raw)["results"] == [[0]]
+
+    def test_clear_absent_record_is_a_noop(self, real_db):
+        import mcp_server
+        db = real_db
+        # Must not raise.
+        mcp_server._candidate_diff_clear(db, "a" * 40, ":function/never-persisted")
+
+    def test_candidate_diff_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        commit_hash = "a" * 40
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
+        result = mcp_server.handle_minigraf_audit()
+
+        assert result["retracted"] == 0
+        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
+
+
 class TestGitCommitsTopoOrder:
     def test_orders_by_topology_not_committer_date(self, git_repo_diamond_clock_skewed):
         import mcp_server

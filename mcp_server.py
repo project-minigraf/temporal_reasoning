@@ -5151,6 +5151,80 @@ def _lineage_confirmed_through_migrate(
     _lineage_confirmed_through_update(db, hi_hash, run_ts_iso, index_con=index_con)
 
 
+def _candidate_diff_ident(commit_hash: str, entity_ident: str) -> str:
+    """Deterministic ident for a candidate-diff record. Not a public schema
+    type -- see the #222 phase 2a design spec's "Schema/audit status of new
+    entity types" section.
+    """
+    return f":candidate/{commit_hash[:12]}-{entity_ident.lstrip(':').replace('/', '-')}"
+
+
+def _candidate_diff_persist(
+    db: Any,
+    commit_hash: str,
+    entity_ident: str,
+    body_hash: str,
+    commit_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """Mint/update one candidate-diff record for (commit_hash, entity_ident).
+    Query-before-write -- no-ops if the persisted body_hash already
+    matches, retracts+reasserts only the :body-hash if it genuinely
+    changed (the other attributes are all derived from commit_hash/
+    entity_ident, which never change for a given record's ident). Uses
+    internal _transact/_retract directly, never handle_minigraf_transact:
+    :type/candidate-diff is deliberately unregistered in MINIGRAF_SCHEMA.
+    """
+    ident = _candidate_diff_ident(commit_hash, entity_ident)
+    existing = _candidate_diff_read(db, commit_hash, entity_ident)
+    if existing == body_hash:
+        return
+    if existing is None:
+        commit_ident = f":commit/{commit_hash[:12]}"
+        facts = [
+            f"[{ident} :entity-type :type/candidate-diff]",
+            f"[{ident} :commit {commit_ident}]",
+            f"[{ident} :entity {entity_ident}]",
+            f'[{ident} :body-hash "{_edn_escape(body_hash)}"]',
+        ]
+        _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
+    else:
+        _retract(db, f'[[{ident} :body-hash "{_edn_escape(existing)}"]]', index_con=index_con)
+        _transact(
+            db, f'[[{ident} :body-hash "{_edn_escape(body_hash)}"]]', commit_ts_iso, index_con=index_con
+        )
+
+
+def _candidate_diff_read(db: Any, commit_hash: str, entity_ident: str) -> Optional[str]:
+    """Return the persisted body_hash for (commit_hash, entity_ident), or
+    None if no candidate record exists for that pair."""
+    ident = _candidate_diff_ident(commit_hash, entity_ident)
+    raw = _db_execute(db, f"(query [:find ?h :where [{ident} :body-hash ?h]])")
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+def _candidate_diff_clear(
+    db: Any, commit_hash: str, entity_ident: str, index_con: Optional[Any] = None
+) -> None:
+    """Retract the candidate record once consumed (2c calls this after
+    confirming/rejecting), so these scratch facts don't accumulate
+    unbounded across a full ingest. No-op if no record exists.
+    """
+    existing = _candidate_diff_read(db, commit_hash, entity_ident)
+    if existing is None:
+        return
+    ident = _candidate_diff_ident(commit_hash, entity_ident)
+    commit_ident = f":commit/{commit_hash[:12]}"
+    facts = [
+        f"[{ident} :entity-type :type/candidate-diff]",
+        f"[{ident} :commit {commit_ident}]",
+        f"[{ident} :entity {entity_ident}]",
+        f'[{ident} :body-hash "{_edn_escape(existing)}"]',
+    ]
+    _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+
+
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
 _LAST_RUN_NUMERIC_ATTRS = frozenset({":total-ingested"})
 
