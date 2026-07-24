@@ -6084,6 +6084,67 @@ class TestFrontierPersistClaim:
         ]
 
 
+class TestLineageProvisionalMarker:
+    def test_unmarked_entity_reads_as_authoritative(self, real_db):
+        import mcp_server
+        db = real_db
+        assert mcp_server._lineage_is_provisional(db, ":function/src-auth-py-login") is False
+
+    def test_mark_then_confirm_round_trip(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._lineage_mark_provisional(db, entity_ident, "2026-01-01T00:00:00Z")
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is True
+
+        mcp_server._lineage_confirm(db, entity_ident)
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is False
+
+    def test_confirm_already_authoritative_entity_is_a_noop(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        # Never marked -- confirming must not raise or create anything.
+        mcp_server._lineage_confirm(db, entity_ident)
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is False
+
+    def test_mark_provisional_is_idempotent(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._lineage_mark_provisional(db, entity_ident, "2026-01-01T00:00:00Z")
+        mcp_server._lineage_mark_provisional(db, entity_ident, "2026-01-01T00:00:01Z")
+
+        ident = mcp_server._lineage_marker_ident(entity_ident)
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?e) :where [{ident} :entity ?e]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_provisional_marker_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            db,
+            f'[[{entity_ident} :entity-type :type/function] '
+            f'[{entity_ident} :description "login"] '
+            f'[{entity_ident} :file "src/auth.py"]]',
+            "2026-01-01T00:00:00Z",
+        )
+
+        mcp_server._lineage_mark_provisional(db, entity_ident, "2026-01-01T00:00:00Z")
+        result = mcp_server.handle_minigraf_audit()
+
+        assert result["retracted"] == 0
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is True
+        raw = mcp_server._db_execute(
+            db, f'(query [:find (count ?d) :where [{entity_ident} :description ?d]])'
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+
 class TestGitCommitsTopoOrder:
     def test_orders_by_topology_not_committer_date(self, git_repo_diamond_clock_skewed):
         import mcp_server

@@ -5017,6 +5017,62 @@ def _frontier_persist_claim(
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
 
 
+_LINEAGE_MARKER_ENTITY_TYPE = ":type/lineage-marker"
+
+
+def _lineage_marker_ident(entity_ident: str) -> str:
+    """Deterministic companion-entity ident for entity_ident's provisional
+    marker. Not a public schema type -- see the #222 phase 2a design spec's
+    "Schema/audit status of new entity types" section.
+    """
+    return f":lineage/{entity_ident.lstrip(':').replace('/', '-')}"
+
+
+def _lineage_mark_provisional(
+    db: Any, entity_ident: str, commit_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """Create the :type/lineage-marker companion entity for entity_ident, if
+    one doesn't already exist. Query-before-write (mirrors _watermark_update)
+    -- a marker already present is a no-op, never a duplicate write. Uses
+    internal _transact directly, never handle_minigraf_transact: :type/
+    lineage-marker is deliberately unregistered in MINIGRAF_SCHEMA, and the
+    public handler's schema gate would reject it outright.
+    """
+    if _lineage_is_provisional(db, entity_ident):
+        return
+    ident = _lineage_marker_ident(entity_ident)
+    facts = [
+        f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
+        f"[{ident} :entity {entity_ident}]",
+        f"[{ident} :status :provisional]",
+    ]
+    _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
+
+
+def _lineage_confirm(db: Any, entity_ident: str, index_con: Optional[Any] = None) -> None:
+    """Retract the :type/lineage-marker companion entity's facts for
+    entity_ident if present; no-op if absent, so callers (2c) can call this
+    unconditionally without checking first.
+    """
+    if not _lineage_is_provisional(db, entity_ident):
+        return
+    ident = _lineage_marker_ident(entity_ident)
+    facts = [
+        f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
+        f"[{ident} :entity {entity_ident}]",
+        f"[{ident} :status :provisional]",
+    ]
+    _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+
+
+def _lineage_is_provisional(db: Any, entity_ident: str) -> bool:
+    """True iff a :type/lineage-marker companion entity currently exists for
+    entity_ident."""
+    ident = _lineage_marker_ident(entity_ident)
+    raw = _db_execute(db, f"(query [:find ?e :where [{ident} :entity ?e]])")
+    return bool(json.loads(raw).get("results", []))
+
+
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
 _LAST_RUN_NUMERIC_ATTRS = frozenset({":total-ingested"})
 
