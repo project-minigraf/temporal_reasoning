@@ -6188,6 +6188,63 @@ class TestLineageConfirmedThroughWatermark:
         assert mcp_server._lineage_confirmed_through_query(db) == "h1"
 
 
+class TestLineageConfirmedThroughMigration:
+    def test_fresh_migration_seeds_from_watermark(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+    def test_already_migrated_graph_still_gets_watermark_seeded(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        # Simulate an earlier Phase-1-only run: frontier-low gets created,
+        # but lineage-confirmed-through (new in Phase 2a) doesn't exist yet.
+        mcp_server._frontier_seed_from_watermark(db, linearization, "2026-01-01T00:00:01Z")
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) is not None
+        assert mcp_server._lineage_confirmed_through_query(db) is None
+
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+    def test_repeated_load_does_not_duplicate_same_value(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+        mcp_server._frontier_load(db, linearization, "2026-01-03T00:00:00Z")
+
+        ident = mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_does_not_clobber_a_value_advanced_past_migration_boundary(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+        # Simulate phase 2c's real sweep having advanced past the original
+        # migration boundary.
+        mcp_server._lineage_confirmed_through_update(db, "h2", "2026-01-03T00:00:00Z")
+
+        mcp_server._frontier_load(db, linearization, "2026-01-04T00:00:00Z")
+
+        assert mcp_server._lineage_confirmed_through_query(db) == "h2"
+
+
 class TestGitCommitsTopoOrder:
     def test_orders_by_topology_not_committer_date(self, git_repo_diamond_clock_skewed):
         import mcp_server

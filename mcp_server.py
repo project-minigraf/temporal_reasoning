@@ -4962,6 +4962,7 @@ def _frontier_load(
         and _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT) is None
     ):
         _frontier_seed_from_watermark(db, linearization, run_ts_iso, index_con=index_con)
+    _lineage_confirmed_through_migrate(db, run_ts_iso, index_con=index_con)
 
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     intervals: List[frontier_registry.Interval] = []
@@ -5125,6 +5126,29 @@ def _lineage_confirmed_through_update(
     if to_retract:
         _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
+def _lineage_confirmed_through_migrate(
+    db: Any, run_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """One-time catch-up: if :ingestion/frontier-low exists (this graph has
+    an authoritative region, whether freshly migrated by
+    _frontier_seed_from_watermark just now or already established by an
+    earlier Phase-1-only run) but :ingestion/lineage-confirmed-through is
+    unset, seed the watermark from frontier-low's *current* :hi-hash --
+    that whole region was ingested by the original single-stream
+    forward-only authoritative walk, so it is already fully
+    lineage-confirmed. No-op if frontier-low doesn't exist yet, or
+    lineage-confirmed-through is already set (so later phases' own sweep
+    updates are never clobbered back to a stale value).
+    """
+    if _lineage_confirmed_through_query(db) is not None:
+        return
+    low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
+    if low_bounds is None:
+        return
+    _, hi_hash = low_bounds
+    _lineage_confirmed_through_update(db, hi_hash, run_ts_iso, index_con=index_con)
 
 
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
