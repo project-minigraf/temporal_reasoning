@@ -105,30 +105,47 @@ exactly one source of truth, mutated atomically (see below).
 
 ### Graph persistence schema
 
-Each maximal interval is one `:type/ingest-interval` entity:
+Phase 1 only ever has at most two live intervals — one anchored at position 0
+(growing upward as Stream 1's future claims extend it) and one anchored at
+the last position (growing downward as Stream 2's future claims extend it).
+Each gets a **stable, role-based ident**, not one derived from its own moving
+bounds — an ident embedding a bound whose entire purpose is to move would
+mint a new entity every claim instead of updating the existing one:
 
 ```
-[:ingestion/interval-<lo_hash>-<hi_hash> :entity-type :type/ingest-interval]
-[:ingestion/interval-<lo_hash>-<hi_hash> :lo-hash "<lo_hash>"]
-[:ingestion/interval-<lo_hash>-<hi_hash> :hi-hash "<hi_hash>"]
-[:ingestion/interval-<lo_hash>-<hi_hash> :tag :authoritative|:provisional]
+[:ingestion/frontier-low :entity-type :type/ingest-interval]
+[:ingestion/frontier-low :lo-hash "<hash>"]
+[:ingestion/frontier-low :hi-hash "<hash>"]
+[:ingestion/frontier-low :tag :authoritative]
+
+[:ingestion/frontier-high :entity-type :type/ingest-interval]
+[:ingestion/frontier-high :lo-hash "<hash>"]
+[:ingestion/frontier-high :hi-hash "<hash>"]
+[:ingestion/frontier-high :tag :provisional]
 ```
 
-Persisted by commit hash, not position — positions are only meaningful
-against one in-memory linearization snapshot, but hashes are the durable
-identity that survives across restarts and (within this phase's
-linear-history assumption) across the branch advancing.
+`:ingestion/frontier-low`'s `:lo-hash` is always `linearization[0]` (`C0`) and
+never changes; only its `:hi-hash` advances. `:ingestion/frontier-high`'s
+`:hi-hash` is fixed at `Ht` for the lifetime of one allocator (tip movement
+mid-run is explicitly out of scope until phase 3); only its `:lo-hash`
+retreats. Either entity is absent entirely until the first claim from that
+side (e.g. `:ingestion/frontier-high` doesn't exist until Stream 2 makes its
+first claim).
 
-On load: every `:type/ingest-interval` fact is read back, its hashes resolved
-through the freshly-built `hash_to_pos` map, and the in-memory
-`FrontierAllocator` is reconstructed from the resulting `(lo_pos, hi_pos,
-tag)` set.
+Positions are never persisted directly — they're only meaningful against one
+in-memory linearization snapshot, whereas hashes are the durable identity
+that survives across restarts. On load, both entities' hashes (whichever are
+present) are resolved through the freshly-built `hash_to_pos` map, and the
+in-memory `FrontierAllocator` is reconstructed from the resulting
+`(lo_pos, hi_pos, tag)` pair.
 
-When an interval's bound moves (a stream extends it by one claimed commit),
-only that entity's `:lo-hash` or `:hi-hash` is retracted+reasserted — same
-cost and pattern as today's per-commit `:hash` update on
-`:ingestion/watermark`, just scoped to whichever one bound actually moved,
-not the whole registry.
+When a bound moves (a stream extends its interval by one claimed commit),
+only that one attribute (`:hi-hash` on `frontier-low`, or `:lo-hash` on
+`frontier-high`) is retracted+reasserted on the existing entity — same cost
+and pattern as today's per-commit `:hash` update on `:ingestion/watermark`.
+This 2-slot scheme is sufficient exactly because phases 1+2 have only one gap
+between two ends; phase 5's "new hole below" and multiple-roots cases need a
+genuinely dynamic set of idents and are explicitly deferred, not solved here.
 
 ### Migration from single-watermark graphs
 
