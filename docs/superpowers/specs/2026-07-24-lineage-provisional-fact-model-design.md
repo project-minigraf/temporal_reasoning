@@ -1,7 +1,7 @@
 # Provisional/Authoritative Lineage Fact Model + Candidate-Diff Persistence — Design Spec
 
 **Issue:** #222 (Phase 2, sub-phase 2a of 4)
-**Date:** 2026-07-24 (revised twice same day after spec review — see "Revision" note)
+**Date:** 2026-07-24 (revised three times same day after spec review — see "Revision" note)
 
 ## Background
 
@@ -91,6 +91,38 @@ Medium issue, both confirmed real and fixed in this version:
    to both equally. **Fixed** by adding a symmetric candidate-diff audit
    test (see Testing).
 
+A third review pass found two more Medium issues, both confirmed real and
+fixed in this version:
+
+7. **Medium** — the spec established that unregistered scratch types are
+   safe from `minigraf_audit` (point 4/#4 above), but didn't say anything
+   about `handle_minigraf_transact` — a *different* code path with its own,
+   narrower validation gate. Verified: `handle_minigraf_transact`
+   (mcp_server.py:3623) calls `_validate_facts` on every string-valued
+   triple (mcp_server.py:3638-3642), which *would* reject
+   `[:candidate/... :body-hash "..."]` outright ("unknown entity type
+   candidate") since `candidate-diff` isn't in `MINIGRAF_SCHEMA` — unlike
+   `minigraf_audit`, this gate runs at write time, not just on a later
+   sweep. The internal `_transact` helper (mcp_server.py:3532) has no such
+   check. **Fixed** by stating explicitly (see below) that every function
+   this spec defines must call the internal `_transact`/`_retract` helpers
+   directly, the same way `_watermark_update`/`_frontier_persist_claim`
+   already do — never the public `handle_minigraf_transact`/
+   `handle_minigraf_retract` MCP tool handlers.
+8. **Medium** — the migration idempotency test only proved "doesn't
+   duplicate the initial seeded value," not the spec's actual claim
+   ("later phases' own sweep updates are never clobbered back to a stale
+   value"). A test that re-seeds the *same* value twice cannot distinguish
+   a correct implementation from a buggy one that ignores its own guard and
+   unconditionally re-derives from `frontier-low`'s `:hi-hash` every call —
+   both would show "still one value, unchanged," since re-deriving the same
+   stale boundary twice looks identical to leaving an already-correct value
+   alone. **Fixed** by adding a test that first advances
+   `lineage-confirmed-through` *past* `frontier-low`'s current `:hi-hash`
+   (simulating phase 2c's real sweep), then calls `_frontier_load` again
+   and asserts the *advanced* value survives, not a clobber back to
+   `frontier-low`'s boundary.
+
 ## Scope (2a only)
 
 In scope:
@@ -138,6 +170,21 @@ scratch/tracking entities safe from ever being silently swept by a routine
 audit run. Neither type needs `:description`/`:ident` or any other
 schema-required attribute for the same reason — they are outside the
 closed-world surface `MINIGRAF_SCHEMA` governs entirely.
+
+**Implementation constraint (fixes Revision note #7): internal `_transact`/
+`_retract` only, never the public handlers.** Being unregistered protects
+these entity types from `minigraf_audit`'s later sweep, but *not* from
+`handle_minigraf_transact`'s (mcp_server.py:3623) write-time validation gate
+— that handler calls `_validate_facts` on every string-valued triple
+(mcp_server.py:3638-3642) and would reject `[:candidate/... :body-hash
+"..."]` outright as an unknown entity type, since `candidate-diff` isn't in
+`MINIGRAF_SCHEMA` either. The internal `_transact`/`_retract` helpers
+(mcp_server.py:3532/3567) have no such check. Every function this spec
+defines — `_lineage_mark_provisional`, `_lineage_confirm`,
+`_candidate_diff_persist`, `_candidate_diff_clear`, and the watermark
+functions below — **must** call `_transact`/`_retract` directly, the same
+way `_watermark_update`/`_frontier_persist_claim` already do, never route
+through `handle_minigraf_transact`/`handle_minigraf_retract`.
 
 ### Provisional marker
 
@@ -358,9 +405,18 @@ Following `docs/testing-conventions.md` (real backend, no mocked
   `:hi-hash` — this is the test that would have caught Revision note #5:
   it fails against the prior revision's `_frontier_seed_from_watermark`-only
   fix, since that branch never runs when `frontier-low` already exists.
-- **Migration seeding idempotency**: call `_frontier_load` a third time
-  after the watermark is already seeded and assert (via raw count) it's
-  still exactly one live `:hash` fact, unchanged — confirms
-  `_lineage_confirmed_through_migrate`'s own guard prevents it from ever
-  clobbering a value phase 2c's real sweep has since advanced past the
-  original migration seed.
+- **Migration seeding idempotency (same value)**: call `_frontier_load` a
+  third time after the watermark is already seeded and assert (via raw
+  count) it's still exactly one live `:hash` fact, unchanged.
+- **Migration seeding does not clobber an advanced value**: after the
+  watermark is seeded once, directly advance
+  `lineage-confirmed-through` to a hash *past* `frontier-low`'s current
+  `:hi-hash` (simulating phase 2c's real sweep having progressed further
+  than the original migration boundary), then call `_frontier_load` again
+  and assert `_lineage_confirmed_through_query` still returns the
+  *advanced* hash, not a clobber back to `frontier-low`'s boundary — the
+  "same value" idempotency test above cannot distinguish a correct
+  implementation from one that ignores its own guard and unconditionally
+  re-derives from `frontier-low` every call, since re-deriving an unchanged
+  value looks identical to leaving it alone; only advancing past it first
+  exposes the difference.
