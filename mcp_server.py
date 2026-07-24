@@ -30,6 +30,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from minigraf import MiniGrafDb, MiniGrafError
 import fact_index
+import frontier_registry
 
 # ---------------------------------------------------------------------------
 # Session-scoped rules — registered once at startup, cached in RuleRegistry
@@ -4907,6 +4908,74 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
     if to_retract:
         _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
+_FRONTIER_LOW_IDENT = ":ingestion/frontier-low"
+_FRONTIER_HIGH_IDENT = ":ingestion/frontier-high"
+
+
+def _frontier_read_bounds(db: Any, ident: str) -> Optional[Tuple[str, str]]:
+    """Return (lo_hash, hi_hash) for ident's :type/ingest-interval fact, or
+    None if that interval hasn't been created yet."""
+    raw = _db_execute(
+        db,
+        f"(query [:find ?lo ?hi :where [{ident} :lo-hash ?lo] [{ident} :hi-hash ?hi]])",
+    )
+    results = json.loads(raw).get("results", [])
+    return (results[0][0], results[0][1]) if results else None
+
+
+def _frontier_seed_from_watermark(
+    db: Any, linearization: List[str], run_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """One-time migration: seed :ingestion/frontier-low as [C0, W] tagged
+    authoritative from the old scalar :ingestion/watermark. No-op if
+    frontier-low already exists or there is no watermark to migrate from
+    (see the #222 phase-1 design spec's "Migration" section).
+    """
+    if _frontier_read_bounds(db, _FRONTIER_LOW_IDENT) is not None:
+        return
+    watermark_hash = _watermark_query(db)
+    if watermark_hash is None or not linearization:
+        return
+    facts = [
+        f"[{_FRONTIER_LOW_IDENT} :entity-type :type/ingest-interval]",
+        f'[{_FRONTIER_LOW_IDENT} :lo-hash "{linearization[0]}"]',
+        f'[{_FRONTIER_LOW_IDENT} :hi-hash "{_edn_escape(watermark_hash)}"]',
+        f"[{_FRONTIER_LOW_IDENT} :tag :authoritative]",
+    ]
+    _transact(db, "[" + " ".join(facts) + "]", run_ts_iso, index_con=index_con)
+
+
+def _frontier_load(
+    db: Any, linearization: List[str], run_ts_iso: str, index_con: Optional[Any] = None
+) -> "frontier_registry.FrontierAllocator":
+    """Reconstruct a FrontierAllocator from persisted graph facts, migrating
+    a pre-#222 watermark-only graph on first load. See the design spec's
+    "Migration" and "Graph persistence schema" sections.
+    """
+    if not linearization:
+        return frontier_registry.FrontierAllocator(0, [])
+
+    if (
+        _frontier_read_bounds(db, _FRONTIER_LOW_IDENT) is None
+        and _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT) is None
+    ):
+        _frontier_seed_from_watermark(db, linearization, run_ts_iso, index_con=index_con)
+
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    intervals: List[frontier_registry.Interval] = []
+    low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
+    if low_bounds is not None and low_bounds[0] in hash_to_pos and low_bounds[1] in hash_to_pos:
+        intervals.append(frontier_registry.Interval(
+            hash_to_pos[low_bounds[0]], hash_to_pos[low_bounds[1]], frontier_registry.TAG_AUTHORITATIVE
+        ))
+    high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
+    if high_bounds is not None and high_bounds[0] in hash_to_pos and high_bounds[1] in hash_to_pos:
+        intervals.append(frontier_registry.Interval(
+            hash_to_pos[high_bounds[0]], hash_to_pos[high_bounds[1]], frontier_registry.TAG_PROVISIONAL
+        ))
+    return frontier_registry.FrontierAllocator(len(linearization), intervals)
 
 
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})

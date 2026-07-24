@@ -25,6 +25,7 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from minigraf import MiniGrafError
+import frontier_registry
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -5948,6 +5949,52 @@ class TestGitHelpers:
         _, _, _, _, new_sha, _ = entries[0][:6]
         content = mcp_server._git_blob_content(str(git_repo), new_sha)
         assert b"def login" in content
+
+
+class TestFrontierLoad:
+    def test_migrates_from_watermark_when_no_intervals_exist(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2", "h3"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        allocator = mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+
+        assert allocator.total_positions == 4
+        assert allocator.intervals() == [
+            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE)
+        ]
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h1")
+
+    def test_second_load_does_not_duplicate_migration(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+        second = mcp_server._frontier_load(db, linearization, "2026-01-03T00:00:00Z")
+
+        assert second.intervals() == [
+            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE)
+        ]
+
+    def test_no_watermark_no_intervals_yields_empty_allocator(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1"]
+
+        allocator = mcp_server._frontier_load(db, linearization, "2026-01-01T00:00:00Z")
+
+        assert allocator.intervals() == []
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) is None
+
+    def test_empty_linearization_yields_empty_allocator(self, real_db):
+        import mcp_server
+        db = real_db
+        allocator = mcp_server._frontier_load(db, [], "2026-01-01T00:00:00Z")
+        assert allocator.total_positions == 0
+        assert allocator.intervals() == []
 
 
 class TestGitCommitsTopoOrder:
