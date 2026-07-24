@@ -4111,7 +4111,7 @@ def _git_commits(
     watermark_hash: Optional[str],
     branch: str = "HEAD",
 ) -> List[tuple]:
-    """Return list of (hash, ts_iso, author_email, subject) in chronological order."""
+    """Return list of (hash, ts_iso, author_email, subject) in topological order."""
     range_spec = f"{watermark_hash}..{branch}" if watermark_hash else branch
     result = _subprocess.run(
         ["git", "log", "--topo-order", "--reverse", "--format=%H %at %ae %s", range_spec],
