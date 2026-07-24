@@ -4978,6 +4978,45 @@ def _frontier_load(
     return frontier_registry.FrontierAllocator(len(linearization), intervals)
 
 
+def _frontier_persist_claim(
+    db: Any,
+    linearization: List[str],
+    pos: int,
+    from_low: bool,
+    commit_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """Persist a single claimed position by extending the correct fixed-ident
+    interval fact -- retracts+reasserts only the moved bound, mirroring
+    _watermark_update's per-commit cost profile (see the design spec's
+    "Persistence timing" and "Graph persistence schema" sections).
+    """
+    ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
+    tag = ":authoritative" if from_low else ":provisional"
+    moved_hash = linearization[pos]
+    existing = _frontier_read_bounds(db, ident)
+
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    if existing is None:
+        to_transact.append(f"[{ident} :entity-type :type/ingest-interval]")
+        to_transact.append(f"[{ident} :tag {tag}]")
+        to_transact.append(f'[{ident} :lo-hash "{_edn_escape(moved_hash)}"]')
+        to_transact.append(f'[{ident} :hi-hash "{_edn_escape(moved_hash)}"]')
+    else:
+        lo_hash, hi_hash = existing
+        if from_low:
+            to_retract.append(f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]')
+            to_transact.append(f'[{ident} :hi-hash "{_edn_escape(moved_hash)}"]')
+        else:
+            to_retract.append(f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]')
+            to_transact.append(f'[{ident} :lo-hash "{_edn_escape(moved_hash)}"]')
+
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
 _LAST_RUN_NUMERIC_ATTRS = frozenset({":total-ingested"})
 

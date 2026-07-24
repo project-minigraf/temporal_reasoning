@@ -6006,6 +6006,63 @@ class TestFrontierLoad:
         assert allocator.intervals() == []
 
 
+class TestFrontierPersistClaim:
+    def test_first_claim_from_low_creates_interval(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+
+        mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
+
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h0")
+
+    def test_second_claim_from_low_extends_hi_hash_only(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+
+        mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
+        mcp_server._frontier_persist_claim(db, linearization, 1, from_low=True, commit_ts_iso="2026-01-01T00:00:01Z")
+
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h1")
+
+    def test_claim_from_high_is_tracked_separately_from_low(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2", "h3"]
+
+        mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
+        mcp_server._frontier_persist_claim(db, linearization, 3, from_low=False, commit_ts_iso="2026-01-01T00:00:01Z")
+        mcp_server._frontier_persist_claim(db, linearization, 2, from_low=False, commit_ts_iso="2026-01-01T00:00:02Z")
+
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h0")
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT) == ("h2", "h3")
+
+    def test_claim_persists_across_reopen(self, tmp_path):
+        """Real file-backed DB, closed and reopened -- proves the claim
+        survives a genuine process restart, not just an in-memory read
+        within the same open() call (docs/testing-conventions.md Pattern 2).
+        """
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        linearization = ["h0", "h1", "h2"]
+
+        mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
+        mcp_server._db_checkpoint(db)
+        mcp_server._db = None  # release lock, force a genuine reopen below
+
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        reopened_db = mcp_server.get_db()
+        allocator = mcp_server._frontier_load(reopened_db, linearization, "2026-01-02T00:00:00Z")
+
+        assert allocator.intervals() == [
+            frontier_registry.Interval(0, 0, frontier_registry.TAG_AUTHORITATIVE)
+        ]
+
+
 class TestGitCommitsTopoOrder:
     def test_orders_by_topology_not_committer_date(self, git_repo_diamond_clock_skewed):
         import mcp_server
