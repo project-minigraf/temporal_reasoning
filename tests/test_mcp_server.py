@@ -25,6 +25,7 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from minigraf import MiniGrafError
+import frontier_registry
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -5860,6 +5861,55 @@ def git_repo(tmp_path):
     return repo
 
 
+@pytest.fixture
+def git_repo_diamond_clock_skewed(tmp_path):
+    """A fork+merge DAG where one forked branch's single commit is dated
+    EARLIER than its own parent (clock skew) -- unlike a linear chain (which
+    has no ordering ambiguity for any git log mode to resolve, verified: a
+    simple parent/child pair produces identical output with or without
+    --topo-order), this fork+merge shape genuinely produces different output
+    depending on --topo-order:
+
+    Plain `git log --reverse` (no --topo-order) outputs C1 BEFORE P, a real
+    topological violation (a commit before its own parent), because C1's
+    date is earlier than P's. `--topo-order --reverse` correctly places P
+    first. Verified empirically against real git before writing this test.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def commit(filename, content, message, date_iso):
+        (repo / filename).write_text(content)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        env = {**os.environ, "GIT_AUTHOR_DATE": date_iso, "GIT_COMMITTER_DATE": date_iso}
+        _subprocess.run(["git", "commit", "-m", message], cwd=repo, check=True, capture_output=True, env=env)
+
+    # P (root), dated Jan 3
+    commit("p.txt", "p\n", "P", "2026-01-03T00:00:00")
+    _subprocess.run(["git", "branch", "branch2"], cwd=repo, check=True, capture_output=True)
+
+    # C1: child of P, dated Jan 1 -- EARLIER than P (the skew)
+    commit("c1.txt", "c1\n", "C1", "2026-01-01T00:00:00")
+    _subprocess.run(["git", "branch", "branch1"], cwd=repo, check=True, capture_output=True)
+
+    # branch2: normal monotonically-increasing chain from P
+    _subprocess.run(["git", "checkout", "branch2"], cwd=repo, check=True, capture_output=True)
+    commit("c2a.txt", "c2a\n", "C2a", "2026-01-05T00:00:00")
+    commit("c2b.txt", "c2b\n", "C2b", "2026-01-06T00:00:00")
+    commit("c2tip.txt", "c2tip\n", "C2tip", "2026-01-07T00:00:00")
+
+    env = {**os.environ, "GIT_AUTHOR_DATE": "2026-01-08T00:00:00", "GIT_COMMITTER_DATE": "2026-01-08T00:00:00"}
+    _subprocess.run(
+        ["git", "merge", "--no-ff", "-m", "MG", "branch1"],
+        cwd=repo, check=True, capture_output=True, env=env,
+    )
+
+    return repo
+
+
 class TestGitHelpers:
     def test_git_commits_full_history(self, git_repo):
         import mcp_server
@@ -5899,6 +5949,147 @@ class TestGitHelpers:
         _, _, _, _, new_sha, _ = entries[0][:6]
         content = mcp_server._git_blob_content(str(git_repo), new_sha)
         assert b"def login" in content
+
+
+class TestFrontierLoad:
+    def test_migrates_from_watermark_when_no_intervals_exist(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2", "h3"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        allocator = mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+
+        assert allocator.total_positions == 4
+        assert allocator.intervals() == [
+            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE)
+        ]
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h1")
+
+    def test_second_load_does_not_duplicate_migration(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+        mcp_server._watermark_update(db, "h1", "2026-01-01T00:00:00Z", "seed watermark")
+
+        mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
+        second = mcp_server._frontier_load(db, linearization, "2026-01-03T00:00:00Z")
+
+        assert second.intervals() == [
+            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE)
+        ]
+        # Directly count raw facts -- _frontier_read_bounds's results[0]
+        # shortcut would silently collapse a duplicate live datom and hide a
+        # broken migration guard, so intervals() equality alone can't prove
+        # non-duplication.
+        raw = mcp_server._db_execute(
+            db,
+            "(query [:find (count ?lo) :where [:ingestion/frontier-low :lo-hash ?lo]])",
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_no_watermark_no_intervals_yields_empty_allocator(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1"]
+
+        allocator = mcp_server._frontier_load(db, linearization, "2026-01-01T00:00:00Z")
+
+        assert allocator.intervals() == []
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) is None
+
+    def test_empty_linearization_yields_empty_allocator(self, real_db):
+        import mcp_server
+        db = real_db
+        allocator = mcp_server._frontier_load(db, [], "2026-01-01T00:00:00Z")
+        assert allocator.total_positions == 0
+        assert allocator.intervals() == []
+
+
+class TestFrontierPersistClaim:
+    def test_first_claim_from_low_creates_interval(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+
+        mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
+
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h0")
+
+    def test_second_claim_from_low_extends_hi_hash_only(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2"]
+
+        mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
+        mcp_server._frontier_persist_claim(db, linearization, 1, from_low=True, commit_ts_iso="2026-01-01T00:00:01Z")
+
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h1")
+        # Directly count raw facts -- _frontier_read_bounds's results[0]
+        # shortcut would not deterministically catch a skipped retract: if
+        # the stale :hi-hash datom were left live alongside the new one, the
+        # bounds tuple _frontier_read_bounds returns depends on the DB
+        # engine's internal fact-iteration order, which isn't guaranteed to
+        # be insertion order (see Task 3's review for the same masking risk).
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count ?hi) :where [{mcp_server._FRONTIER_LOW_IDENT} :hi-hash ?hi]])",
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_claim_from_high_is_tracked_separately_from_low(self, real_db):
+        import mcp_server
+        db = real_db
+        linearization = ["h0", "h1", "h2", "h3"]
+
+        mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
+        mcp_server._frontier_persist_claim(db, linearization, 3, from_low=False, commit_ts_iso="2026-01-01T00:00:01Z")
+        mcp_server._frontier_persist_claim(db, linearization, 2, from_low=False, commit_ts_iso="2026-01-01T00:00:02Z")
+
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h0")
+        assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT) == ("h2", "h3")
+        # Directly count raw facts for the bound that moved on the second
+        # high claim (:lo-hash on frontier-high, h3 -> h2) -- same masking
+        # risk as above: _frontier_read_bounds's results[0] shortcut would
+        # not deterministically catch a skipped retract leaving a stale
+        # :lo-hash datom live alongside the new one.
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count ?lo) :where [{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash ?lo]])",
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_claim_persists_across_reopen(self, tmp_path):
+        """Real file-backed DB, closed and reopened -- proves the claim
+        survives a genuine process restart, not just an in-memory read
+        within the same open() call (docs/testing-conventions.md Pattern 2).
+        """
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db = mcp_server.get_db()
+        linearization = ["h0", "h1", "h2"]
+
+        mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
+        mcp_server._db_checkpoint(db)
+        mcp_server._db = None  # release lock, force a genuine reopen below
+
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        reopened_db = mcp_server.get_db()
+        allocator = mcp_server._frontier_load(reopened_db, linearization, "2026-01-02T00:00:00Z")
+
+        assert allocator.intervals() == [
+            frontier_registry.Interval(0, 0, frontier_registry.TAG_AUTHORITATIVE)
+        ]
+
+
+class TestGitCommitsTopoOrder:
+    def test_orders_by_topology_not_committer_date(self, git_repo_diamond_clock_skewed):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo_diamond_clock_skewed), watermark_hash=None)
+        subjects = [c[3] for c in commits]
+        assert subjects == ["P", "C2a", "C2b", "C2tip", "C1", "MG"]
 
 
 class TestDefaultGitBranch:
