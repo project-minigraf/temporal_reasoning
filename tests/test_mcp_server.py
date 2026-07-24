@@ -3386,6 +3386,48 @@ class TestExtractGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestNormalizedBodyHash:
+    def _python_parser(self):
+        import mcp_server
+        import tree_sitter
+        import tree_sitter_python
+        mcp_server._grammar_cache.clear()
+        real_lang = tree_sitter.Language(tree_sitter_python.language())
+        real_parser = tree_sitter.Parser(real_lang)
+        mcp_server._grammar_cache["python"] = real_parser
+        return real_parser
+
+    def _login_node(self, parser, source: bytes):
+        import mcp_server
+        root = parser.parse(source).root_node
+        return mcp_server._collect_entity_nodes(root, "python")["function"]["login"]
+
+    def test_whitespace_only_change_produces_identical_hash(self):
+        import mcp_server
+        parser = self._python_parser()
+        node_a = self._login_node(parser, b"def login(user):\n    return user.ok\n")
+        node_b = self._login_node(parser, b"def login(user):\n\n    return   user.ok\n\n")
+        assert mcp_server._normalized_body_hash(node_a) == mcp_server._normalized_body_hash(node_b)
+
+    def test_real_change_produces_different_hash(self):
+        import mcp_server
+        parser = self._python_parser()
+        node_a = self._login_node(parser, b"def login(user):\n    return user.ok\n")
+        node_b = self._login_node(parser, b"def login(user):\n    return user.active\n")
+        assert mcp_server._normalized_body_hash(node_a) != mcp_server._normalized_body_hash(node_b)
+
+    def test_comment_only_change_still_counts_as_different(self):
+        """v1 scope: only whitespace is normalized, not comments (see the
+        design doc's Scope section) -- a comment-only edit still registers
+        as a body change. This test locks in that scope decision so a future
+        change to it is deliberate, not accidental."""
+        import mcp_server
+        parser = self._python_parser()
+        node_a = self._login_node(parser, b"def login(user):\n    return user.ok\n")
+        node_b = self._login_node(parser, b"def login(user):\n    # checks auth\n    return user.ok\n")
+        assert mcp_server._normalized_body_hash(node_a) != mcp_server._normalized_body_hash(node_b)
+
+
 class TestPythonGlobalsAndFields:
     def _parser(self):
         import tree_sitter_python
