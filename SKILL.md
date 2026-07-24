@@ -192,6 +192,12 @@ memory_prepare_turn(user_message="what database did we decide on?")
 # → "Relevant memory context:\n  :name | PostgreSQL 15\n  :role | primary database"
 ```
 
+On build/fix/navigate-shaped messages (verbs like add/implement/build/fix/debug/refactor,
+or phrasings like "where is"/"how does", combined with a code-ish noun), and only once the
+repo has an ingested code graph, the block also gets a one-line nudge toward
+`minigraf_query`-based navigation — see "[Using ingested code structure to scope a
+change](#using-ingested-code-structure-to-scope-a-change)" below.
+
 ### memory_finalize_turn
 
 Call at the **end** of each turn. Extracts durable facts from the completed exchange and stores them.

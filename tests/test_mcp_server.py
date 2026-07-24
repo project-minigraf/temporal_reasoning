@@ -10464,6 +10464,93 @@ class TestHandleMemoryPrepareTurnFts5:
         assert ":module/old-cache" in result
 
 
+class TestLooksLikeNavigationTask:
+    """Heuristic verb/phrase + code-noun match for #220's lightweight nudge."""
+
+    def test_task_verb_with_code_noun_matches(self):
+        import mcp_server
+        assert mcp_server._looks_like_navigation_task("fix the login bug")
+        assert mcp_server._looks_like_navigation_task("please implement a new auth module")
+        assert mcp_server._looks_like_navigation_task("let's refactor this function")
+
+    def test_navigation_phrase_with_code_noun_matches(self):
+        import mcp_server
+        assert mcp_server._looks_like_navigation_task("where is the caching logic?")
+        assert mcp_server._looks_like_navigation_task("how does the query handler work")
+
+    def test_inflected_task_verb_with_code_noun_matches(self):
+        import mcp_server
+        assert mcp_server._looks_like_navigation_task("I've been fixing the login bug")
+        assert mcp_server._looks_like_navigation_task("just fixed the query handler")
+        assert mcp_server._looks_like_navigation_task("debugging the auth module now")
+        assert mcp_server._looks_like_navigation_task("we refactored the test file")
+        assert mcp_server._looks_like_navigation_task("added a new API endpoint")
+        assert mcp_server._looks_like_navigation_task("implementing the schema module")
+        assert mcp_server._looks_like_navigation_task("built a caching component")
+
+    def test_task_verb_without_code_noun_does_not_match(self):
+        import mcp_server
+        assert not mcp_server._looks_like_navigation_task("let's fix dinner tonight")
+        assert not mcp_server._looks_like_navigation_task("we should build a sandcastle")
+
+    def test_code_noun_without_task_verb_does_not_match(self):
+        import mcp_server
+        assert not mcp_server._looks_like_navigation_task("the module looks fine to me")
+
+    def test_unrelated_message_does_not_match(self):
+        import mcp_server
+        assert not mcp_server._looks_like_navigation_task("what's the weather like today?")
+
+
+class TestHandleMemoryPrepareTurnNavigationNudge:
+    """#220: memory_prepare_turn appends a one-line code-graph navigation nudge
+    on build/fix/navigate-shaped messages, gated on ingestion being present."""
+
+    def test_nudge_appended_when_task_shaped_and_ingestion_present(self, real_db, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 5)
+        result = mcp_server.handle_memory_prepare_turn("fix the login bug")
+        assert "minigraf_query" in result
+        assert "Using ingested code structure to scope a change" in result
+
+    def test_no_nudge_when_task_shaped_but_no_ingestion(self, real_db, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 0)
+        result = mcp_server.handle_memory_prepare_turn("fix the login bug")
+        assert result == ""
+
+    def test_no_nudge_when_ingestion_present_but_not_task_shaped(self, real_db, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 5)
+        result = mcp_server.handle_memory_prepare_turn("what's the weather like today?")
+        assert result == ""
+
+    def test_nudge_combined_with_memory_context(self, real_db, monkeypatch):
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 5)
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
+        )
+        result = mcp_server.handle_memory_prepare_turn("fix the redis caching bug")
+        assert "Relevant memory context:" in result
+        assert "use redis for caching" in result
+        assert "minigraf_query" in result
+
+    def test_nudge_check_failure_does_not_break_memory_context(self, real_db, monkeypatch):
+        import mcp_server
+
+        def _boom(db):
+            raise RuntimeError("simulated ingestion-check failure")
+
+        monkeypatch.setattr(mcp_server, "_count_commit_entities", _boom)
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
+        )
+        result = mcp_server.handle_memory_prepare_turn("fix the redis caching bug")
+        assert "use redis for caching" in result
+        assert "minigraf_query" not in result
+
+
 class TestIndexCacheInvalidation:
     def test_successful_transact_triggers_invalidation(self, real_db):
         import mcp_server

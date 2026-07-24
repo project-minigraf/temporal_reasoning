@@ -5360,10 +5360,48 @@ async def _run_startup_backfill() -> None:
         _db = None
 
 
+_NAV_TASK_VERBS = re.compile(
+    r"\b(?:add(?:ing|ed|s)?|implement(?:ing|ed|s)?|build(?:ing|s)?|built|"
+    r"fix(?:ing|ed|es)?|debug(?:ging|ged|s)?|refactor(?:ing|ed|s)?)\b",
+    re.IGNORECASE,
+)
+_NAV_TASK_PHRASES = re.compile(
+    r"\b(?:where\s+is|where's|how\s+does|how\s+do)\b", re.IGNORECASE
+)
+_NAV_TASK_NOUNS = re.compile(
+    r"\b(?:code|function|method|class|module|file|bug|feature|endpoint|api|"
+    r"service|component|test|logic|handler|query|database|schema|route|"
+    r"script|implementation)\b",
+    re.IGNORECASE,
+)
+
+_NAV_NUDGE = (
+    'This repo has an ingested code graph. Consider minigraf_query for impact '
+    '(reverse :depends-on plus the reachable rule) and co-change precedent '
+    '(shared :introduced-by/:modified-in commits) before diving in -- see '
+    'SKILL.md\'s "Using ingested code structure to scope a change" section.'
+)
+
+
+def _looks_like_navigation_task(user_message: str) -> bool:
+    """Heuristic match for a build/fix/navigate task shape (#220): a task
+    verb (add/implement/build/fix/debug/refactor, including common
+    inflections like "fixing"/"fixed"/"debugged") or a navigation phrase
+    (where is/how does) combined with a code-ish noun -- the noun
+    requirement keeps everyday phrasing that happens to share a verb (e.g.
+    "fix dinner") from triggering the nudge.
+    """
+    if not (_NAV_TASK_VERBS.search(user_message) or _NAV_TASK_PHRASES.search(user_message)):
+        return False
+    return bool(_NAV_TASK_NOUNS.search(user_message))
+
+
 def handle_memory_prepare_turn(user_message: str) -> str:
     """Query the persisted fact index for facts relevant to the user message,
     including labeled historical (retracted/superseded) facts -- the index
     is the entry point into history, the bi-temporal graph is the archive.
+    Also appends a lightweight code-graph navigation nudge (#220) on
+    build/fix/navigate-shaped messages, gated on ingestion being present.
 
     Returns a formatted context block string for injection as
     additionalContext, or an empty string if no relevant facts are found.
@@ -5377,6 +5415,7 @@ def handle_memory_prepare_turn(user_message: str) -> str:
     boost = float(os.environ.get("MINIGRAF_MEMORY_BOOST", "2.0"))
     historical_discount = float(os.environ.get("MINIGRAF_HISTORICAL_DISCOUNT", "0.5"))
     path = fact_index.index_path_for(_graph_path or _get_graph_path())
+    memory_block = ""
     try:
         if fact_index.needs_backfill(path):
             _rebuild_index_from_graph()
@@ -5384,12 +5423,20 @@ def handle_memory_prepare_turn(user_message: str) -> str:
             path, user_message, top_n=scan_limit, boost=boost,
             historical_discount=historical_discount,
         )
+        if results:
+            memory_block = f"Relevant memory context:\n{_format_facts(results)}"
     except Exception as e:
         print(f"[fact_index] prepare_turn failed: {e}", file=sys.stderr)
-        return ""
-    if not results:
-        return ""
-    return f"Relevant memory context:\n{_format_facts(results)}"
+
+    nav_nudge = ""
+    if _looks_like_navigation_task(user_message):
+        try:
+            if _count_commit_entities(get_db()) > 0:
+                nav_nudge = _NAV_NUDGE
+        except Exception as e:
+            print(f"[prepare_turn] navigation nudge check failed: {e}", file=sys.stderr)
+
+    return "\n\n".join(part for part in (memory_block, nav_nudge) if part)
 
 
 # ---------------------------------------------------------------------------
@@ -7699,7 +7746,10 @@ _TOOLS: List[Tool] = [
         description=(
             "Retrieve relevant memory context for the current user message. "
             "Call this at the START of every turn, before reading the user's message. "
-            "Returns a context block string to prepend to your working context."
+            "Returns a context block string to prepend to your working context. "
+            "On build/fix/navigate-shaped messages, also appends a one-line nudge "
+            "toward minigraf_query-based code-graph navigation when the repo has "
+            "an ingested graph."
         ),
         inputSchema={
             "type": "object",
