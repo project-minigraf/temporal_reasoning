@@ -455,6 +455,50 @@ Once ingestion is complete, query code structure with `:valid-at` for point-in-t
  :where (reachable :module/src-auth-py ?d) [?d :description ?dep]]
 ```
 
+### Using ingested code structure to scope a change
+
+For the highest-frequency developer task — "which parts of the codebase should I read or
+modify to build feature X or fix bug Y" — treat the ingested graph as a navigation tool,
+not just a history log.
+
+**Blast radius / impact.** Use the pre-registered `reachable` rule against `:depends-on`
+in reverse to find every entity transitively affected by a change — read and test all of
+them before you're done:
+```datalog
+[:find ?desc :where (reachable ?dependent :module/src-auth-py) [?dependent :description ?desc]]
+```
+
+**Co-change precedent.** Entities sharing the `:introduced-by` or `:modified-in` commit of
+a past similar feature form a template constellation of files worth touching for an
+analogous change today:
+```datalog
+[:find ?desc :where [?e :modified-in :commit/abc123def456] [?e :description ?desc]]
+```
+If a prior feature touched five files in one commit, a similar feature today likely needs
+the same five — or their current equivalents, following `:renamed-to` for anything that
+moved since.
+
+**Centrality.** File-level churn — the count of `:modified-in` edges on a `:type/module` —
+surfaces the load-bearing files near a concept area:
+```datalog
+[:find ?desc (count ?c) :where [?m :entity-type :type/module] [?m :modified-in ?c] [?m :description ?desc]]
+```
+
+**Honest limits — this complements grep/Read, it doesn't replace them:**
+- **Lagging snapshot.** The graph reflects the last ingested commit, not the live tree or
+  uncommitted work. Check `minigraf_ingest_status` before trusting it for something just written.
+- **No code text stored.** Names, structure, and history only — still `Read` the actual
+  file to understand what a function does, not just that it exists or changed.
+- **Function-level `:modified-in` is body-diff gated; module-level is not.** For
+  `:type/function`/`:type/class`/`:type/variable`/`:type/field`, a `:modified-in` edge means
+  the entity's own body provably changed (whitespace-only reformatting does not create one).
+  For `:type/module`, `:modified-in` fires on every commit that touches the file at all — so
+  the centrality query above is a genuine per-commit file-churn signal, while function-level
+  churn is an independently trustworthy signal in its own right, not a re-derivation of file churn.
+- **Rename/lifecycle is per-entity and reliable.** `:renamed-from`/`:renamed-to` track true
+  introduce/rename/close history for every code entity type — follow it to keep a chain of
+  identity across a rename that would otherwise look like an unrelated delete+create.
+
 Cross-layer queries joining code structure with agent decisions — a genuine single-query
 join, not two queries diffed externally. Every fact carries its own bi-temporal validity
 window, bindable via `:db/valid-from ?vf` / `:db/valid-to ?vt` pseudo-attributes (see
