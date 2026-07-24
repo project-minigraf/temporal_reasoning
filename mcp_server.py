@@ -6066,6 +6066,10 @@ def _build_code_triples(
     module_ident = precomputed["module_ident"]
     field_class_map = precomputed.get("field_class_map", {})
     field_static_map = precomputed.get("field_static_map", {})
+    # #221: idents whose body provably did NOT change this commit (empty for
+    # every caller that doesn't pass old_entity_nodes/new_entity_nodes to
+    # _precompute_file_triples, preserving today's unconditional behavior).
+    unchanged_idents = precomputed.get("unchanged_idents", set())
 
     is_new_module = module_ident not in entity_valid_from
     # Track all idents for this file (for deletion cleanup)
@@ -6078,7 +6082,9 @@ def _build_code_triples(
         entity_valid_from[module_ident] = commit_ts_iso
         entity_descriptions[module_ident] = file_path
     else:
-        # Existing module: only record that this commit modified it
+        # Existing module: only record that this commit modified it. NOT
+        # gated by unchanged_idents (#221) -- the module IS the file, so any
+        # file change is legitimate module-level churn.
         triples.append(f"[{module_ident} :modified-in {commit_ident}]")
 
     for fn_ident, fn_name, candidate_triples in precomputed["function_entries"]:
@@ -6088,8 +6094,9 @@ def _build_code_triples(
                 idents_for_file.append(fn_ident)
             entity_valid_from[fn_ident] = commit_ts_iso
             entity_descriptions[fn_ident] = fn_name
-        else:
-            # Pre-existing function: record that this commit modified it
+        elif fn_ident not in unchanged_idents:
+            # Pre-existing function whose body actually changed (#221):
+            # record that this commit modified it.
             triples.append(f"[{fn_ident} :modified-in {commit_ident}]")
 
     for cls_ident, cls_name, candidate_triples in precomputed["class_entries"]:
@@ -6099,8 +6106,9 @@ def _build_code_triples(
                 idents_for_file.append(cls_ident)
             entity_valid_from[cls_ident] = commit_ts_iso
             entity_descriptions[cls_ident] = cls_name
-        else:
-            # Pre-existing class: record that this commit modified it
+        elif cls_ident not in unchanged_idents:
+            # Pre-existing class whose body actually changed (#221): record
+            # that this commit modified it.
             triples.append(f"[{cls_ident} :modified-in {commit_ident}]")
 
     for gvar_ident, gvar_name, candidate_triples in precomputed["global_entries"]:
@@ -6110,7 +6118,7 @@ def _build_code_triples(
                 idents_for_file.append(gvar_ident)
             entity_valid_from[gvar_ident] = commit_ts_iso
             entity_descriptions[gvar_ident] = gvar_name
-        else:
+        elif gvar_ident not in unchanged_idents:
             triples.append(f"[{gvar_ident} :modified-in {commit_ident}]")
 
     for field_ident, field_name, candidate_triples in precomputed["field_entries"]:
@@ -6129,7 +6137,7 @@ def _build_code_triples(
             # (see _build_close_triples / issue #134) without re-deriving it.
             if field_static_ident is not None and field_ident in field_static_map:
                 field_static_ident[field_ident] = field_static_map[field_ident]
-        else:
+        elif field_ident not in unchanged_idents:
             triples.append(f"[{field_ident} :modified-in {commit_ident}]")
 
     return triples

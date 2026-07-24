@@ -7426,6 +7426,55 @@ class TestIngestionWrites:
         assert not any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
         assert any(f"[{fn_ident} :introduced-by {commit_ident}]" in t for t in triples)
 
+    def test_build_code_triples_skips_modified_in_for_unchanged_ident(self):
+        import mcp_server
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        entity_valid_from = {
+            module_ident: "2025-01-01T00:00:00Z",
+            fn_ident: "2025-01-01T00:00:00Z",
+        }
+        commit_ident = ":commit/deadbeef12345678"
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
+        precomputed["unchanged_idents"] = {fn_ident}
+        triples = mcp_server._build_code_triples(
+            "auth.py",
+            extracted,
+            "2025-02-01T00:00:00Z",
+            entity_valid_from,
+            {},
+            {},
+            commit_ident,
+            precomputed,
+        )
+        assert not any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
+
+    def test_build_code_triples_module_ignores_unchanged_idents(self):
+        """Module-level churn is deliberately NOT gated by unchanged_idents --
+        the module IS the file, so any file change is legitimate module
+        churn (see design doc's Scope section: 'module is deliberately
+        excluded'). Even if unchanged_idents (hypothetically, incorrectly)
+        contained the module ident, it must still get :modified-in."""
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        entity_valid_from = {module_ident: "2025-01-01T00:00:00Z"}
+        commit_ident = ":commit/deadbeef12345678"
+        extracted = {"functions": [], "classes": [], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
+        precomputed["unchanged_idents"] = {module_ident}
+        triples = mcp_server._build_code_triples(
+            "auth.py",
+            extracted,
+            "2025-02-01T00:00:00Z",
+            entity_valid_from,
+            {},
+            {},
+            commit_ident,
+            precomputed,
+        )
+        assert any(f"[{module_ident} :modified-in {commit_ident}]" in t for t in triples)
+
     def test_build_code_triples_populates_entity_descriptions(self):
         import mcp_server
         entity_valid_from: dict = {}
