@@ -383,7 +383,17 @@ Following `docs/testing-conventions.md` (real backend, no mocked
   prior revision.
 - **Watermark round-trip**: mirrors phase 1's `_watermark_update`/
   `_watermark_query` tests — persist, re-query, update again, confirm only
-  one live `:hash` fact exists via a `(count ...)` query.
+  one live `:hash` fact exists via a `(count ...)` query. Unlike the
+  lineage-marker/candidate-diff entities, `:ingestion/lineage-confirmed-through`
+  uses entity-type `:type/ingestion` — the *same registered, audited* type
+  `:ingestion/watermark` already uses (`ingestion` is in `MINIGRAF_SCHEMA`,
+  requiring `:description` and allowing `:hash` among its optional attrs).
+  This test must additionally assert the entity has the expected constant
+  attrs (`:entity-type`, `:ident`, `:description`) — matching
+  `_watermark_update`'s own constants block exactly — and/or survives a
+  `handle_minigraf_audit()` run unretracted, since (unlike the deliberately
+  unregistered types above) this one *is* subject to schema validation and
+  must genuinely conform, not merely avoid audit by being invisible to it.
 - **Candidate-diff round-trip + idempotency**: persist a candidate record,
   read it back, confirm the correct `(commit, entity)` pair resolves to the
   correct hash and a *different* `(commit, entity)` pair returns `None`;
