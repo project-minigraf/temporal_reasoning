@@ -7899,6 +7899,111 @@ class TestPrecomputeGlobalsAndFields:
         assert f"[{ident} :class {class_ident}]" in triples
 
 
+class TestPrecomputeFileTriplesBodyDiff:
+    def _python_parser(self):
+        import mcp_server
+        import tree_sitter
+        import tree_sitter_python
+        mcp_server._grammar_cache.clear()
+        real_lang = tree_sitter.Language(tree_sitter_python.language())
+        real_parser = tree_sitter.Parser(real_lang)
+        mcp_server._grammar_cache["python"] = real_parser
+        return real_parser
+
+    def _all_nodes(self, parser, source: bytes):
+        """Mirrors _extract_commit's own local collect_all_nodes helper:
+        _collect_entity_nodes (function/class) widened with
+        _extract_globals_and_fields' global/field live nodes."""
+        import mcp_server
+        root = parser.parse(source).root_node
+        base = mcp_server._collect_entity_nodes(root, "python")
+        gf = mcp_server._extract_globals_and_fields(root, "python")
+        base["variable"] = dict(gf.get("global_nodes", {}))
+        base["field"] = dict(gf.get("field_nodes", {}))
+        return base
+
+    def test_unchanged_function_body_is_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        new_nodes = self._all_nodes(parser, b"def login(user):\n\n    return   user.ok\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {},
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert fn_ident in result["unchanged_idents"]
+
+    def test_changed_function_body_is_not_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.active\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {},
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert fn_ident not in result["unchanged_idents"]
+
+    def test_absent_old_and_new_nodes_default_to_empty_set(self):
+        """Every pre-#221 caller of _precompute_file_triples (~15 call sites
+        in this test file alone) doesn't pass old_entity_nodes/new_entity_nodes
+        at all -- unchanged_idents must default to empty, never suppressing
+        :modified-in for callers with no diff context."""
+        import mcp_server
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples("auth.py", extracted, ":commit/c1", {})
+        assert result["unchanged_idents"] == set()
+
+    def test_class_body_unchanged_is_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"class Foo:\n    pass\n")
+        new_nodes = self._all_nodes(parser, b"class Foo:\n\n    pass\n")
+        extracted = {"functions": [], "classes": ["Foo"], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "models.py", extracted, ":commit/c1", {},
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        cls_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        assert cls_ident in result["unchanged_idents"]
+
+    def test_global_variable_unchanged_is_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"CONF = 1\n")
+        new_nodes = self._all_nodes(parser, b"CONF  =  1\n")
+        extracted = {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "globals": ["CONF"], "fields": [],
+        }
+        result = mcp_server._precompute_file_triples(
+            "config.py", extracted, ":commit/c1", {}, segment_index=None,
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        gvar_ident = mcp_server._code_ident("variable", "config.py", "CONF")
+        assert gvar_ident in result["unchanged_idents"]
+
+    def test_field_qualified_name_unchanged_is_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"class Foo:\n    def __init__(self):\n        self.bar = 1\n")
+        new_nodes = self._all_nodes(parser, b"class Foo:\n    def __init__(self):\n        self.bar  =  1\n")
+        extracted = {
+            "functions": ["__init__"], "classes": ["Foo"], "imports": [], "calls": [],
+            "globals": [], "fields": [("bar", "Foo", False)],
+        }
+        result = mcp_server._precompute_file_triples(
+            "models.py", extracted, ":commit/c1", {}, segment_index=None,
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
+        assert field_ident in result["unchanged_idents"]
+
+
 class TestFieldClassContainment:
     """Fields owned by a real (extracted) class get BOTH module- and
     class-containment plus a :class edge; fields whose reported owner is not a

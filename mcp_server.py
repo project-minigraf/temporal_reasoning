@@ -5873,6 +5873,8 @@ def _precompute_file_triples(
     commit_ident: str,
     known_files: Dict[str, List[str]],
     segment_index: Optional[_SegmentSuffixIndex] = None,
+    old_entity_nodes: Optional[Dict[str, Dict[str, Any]]] = None,
+    new_entity_nodes: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Pure, per-commit-independent precomputation for _build_code_triples.
 
@@ -5883,7 +5885,9 @@ def _precompute_file_triples(
         entity_valid_from decides the ident is genuinely new (see _build_code_triples);
       - the resolved dependency ident for every import in the file, via
         _resolve_module_import against known_files (this commit's own git-ls-tree
-        state, not the incrementally-mutated file_entities).
+        state, not the incrementally-mutated file_entities);
+      - (#221) unchanged_idents: idents whose body provably did NOT change in
+        this commit, via old_entity_nodes/new_entity_nodes.
 
     known_files must come from _known_files_at_commit for the SAME commit_hash this
     file was extracted from — it determines what "is_resolved" means here.
@@ -5892,6 +5896,17 @@ def _precompute_file_triples(
     known_files — _extract_commit builds it once per commit and passes it here for
     every A/M file so _resolve_module_import's tiers 3a/3b aren't rebuilding it (or
     linear-scanning known_files) once per import.
+
+    old_entity_nodes/new_entity_nodes, if given, are the SAME category-keyed
+    ("function"/"class"/"variable"/"field") live tree-sitter node maps
+    _extract_commit's own collect_all_nodes already produces from the old
+    (parent-blob) and new (this commit's) parse of this file, for rename
+    matching. Reused here (#221) as a per-entity body-diff signal: a name
+    present in both maps with a matching _normalized_body_hash did NOT
+    actually change in this commit, even though the file did. Both default
+    to None (treated as {}), so every caller that doesn't have diff context
+    gets an empty unchanged_idents -- the same (safe, if overzealous)
+    unconditional :modified-in behavior as before this parameter existed.
     """
     module_ident = _code_ident("module", file_path)
     module_candidate_triples = [
@@ -5980,6 +5995,28 @@ def _precompute_file_triples(
         )
         resolved_imports.append((import_name, dep_ident, is_resolved))
 
+    # #221: per-entity body-diff signal for _build_code_triples' "already
+    # known" branches. A name present in both old_entity_nodes and
+    # new_entity_nodes, with an identical normalized (whitespace-insensitive)
+    # hash, did NOT actually change here, even though the file did. Absent
+    # from either side (a genuinely new/removed entity, a parse failure, or
+    # simply no diff context passed) is treated conservatively as changed --
+    # this only ever NARROWS which idents get :modified-in, never widens it.
+    # Category keys ("function"/"class"/"variable"/"field") are identical to
+    # the entity_type string _code_ident expects for each, by construction.
+    unchanged_idents: Set[str] = set()
+    try:
+        old_nodes = old_entity_nodes or {}
+        new_nodes = new_entity_nodes or {}
+        for category in ("function", "class", "variable", "field"):
+            old_cat = old_nodes.get(category, {})
+            new_cat = new_nodes.get(category, {})
+            for name in old_cat.keys() & new_cat.keys():
+                if _normalized_body_hash(old_cat[name]) == _normalized_body_hash(new_cat[name]):
+                    unchanged_idents.add(_code_ident(category, file_path, name))
+    except Exception:
+        unchanged_idents = set()
+
     return {
         "module_ident": module_ident,
         "module_candidate_triples": module_candidate_triples,
@@ -5990,6 +6027,7 @@ def _precompute_file_triples(
         "field_class_map": field_class_map,
         "field_static_map": field_static_map,
         "resolved_imports": resolved_imports,
+        "unchanged_idents": unchanged_idents,
     }
 
 
