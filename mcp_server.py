@@ -5361,7 +5361,9 @@ async def _run_startup_backfill() -> None:
 
 
 _NAV_TASK_VERBS = re.compile(
-    r"\b(?:add|implement|build|fix|debug|refactor)\b", re.IGNORECASE
+    r"\b(?:add(?:ing|ed|s)?|implement(?:ing|ed|s)?|build(?:ing|s)?|built|"
+    r"fix(?:ing|ed|es)?|debug(?:ging|ged|s)?|refactor(?:ing|ed|s)?)\b",
+    re.IGNORECASE,
 )
 _NAV_TASK_PHRASES = re.compile(
     r"\b(?:where\s+is|where's|how\s+does|how\s+do)\b", re.IGNORECASE
@@ -5383,7 +5385,8 @@ _NAV_NUDGE = (
 
 def _looks_like_navigation_task(user_message: str) -> bool:
     """Heuristic match for a build/fix/navigate task shape (#220): a task
-    verb (add/implement/build/fix/debug/refactor) or a navigation phrase
+    verb (add/implement/build/fix/debug/refactor, including common
+    inflections like "fixing"/"fixed"/"debugged") or a navigation phrase
     (where is/how does) combined with a code-ish noun -- the noun
     requirement keeps everyday phrasing that happens to share a verb (e.g.
     "fix dinner") from triggering the nudge.

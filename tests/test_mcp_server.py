@@ -10478,6 +10478,16 @@ class TestLooksLikeNavigationTask:
         assert mcp_server._looks_like_navigation_task("where is the caching logic?")
         assert mcp_server._looks_like_navigation_task("how does the query handler work")
 
+    def test_inflected_task_verb_with_code_noun_matches(self):
+        import mcp_server
+        assert mcp_server._looks_like_navigation_task("I've been fixing the login bug")
+        assert mcp_server._looks_like_navigation_task("just fixed the query handler")
+        assert mcp_server._looks_like_navigation_task("debugging the auth module now")
+        assert mcp_server._looks_like_navigation_task("we refactored the test file")
+        assert mcp_server._looks_like_navigation_task("added a new API endpoint")
+        assert mcp_server._looks_like_navigation_task("implementing the schema module")
+        assert mcp_server._looks_like_navigation_task("built a caching component")
+
     def test_task_verb_without_code_noun_does_not_match(self):
         import mcp_server
         assert not mcp_server._looks_like_navigation_task("let's fix dinner tonight")
