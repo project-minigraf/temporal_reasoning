@@ -3386,6 +3386,48 @@ class TestExtractGlobalsAndFields:
         assert result["fields"] == []
 
 
+class TestNormalizedBodyHash:
+    def _python_parser(self):
+        import mcp_server
+        import tree_sitter
+        import tree_sitter_python
+        mcp_server._grammar_cache.clear()
+        real_lang = tree_sitter.Language(tree_sitter_python.language())
+        real_parser = tree_sitter.Parser(real_lang)
+        mcp_server._grammar_cache["python"] = real_parser
+        return real_parser
+
+    def _login_node(self, parser, source: bytes):
+        import mcp_server
+        root = parser.parse(source).root_node
+        return mcp_server._collect_entity_nodes(root, "python")["function"]["login"]
+
+    def test_whitespace_only_change_produces_identical_hash(self):
+        import mcp_server
+        parser = self._python_parser()
+        node_a = self._login_node(parser, b"def login(user):\n    return user.ok\n")
+        node_b = self._login_node(parser, b"def login(user):\n\n    return   user.ok\n\n")
+        assert mcp_server._normalized_body_hash(node_a) == mcp_server._normalized_body_hash(node_b)
+
+    def test_real_change_produces_different_hash(self):
+        import mcp_server
+        parser = self._python_parser()
+        node_a = self._login_node(parser, b"def login(user):\n    return user.ok\n")
+        node_b = self._login_node(parser, b"def login(user):\n    return user.active\n")
+        assert mcp_server._normalized_body_hash(node_a) != mcp_server._normalized_body_hash(node_b)
+
+    def test_comment_only_change_still_counts_as_different(self):
+        """v1 scope: only whitespace is normalized, not comments (see the
+        design doc's Scope section) -- a comment-only edit still registers
+        as a body change. This test locks in that scope decision so a future
+        change to it is deliberate, not accidental."""
+        import mcp_server
+        parser = self._python_parser()
+        node_a = self._login_node(parser, b"def login(user):\n    return user.ok\n")
+        node_b = self._login_node(parser, b"def login(user):\n    # checks auth\n    return user.ok\n")
+        assert mcp_server._normalized_body_hash(node_a) != mcp_server._normalized_body_hash(node_b)
+
+
 class TestPythonGlobalsAndFields:
     def _parser(self):
         import tree_sitter_python
@@ -7237,6 +7279,51 @@ class TestExtractCommitRename:
         assert renamed_pairs == []
 
 
+class TestExtractCommitBodyDiff:
+    def test_rename_does_not_populate_unchanged_idents(self, tmp_path):
+        """A renamed entity gets a brand-new ident (different name ->
+        different _code_ident), so old_entity_nodes/new_entity_nodes never
+        share that name -- unchanged_idents must stay empty. Confirms the
+        design doc's architectural claim empirically, not just by
+        inspection: rename linkage and #221's body-diff gating don't
+        interact.
+
+        The function's own name must change here (not just the file), per
+        the design doc's testing item 8 ("rename ... changes both name and
+        body, or name only") -- a file-only rename with the function's bare
+        name unchanged is a DIFFERENT scenario: old_entity_nodes and
+        new_entity_nodes legitimately share that bare name, so it correctly
+        (and harmlessly, since a never-before-seen ident never reaches the
+        :modified-in "already known" branch) lands in unchanged_idents.
+        Verified empirically: a same-name file-only rename here does NOT
+        keep unchanged_idents empty, which is why this test renames the
+        function too.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text(
+            "def login():\n    x = 1\n    y = 2\n    z = 3\n    return x + y + z\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        (repo / "new_name.py").write_text(
+            "def signin():\n    x = 1\n    y = 2\n    z = 3\n    return x + y + z\n"
+        )
+        _subprocess.run(["git", "commit", "-am", "rename file and function"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "R"
+        assert renamed_pairs == [("function", "old_name.py", "login", "new_name.py", "signin")]
+        assert precomputed["unchanged_idents"] == set()
+
+
 class TestIngestionWrites:
     def test_ingest_transact_uses_valid_from(self, real_db):
         import mcp_server
@@ -7383,6 +7470,55 @@ class TestIngestionWrites:
         fn_ident = mcp_server._code_ident("function", "auth.py", "new_func")
         assert not any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
         assert any(f"[{fn_ident} :introduced-by {commit_ident}]" in t for t in triples)
+
+    def test_build_code_triples_skips_modified_in_for_unchanged_ident(self):
+        import mcp_server
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        entity_valid_from = {
+            module_ident: "2025-01-01T00:00:00Z",
+            fn_ident: "2025-01-01T00:00:00Z",
+        }
+        commit_ident = ":commit/deadbeef12345678"
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
+        precomputed["unchanged_idents"] = {fn_ident}
+        triples = mcp_server._build_code_triples(
+            "auth.py",
+            extracted,
+            "2025-02-01T00:00:00Z",
+            entity_valid_from,
+            {},
+            {},
+            commit_ident,
+            precomputed,
+        )
+        assert not any(f"[{fn_ident} :modified-in {commit_ident}]" in t for t in triples)
+
+    def test_build_code_triples_module_ignores_unchanged_idents(self):
+        """Module-level churn is deliberately NOT gated by unchanged_idents --
+        the module IS the file, so any file change is legitimate module
+        churn (see design doc's Scope section: 'module is deliberately
+        excluded'). Even if unchanged_idents (hypothetically, incorrectly)
+        contained the module ident, it must still get :modified-in."""
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        entity_valid_from = {module_ident: "2025-01-01T00:00:00Z"}
+        commit_ident = ":commit/deadbeef12345678"
+        extracted = {"functions": [], "classes": [], "imports": []}
+        precomputed = mcp_server._precompute_file_triples("auth.py", extracted, commit_ident, {})
+        precomputed["unchanged_idents"] = {module_ident}
+        triples = mcp_server._build_code_triples(
+            "auth.py",
+            extracted,
+            "2025-02-01T00:00:00Z",
+            entity_valid_from,
+            {},
+            {},
+            commit_ident,
+            precomputed,
+        )
+        assert any(f"[{module_ident} :modified-in {commit_ident}]" in t for t in triples)
 
     def test_build_code_triples_populates_entity_descriptions(self):
         import mcp_server
@@ -7855,6 +7991,111 @@ class TestPrecomputeGlobalsAndFields:
         assert f"[{ident} :static true]" in triples
         class_ident = mcp_server._code_ident("class", "models.py", "Foo")
         assert f"[{ident} :class {class_ident}]" in triples
+
+
+class TestPrecomputeFileTriplesBodyDiff:
+    def _python_parser(self):
+        import mcp_server
+        import tree_sitter
+        import tree_sitter_python
+        mcp_server._grammar_cache.clear()
+        real_lang = tree_sitter.Language(tree_sitter_python.language())
+        real_parser = tree_sitter.Parser(real_lang)
+        mcp_server._grammar_cache["python"] = real_parser
+        return real_parser
+
+    def _all_nodes(self, parser, source: bytes):
+        """Mirrors _extract_commit's own local collect_all_nodes helper:
+        _collect_entity_nodes (function/class) widened with
+        _extract_globals_and_fields' global/field live nodes."""
+        import mcp_server
+        root = parser.parse(source).root_node
+        base = mcp_server._collect_entity_nodes(root, "python")
+        gf = mcp_server._extract_globals_and_fields(root, "python")
+        base["variable"] = dict(gf.get("global_nodes", {}))
+        base["field"] = dict(gf.get("field_nodes", {}))
+        return base
+
+    def test_unchanged_function_body_is_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        new_nodes = self._all_nodes(parser, b"def login(user):\n\n    return   user.ok\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {},
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert fn_ident in result["unchanged_idents"]
+
+    def test_changed_function_body_is_not_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.active\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {},
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert fn_ident not in result["unchanged_idents"]
+
+    def test_absent_old_and_new_nodes_default_to_empty_set(self):
+        """Every pre-#221 caller of _precompute_file_triples (~15 call sites
+        in this test file alone) doesn't pass old_entity_nodes/new_entity_nodes
+        at all -- unchanged_idents must default to empty, never suppressing
+        :modified-in for callers with no diff context."""
+        import mcp_server
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples("auth.py", extracted, ":commit/c1", {})
+        assert result["unchanged_idents"] == set()
+
+    def test_class_body_unchanged_is_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"class Foo:\n    pass\n")
+        new_nodes = self._all_nodes(parser, b"class Foo:\n\n    pass\n")
+        extracted = {"functions": [], "classes": ["Foo"], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "models.py", extracted, ":commit/c1", {},
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        cls_ident = mcp_server._code_ident("class", "models.py", "Foo")
+        assert cls_ident in result["unchanged_idents"]
+
+    def test_global_variable_unchanged_is_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"CONF = 1\n")
+        new_nodes = self._all_nodes(parser, b"CONF  =  1\n")
+        extracted = {
+            "functions": [], "classes": [], "imports": [], "calls": [],
+            "globals": ["CONF"], "fields": [],
+        }
+        result = mcp_server._precompute_file_triples(
+            "config.py", extracted, ":commit/c1", {}, segment_index=None,
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        gvar_ident = mcp_server._code_ident("variable", "config.py", "CONF")
+        assert gvar_ident in result["unchanged_idents"]
+
+    def test_field_qualified_name_unchanged_is_flagged_unchanged(self):
+        import mcp_server
+        parser = self._python_parser()
+        old_nodes = self._all_nodes(parser, b"class Foo:\n    def __init__(self):\n        self.bar = 1\n")
+        new_nodes = self._all_nodes(parser, b"class Foo:\n    def __init__(self):\n        self.bar  =  1\n")
+        extracted = {
+            "functions": ["__init__"], "classes": ["Foo"], "imports": [], "calls": [],
+            "globals": [], "fields": [("bar", "Foo", False)],
+        }
+        result = mcp_server._precompute_file_triples(
+            "models.py", extracted, ":commit/c1", {}, segment_index=None,
+            old_entity_nodes=old_nodes, new_entity_nodes=new_nodes,
+        )
+        field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
+        assert field_ident in result["unchanged_idents"]
 
 
 class TestFieldClassContainment:
@@ -8683,6 +8924,138 @@ class TestRunIngestion:
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         assert mcp_server._ingest_progress["prior_ingested"] == 21715
         assert mcp_server._ingest_progress["processed"] == 21717  # 21715 + 2 commits
+
+    @pytest.mark.asyncio
+    async def test_whitespace_reformat_commit_produces_no_modified_in_fact(self, tmp_path):
+        """The core #221 repro: a reformat-only commit must not flag the
+        function as modified.
+
+        Uses a real, file-backed MiniGrafDb (not the `real_db` in-memory
+        fixture) per docs/testing-conventions.md's Pattern 2: _run_ingestion
+        releases the DB lock (`_db = None`) and reopens between every
+        commit, and `real_db`'s open_in_memory() hands back a brand-new,
+        isolated (empty) store on every open -- it can't survive that
+        reopen cycle across this test's two commits, only a real on-disk
+        graph can."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(user):\n    return user.ok\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(user):\n\n    return   user.ok\n")
+        _subprocess.run(["git", "commit", "-am", "reformat"], cwd=repo, check=True, capture_output=True)
+
+        try:
+            mcp_server._db = None
+            mcp_server._graph_path = None
+            mcp_server.open_db(str(tmp_path / "memory.graph"))
+            mcp_server._ingest_progress = {
+                "status": "idle", "processed": 0, "total": 0,
+                "current_commit": "", "error": None,
+            }
+            await mcp_server._run_ingestion(str(repo), "main")
+
+            fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+            result = json.loads(mcp_server.get_db().execute(
+                f'(query [:find ?c :where [{fn_ident} :modified-in ?c]])'
+            ))
+            assert result["results"] == [], (
+                "a whitespace-only reformat must not produce a :modified-in "
+                "fact -- this is the core repro #221 exists to fix"
+            )
+        finally:
+            mcp_server._db = None  # release the real file lock for subsequent tests
+
+    @pytest.mark.asyncio
+    async def test_genuine_change_commit_still_produces_modified_in_fact(self, tmp_path):
+        """Real, file-backed MiniGrafDb -- see the docstring on
+        test_whitespace_reformat_commit_produces_no_modified_in_fact for why
+        `real_db` can't be used for a multi-commit _run_ingestion test."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(user):\n    return user.ok\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(user):\n    return user.active\n")
+        _subprocess.run(["git", "commit", "-am", "real change"], cwd=repo, check=True, capture_output=True)
+
+        try:
+            mcp_server._db = None
+            mcp_server._graph_path = None
+            mcp_server.open_db(str(tmp_path / "memory.graph"))
+            mcp_server._ingest_progress = {
+                "status": "idle", "processed": 0, "total": 0,
+                "current_commit": "", "error": None,
+            }
+            await mcp_server._run_ingestion(str(repo), "main")
+
+            fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+            result = json.loads(mcp_server.get_db().execute(
+                f'(query [:find ?c :where [{fn_ident} :modified-in ?c]])'
+            ))
+            assert len(result["results"]) == 1
+        finally:
+            mcp_server._db = None  # release the real file lock for subsequent tests
+
+    @pytest.mark.asyncio
+    async def test_only_the_changed_function_gets_modified_in_others_do_not(self, tmp_path):
+        """The issue's own motivating scenario: a file with multiple
+        functions where only one actually changed must flag only that one,
+        not every function in the file (the pre-#221 file-broadcast bug).
+
+        Real, file-backed MiniGrafDb -- see the docstring on
+        test_whitespace_reformat_commit_produces_no_modified_in_fact for why
+        `real_db` can't be used for a multi-commit _run_ingestion test."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text(
+            "def login(user):\n    return user.ok\n\ndef logout(user):\n    return None\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text(
+            "def login(user):\n    return user.active\n\ndef logout(user):\n    return None\n"
+        )
+        _subprocess.run(["git", "commit", "-am", "change login only"], cwd=repo, check=True, capture_output=True)
+
+        try:
+            mcp_server._db = None
+            mcp_server._graph_path = None
+            mcp_server.open_db(str(tmp_path / "memory.graph"))
+            mcp_server._ingest_progress = {
+                "status": "idle", "processed": 0, "total": 0,
+                "current_commit": "", "error": None,
+            }
+            await mcp_server._run_ingestion(str(repo), "main")
+
+            login_ident = mcp_server._code_ident("function", "auth.py", "login")
+            logout_ident = mcp_server._code_ident("function", "auth.py", "logout")
+            db = mcp_server.get_db()
+            login_result = json.loads(db.execute(
+                f'(query [:find ?c :where [{login_ident} :modified-in ?c]])'
+            ))
+            logout_result = json.loads(db.execute(
+                f'(query [:find ?c :where [{logout_ident} :modified-in ?c]])'
+            ))
+            assert len(login_result["results"]) == 1
+            assert logout_result["results"] == [], (
+                "logout's body did not change in the second commit -- the "
+                "pre-#221 file-broadcast bug would have wrongly flagged it too"
+            )
+        finally:
+            mcp_server._db = None  # release the real file lock for subsequent tests
 
 
 class TestRunIngestionCommitFaultIsolation:

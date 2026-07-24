@@ -12,6 +12,7 @@ import configparser
 import contextlib
 import datetime
 import fnmatch
+import hashlib
 import json
 import multiprocessing
 import os
@@ -2943,6 +2944,33 @@ def _collect_entity_nodes(root_node: Any, lang_name: str) -> Dict[str, Dict[str,
     return result
 
 
+def _normalized_body_hash(node: Any) -> str:
+    """Whitespace-insensitive content hash of a tree-sitter node's span.
+
+    Joins the text of every leaf token (a node with no children) in
+    document order, then hashes the result -- so a purely cosmetic reformat
+    (e.g. this repo's own periodic clang-format sweeps) hashes identically
+    to the original, while any change to the token text stream itself changes
+    the hash. No per-language handling needed: leaf-token walking is
+    generic across every tree-sitter grammar. Comment text is NOT stripped
+    (see #221 design doc's Scope section) -- a comment-only edit still
+    counts as a body change in v1. Note: tree structure/indentation changes
+    are not captured; in indentation-significant languages, a pure re-indentation
+    that changes semantics will hash identically (accepted v1 tradeoff).
+    """
+    leaves: List[bytes] = []
+
+    def walk(n: Any) -> None:
+        if len(n.children) == 0:
+            leaves.append(n.text)
+        else:
+            for child in n.children:
+                walk(child)
+
+    walk(node)
+    return hashlib.sha256(b"\x00".join(leaves)).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # DB lifecycle
 # ---------------------------------------------------------------------------
@@ -5847,6 +5875,8 @@ def _precompute_file_triples(
     commit_ident: str,
     known_files: Dict[str, List[str]],
     segment_index: Optional[_SegmentSuffixIndex] = None,
+    old_entity_nodes: Optional[Dict[str, Dict[str, Any]]] = None,
+    new_entity_nodes: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Pure, per-commit-independent precomputation for _build_code_triples.
 
@@ -5857,7 +5887,9 @@ def _precompute_file_triples(
         entity_valid_from decides the ident is genuinely new (see _build_code_triples);
       - the resolved dependency ident for every import in the file, via
         _resolve_module_import against known_files (this commit's own git-ls-tree
-        state, not the incrementally-mutated file_entities).
+        state, not the incrementally-mutated file_entities);
+      - (#221) unchanged_idents: idents whose body provably did NOT change in
+        this commit, via old_entity_nodes/new_entity_nodes.
 
     known_files must come from _known_files_at_commit for the SAME commit_hash this
     file was extracted from — it determines what "is_resolved" means here.
@@ -5866,6 +5898,17 @@ def _precompute_file_triples(
     known_files — _extract_commit builds it once per commit and passes it here for
     every A/M file so _resolve_module_import's tiers 3a/3b aren't rebuilding it (or
     linear-scanning known_files) once per import.
+
+    old_entity_nodes/new_entity_nodes, if given, are the SAME category-keyed
+    ("function"/"class"/"variable"/"field") live tree-sitter node maps
+    _extract_commit's own collect_all_nodes already produces from the old
+    (parent-blob) and new (this commit's) parse of this file, for rename
+    matching. Reused here (#221) as a per-entity body-diff signal: a name
+    present in both maps with a matching _normalized_body_hash did NOT
+    actually change in this commit, even though the file did. Both default
+    to None (treated as {}), so every caller that doesn't have diff context
+    gets an empty unchanged_idents -- the same (safe, if overzealous)
+    unconditional :modified-in behavior as before this parameter existed.
     """
     module_ident = _code_ident("module", file_path)
     module_candidate_triples = [
@@ -5954,6 +5997,28 @@ def _precompute_file_triples(
         )
         resolved_imports.append((import_name, dep_ident, is_resolved))
 
+    # #221: per-entity body-diff signal for _build_code_triples' "already
+    # known" branches. A name present in both old_entity_nodes and
+    # new_entity_nodes, with an identical normalized (whitespace-insensitive)
+    # hash, did NOT actually change here, even though the file did. Absent
+    # from either side (a genuinely new/removed entity, a parse failure, or
+    # simply no diff context passed) is treated conservatively as changed --
+    # this only ever NARROWS which idents get :modified-in, never widens it.
+    # Category keys ("function"/"class"/"variable"/"field") are identical to
+    # the entity_type string _code_ident expects for each, by construction.
+    unchanged_idents: Set[str] = set()
+    try:
+        old_nodes = old_entity_nodes or {}
+        new_nodes = new_entity_nodes or {}
+        for category in ("function", "class", "variable", "field"):
+            old_cat = old_nodes.get(category, {})
+            new_cat = new_nodes.get(category, {})
+            for name in old_cat.keys() & new_cat.keys():
+                if _normalized_body_hash(old_cat[name]) == _normalized_body_hash(new_cat[name]):
+                    unchanged_idents.add(_code_ident(category, file_path, name))
+    except Exception:
+        unchanged_idents = set()
+
     return {
         "module_ident": module_ident,
         "module_candidate_triples": module_candidate_triples,
@@ -5964,6 +6029,7 @@ def _precompute_file_triples(
         "field_class_map": field_class_map,
         "field_static_map": field_static_map,
         "resolved_imports": resolved_imports,
+        "unchanged_idents": unchanged_idents,
     }
 
 
@@ -6002,6 +6068,10 @@ def _build_code_triples(
     module_ident = precomputed["module_ident"]
     field_class_map = precomputed.get("field_class_map", {})
     field_static_map = precomputed.get("field_static_map", {})
+    # #221: idents whose body provably did NOT change this commit (empty for
+    # every caller that doesn't pass old_entity_nodes/new_entity_nodes to
+    # _precompute_file_triples, preserving today's unconditional behavior).
+    unchanged_idents = precomputed.get("unchanged_idents", set())
 
     is_new_module = module_ident not in entity_valid_from
     # Track all idents for this file (for deletion cleanup)
@@ -6014,7 +6084,9 @@ def _build_code_triples(
         entity_valid_from[module_ident] = commit_ts_iso
         entity_descriptions[module_ident] = file_path
     else:
-        # Existing module: only record that this commit modified it
+        # Existing module: only record that this commit modified it. NOT
+        # gated by unchanged_idents (#221) -- the module IS the file, so any
+        # file change is legitimate module-level churn.
         triples.append(f"[{module_ident} :modified-in {commit_ident}]")
 
     for fn_ident, fn_name, candidate_triples in precomputed["function_entries"]:
@@ -6024,8 +6096,9 @@ def _build_code_triples(
                 idents_for_file.append(fn_ident)
             entity_valid_from[fn_ident] = commit_ts_iso
             entity_descriptions[fn_ident] = fn_name
-        else:
-            # Pre-existing function: record that this commit modified it
+        elif fn_ident not in unchanged_idents:
+            # Pre-existing function whose body actually changed (#221):
+            # record that this commit modified it.
             triples.append(f"[{fn_ident} :modified-in {commit_ident}]")
 
     for cls_ident, cls_name, candidate_triples in precomputed["class_entries"]:
@@ -6035,8 +6108,9 @@ def _build_code_triples(
                 idents_for_file.append(cls_ident)
             entity_valid_from[cls_ident] = commit_ts_iso
             entity_descriptions[cls_ident] = cls_name
-        else:
-            # Pre-existing class: record that this commit modified it
+        elif cls_ident not in unchanged_idents:
+            # Pre-existing class whose body actually changed (#221): record
+            # that this commit modified it.
             triples.append(f"[{cls_ident} :modified-in {commit_ident}]")
 
     for gvar_ident, gvar_name, candidate_triples in precomputed["global_entries"]:
@@ -6046,7 +6120,7 @@ def _build_code_triples(
                 idents_for_file.append(gvar_ident)
             entity_valid_from[gvar_ident] = commit_ts_iso
             entity_descriptions[gvar_ident] = gvar_name
-        else:
+        elif gvar_ident not in unchanged_idents:
             triples.append(f"[{gvar_ident} :modified-in {commit_ident}]")
 
     for field_ident, field_name, candidate_triples in precomputed["field_entries"]:
@@ -6065,7 +6139,7 @@ def _build_code_triples(
             # (see _build_close_triples / issue #134) without re-deriving it.
             if field_static_ident is not None and field_ident in field_static_map:
                 field_static_ident[field_ident] = field_static_map[field_ident]
-        else:
+        elif field_ident not in unchanged_idents:
             triples.append(f"[{field_ident} :modified-in {commit_ident}]")
 
     return triples
@@ -6639,22 +6713,16 @@ def _extract_commit(
             content = _git_file_content(repo_path, commit_hash, file_path)
         except Exception:
             continue
-        extracted = _extract_from_source(content, parser, file_path)
-        if known_files is None:
-            known_files = _known_files_at_commit(repo_path, commit_hash, ignore_patterns)
-            segment_index = _SegmentSuffixIndex(known_files)
-        precomputed = _precompute_file_triples(
-            file_path, extracted, commit_ident, known_files, segment_index=segment_index,
-        )
-        results.append((status, file_path, extracted, precomputed, old_path if status == "R" else ""))
 
-        # Build this file's contribution to the removed/added pools. Live
-        # nodes for the NEW side come from re-parsing (extracted only carries
-        # text, per Task 6) — cheap, since this is the same content already
-        # fetched above; a second parse of the same bytes is a deliberate
-        # simplicity/cost tradeoff over threading Node references through
-        # _extract_from_source's return value, which must stay plain-data-only
-        # for other callers.
+        # Live nodes for the NEW side come from re-parsing (extracted only
+        # carries text, per Task 6) — cheap, since this is the same content
+        # already fetched above; a second parse of the same bytes is a
+        # deliberate simplicity/cost tradeoff over threading Node references
+        # through _extract_from_source's return value, which must stay
+        # plain-data-only for other callers. Computed here, BEFORE
+        # _precompute_file_triples, so #221's body-diff hash-compare can use
+        # it alongside old_entity_nodes; still reused further below for its
+        # original rename-matching purpose too.
         #
         # Wrapped best-effort, same as the old-side call above: a
         # pathologically nested file parses fine under tree-sitter but can
@@ -6672,6 +6740,16 @@ def _extract_commit(
             new_entity_nodes = {
                 "function": {}, "class": {}, "variable": {}, "field": {},
             }  # best-effort: matching degrades to no-match
+
+        extracted = _extract_from_source(content, parser, file_path)
+        if known_files is None:
+            known_files = _known_files_at_commit(repo_path, commit_hash, ignore_patterns)
+            segment_index = _SegmentSuffixIndex(known_files)
+        precomputed = _precompute_file_triples(
+            file_path, extracted, commit_ident, known_files, segment_index=segment_index,
+            old_entity_nodes=old_entity_nodes, new_entity_nodes=new_entity_nodes,
+        )
+        results.append((status, file_path, extracted, precomputed, old_path if status == "R" else ""))
 
         # Record every entity whose name is present, unchanged, on BOTH sides
         # of this file — these survive the commit unrenamed and so must be
