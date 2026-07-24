@@ -5860,6 +5860,35 @@ def git_repo(tmp_path):
     return repo
 
 
+@pytest.fixture
+def git_repo_clock_skewed(tmp_path):
+    """Two commits where the CHILD's committer date is earlier than its
+    PARENT's -- simulates clock skew / a rebase. Plain chronological
+    ordering (git log's default, newest-first by date) would list the
+    parent before the child in the non-reversed traversal (parent has the
+    later date), so --reverse alone flips that to [child, parent] -- wrong,
+    since child is structurally after parent. --topo-order must still
+    produce [parent, child] regardless of the date skew.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    env_parent = {**os.environ, "GIT_COMMITTER_DATE": "2026-01-10T00:00:00", "GIT_AUTHOR_DATE": "2026-01-10T00:00:00"}
+    (repo / "a.py").write_text("x = 1\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "parent"], cwd=repo, check=True, capture_output=True, env=env_parent)
+
+    env_child = {**os.environ, "GIT_COMMITTER_DATE": "2026-01-01T00:00:00", "GIT_AUTHOR_DATE": "2026-01-01T00:00:00"}
+    (repo / "b.py").write_text("y = 2\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "child"], cwd=repo, check=True, capture_output=True, env=env_child)
+
+    return repo
+
+
 class TestGitHelpers:
     def test_git_commits_full_history(self, git_repo):
         import mcp_server
@@ -5899,6 +5928,14 @@ class TestGitHelpers:
         _, _, _, _, new_sha, _ = entries[0][:6]
         content = mcp_server._git_blob_content(str(git_repo), new_sha)
         assert b"def login" in content
+
+
+class TestGitCommitsTopoOrder:
+    def test_orders_by_topology_not_committer_date(self, git_repo_clock_skewed):
+        import mcp_server
+        commits = mcp_server._git_commits(str(git_repo_clock_skewed), watermark_hash=None)
+        subjects = [c[3] for c in commits]
+        assert subjects == ["parent", "child"]
 
 
 class TestDefaultGitBranch:

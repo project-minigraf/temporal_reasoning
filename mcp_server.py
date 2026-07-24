@@ -4114,7 +4114,7 @@ def _git_commits(
     """Return list of (hash, ts_iso, author_email, subject) in chronological order."""
     range_spec = f"{watermark_hash}..{branch}" if watermark_hash else branch
     result = _subprocess.run(
-        ["git", "log", "--reverse", "--format=%H %at %ae %s", range_spec],
+        ["git", "log", "--topo-order", "--reverse", "--format=%H %at %ae %s", range_spec],
         cwd=repo_path, capture_output=True, text=True, check=True,
     )
     commits = []
