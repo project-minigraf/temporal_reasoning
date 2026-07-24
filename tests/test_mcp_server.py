@@ -6145,6 +6145,49 @@ class TestLineageProvisionalMarker:
         assert json.loads(raw)["results"] == [[1]]
 
 
+class TestLineageConfirmedThroughWatermark:
+    def test_unset_reads_as_none(self, real_db):
+        import mcp_server
+        assert mcp_server._lineage_confirmed_through_query(real_db) is None
+
+    def test_update_then_query_round_trip(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._lineage_confirmed_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+        mcp_server._lineage_confirmed_through_update(db, "h2", "2026-01-02T00:00:00Z")
+        assert mcp_server._lineage_confirmed_through_query(db) == "h2"
+
+    def test_update_does_not_duplicate_hash_fact(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._lineage_confirmed_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_confirmed_through_update(db, "h2", "2026-01-02T00:00:00Z")
+
+        ident = mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_entity_carries_expected_constants_and_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._lineage_confirmed_through_update(db, "h1", "2026-01-01T00:00:00Z")
+
+        ident = mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT
+        raw = mcp_server._db_execute(
+            db, f"(query [:find ?a ?v :where [{ident} ?a ?v]])"
+        )
+        attrs = dict(json.loads(raw)["results"])
+        assert attrs[":entity-type"] == ":type/ingestion"
+        assert attrs[":ident"] == ident
+        assert isinstance(attrs[":description"], str) and attrs[":description"]
+
+        result = mcp_server.handle_minigraf_audit()
+        assert result["retracted"] == 0
+        assert mcp_server._lineage_confirmed_through_query(db) == "h1"
+
+
 class TestGitCommitsTopoOrder:
     def test_orders_by_topology_not_committer_date(self, git_repo_diamond_clock_skewed):
         import mcp_server

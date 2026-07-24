@@ -5073,6 +5073,60 @@ def _lineage_is_provisional(db: Any, entity_ident: str) -> bool:
     return bool(json.loads(raw).get("results", []))
 
 
+_LINEAGE_CONFIRMED_THROUGH_IDENT = ":ingestion/lineage-confirmed-through"
+
+
+def _lineage_confirmed_through_query(db: Any) -> Optional[str]:
+    """Return the hash of the last commit through which lineage is fully
+    confirmed, or None if nothing has been confirmed yet."""
+    raw = _db_execute(
+        db, f"(query [:find ?h :where [{_LINEAGE_CONFIRMED_THROUGH_IDENT} :hash ?h]])"
+    )
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+def _lineage_confirmed_through_update(
+    db: Any, commit_hash: str, commit_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """Record the last lineage-confirmed commit hash, mirroring
+    _watermark_update's retract-only-if-changed pattern. Uses :type/
+    ingestion -- the SAME registered/audited entity type :ingestion/
+    watermark already uses -- so this entity carries the same required
+    :description constant _watermark_update's own entity does.
+    """
+    current_raw = _db_execute(
+        db, f"(query [:find ?a ?v :where [{_LINEAGE_CONFIRMED_THROUGH_IDENT} ?a ?v]])"
+    )
+    current: Dict[str, str] = dict(json.loads(current_raw).get("results", []))
+
+    def _edn(attr: str, value: str) -> str:
+        return value if attr == ":entity-type" else f'"{_edn_escape(value)}"'
+
+    constants = {
+        ":entity-type": ":type/ingestion",
+        ":ident": _LINEAGE_CONFIRMED_THROUGH_IDENT,
+        ":description": "lineage confirmed-through watermark",
+    }
+
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    for attr, value in constants.items():
+        if current.get(attr) == value:
+            continue
+        if attr in current:
+            to_retract.append(f"[{_LINEAGE_CONFIRMED_THROUGH_IDENT} {attr} {_edn(attr, current[attr])}]")
+        to_transact.append(f"[{_LINEAGE_CONFIRMED_THROUGH_IDENT} {attr} {_edn(attr, value)}]")
+
+    if ":hash" in current:
+        to_retract.append(f"[{_LINEAGE_CONFIRMED_THROUGH_IDENT} :hash {_edn(':hash', current[':hash'])}]")
+    to_transact.append(f"[{_LINEAGE_CONFIRMED_THROUGH_IDENT} :hash {_edn(':hash', commit_hash)}]")
+
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
 _LAST_RUN_NUMERIC_ATTRS = frozenset({":total-ingested"})
 
