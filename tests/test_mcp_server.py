@@ -7279,6 +7279,51 @@ class TestExtractCommitRename:
         assert renamed_pairs == []
 
 
+class TestExtractCommitBodyDiff:
+    def test_rename_does_not_populate_unchanged_idents(self, tmp_path):
+        """A renamed entity gets a brand-new ident (different name ->
+        different _code_ident), so old_entity_nodes/new_entity_nodes never
+        share that name -- unchanged_idents must stay empty. Confirms the
+        design doc's architectural claim empirically, not just by
+        inspection: rename linkage and #221's body-diff gating don't
+        interact.
+
+        The function's own name must change here (not just the file), per
+        the design doc's testing item 8 ("rename ... changes both name and
+        body, or name only") -- a file-only rename with the function's bare
+        name unchanged is a DIFFERENT scenario: old_entity_nodes and
+        new_entity_nodes legitimately share that bare name, so it correctly
+        (and harmlessly, since a never-before-seen ident never reaches the
+        :modified-in "already known" branch) lands in unchanged_idents.
+        Verified empirically: a same-name file-only rename here does NOT
+        keep unchanged_idents empty, which is why this test renames the
+        function too.
+        """
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "old_name.py").write_text(
+            "def login():\n    x = 1\n    y = 2\n    z = 3\n    return x + y + z\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "mv", "old_name.py", "new_name.py"], cwd=repo, check=True, capture_output=True)
+        (repo / "new_name.py").write_text(
+            "def signin():\n    x = 1\n    y = 2\n    z = 3\n    return x + y + z\n"
+        )
+        _subprocess.run(["git", "commit", "-am", "rename file and function"], cwd=repo, check=True, capture_output=True)
+
+        commits = mcp_server._git_commits(str(repo), watermark_hash=None)
+        results, _, _, renamed_pairs = mcp_server._extract_commit(str(repo), commits[1][0])
+        status, file_path, extracted, precomputed, old_path = results[0]
+        assert status == "R"
+        assert renamed_pairs == [("function", "old_name.py", "login", "new_name.py", "signin")]
+        assert precomputed["unchanged_idents"] == set()
+
+
 class TestIngestionWrites:
     def test_ingest_transact_uses_valid_from(self, real_db):
         import mcp_server
@@ -8879,6 +8924,132 @@ class TestRunIngestion:
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         assert mcp_server._ingest_progress["prior_ingested"] == 21715
         assert mcp_server._ingest_progress["processed"] == 21717  # 21715 + 2 commits
+
+    @pytest.mark.asyncio
+    async def test_whitespace_reformat_commit_produces_no_modified_in_fact(self, tmp_path):
+        """The core #221 repro: a reformat-only commit must not flag the
+        function as modified.
+
+        Uses a real, file-backed MiniGrafDb (not the `real_db` in-memory
+        fixture) per docs/testing-conventions.md's Pattern 2: _run_ingestion
+        releases the DB lock (`_db = None`) and reopens between every
+        commit, and `real_db`'s open_in_memory() hands back a brand-new,
+        isolated (empty) store on every open -- it can't survive that
+        reopen cycle across this test's two commits, only a real on-disk
+        graph can."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(user):\n    return user.ok\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(user):\n\n    return   user.ok\n")
+        _subprocess.run(["git", "commit", "-am", "reformat"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(tmp_path / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(repo), "main")
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        result = json.loads(mcp_server.get_db().execute(
+            f'(query [:find ?c :where [{fn_ident} :modified-in ?c]])'
+        ))
+        mcp_server._db = None  # release the real file lock for subsequent tests
+        assert result["results"] == [], (
+            "a whitespace-only reformat must not produce a :modified-in "
+            "fact -- this is the core repro #221 exists to fix"
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuine_change_commit_still_produces_modified_in_fact(self, tmp_path):
+        """Real, file-backed MiniGrafDb -- see the docstring on
+        test_whitespace_reformat_commit_produces_no_modified_in_fact for why
+        `real_db` can't be used for a multi-commit _run_ingestion test."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(user):\n    return user.ok\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(user):\n    return user.active\n")
+        _subprocess.run(["git", "commit", "-am", "real change"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(tmp_path / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(repo), "main")
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        result = json.loads(mcp_server.get_db().execute(
+            f'(query [:find ?c :where [{fn_ident} :modified-in ?c]])'
+        ))
+        mcp_server._db = None  # release the real file lock for subsequent tests
+        assert len(result["results"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_only_the_changed_function_gets_modified_in_others_do_not(self, tmp_path):
+        """The issue's own motivating scenario: a file with multiple
+        functions where only one actually changed must flag only that one,
+        not every function in the file (the pre-#221 file-broadcast bug).
+
+        Real, file-backed MiniGrafDb -- see the docstring on
+        test_whitespace_reformat_commit_produces_no_modified_in_fact for why
+        `real_db` can't be used for a multi-commit _run_ingestion test."""
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text(
+            "def login(user):\n    return user.ok\n\ndef logout(user):\n    return None\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text(
+            "def login(user):\n    return user.active\n\ndef logout(user):\n    return None\n"
+        )
+        _subprocess.run(["git", "commit", "-am", "change login only"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(tmp_path / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(repo), "main")
+
+        login_ident = mcp_server._code_ident("function", "auth.py", "login")
+        logout_ident = mcp_server._code_ident("function", "auth.py", "logout")
+        db = mcp_server.get_db()
+        login_result = json.loads(db.execute(
+            f'(query [:find ?c :where [{login_ident} :modified-in ?c]])'
+        ))
+        logout_result = json.loads(db.execute(
+            f'(query [:find ?c :where [{logout_ident} :modified-in ?c]])'
+        ))
+        mcp_server._db = None  # release the real file lock for subsequent tests
+        assert len(login_result["results"]) == 1
+        assert logout_result["results"] == [], (
+            "logout's body did not change in the second commit -- the "
+            "pre-#221 file-broadcast bug would have wrongly flagged it too"
+        )
 
 
 class TestRunIngestionCommitFaultIsolation:

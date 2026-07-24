@@ -6711,22 +6711,16 @@ def _extract_commit(
             content = _git_file_content(repo_path, commit_hash, file_path)
         except Exception:
             continue
-        extracted = _extract_from_source(content, parser, file_path)
-        if known_files is None:
-            known_files = _known_files_at_commit(repo_path, commit_hash, ignore_patterns)
-            segment_index = _SegmentSuffixIndex(known_files)
-        precomputed = _precompute_file_triples(
-            file_path, extracted, commit_ident, known_files, segment_index=segment_index,
-        )
-        results.append((status, file_path, extracted, precomputed, old_path if status == "R" else ""))
 
-        # Build this file's contribution to the removed/added pools. Live
-        # nodes for the NEW side come from re-parsing (extracted only carries
-        # text, per Task 6) — cheap, since this is the same content already
-        # fetched above; a second parse of the same bytes is a deliberate
-        # simplicity/cost tradeoff over threading Node references through
-        # _extract_from_source's return value, which must stay plain-data-only
-        # for other callers.
+        # Live nodes for the NEW side come from re-parsing (extracted only
+        # carries text, per Task 6) — cheap, since this is the same content
+        # already fetched above; a second parse of the same bytes is a
+        # deliberate simplicity/cost tradeoff over threading Node references
+        # through _extract_from_source's return value, which must stay
+        # plain-data-only for other callers. Computed here, BEFORE
+        # _precompute_file_triples, so #221's body-diff hash-compare can use
+        # it alongside old_entity_nodes; still reused further below for its
+        # original rename-matching purpose too.
         #
         # Wrapped best-effort, same as the old-side call above: a
         # pathologically nested file parses fine under tree-sitter but can
@@ -6744,6 +6738,16 @@ def _extract_commit(
             new_entity_nodes = {
                 "function": {}, "class": {}, "variable": {}, "field": {},
             }  # best-effort: matching degrades to no-match
+
+        extracted = _extract_from_source(content, parser, file_path)
+        if known_files is None:
+            known_files = _known_files_at_commit(repo_path, commit_hash, ignore_patterns)
+            segment_index = _SegmentSuffixIndex(known_files)
+        precomputed = _precompute_file_triples(
+            file_path, extracted, commit_ident, known_files, segment_index=segment_index,
+            old_entity_nodes=old_entity_nodes, new_entity_nodes=new_entity_nodes,
+        )
+        results.append((status, file_path, extracted, precomputed, old_path if status == "R" else ""))
 
         # Record every entity whose name is present, unchanged, on BOTH sides
         # of this file — these survive the commit unrenamed and so must be
