@@ -72,7 +72,7 @@ dependencies = [
     # resolved 2.0.0 and every test that imports mcp_server errored at import
     # (902 of them). Migrating to the 2.x handler API is its own change --
     # raise the cap as part of that, not before it.
-    "mcp>=1.27.0,<2.0.0",
+    "mcp>=1.27.0,<3.0.0",
 ]
 
 [project.scripts]
