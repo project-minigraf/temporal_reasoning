@@ -67,15 +67,29 @@ worth knowing before it is blamed on 3.13.**
 `TestMcpToolWiring::test_call_tool_lock_retry_does_not_block_event_loop` failed
 once in a full 3.13 run and passed in isolation, on the rerun, and on master
 under the same interpreter, so it is pre-existing and unrelated to any change
-here. Cause: the test does `monkeypatch.setattr(mcp_server.time, "sleep", ...)`,
-and `mcp_server.time` IS the `time` module, so the patch replaces `time.sleep`
-**process-wide**. `_open_index_writer_safe` (`mcp_server.py`) and
-`fact_index.py`'s SQLite retry both call `time.sleep` from WORKER THREADS by
-design — both are documented as safe precisely because they never run on the
-event loop. A worker thread from an earlier test hitting lock contention inside
-this test's window therefore trips an assertion written only for the event-loop
-path. The guard is too broad, not the code under it. Tracked as #334; do not
-"fix" it by widening the version policy.
+here. Fixed in #334, and **the mechanism first recorded here was wrong.** The
+test patched `mcp_server.time.sleep` — which IS the `time` module, so
+process-wide — with an unconditional tripwire, and the blame went to worker
+threads that sleep by design (`_open_index_writer_safe`, `fact_index.py`'s
+SQLite retry). Measured, that cannot fail this test: an exception raised on a
+worker thread surfaces only as a `PytestUnhandledThreadExceptionWarning`, and
+no worker-thread sleep was observed in its window. The real trigger was the
+test's own cleanup. `_hold_lock_subprocess` reaps the holder with
+`Popen.wait(timeout=5)`, which CPython implements on POSIX as a `time.sleep`
+polling loop **on the test thread**, and under load the child has released the
+lock but not yet exited (51 of 60 iterations under 2x CPU load; the real test
+failed 8 of 10). Comparing `threading.get_ident()`, the fix #334 proposed,
+would not have helped — the event loop and that cleanup share the main thread.
+`_forbid_blocking_sleep_on_event_loop` (tests) fires only when
+`asyncio.get_running_loop()` succeeds on the calling thread, which is #99's
+guarantee stated exactly.
+
+**The same investigation found the test had been vacuous since minigraf
+2.0.0.** `MiniGrafDb.open` now retries its own lock for ~375 ms, so the 0.1 s
+hold cleared inside the first `try_acquire` and the test passed with a blocking
+`time.sleep` put back into `db_lease_async`. The hold is now 1.0 s and the test
+asserts at least one refused `try_acquire`, so every run re-proves that the
+backoff actually ran.
 
 **The six "Python 3.14 failures" that prompted this policy were not Python 3.14
 failures, and the misdiagnosis is the part worth remembering (#331).**
