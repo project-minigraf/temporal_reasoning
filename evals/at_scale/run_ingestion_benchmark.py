@@ -22,7 +22,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 REPO_ROOT = Path(__file__).parent.parent.parent.resolve()
 if str(REPO_ROOT) not in sys.path:
@@ -42,16 +42,49 @@ from evals.at_scale.stderr_capture import (  # noqa: E402
 
 _STATUS_QUERY = "[:find (count ?e) :where [?e :entity-type :type/commit]]"
 
+_SHORT = {"forward": "fwd", "reverse": "rev"}
+
+
+def format_progress_line(status: Dict[str, Any]) -> str:
+    """One human line from a minigraf_ingest_status response (#222 phase 4).
+    Importable so a probe can reuse it; the benchmark prints it to STDOUT,
+    never stderr, which stderr_capture scans for error signals."""
+    run = status.get("this_run")
+    if run is None:
+        return f"[progress] {status.get('status')}"
+    streams = status["streams"]
+
+    def stream(name: str) -> str:
+        st = streams[name]
+        rate = st.get("rate_per_min")
+        return f"{_SHORT[name]} {st['retired']}" + (f" @{rate:.1f}/min" if rate is not None else "")
+
+    sw = streams["sweep"]
+    sweep = f"sweep {sw['state']}" + (f" {sw['swept']}/{sw['to_sweep']}" if sw.get("to_sweep") else "")
+    lin, vis = status["lineage"], status["visibility"]
+    confirmed = "?" if lin["confirmed"] is None else lin["confirmed"]
+    return (
+        f"[progress] {status.get('phase') or status.get('status')} "
+        f"this_run {run['retired']}/{run['to_retire']} · {stream('forward')} · "
+        f"{stream('reverse')} · {sweep} · visibility {vis['verified']}/{vis['total']} · "
+        f"lineage {confirmed}/{lin['total']} · idle {run['seconds_since_progress']:.0f}s"
+    )
+
 
 async def _poll_during_ingestion(
     ingest_task: "asyncio.Task[None]",
     poll_interval: float,
     duty_factor: float = 10.0,
+    progress_interval: Optional[float] = None,
+    out=None,
 ) -> tuple[list[float], list[float], list[float]]:
     """Poll ingest_status and a graph query while ingest_task runs.
 
     Returns (status_latencies, query_latencies, poll_offsets); latencies in
     seconds, offsets in seconds since polling began.
+
+    [progress] lines: --progress-interval (#222 phase 4). Lines go to stdout
+    and add no status call.
 
     #242: both halves of this are load-bearing.
 
@@ -96,6 +129,7 @@ async def _poll_during_ingestion(
     query_latencies: list[float] = []
     poll_offsets: list[float] = []
     started = time.perf_counter()
+    last_progress: Optional[float] = None
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="bench-poll"
@@ -104,11 +138,17 @@ async def _poll_during_ingestion(
             poll_offsets.append(time.perf_counter() - started)
 
             t0 = time.perf_counter()
-            await loop.run_in_executor(
+            status = await loop.run_in_executor(
                 poll_executor, mcp_server.handle_minigraf_ingest_status
             )
             status_duration = time.perf_counter() - t0
             status_latencies.append(status_duration)
+
+            if progress_interval is not None:
+                now = time.perf_counter()
+                if last_progress is None or now - last_progress >= progress_interval:
+                    print(format_progress_line(status), file=out or sys.stdout, flush=True)
+                    last_progress = now
 
             t0 = time.perf_counter()
             await loop.run_in_executor(
@@ -132,6 +172,7 @@ async def run_ingestion_benchmark(
     duty_factor: float = 10.0,
     compare_ignore: bool = False,
     trace_path: Optional[Path] = None,
+    progress_interval: Optional[float] = None,
 ) -> dict[str, Any]:
     """Run a full git ingestion against repo_path into an isolated graph at
     graph_path, measuring wall-clock, throughput, peak RSS, final graph/index
@@ -200,7 +241,7 @@ async def run_ingestion_benchmark(
             )
             try:
                 status_latencies, query_latencies, poll_offsets = await _poll_during_ingestion(
-                    ingest_task, poll_interval, duty_factor
+                    ingest_task, poll_interval, duty_factor, progress_interval=progress_interval
                 )
                 await ingest_task
             except BaseException:
@@ -618,6 +659,11 @@ def main() -> int:
              "evals/at_scale/probe_per_commit_cost.py. Off by default.",
     )
     parser.add_argument(
+        "--progress-interval", type=float, default=None,
+        help="Print one [progress] line to STDOUT at most every N seconds, "
+             "from the existing status poll (#222 phase 4). Off by default.",
+    )
+    parser.add_argument(
         "--graph-path", default=None,
         help="Persist the graph at this path instead of using a temporary "
              "directory. Must not already exist. Required for the #256 "
@@ -669,6 +715,7 @@ def main() -> int:
                 duty_factor=args.poll_duty_factor,
                 compare_ignore=args.compare_ignore,
                 trace_path=Path(args.trace_path) if args.trace_path else None,
+                progress_interval=args.progress_interval,
             )
         )
 

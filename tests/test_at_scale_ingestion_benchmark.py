@@ -1213,3 +1213,61 @@ class TestResolveGraphPath:
         with pytest.raises(SystemExit, match="already exists"):
             with resolve_graph_path(str(target)):
                 pass
+
+
+class TestProgressInterval:
+    """#222 phase 4: mid-run progress on STDOUT (stderr is teed and scanned by
+    stderr_capture), and never an extra status call."""
+
+    def _status(self):
+        return {
+            "status": "running", "phase": "converging",
+            "this_run": {"to_retire": 9000, "retired": 412, "seconds_since_progress": 3.2},
+            "streams": {
+                "forward": {"retired": 206, "rate_per_min": 11.2},
+                "reverse": {"retired": 206, "rate_per_min": 11.0},
+                "sweep": {"state": "waiting", "swept": 0, "to_sweep": None},
+            },
+            "visibility": {"verified": 8203, "total": 53289},
+            "lineage": {"confirmed": 7800, "total": 53289},
+        }
+
+    def test_format(self):
+        from evals.at_scale.run_ingestion_benchmark import format_progress_line
+        assert format_progress_line(self._status()) == (
+            "[progress] converging this_run 412/9000 · fwd 206 @11.2/min · "
+            "rev 206 @11.0/min · sweep waiting · visibility 8203/53289 · "
+            "lineage 7800/53289 · idle 3s"
+        )
+
+    def test_format_before_the_model_exists(self):
+        from evals.at_scale.run_ingestion_benchmark import format_progress_line
+        assert format_progress_line({"status": "starting"}) == "[progress] starting"
+
+    def test_format_null_lineage_and_running_sweep(self):
+        from evals.at_scale.run_ingestion_benchmark import format_progress_line
+        s = self._status()
+        s["lineage"]["confirmed"] = None
+        s["streams"]["sweep"] = {"state": "running", "swept": 3, "to_sweep": 40}
+        line = format_progress_line(s)
+        assert "sweep running 3/40" in line and "lineage ?/53289" in line
+
+    @pytest.mark.parametrize("interval", [None, 0.0])
+    async def test_status_calls_equal_polls_with_or_without_the_flag(self, interval, monkeypatch, capsys):
+        import asyncio
+        import mcp_server
+        from evals.at_scale.run_ingestion_benchmark import _poll_during_ingestion
+        calls = {"status": 0}
+
+        def fake_status():
+            calls["status"] += 1
+            return self._status()
+
+        monkeypatch.setattr(mcp_server, "handle_minigraf_ingest_status", fake_status)
+        monkeypatch.setattr(mcp_server, "handle_minigraf_query", lambda q: {"ok": True})
+        task = asyncio.create_task(asyncio.sleep(0.3))
+        _s, _q, offsets = await _poll_during_ingestion(task, 0.05, 1.0, progress_interval=interval)
+        assert calls["status"] == len(offsets)
+        out, err = capsys.readouterr()
+        assert "[progress]" not in err
+        assert ("[progress]" in out) is (interval is not None)
