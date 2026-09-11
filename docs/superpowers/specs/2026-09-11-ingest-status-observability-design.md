@@ -106,8 +106,9 @@ is unchanged (`status`, `phase`, `total`, `current_commit`, `prior_ingested`,
   already matches.
 - **`streams.forward` / `streams.reverse`** — `state` is `not-started`
   (Stage A not yet begun), `running`, `done` (Stage A ended and the stream
-  retired at least one position), or `not-needed` (the gap was empty at load,
-  or Stage A ended with zero claims for that stream). `rate_per_min` is the
+  retired at least one position), `not-needed` (the gap was empty at load,
+  or Stage A ended with zero claims for that stream), or `stopped` / `error`
+  (the run ended that way while the stream was still running). `rate_per_min` is the
   stream's `retired` over wall time since Stage A began; null before the first
   retirement.
 - **`streams.sweep`** — `state` is `waiting` (Stage A running), `running`,
@@ -115,8 +116,9 @@ is unchanged (`status`, `phase`, `total`, `current_commit`, `prior_ingested`,
   anything or not), `not-needed` (no frontier-high: nothing provisional to
   confirm), `blocked` (with `blocked_reason`), `not-run` (Stage A ended
   stopped or in error, so Stage B was never entered), `stopped` (shutdown
-  requested mid-sweep), or `aborted` (a sweep step raised; the next run
-  re-selects that commit, as today). `blocked_reason` is one of `gap-open`,
+  requested mid-sweep), `aborted` (a sweep step raised; the next run
+  re-selects that commit, as today), or `error` (the run's own top-level
+  handler caught an exception while the sweep was running). `blocked_reason` is one of `gap-open`,
   `fragmented`, `stale-bound`, `metadata-mismatch`. `to_sweep` is known once
   Stage B plans.
 - **`visibility.verified`** = `(total − to_retire) + written + skipped`: the
@@ -190,12 +192,15 @@ Built once per run, in the `db_lease_async()` block that already calls
 Two extra point queries per run. Frontier-high's bounds come from the
 allocator already in hand.
 
-It is published to a module global `_ingest_run_progress: Optional[RunProgress]`,
-reset to None at the top of `_run_ingestion` (so a refused or early-failing
-run never shows a previous run's numbers — the same reasoning as
-`index_cross_check`) and set once construction succeeds. Tests and harnesses
-that assign `_ingest_progress` dicts directly keep working; the handler
-renders `snapshot()` only when the global is non-None.
+It is published as `_ingest_progress["_run"]`, reset to None at the top of
+`_run_ingestion` (so a refused or early-failing run never shows a previous
+run's numbers — the same reasoning as `index_cross_check`) and set once
+construction succeeds. Keeping it inside the dict rather than in a separate
+module global means every site that already resets `_ingest_progress` by
+assigning a fresh dict — `handle_minigraf_ingest_git`, `main()`, every test
+and every at-scale harness — clears it too, with no new reset to forget. The
+handler copies every key NOT starting with `_` and merges `snapshot()` when
+`_run` is non-None, so the object never reaches `json.dumps`.
 
 ### Events
 
@@ -206,8 +211,7 @@ Each replaces an existing `_ingest_progress[...]` mutation in `_run_ingestion`:
 | `stage_a_started()` | where `phase = "converging"` is set |
 | `retired("rev", "skipped", pos)` | the `_skip_claim` path in `submit_next` |
 | `retired(tag, "failed", pos)` | the extraction-failure `except` |
-| `retired(tag, "written" \| "failed", pos)` | after the write dispatch, keyed on `_trace_write_ok` |
-| `forward_confirmed(pos)` | same site, `tag == "fwd"` and the write succeeded — mirrors the `:ingestion/lineage-confirmed-through` `_forward_apply` just persisted |
+| `retired(tag, "written" \| "failed", pos)` | after the write dispatch, keyed on `_trace_write_ok`. `retired("fwd", "written", pos)` also moves `lineage_pos` to `pos` — it mirrors the `:ingestion/lineage-confirmed-through` that a non-raising `_forward_apply` has just persisted, so no separate event is needed |
 | `stage_a_finished(completed)` | after the `while pending` loop |
 | `sweep_planned(to_sweep=…)` / `sweep_planned(blocked_reason=…)` / `sweep_planned(done=True)` / `sweep_planned(not_needed=True)` | Stage B, before its loop |
 | `swept(pos)` | after `_correction_sweep_through_update` succeeds |
@@ -249,7 +253,14 @@ the old formula on the same run:
   this_run.retired`. The metrics JSON key `commits_ingested` keeps its name,
   so `report.py` and every recorded `results/` file stay comparable.
 - `evals/at_scale/probe_resume_census.py` — `walk_claimed`, and
-  `processed_this_run` → `this_run.retired` inside `retention_engaged`.
+  `processed_this_run` → `this_run.retired` inside `retention_engaged`. The
+  probe's own output keys follow the status rename: `processed_this_run` →
+  `retired_this_run`, `positions_skipped_this_run` → `skipped_this_run`.
+  `results/325-resume-census.json` is a historical artifact and keeps its
+  old keys; no code reads it back.
+- A shared `commit_census.walk_claimed_from_progress(progress)` computes
+  `prior_ingested + _run.retired` (0 retired when `_run` is None — a run
+  that failed before construction), so the three harnesses cannot drift.
 - `evals/at_scale/profile_forward_reconcile_attribution.py`.
 - The `_ingest_progress` literal dicts in `run_ingestion_benchmark.py`,
   `probe_resume_census.py`, `probe_dep_preload_exposure.py` and the test
