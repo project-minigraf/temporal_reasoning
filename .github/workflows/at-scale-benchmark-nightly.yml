@@ -127,9 +127,32 @@ jobs:
           echo "simulate_failure=true -- failing deliberately to exercise the notifier"
           exit 1
 
+      # #330. THERE IS DELIBERATELY NO --branch HERE. This step carried
+      # `--branch HEAD` for months. That is truthy, so it does not select the
+      # checked-out ref *in addition to* the harness's own resolution -- it
+      # DEFEATS `branch or mcp_server._default_git_branch(repo_path)`
+      # (run_ingestion_benchmark.py) outright, and the literal reaches
+      # _git_commits' range spec, _run_ingestion's repo_total and #317's
+      # commit census alike.
+      #
+      # The failure that produces is quiet, not loud, which is why it survived
+      # this long: everything downstream inherits the SAME wrong ref, so no
+      # count in the tier disagrees with another. They simply all describe
+      # whatever happens to be checked out rather than the branch being
+      # tracked. On a scheduled run those denote the same commit and nothing
+      # is wrong; on a workflow_dispatch against a branch, a tag, or any
+      # detached checkout they do not. #317 caught the identical shape in
+      # _run_ingestion only because the harness resolved "master" while the
+      # checkout sat on a feature branch, making two numbers that should have
+      # matched differ.
+      #
+      # Omitting the argument is what lets _default_git_branch resolve it.
+      # main() now refuses the literal outright, so re-adding it turns this
+      # step red rather than quiet -- but the argument is easier not to add
+      # than to debug, hence this note.
       - name: Run ingestion benchmark
         id: ingestion
-        run: python -m evals.at_scale.run_ingestion_benchmark --repo-path . --branch HEAD
+        run: python -m evals.at_scale.run_ingestion_benchmark --repo-path .
 
       - name: Run query-correctness benchmark
         id: query
@@ -221,7 +244,17 @@ jobs:
         id: resume_census
         if: always()
         run: |
-          resolved_branch=$(git rev-parse --abbrev-ref HEAD)
+          # #330. Resolved through the SHIPPED helper, not `git rev-parse
+          # --abbrev-ref HEAD`, which is what this line used to run. That
+          # prints the literal string HEAD on a detached checkout -- the one
+          # value probe_resume_census's own --branch help text forbids -- and
+          # on a workflow_dispatch against a branch it prints the FEATURE
+          # branch, which is #317's scenario verbatim. Either way the slice
+          # below would be taken from a different linearization than the code
+          # under measurement walks, silently. _default_git_branch is the
+          # resolution ingestion itself performs, so this tracks it by
+          # construction instead of by a matching guess.
+          resolved_branch=$(python -c "import mcp_server; print(mcp_server._default_git_branch('.'))")
           target_ref=$(git log --topo-order --reverse --format=%H "$resolved_branch" | sed -n '300p')
           python evals/at_scale/probe_resume_census.py \
             --repo . --branch "$target_ref" \

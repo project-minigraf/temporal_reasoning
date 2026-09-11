@@ -119,13 +119,22 @@ at all -- see `resume_ok`.
 
 THE REF IS THE RESOLVED BRANCH, NEVER "HEAD". `_run_ingestion`'s own
 `repo_total` was hardcoded to `HEAD` while ingestion took a `branch` argument,
-live in the very run that measured #317 -- the at-scale nightly still invokes
-`run_ingestion_benchmark` with the literal string `--branch HEAD`
-(`.github/workflows/at-scale-benchmark-nightly.yml`), which is a separate,
-untouched defect. This probe's `branch` parameter has no default and is never
-substituted with `"HEAD"`; the nightly step added alongside this probe
-resolves the checked-out branch name with `git rev-parse --abbrev-ref HEAD`
-and passes THAT string.
+live in the very run that measured #317. This probe's `branch` parameter has
+no default and is never substituted with `"HEAD"`.
+
+The nightly's two instances of that same shape are now CLOSED (#330), and this
+paragraph used to describe them as live -- do not read an older copy of it as
+current. The ingestion step passed the literal string `--branch HEAD`, which
+is truthy and therefore defeated `run_ingestion_benchmark`'s own
+`branch or _default_git_branch(...)` rather than adding to it; it now omits
+the argument entirely, and `main()` refuses that literal outright. The step
+that drives THIS probe resolved its linearization with
+`git rev-parse --abbrev-ref HEAD`, which prints the literal string `HEAD` on a
+detached checkout -- the one value `--branch`'s own help text below forbids --
+and prints the FEATURE branch on a `workflow_dispatch`, which is #317's
+scenario verbatim; it now calls `mcp_server._default_git_branch` directly, so
+it tracks the shipped resolution by construction rather than by a matching
+guess. `tests/test_at_scale_nightly_workflow.py` keeps both closed.
 
 STATUS KEY VERIFIED, NOT ASSUMED. `_ingest_progress["status"]` is the field
 `handle_minigraf_ingest_status` itself reads (mcp_server.py) and the one
