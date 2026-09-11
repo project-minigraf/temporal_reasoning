@@ -9,6 +9,7 @@ Every damaged-graph test asserts its PRECONDITION (which reads the damage
 falsifies) before exercising the check, so a construction that silently stops
 producing damage fails as a precondition, never as a pass.
 """
+import json
 import os
 import random
 import struct
@@ -124,6 +125,47 @@ def _fixed_count():
     return len(mcp_server._index_cross_check_fixed_idents())
 
 
+def _eavt_types(db, ident):
+    """ident's :entity-type values through a keyword-literal entity pattern
+    (EAVT) -- an independent witness, not the function under test."""
+    raw = db.execute(f"(query [:find ?t :where [{ident} :entity-type ?t]])")
+    return {row[0] for row in json.loads(raw)["results"]}
+
+
+def _aevt_types(db, ident):
+    """ident's :entity-type values through an attribute-only scan (AEVT),
+    filtered in Python -- an independent witness, not the function under
+    test."""
+    raw = db.execute("(query [:find ?e ?t :where [?e :entity-type ?t]])")
+    entity = str(_entity_uuid(ident))
+    return {t for e, t in json.loads(raw)["results"] if e == entity}
+
+
+def _build_same_transaction_types_graph(graph, tag):
+    """A HEALTHY graph, written through the public handler in one transact:
+    30 single-typed :decision/ fillers plus one entity typed both
+    :type/decision and :type/constraint. Returns that entity's ident."""
+    x = f":decision/x{tag}"
+    facts = [
+        f"[{x} :entity-type :type/decision]",
+        f"[{x} :entity-type :type/constraint]",
+        f'[{x} :description "two types"]',
+    ]
+    for i in range(30):
+        facts.append(f"[:decision/f{tag}-{i} :entity-type :type/decision]")
+        facts.append(f'[:decision/f{tag}-{i} :description "f"]')
+    mcp_server._reset_db_state()
+    mcp_server.open_db(str(graph))
+    try:
+        result = mcp_server.handle_minigraf_transact(
+            "[" + " ".join(facts) + "]", "same-transaction types"
+        )
+    finally:
+        mcp_server._reset_db_state()
+    assert result["ok"], result
+    return x
+
+
 class TestGraphIndexCrossCheck:
     def test_healthy_graph_passes_and_reports_its_denominators(self, tmp_path):
         graph = tmp_path / "g.graph"
@@ -188,6 +230,83 @@ class TestGraphIndexCrossCheck:
         assert mcp_server._graph_format_version_read(db) == 1
         with pytest.raises(mcp_server.GraphIndexDamageError):
             mcp_server._graph_index_cross_check(db, rng=random.Random(0))
+
+    def test_same_transaction_types_read_differently_are_not_refused(
+        self, tmp_path, capsys
+    ):
+        """Two :entity-type values in ONE transact share (entity, attribute,
+        tx_count, asserted), and minigraf keeps one per read -- whichever its
+        unstable per-index sort put first -- so AEVT and EAVT can each return
+        a DIFFERENT single value on a healthy graph. Refusing that tells the
+        user to discard a healthy graph. Deterministic for a given tag; tag h0
+        disagrees on minigraf 2.0.0, and the loop only guards against a sort
+        change moving the disagreement to another tag.
+        """
+        chosen = None
+        for tag in (f"h{i}" for i in range(6)):
+            graph = tmp_path / f"{tag}.graph"
+            x = _build_same_transaction_types_graph(graph, tag)
+            handle = MiniGrafDb.open(str(graph))
+            eavt, aevt = _eavt_types(handle, x), _aevt_types(handle, x)
+            if eavt and aevt and eavt != aevt:
+                chosen = handle
+                break
+            del handle
+        # Precondition, witnessed independently of the functions under test:
+        # both indexes answer for x, with different values.
+        assert chosen is not None, (
+            "precondition: no tag produced an AEVT/EAVT :entity-type "
+            "disagreement on a healthy graph"
+        )
+        db = chosen
+        assert eavt and aevt and eavt != aevt
+        assert eavt | aevt <= {":type/decision", ":type/constraint"}
+        capsys.readouterr()
+        report = mcp_server._graph_index_cross_check(db, rng=random.Random(0))
+        assert report["population"] == 31
+        assert report["probed"] == _fixed_count() + 31
+        assert capsys.readouterr().err == (
+            "[_graph_index_cross_check] 1 entities read different "
+            ":entity-type values through AEVT and EAVT; not index damage -- "
+            "minigraf keeps one of several same-transaction values per index "
+            "(not refused)\n"
+        )
+
+    def test_damage_confined_to_sampled_entities_is_refused(self, tmp_path):
+        """Every other damaged-graph test also damages a control entity,
+        which is probed first -- so a check that stopped probing the random
+        sample would still pass them. Here only sampled entities are damaged.
+        """
+        graph = tmp_path / "g.graph"
+        lowest_fixed = min(
+            _entity_uuid(ident)
+            for ident in mcp_server._index_cross_check_fixed_idents()
+        )
+        # Every filler sorts below every fixed ident in EAVT, so the kept
+        # rightmost leaf holds the control entities' facts, not the fillers'.
+        fillers = _filler_idents(400, keep=lambda u: u < lowest_fixed)
+        _write_facts(graph, _CONTROL_FACTS + _filler_facts(fillers))
+        _keep_rightmost_leaf(graph, _EAVT_ROOT_OFFSET)
+        db = MiniGrafDb.open(str(graph))
+        # Precondition, through keyword-literal EAVT reads: every control
+        # ident that has facts still reads intact...
+        assert mcp_server._graph_format_version_read(db) == 1
+        assert mcp_server._watermark_query(db) == "abc"
+        for ident in (
+            ":ingestion/format-version", ":ingestion/watermark",
+            ":ingestion/frontier-low",
+        ):
+            assert _eavt_types(db, ident) == _aevt_types(db, ident) != set()
+        # ...while most fillers are invisible through EAVT, though AEVT
+        # still lists them.
+        visible = sum(1 for x in fillers if _eavt_types(db, x))
+        assert visible < len(fillers) // 2
+        assert all(_aevt_types(db, x) == {":type/filler"} for x in fillers[:5])
+        with pytest.raises(mcp_server.GraphIndexDamageError) as exc:
+            mcp_server._graph_index_cross_check(db, rng=random.Random(0))
+        message = str(exc.value)
+        assert ":ingestion/" not in message
+        assert any(str(_entity_uuid(x)) in message for x in fillers)
 
     def test_entity_retracted_mid_check_is_not_reported_as_damage(
         self, tmp_path, monkeypatch
@@ -291,7 +410,11 @@ class TestIndexCrossCheckAtRunStart:
         second = await _ingest(repo, graph)
         assert second["status"] == "complete", second.get("error")
         assert second["index_cross_check"]["population"] > 0
-        assert second["index_cross_check"]["control_probed"] >= _fixed_count()
+        # Non-control entities were probed, not just the control set.
+        assert (
+            second["index_cross_check"]["probed"]
+            > second["index_cross_check"]["control_probed"]
+        )
 
     async def test_damaged_mature_graph_is_refused_not_adopted_as_fresh(
         self, repo, tmp_path

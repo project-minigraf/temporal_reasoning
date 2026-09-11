@@ -6217,20 +6217,25 @@ def _index_cross_check_fixed_idents() -> Tuple[str, ...]:
 
 
 def _index_cross_check_population(db: Any) -> Dict[str, Set[str]]:
-    """Every live entity's :entity-type values, read through AEVT."""
+    """Every live entity's :entity-type values, read through AEVT.
+
+    Indexes "results" rather than .get()-ing it: an unexpected response shape
+    must fail CLOSED (raise), never read as an empty population.
+    """
     raw = _db_execute(db, _INDEX_CROSS_CHECK_POPULATION_QUERY)
     population: Dict[str, Set[str]] = {}
-    for entity, entity_type in json.loads(raw).get("results", []):
+    for entity, entity_type in json.loads(raw)["results"]:
         population.setdefault(entity, set()).add(entity_type)
     return population
 
 
 def _index_cross_check_probe(db: Any, entity_uuid: str) -> Set[str]:
-    """One entity's :entity-type values, read through EAVT."""
+    """One entity's :entity-type values, read through EAVT. Fails closed on an
+    unexpected response shape, like _index_cross_check_population."""
     raw = _db_execute(
         db, f'(query [:find ?t :where [#uuid "{entity_uuid}" :entity-type ?t]])'
     )
-    return {row[0] for row in json.loads(raw).get("results", [])}
+    return {row[0] for row in json.loads(raw)["results"]}
 
 
 def _index_damage_message(
@@ -6265,17 +6270,40 @@ def _graph_index_cross_check(
     docs/superpowers/specs/2026-09-11-index-cross-check-design.md.
 
     Probes every control entity (the fixed idents plus everything carrying a
-    control type) and a uniform random sample of the rest. An entity's EAVT set
-    must EQUAL its AEVT set, which catches loss in either index for the entities
-    probed. A disagreement is re-read once before it counts, because call_tool
-    can join this lease and retract a sampled entity between scan and probe --
-    and a false refusal tells the user to discard a healthy graph.
+    control type) and a uniform random sample of the rest. It refuses ONLY
+    when exactly one index reads an entity's :entity-type set as EMPTY and the
+    other does not: EAVT empty with AEVT non-empty is #370's shape, AEVT empty
+    with EAVT non-empty is the shape AEVT damage leaves on a fixed ident. Both
+    empty agrees. That catches loss in either index for the entities probed.
 
-    Returns {"population", "probed", "control_probed"}. A population of 0 is
-    not a verification; it is reported so nobody reads it as one (#316's
+    Both non-empty but DIFFERENT is not refused, because a healthy graph
+    produces it. An entity given two :entity-type values in ONE transact
+    carries two facts sharing (entity, attribute, tx_count, asserted), and
+    minigraf keeps only one of them per read: its EAVT/AEVT keys carry no value
+    bytes, build_sorted_index_entries sorts each index with sort_unstable_by
+    (storage/persistent_facts.rs), and selective_fact_fetch dedups on exactly
+    that tuple, keeping whichever fact comes first (query/datalog/executor.rs).
+    So each index can return a DIFFERENT single value -- measured 3 of 6
+    healthy graphs built through handle_minigraf_transact, e.g. AEVT
+    {:type/decision} against EAVT {:type/constraint}. Such entities are
+    counted and summarized in one stderr line, never refused. The residual: an
+    entity given two same-transaction types that later has ONE of them
+    retracted can read empty through one index and the survivor through the
+    other, and is then refused although the graph is healthy.
+
+    A disagreement is re-read once before it counts, because call_tool can
+    join this lease and retract a sampled entity between scan and probe -- and
+    a false refusal tells the user to discard a healthy graph. The fresh
+    population scan replaces the old one, so later entities compare against
+    it and a race costs one rescan, not one per entity.
+
+    Returns {"population", "probed", "control_probed"}. "population" is the
+    size of the scan the sample was drawn from. A population of 0 is not a
+    verification; it is reported so nobody reads it as one (#316's
     code_entities_scanned idiom).
     """
     population = _index_cross_check_population(db)
+    population_size = len(population)
     fixed = {
         str(uuid.uuid5(uuid.NAMESPACE_OID, ident)): ident
         for ident in _index_cross_check_fixed_idents()
@@ -6288,17 +6316,29 @@ def _graph_index_cross_check(
     if len(rest) > sample_size:
         rest = (rng or random.Random()).sample(rest, sample_size)
     selected = sorted(control) + rest
+    differing_values = 0
     for entity in selected:
         if _index_cross_check_probe(db, entity) == population.get(entity, set()):
             continue
-        aevt = _index_cross_check_population(db).get(entity, set())
+        population = _index_cross_check_population(db)
+        aevt = population.get(entity, set())
         eavt = _index_cross_check_probe(db, entity)
-        if eavt != aevt:
+        if bool(eavt) != bool(aevt):
             raise GraphIndexDamageError(
                 _index_damage_message(entity, fixed.get(entity), aevt, eavt)
             )
+        if eavt != aevt:
+            differing_values += 1
+    if differing_values:
+        print(
+            f"[_graph_index_cross_check] {differing_values} entities read "
+            "different :entity-type values through AEVT and EAVT; not index "
+            "damage -- minigraf keeps one of several same-transaction values "
+            "per index (not refused)",
+            file=sys.stderr,
+        )
     return {
-        "population": len(population),
+        "population": population_size,
         "probed": len(selected),
         "control_probed": len(control),
     }
