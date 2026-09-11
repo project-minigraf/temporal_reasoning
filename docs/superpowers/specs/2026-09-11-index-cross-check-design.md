@@ -65,7 +65,10 @@ no rules, at most 4 distinct lookups):
 
 So `[:find ?e ?t :where [?e :entity-type ?t]]` is an AEVT read and
 `[:find ?t :where [#uuid "<e>" :entity-type ?t]]` is an EAVT read of the same
-facts. Comparing them is an exact two-index comparison.
+facts. Comparing them is an exact two-index comparison **of presence** — but
+not of which value each index returns when an entity holds several
+same-transaction `:entity-type` values (amendment, 2026-09-11, measured; see
+the same-transaction dedup amendment under step 3).
 
 ## Design
 
@@ -98,18 +101,46 @@ facts. Comparing them is an exact two-index comparison.
      if fewer). `rng` defaults to a fresh `random.Random()`, so successive runs
      cover different entities; tests inject a seeded one.
 3. **Probe.** Per selected entity, `[:find ?t :where [#uuid "<e>" :entity-type ?t]]`.
-   The EAVT set must EQUAL the AEVT set for that entity. Both directions come
+   ~~The EAVT set must EQUAL the AEVT set for that entity. Both directions come
    free: EAVT missing a type is #370; EAVT holding a type AEVT lacks is AEVT
-   damage for that entity.
+   damage for that entity.~~
+
+   **Amendment, 2026-09-11 (final review, measured): same-transaction dedup
+   makes set equality refuse healthy graphs, so refusal is empty-vs-non-empty
+   only.** An entity given two `:entity-type` values IN ONE TRANSACT holds two
+   facts sharing `(entity, attribute, tx_count, asserted)`. minigraf's
+   `EavtKey`/`AevtKey` carry no value bytes, `build_sorted_index_entries` sorts
+   each index with `sort_unstable_by` (`storage/persistent_facts.rs:1197,1215`),
+   and `selective_fact_fetch` dedups on exactly that tuple, keeping whichever
+   fact comes first (`query/datalog/executor.rs:411`). So AEVT and EAVT can
+   each return a DIFFERENT single value for the same healthy entity. Measured:
+   **3 of 6** healthy graphs built through `handle_minigraf_transact` (30
+   single-typed `:decision/` fillers plus one entity typed both `:type/decision`
+   and `:type/constraint`) read e.g. AEVT `{:type/decision}` against EAVT
+   `{:type/constraint}`, and the equality rule refused all three; a raw
+   transact reproduces it too. Deterministic per graph content (the same three
+   tags refuse on every rerun).
+
+   The rule is therefore: refuse ONLY when exactly one side is empty — EAVT
+   empty with AEVT non-empty (#370's shape) or AEVT empty with EAVT non-empty
+   (the fixed-ident AEVT-damage shape, step 2). Both empty agrees. Both
+   non-empty but different is NOT damage: such entities are counted and, if
+   any, summarized in one stderr line (`[_graph_index_cross_check] N entities
+   read different :entity-type values through AEVT and EAVT; not index damage
+   -- …`). It has no `stderr_capture` pattern, deliberately — it fires on
+   healthy graphs. The return dict is unchanged.
 4. **Re-confirm before refusing.** On the first disagreement, re-run the step-1
    query once and re-probe that entity. Refuse only if the disagreement
    survives. This excludes an in-process race: `call_tool` can join the
    preload lease, so a concurrent `minigraf_retract` of the sampled entity
    between steps 1 and 3 would otherwise read as damage. minigraf rejects
    `[(= ?e #uuid "…")]` (`PRS-070 unsupported expression argument: Uuid`), so
-   the re-confirm is a full re-scan, paid only on the failure path.
+   the re-confirm is a full re-scan, paid only on the failure path. (Amendment,
+   2026-09-11: the fresh scan replaces the population, so later entities
+   compare against it and a race costs one re-scan, not one per entity.)
 5. **Refuse** with `GraphIndexDamageError(RuntimeError)` on a confirmed
-   disagreement — stop at the first one. The message names the entity UUID,
+   empty-vs-non-empty disagreement (step 3's amendment) — stop at the first
+   one. The message names the entity UUID,
    its AEVT and EAVT answers, minigraf#370, and the recovery: re-ingest into a
    fresh graph path (`MINIGRAF_GRAPH_PATH` to a new file, or delete the graph
    and its `.fts.sqlite3`). It states that re-running ingestion and
@@ -188,7 +219,8 @@ garbage. Real backend, per `docs/testing-conventions.md`; nothing is faked.
 
 ## Tests
 
-In `tests/test_mcp_server.py`, each proven by ablation (revert the guarded code,
+In a new `tests/test_index_cross_check.py` (not the 26k-line
+`tests/test_mcp_server.py`), each proven by ablation (revert the guarded code,
 watch it fail, restore):
 
 1. **A damaged mature graph is refused before any write, not adopted as
@@ -225,13 +257,25 @@ watch it fail, restore):
    `aevt_root_page` redirected to its rightmost leaf (precondition asserted:
    the population query returns 0 rows). The check raises. Ablation: drop the
    fixed-ident union — it passes as population 0.
+8. **Same-transaction types that read differently are not refused**
+   (amendment, 2026-09-11). The healthy multi-type graph from step 3's
+   amendment, built through `handle_minigraf_transact`; precondition, through
+   independent witnesses (a keyword-literal EAVT read and an attribute-only
+   AEVT read filtered in Python): both sets non-empty and different. The check
+   passes and prints the one-line stderr summary. Ablation: restore the
+   `eavt != aevt` refusal — it raises `GraphIndexDamageError`.
+9. **Damage confined to sampled entities is refused** (amendment,
+   2026-09-11). Tests 1, 2 and 7 all damage a control entity, which is probed
+   first, so a check that stopped probing the random sample would pass them.
+   Fillers all below the lowest fixed-ident UUID, EAVT redirected to its
+   rightmost leaf; precondition: every control ident with facts still reads
+   through EAVT, most fillers do not. The check raises, naming a filler.
+   Ablation: iterate only the control set — it passes.
 
 Tests 1–2 need deterministic commit hashes (which entities survive in the
 kept leaf depends on UUID order), so their repo fixes
 `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`, and every damaged-graph test asserts
 its precondition (which reads are misread) before exercising the check.
-They live in a new `tests/test_index_cross_check.py`, not the 26k-line
-`tests/test_mcp_server.py`.
 
 ## Docs
 
@@ -245,8 +289,15 @@ They live in a new `tests/test_index_cross_check.py`, not the 26k-line
 
 * **AEVT damage, beyond the fixed control idents.** An entity missing from
   AEVT is never in the population, so it is never sampled. The fixed control
-  idents are probed regardless, and the both-directions comparison catches
-  AEVT loss on any entity that is sampled; nothing else.
+  idents are probed regardless; nothing else. (Amended 2026-09-11: the
+  original text also claimed the "both-directions comparison" caught AEVT loss
+  on any sampled entity. A sampled entity is in the population, so AEVT is
+  non-empty for it, and under step 3's empty-vs-non-empty rule a PARTIAL AEVT
+  loss on it is not refused.)
+* **Same-transaction types, one later retracted** (amendment, 2026-09-11). An
+  entity given two `:entity-type` values in one transact that later has one
+  of them retracted can read empty through one index and the survivor
+  through the other — and is then refused although the graph is healthy.
 * **Partial within-entity loss.** Only `:entity-type` is compared. An EAVT
   range that lost some of an entity's facts but kept `:entity-type` passes.
 * **Light damage** can escape the sample (see Detection power). Random

@@ -459,9 +459,19 @@ opens clean, scans and counts are right, and every entity-bound lookup returns
 (`[?e :entity-type ?t]`) and re-reads each selected one through EAVT
 (`[#uuid "…" :entity-type ?t]`) — minigraf's `selective_fact_fetch` routes an
 entity-literal pattern to `get_facts_by_entity` and an attribute-only one to
-`get_facts_by_attribute`, so the two queries are an exact two-index comparison.
-It probes every control entity and 512 random others, and raises
-`GraphIndexDamageError` on a disagreement that survives one re-read.
+`get_facts_by_attribute`, so the two queries compare the two indexes exactly
+for PRESENCE — but not for which of several same-transaction values each index
+returns. Two `:entity-type` values written in ONE transact share
+`(entity, attribute, tx_count, asserted)`; the index keys carry no value bytes,
+each index is sorted with `sort_unstable_by`, and `selective_fact_fetch` dedups
+on that tuple keeping whichever comes first — so a HEALTHY entity can read
+`{:type/decision}` through AEVT and `{:type/constraint}` through EAVT (3 of 6
+graphs built through `handle_minigraf_transact`, measured). The check therefore
+refuses ONLY when exactly one side is empty; both non-empty but different is
+counted and summarized in one stderr line, never refused, and deliberately has
+no `stderr_capture` pattern. It probes every control entity and up to 512
+random others, and raises `GraphIndexDamageError` on an empty-vs-non-empty
+disagreement that survives one re-read.
 
 **It must precede `_graph_format_version_verify`, not merely the first
 write.** That check and `_graph_has_ingestion_state` are entity-bound reads
@@ -487,9 +497,13 @@ asserts every layout fact it uses, so a minigraf format change fails it loudly.
 
 Cost: 0.10 s for the population scan at 6,148 entities, 0.56 ms per EAVT probe
 (~0.4 s total); the scan is linear in entities (~25 s extrapolated at 1.6M,
-not measured). Residuals, stated rather than fixed: an entity AEVT lost is
-never sampled unless it is a fixed control ident; only `:entity-type` is
-compared, so partial loss inside one entity's EAVT range passes; light damage
+not measured), and its memory at 1.6M entities — the population is held as a
+dict of sets — is unmeasured too. Residuals, stated rather than fixed: an
+entity AEVT lost is never sampled unless it is a fixed control ident; only
+`:entity-type` is compared, so partial loss inside one entity's EAVT range
+passes; an entity given two same-transaction types that later has one
+retracted can read empty through one index and the survivor through the
+other, and is then refused on a healthy graph; light damage
 can escape a 512 sample ((1 − f)^512, 0.6% at f = 1%); and readers outside
 ingestion — `minigraf_query`, the memory hooks, `minigraf_ingest_status`'s own
 `:ingestion/last-run-at` read — are unguarded. The rest of #336 (per-file
