@@ -17,6 +17,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import random
 import socket
 import re
 import signal
@@ -25,6 +26,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import weakref
 from collections import deque
 from dataclasses import dataclass, field
@@ -6152,6 +6154,154 @@ def _graph_format_version_verify(db: Any) -> None:
         "MINIGRAF_GRAPH_PATH to a new file, or delete the existing graph "
         "and its .fts.sqlite3 index first)."
     )
+
+
+class GraphIndexDamageError(RuntimeError):
+    """Raised when the graph's EAVT and AEVT indexes disagree about an entity.
+
+    project-minigraf/minigraf#370: a process killed mid-save can leave a graph
+    that opens without error, answers every attribute-driven scan and count
+    correctly, and returns [] for entity-bound lookups, because its EAVT index
+    lost most entities' entries while AEVT kept them. Deliberately a hard
+    failure (#336): this module has >=14 entity-bound point-query sites --
+    frontier bounds, :introduced-by, :ident liveness, the watermarks, the format
+    stamp -- and every one misreads on such a graph, so no part of ingestion is
+    safe to run on it.
+    """
+
+
+# #336. Lists every live entity through AEVT. minigraf's executor
+# (executor.rs selective_fact_fetch) serves an attribute-only pattern from
+# FactStorage::get_facts_by_attribute (AEVT) and an entity-literal pattern
+# from get_facts_by_entity (EAVT), so this query and _index_cross_check_probe
+# read the same facts through the two different indexes. Module-level so a
+# test can recognise it.
+_INDEX_CROSS_CHECK_POPULATION_QUERY = (
+    "(query [:find ?e ?t :where [?e :entity-type ?t]])"
+)
+# Ingestion control state, probed exhaustively rather than sampled: the format
+# stamp, the watermarks, frontier intervals and archived regions. They are few,
+# and misreading them is what makes a damaged mature graph look brand new.
+# Literals rather than the constants because _COMPLETED_REGION_ENTITY_TYPE is
+# defined further down this module; a test pins the two together.
+_INDEX_CROSS_CHECK_CONTROL_TYPES = frozenset({
+    ":type/ingestion", ":type/ingest-interval", ":type/completed-region",
+})
+# Uniform random sample of the non-control population. Misses damage covering
+# a fraction f of entities with probability (1 - f) ** 512: 0.6% at f = 1%.
+_INDEX_CROSS_CHECK_SAMPLE_SIZE = 512
+
+
+def _index_cross_check_fixed_idents() -> Tuple[str, ...]:
+    """The fixed-ident control entities, probed whether or not AEVT lists them.
+
+    This is what keeps the check from failing OPEN on AEVT damage: a graph
+    whose AEVT lost the whole :entity-type block returns an empty population
+    (measured) while EAVT still answers for these, so an empty population alone
+    must not be read as "nothing to check". An ident absent from both indexes
+    compares empty to empty, so a fresh graph passes.
+
+    Built at call time, not as a module constant, because
+    _LINEAGE_CONFIRMED_THROUGH_IDENT and _CORRECTION_SWEEP_THROUGH_IDENT are
+    defined further down this module.
+    """
+    return (
+        _FORMAT_VERSION_IDENT,
+        ":ingestion/watermark",
+        _FRONTIER_LOW_IDENT,
+        _FRONTIER_HIGH_IDENT,
+        _LINEAGE_CONFIRMED_THROUGH_IDENT,
+        _CORRECTION_SWEEP_THROUGH_IDENT,
+        ":ingestion/last-run-at",
+    )
+
+
+def _index_cross_check_population(db: Any) -> Dict[str, Set[str]]:
+    """Every live entity's :entity-type values, read through AEVT."""
+    raw = _db_execute(db, _INDEX_CROSS_CHECK_POPULATION_QUERY)
+    population: Dict[str, Set[str]] = {}
+    for entity, entity_type in json.loads(raw).get("results", []):
+        population.setdefault(entity, set()).add(entity_type)
+    return population
+
+
+def _index_cross_check_probe(db: Any, entity_uuid: str) -> Set[str]:
+    """One entity's :entity-type values, read through EAVT."""
+    raw = _db_execute(
+        db, f'(query [:find ?t :where [#uuid "{entity_uuid}" :entity-type ?t]])'
+    )
+    return {row[0] for row in json.loads(raw).get("results", [])}
+
+
+def _index_damage_message(
+    entity_uuid: str, ident: Optional[str], aevt: Set[str], eavt: Set[str]
+) -> str:
+    name = f"{ident} ({entity_uuid})" if ident else entity_uuid
+    return (
+        f"Graph index damage: entity {name} has :entity-type {sorted(aevt)} "
+        f"through the attribute index (AEVT) but {sorted(eavt)} through the "
+        "entity index (EAVT). This is project-minigraf/minigraf#370, an index "
+        "left partial by a process killed mid-save. Every entity-bound read "
+        "misreads on such a graph, so ingestion refuses to run rather than "
+        "write from wrong answers. Nothing repairs it in place: re-running "
+        "ingestion and checkpoint() both copy the damaged index forward. "
+        "Re-ingest into a FRESH graph path (set MINIGRAF_GRAPH_PATH to a new "
+        "file, or delete the existing graph and its .fts.sqlite3 index first)."
+    )
+
+
+def _graph_index_cross_check(
+    db: Any,
+    sample_size: int = _INDEX_CROSS_CHECK_SAMPLE_SIZE,
+    rng: Optional[random.Random] = None,
+) -> Dict[str, int]:
+    """Refuse a graph whose EAVT and AEVT indexes disagree (#336).
+
+    READ-ONLY, and must be the FIRST read of a run: _graph_format_version_verify
+    and _graph_has_ingestion_state are themselves entity-bound reads, so on a
+    damaged graph they read the stamp, watermark and frontiers as absent and
+    adopt a mature graph as fresh (measured on a real ingested graph: 863
+    commits through AEVT, has_state False through EAVT). See
+    docs/superpowers/specs/2026-09-11-index-cross-check-design.md.
+
+    Probes every control entity (the fixed idents plus everything carrying a
+    control type) and a uniform random sample of the rest. An entity's EAVT set
+    must EQUAL its AEVT set, which catches loss in either index for the entities
+    probed. A disagreement is re-read once before it counts, because call_tool
+    can join this lease and retract a sampled entity between scan and probe --
+    and a false refusal tells the user to discard a healthy graph.
+
+    Returns {"population", "probed", "control_probed"}. A population of 0 is
+    not a verification; it is reported so nobody reads it as one (#316's
+    code_entities_scanned idiom).
+    """
+    population = _index_cross_check_population(db)
+    fixed = {
+        str(uuid.uuid5(uuid.NAMESPACE_OID, ident)): ident
+        for ident in _index_cross_check_fixed_idents()
+    }
+    control = set(fixed) | {
+        entity for entity, types in population.items()
+        if types & _INDEX_CROSS_CHECK_CONTROL_TYPES
+    }
+    rest = sorted(entity for entity in population if entity not in control)
+    if len(rest) > sample_size:
+        rest = (rng or random.Random()).sample(rest, sample_size)
+    selected = sorted(control) + rest
+    for entity in selected:
+        if _index_cross_check_probe(db, entity) == population.get(entity, set()):
+            continue
+        aevt = _index_cross_check_population(db).get(entity, set())
+        eavt = _index_cross_check_probe(db, entity)
+        if eavt != aevt:
+            raise GraphIndexDamageError(
+                _index_damage_message(entity, fixed.get(entity), aevt, eavt)
+            )
+    return {
+        "population": len(population),
+        "probed": len(selected),
+        "control_probed": len(control),
+    }
 
 
 def _graph_format_version_stamp_if_new(
