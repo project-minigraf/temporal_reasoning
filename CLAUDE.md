@@ -340,6 +340,14 @@ Two things it depends on. The ref is **the resolved branch, never `HEAD`** —
 `_run_ingestion`'s own `repo_total` was hardcoded to `HEAD` while ingestion
 takes a `branch` argument, live in the very run that measured this (the harness
 resolves `master` while the checkout sits on a feature branch); fixed at source.
+The at-scale nightly carried two more instances of the same shape until #330 —
+`--branch HEAD` on the ingestion step (truthy, so it DEFEATS
+`branch or _default_git_branch(...)` rather than adding to it) and
+`git rev-parse --abbrev-ref HEAD` on the resume-census step. Both now resolve
+through `_default_git_branch`; `run_ingestion_benchmark.main()` refuses a literal
+`HEAD`, and `tests/test_at_scale_nightly_workflow.py` keeps the workflow clean.
+The refusal is on the CLI argument only: `_default_git_branch` legitimately
+RETURNS `"HEAD"` as its last-resort fallback, and that path stays reachable.
 And **`_count_commit_entities` now uses `count-distinct`, not `count`**:
 `(count ?e)` counts matching ROWS, so one duplicated commit entity would CANCEL
 one genuinely lost commit and the census would read clean on a graph that lost

@@ -684,6 +684,89 @@ class TestRunIngestionBenchmark:
         assert metrics["commits_ingested"] == 2
 
 
+class _ReachedBenchmark(Exception):
+    """Raised by the sentinel below when main() gets past its argument checks.
+
+    Ablating the #330 guard without this would drive a REAL ingestion out of
+    main(), which appends to the repo's own evals/at_scale/benchmark.md and
+    writes into evals/at_scale/results/. An ablation that edits tracked files
+    is one nobody runs a second time, so the counterfactual has to stay cheap
+    and side-effect-free to stay worth running.
+    """
+
+
+class TestMainRefusesALiteralHeadBranch:
+    """#330. `--branch HEAD` is truthy, so it does not *also* select the
+    checked-out ref -- it DEFEATS `branch or _default_git_branch(repo_path)`
+    outright, and the literal reaches `_git_commits`' range spec,
+    `_run_ingestion`'s `repo_total` and #317's commit census alike. Every one
+    of them inherits the same wrong ref, so they stay internally consistent
+    with each other while describing whatever is checked out rather than the
+    branch being tracked; nothing in the tier disagrees with anything else.
+    The at-scale nightly shipped exactly that.
+
+    THE GUARD IS ON THE CLI ARGUMENT, NEVER ON `resolved_branch`, for two
+    independent reasons -- neither of which the other covers:
+
+      * `_default_git_branch` legitimately RETURNS "HEAD", as its documented
+        last-resort fallback when neither `main` nor `master` resolves. A
+        check downstream of the `or` would refuse that supported path, and
+        this change is not entitled to make the fallback unreachable.
+      * `run_ingestion_benchmark(repo, "HEAD", ...)` is the CORRECT call for a
+        throwaway fixture repo whose branch name is whatever `git init` chose,
+        which is how most tests in this file drive it (see
+        `test_ingests_all_commits`).
+
+    So what is guarded is a human writing an argument, which is precisely
+    where the defect happened and the only place it can be caught without
+    breaking a supported path.
+    """
+
+    @staticmethod
+    def _argv(tmp_path, *extra):
+        return [
+            "run_ingestion_benchmark",
+            "--repo-path", ".",
+            "--graph-path", str(tmp_path / "bench.graph"),
+            *extra,
+        ]
+
+    @staticmethod
+    def _sentinel(monkeypatch):
+        def _boom(*args, **kwargs):
+            raise _ReachedBenchmark()
+
+        monkeypatch.setattr(rib, "run_ingestion_benchmark", _boom)
+
+    def test_a_literal_head_is_refused(self, tmp_path, monkeypatch):
+        self._sentinel(monkeypatch)
+        monkeypatch.setattr(sys, "argv", self._argv(tmp_path, "--branch", "HEAD"))
+        with pytest.raises(SystemExit) as excinfo:
+            rib.main()
+        assert "HEAD" in str(excinfo.value)
+
+    def test_a_real_branch_name_is_not_refused(self, tmp_path, monkeypatch):
+        # NEGATIVE CONTROL. A guard that refused every --branch would satisfy
+        # the test above while breaking the argument outright, and a refusal
+        # is indistinguishable from a correct one when nothing ever gets past
+        # it. This is the assertion that says the guard discriminates.
+        self._sentinel(monkeypatch)
+        monkeypatch.setattr(sys, "argv", self._argv(tmp_path, "--branch", "master"))
+        with pytest.raises(_ReachedBenchmark):
+            rib.main()
+
+    def test_an_omitted_branch_is_not_refused(self, tmp_path, monkeypatch):
+        # The shape the nightly now uses: no --branch at all, leaving
+        # _default_git_branch to resolve it inside run_ingestion_benchmark.
+        # Guarded separately from the case above because argparse's default is
+        # None rather than a string, so a guard written against `.upper()` or
+        # a bare `in` would fail here and nowhere else.
+        self._sentinel(monkeypatch)
+        monkeypatch.setattr(sys, "argv", self._argv(tmp_path))
+        with pytest.raises(_ReachedBenchmark):
+            rib.main()
+
+
 class TestBenchmarkTracePath:
     """#260: --trace-path arms the per-commit trace and records where it went."""
 

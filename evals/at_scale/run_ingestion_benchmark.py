@@ -596,7 +596,12 @@ def resolve_graph_path(graph_path_arg: Optional[str]):
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the at-scale ingestion benchmark (#120).")
     parser.add_argument("--repo-path", default=".")
-    parser.add_argument("--branch", default=None)
+    parser.add_argument(
+        "--branch", default=None,
+        help="Branch or commit to walk. Omit to resolve via "
+             "mcp_server._default_git_branch (main, then master). Never "
+             "'HEAD': it defeats that resolution and is refused (#330).",
+    )
     parser.add_argument("--poll-interval", type=float, default=0.5)
     parser.add_argument(
         "--poll-duty-factor", type=float, default=10.0,
@@ -616,6 +621,40 @@ def main() -> int:
              "provisional-residue probe, which queries the surviving graph.",
     )
     args = parser.parse_args()
+
+    # #330. "HEAD" is the one value --branch must never receive. It is truthy,
+    # so it does not select the checked-out ref *in addition to* the
+    # resolution run_ingestion_benchmark performs -- it DEFEATS
+    # `branch or _default_git_branch(repo_path)` entirely, and the literal
+    # propagates to _git_commits' range spec, _run_ingestion's repo_total and
+    # #317's commit census alike. The failure is quiet rather than loud:
+    # everything downstream inherits the SAME wrong ref, so no count in the
+    # tier disagrees with another; they simply all describe whatever happens
+    # to be checked out instead of the branch being tracked. #317 caught the
+    # identical shape in _run_ingestion only because the harness resolved
+    # "master" while the checkout sat on a feature branch, making two numbers
+    # that should have matched differ. The at-scale nightly passed this
+    # literal for months and nothing went red, because it runs on a checkout
+    # of the default branch where the two refs denote the same commit.
+    #
+    # Refused HERE, on the argument, and deliberately NOT downstream of the
+    # `or`: _default_git_branch legitimately RETURNS "HEAD" as its documented
+    # last-resort fallback when neither main nor master resolves, and
+    # run_ingestion_benchmark(repo, "HEAD", ...) is the correct call for a
+    # throwaway fixture repo with no branch name worth resolving (most tests
+    # in tests/test_at_scale_ingestion_benchmark.py drive it that way). This
+    # guards a human writing an argument, which is where the defect was.
+    if args.branch == "HEAD":
+        raise SystemExit(
+            "--branch HEAD is refused (#330). HEAD is truthy, so it does not "
+            "resolve to the tracked branch -- it defeats the resolution this "
+            "harness performs and propagates the literal to every ref "
+            "downstream, quietly, because they all inherit it and stay "
+            "consistent with each other. Omit --branch entirely to let "
+            "mcp_server._default_git_branch resolve it (this is what the "
+            "at-scale nightly does), or pass an explicit branch name or "
+            "commit sha if you mean to walk something else."
+        )
 
     with resolve_graph_path(args.graph_path) as graph_path:
         metrics = asyncio.run(
