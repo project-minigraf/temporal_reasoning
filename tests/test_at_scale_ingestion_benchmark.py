@@ -1252,6 +1252,15 @@ class TestProgressInterval:
         line = format_progress_line(s)
         assert "sweep running 3/40" in line and "lineage ?/53289" in line
 
+    def test_format_done_sweep_with_zero_to_sweep(self):
+        """ingest_progress.py sets to_sweep=0 when the sweep reaches "done" via
+        "reached-ceiling" — a real state, not an absent count. A truthiness
+        check on to_sweep drops the count here; must use `is not None`."""
+        from evals.at_scale.run_ingestion_benchmark import format_progress_line
+        s = self._status()
+        s["streams"]["sweep"] = {"state": "done", "swept": 0, "to_sweep": 0}
+        assert "sweep done 0/0" in format_progress_line(s)
+
     @pytest.mark.parametrize("interval", [None, 0.0])
     async def test_status_calls_equal_polls_with_or_without_the_flag(self, interval, monkeypatch, capsys):
         import asyncio

@@ -7443,6 +7443,13 @@ class TestMinigrafIngestStatus:
         assert result["last_run_at"] == "2026-01-03T00:00:00.000Z"
         assert result["last_commit"] == "hashC_run3_LATEST"
 
+    def test_idle_reports_the_lineage_watermark(self, real_db):
+        import mcp_server
+        mcp_server._ingest_progress = {"status": "idle", "total": 0,
+                                       "current_commit": "", "error": None}
+        mcp_server._lineage_confirmed_through_update(real_db, "abc123", "2026-01-01T00:00:00.000Z")
+        assert mcp_server.handle_minigraf_ingest_status()["lineage_confirmed_through"] == "abc123"
+
 
 class TestCodeIdent:
     def test_module_ident_from_path(self):

@@ -14302,10 +14302,12 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
                 # mid-way (see issue #85).
                 n = _count_commit_entities(db)
                 result["total_ingested"] = n if n > 0 else None
+                result["lineage_confirmed_through"] = _lineage_confirmed_through_query(db)
         except Exception:
             result["last_run_at"] = None
             result["last_commit"] = None
             result["total_ingested"] = None
+            result["lineage_confirmed_through"] = None
     return result
 
 
@@ -14590,11 +14592,15 @@ _TOOLS: List[Tool] = [
             "by scraping a holder PID out of minigraf's lock-contention message, "
             "and minigraf 2.0.0 removed that PID from the text (#284) — but it "
             "does include error_at, the timestamp the failure occurred. "
-            "this_run.skipped counts positions retired without parsing or "
-            "writing them because an earlier run had already written them "
-            "completely (#326); it climbing while this_run.retired matches "
-            "it and the commit count stays flat means the run is replaying "
-            "an already-ingested region."
+            "this_run reports this run's own work: to_retire (positions in "
+            "the gap at load) and retired (written + skipped + failed), which "
+            "never exceeds to_retire; this_run.skipped climbing while the "
+            "commit count stays flat means the run is replaying an "
+            "already-ingested region (#326). streams gives forward, reverse "
+            "and sweep state, counts and rate_per_min; sweep.blocked_reason "
+            "says why the confirmation pass declined. status=complete means "
+            "only that the run finished: ingestion is done when "
+            "visibility.complete and lineage.complete are both true."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),

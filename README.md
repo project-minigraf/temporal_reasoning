@@ -286,7 +286,7 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 - **memory_finalize_turn** — Extract and store memorable facts after a turn
 - **minigraf_audit** — Audit all entities against the schema; retracts violators (history preserved)
 - **minigraf_ingest_git** — Ingest code structure from git history into the bi-temporal graph (background task)
-- **minigraf_ingest_status** — Poll progress of a running git ingestion; reports wall-clock time and final commit hash of the last completed run (including hook-driven ingestion)
+- **minigraf_ingest_status** — Poll a running git ingestion: this run's work (to_retire/retired), per-stream state and rate, and whether the graph is fully visible and lineage-confirmed; when idle, reports the last completed run's time and branch tip
 
 ## Query Examples
 

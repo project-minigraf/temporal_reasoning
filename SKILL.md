@@ -318,15 +318,23 @@ Poll the current git ingestion progress.
 
 ```python
 minigraf_ingest_status()
-# → {"ok": true, "status": "running", "processed": 21717, "processed_this_run": 2,
-#    "positions_skipped_this_run": 0, "total": 47, "current_commit": "a3f2bc...",
-#    "error": null}
+# → {"ok": true, "status": "running", "phase": "converging", "total": 20,
+#    "prior_ingested": 19, "current_commit": "a3f2bc...", "error": null,
+#    "this_run": {"to_retire": 9, "retired": 4, "written": 4, "skipped": 0,
+#                 "failed": 0, "seconds_since_progress": 3.1, ...},
+#    "streams": {"forward": {"state": "running", "retired": 2, "rate_per_min": 12.0, ...},
+#                "reverse": {"state": "running", "retired": 2, "rate_per_min": 11.8, ...},
+#                "sweep": {"state": "waiting", "swept": 0, "to_sweep": null,
+#                          "blocked_reason": null, ...}},
+#    "visibility": {"verified": 15, "total": 20, "complete": false},
+#    "lineage": {"confirmed": 11, "total": 20, "complete": false,
+#                "confirmed_through": "e1d4..."}}
 ```
 
 `status` is one of: `idle`, `starting`, `running`, `complete`, `error`, `stopped`, `skipped`.
 `starting` means a background ingestion task has been created (auto-started at
 server boot, or via `minigraf_ingest_git`) but hasn't finished its preload phase
-(re-scanning already-known entities/dependencies) yet, so `processed`/`total`
+(re-scanning already-known entities/dependencies) yet, so `this_run`/`total`
 aren't populated — a subsequent `minigraf_ingest_git` call will still be
 rejected with "already in progress" during this window, same as `running`.
 `stopped` means a graceful shutdown (session end) paused ingestion between commits —
@@ -341,26 +349,30 @@ retry is likely to succeed now — check it before assuming a cached state is
 still accurate. `error` no longer carries `stale`: it was derived by scraping a
 holder PID out of minigraf's lock-contention message, and minigraf 2.0.0
 removed that PID from the text.
-`error` also includes `error_at`, the timestamp the failure occurred. `processed` is the
-cumulative count of durably persisted commits (seeded from the true
-`:type/commit` entity count at run start, so it stays accurate even after a
-prior run was interrupted mid-way — e.g. by lock contention). `processed_this_run`
-is how many commits *this* run-attempt has ingested, useful for distinguishing
-fresh progress from work already persisted by earlier runs. When idle,
-`total_ingested` similarly reflects the true persisted count, not a
-potentially stale watermark.
-
-`positions_skipped_this_run` counts positions this run retired WITHOUT parsing
-or writing them, because they were already written completely by an earlier run
-(#326). It is the signal that distinguishes a run replaying an already-ingested
-region from one making progress: if it climbs alongside `processed_this_run`
-while the graph's commit count stays flat, the run is re-walking territory it
-already holds. Skipped positions are still counted in `processed`, since they
-are genuinely retired. The response also carries a bare `positions_skipped` —
-the same number, unqualified by run — but the counter itself is reset at the
-start of every run rather than accumulated across runs the way `processed` is,
-so the two keys are always equal today; there is no separate process-lifetime
-figure to look for under the unqualified name.
+- `error` also includes `error_at`.
+- **`this_run`** is this run's own work: `to_retire` positions were in the gap
+  when it loaded, and `retired` counts those it has finished (`written`,
+  `skipped` because an earlier run already wrote them completely, or
+  `failed`). It never exceeds `to_retire`. A climbing `skipped` with a flat
+  commit count means the run is replaying an already-ingested region.
+  `seconds_since_progress` growing while nothing retires is a stall.
+- **`streams`**: a table of states for `forward`/`reverse` (`not-started`,
+  `running`, `done`, `not-needed`, `stopped`, `error`) and `sweep` (`waiting`,
+  `running`, `done`, `not-needed`, `blocked` with `blocked_reason` ∈
+  `gap-open`/`fragmented`/`stale-bound`/`metadata-mismatch`, `not-run`,
+  `stopped`, `aborted`, `error`).
+- **`visibility.verified`** is what the frontier can prove complete. It can be
+  LOWER at the start of a run than the graph's commit count, when earlier
+  positions must be re-walked.
+- **`lineage.confirmed`** is how much history has final `:introduced-by`, and
+  `null` when a watermark no longer resolves (e.g. after a rewritten history).
+- **Done means `visibility.complete and lineage.complete`.** `status:
+  complete` alone only says the run finished. A run that lost a commit or
+  could not confirm lineage finishes with `status: complete` and one flag
+  false.
+- When idle, `total_ingested` is the true persisted commit count,
+  `last_commit` is the branch tip the last completed run covered, and
+  `lineage_confirmed_through` is read from the graph.
 
 ### Git-Ingested Data Schema
 

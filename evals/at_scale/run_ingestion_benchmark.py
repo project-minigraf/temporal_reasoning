@@ -60,7 +60,7 @@ def format_progress_line(status: Dict[str, Any]) -> str:
         return f"{_SHORT[name]} {st['retired']}" + (f" @{rate:.1f}/min" if rate is not None else "")
 
     sw = streams["sweep"]
-    sweep = f"sweep {sw['state']}" + (f" {sw['swept']}/{sw['to_sweep']}" if sw.get("to_sweep") else "")
+    sweep = f"sweep {sw['state']}" + (f" {sw['swept']}/{sw['to_sweep']}" if sw.get("to_sweep") is not None else "")
     lin, vis = status["lineage"], status["visibility"]
     confirmed = "?" if lin["confirmed"] is None else lin["confirmed"]
     return (
