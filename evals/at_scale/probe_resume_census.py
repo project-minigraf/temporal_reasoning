@@ -46,7 +46,7 @@ interval's stored count against ITS span under that grown linearization. A
 run reporting `retention_engaged: true` (see `results/325-resume-census.json`,
 truncate_by=30, prior_ingested=262) is evidence the count check ran and
 passed, not evidence it was never reached: a mismatch there would discard the
-interval and push `processed_this_run` up toward `repo_commits`, reading
+interval and push `retired_this_run` up toward `repo_commits`, reading
 `retention_engaged` False. What genuinely never happens in one run of this
 probe is a SECOND append landing inside the interval this run's own resume
 just retained -- that would need a third ingestion pass this probe does not
@@ -55,7 +55,7 @@ understated the probe's own coverage), but a reader could still conclude the
 checksum path itself is never touched here, which is wrong.
 
 Also worth stating plainly: `retention_engaged` has ZERO MARGIN at the
-truncate_by boundary. `processed_this_run < repo_commits` is a strict
+truncate_by boundary. `retired_this_run < repo_commits` is a strict
 inequality with no threshold, so a partial regression that re-walks 299 of a
 300-position resume still reads `retention_engaged: True` -- it discriminates
 a TOTAL regression in the retention predicate (a full re-walk), never a
@@ -68,24 +68,28 @@ a bounded collection would see only new-vs-new); this probe's bound is the
 opposite trade, accepted for cost, and named here rather than left implicit.
 
 WALK_CLAIMED IS NOT A MANUAL RESET, AND ITS OWN FORMULA IS ALREADY
-ESTABLISHED. `_run_ingestion` seeds `_ingest_progress["processed"]` with its
-own freshly recomputed `prior_ingested` (`_count_commit_entities(db)`, run
-again at the TOP of every call -- see `_load_ingestion_preload_state`) and
-then increments `processed` for every position retired this run, including
-ones already inside that seed. `handle_minigraf_ingest_status` already derives
-`processed_this_run = _ingest_progress["processed"] -
-_ingest_progress.get("prior_ingested", 0)` for exactly this reason (issue
-#85); this probe reuses that same formula rather than re-deriving it, and
-rather than the earlier draft's `_ingest_progress["processed"] = 0` reset
-before the resume call -- which does nothing, because `_run_ingestion`
-overwrites `processed` back to its own `prior_ingested` immediately after
-setting `_ingest_progress["status"] = "running"`, before a single commit is
-walked. That draft's `this_run` was silently the CUMULATIVE total, not the
-run's own delta, and handing it to `walk_claimed = prior + this_run` would
-have double-counted the overlap.
-`_ingest_progress["processed"]` after the resume call already equals
-`prior_ingested + processed_this_run` by construction, so `walk_claimed` is
-just that field, read once, after the resume completes.
+ESTABLISHED. `_run_ingestion` builds a fresh `RunProgress` for every call,
+seeded from its own freshly recomputed `prior_ingested`
+(`_count_commit_entities(db)`, run again at the TOP of every call -- see
+`_load_ingestion_preload_state`), and stores it at
+`_ingest_progress["_run"]`; `RunProgress.retired_count` increments for every
+position retired THIS run (written, skipped or failed), including ones
+already inside that seed -- never a cumulative total.
+`walk_claimed_from_progress` (evals/at_scale/commit_census.py, #222 phase 4)
+is `prior_ingested + run.retired_count` for exactly this reason; this probe
+reads `run.retired_count` straight off the `RunProgress` for
+`retired_this_run` rather than re-deriving it by subtraction, and rather
+than the earlier draft's `_ingest_progress["processed"] = 0` reset before
+the resume call -- which would have done nothing under the old mechanism
+either, because `_run_ingestion` overwrote `processed` back to its own
+`prior_ingested` immediately after setting `_ingest_progress["status"] =
+"running"`, before a single commit was walked. That draft's `this_run` was
+silently the CUMULATIVE total, not the run's own delta, and handing it to
+`walk_claimed = prior + this_run` would have double-counted the overlap.
+`walk_claimed_from_progress(mcp_server._ingest_progress)` after the resume
+call already equals `prior_ingested + retired_this_run` by construction, so
+`walk_claimed` is just that helper, called once, after the resume
+completes.
 
 WHY THE PROBE'S OWN `ok` IS `repo_vs_graph`, NOT collect_commit_census's --
 A CONTROLLER RULING, not this file's own design choice. Two earlier stated
@@ -98,11 +102,12 @@ complete). A resume that RE-TOUCHES already-ingested territory -- the #326
 same-run skip fast path, #313's torn-position repair re-walk, and this
 branch's own below-`rev_claim_floor` re-walk are all examples, and all
 three are CORRECT behaviour, not degraded resumes -- double-counts that
-territory: `_ingest_progress["processed"]` counts positions RETIRED this
-run (skip, extraction failure, or reaching write dispatch regardless of
-outcome -- mcp_server.py's three increment sites), never commits actually
-WRITTEN, and is SEEDED with `prior_ingested` at run start, so a re-touched
-position already inside that seed drives `walk_claimed`, and therefore
+territory: `RunProgress.retired_count` counts positions RETIRED this run
+(skip, extraction failure, or reaching write dispatch regardless of outcome
+-- mcp_server.py's three retirement sites), never commits actually WRITTEN,
+and `walk_claimed_from_progress` adds it to `prior_ingested` at run start,
+so a re-touched position already inside that seed drives `walk_claimed`, and
+therefore
 `walk_vs_graph = walk_claimed - graph_commit_entities`, POSITIVE on a
 perfectly healthy run. `collect_commit_census` gates `walk_vs_graph` BEFORE
 `repo_vs_walk` (an `elif` chain in commit_census.py), so `walk_vs_graph` is
@@ -161,7 +166,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 import mcp_server  # noqa: E402
 
-from evals.at_scale.commit_census import collect_commit_census  # noqa: E402
+from evals.at_scale.commit_census import (  # noqa: E402
+    collect_commit_census,
+    walk_claimed_from_progress,
+)
 
 __all__ = ["run_resume_census", "resume_ok", "retention_engaged", "main"]
 
@@ -249,22 +257,22 @@ def retention_engaged(census: Dict[str, Any]) -> bool:
     the case this clause reads False rather than True by coincidence, not a
     `truncate_by=0` run.
 
-    `processed_this_run < repo_commits`: the run did NOT re-walk (or
+    `retired_this_run < repo_commits`: the run did NOT re-walk (or
     re-claim) every position the repo has. On a healthy resume this is
-    `processed_this_run == repo_commits - prior_ingested` (only the newly
-    appended commits were freshly processed); a wrongly-discarding
-    `_frontier_load` would instead push `processed_this_run` up toward
+    `retired_this_run == repo_commits - prior_ingested` (only the newly
+    appended commits were freshly retired); a wrongly-discarding
+    `_frontier_load` would instead push `retired_this_run` up toward
     `repo_commits` as it re-walks the whole already-ingested region. This is
     a WEAKER check than counting skipped positions directly
-    (`positions_skipped_this_run` reads 0 on a perfectly healthy resume too
-    -- see its own comment -- because a retained region is excluded from the
-    walkable gap before the loop begins, never iterated-then-skipped), which
-    is why it is phrased as "did the run avoid re-walking everything",
-    not "did the skip counter fire".
+    (`skipped_this_run` reads 0 on a perfectly healthy resume too -- see its
+    own comment -- because a retained region is excluded from the walkable
+    gap before the loop begins, never iterated-then-skipped), which is why
+    it is phrased as "did the run avoid re-walking everything", not "did the
+    skip counter fire".
     """
     return (
         census["prior_ingested"] > 0
-        and census["processed_this_run"] < census["repo_commits"]
+        and census["retired_this_run"] < census["repo_commits"]
     )
 
 
@@ -308,9 +316,10 @@ async def run_resume_census(
     await mcp_server._run_ingestion(repo_path, truncated_ref)
     await mcp_server._run_ingestion(repo_path, branch)
 
-    walk_claimed = mcp_server._ingest_progress["processed"]
+    walk_claimed = walk_claimed_from_progress(mcp_server._ingest_progress)
     prior_ingested = mcp_server._ingest_progress.get("prior_ingested", 0)
-    processed_this_run = walk_claimed - prior_ingested
+    run = mcp_server._ingest_progress.get("_run")
+    retired_this_run = run.retired_count if run is not None else 0
     final_status = mcp_server._ingest_progress.get("status", "error")
 
     census = collect_commit_census(
@@ -321,34 +330,32 @@ async def run_resume_census(
         final_status=final_status,
     )
     census["prior_ingested"] = prior_ingested
-    census["processed_this_run"] = processed_this_run
+    census["retired_this_run"] = retired_this_run
     census["truncate_by"] = truncate_by
     # NOT what #325's retention shows up as -- a RETAINED interval's
     # positions are excluded from the walkable gap entirely (they are never
     # claimed this run at all), so a HEALTHY retention-using resume HOLDS
-    # `processed_this_run` AT `repo_commits - prior_ingested` (see
+    # `retired_this_run` AT `repo_commits - prior_ingested` (see
     # retention_engaged's own docstring: "On a healthy resume this is
-    # processed_this_run == repo_commits - prior_ingested") -- it does not
-    # push it below that value. What pushes `processed_this_run` UP, toward
+    # retired_this_run == repo_commits - prior_ingested") -- it does not
+    # push it below that value. What pushes `retired_this_run` UP, toward
     # `repo_commits`, is a WRONGLY-discarding `_frontier_load` re-walking
     # territory retention should have held out of this run; that upward
     # direction is what `retention_engaged`'s own `< repo_commits` check
-    # actually watches for. This counter (`positions_skipped_this_run`) is
-    # a DIFFERENT signal, #326's own same-run skip-fast-path (a position
-    # retired via an archived `:type/completed-region` without parsing or
-    # writing it) -- and after #325 that path is narrowed to the
-    # unresolvable-bounds ("divergent-ref leak") case, mutually exclusive
-    # within one run with what this probe's own resume can ever produce
-    # (see CLAUDE.md's "#326's skip fast path is now VESTIGIAL" paragraph).
-    # The measured baseline (results/325-resume-census.json) is exactly
-    # this: `positions_skipped_this_run: 0` alongside `retention_engaged:
-    # true` on a perfectly healthy resume -- 0 here is the expected reading
-    # for this probe's own scenario, not evidence the mechanism failed to
-    # engage. Rendered for visibility regardless, in case a future scenario
-    # (a divergent ref) does exercise it.
-    census["positions_skipped_this_run"] = mcp_server._ingest_progress.get(
-        "positions_skipped", 0
-    )
+    # actually watches for. This counter (`skipped_this_run`) is a DIFFERENT
+    # signal, #326's own same-run skip-fast-path (a position retired via an
+    # archived `:type/completed-region` without parsing or writing it) --
+    # and after #325 that path is narrowed to the unresolvable-bounds
+    # ("divergent-ref leak") case, mutually exclusive within one run with
+    # what this probe's own resume can ever produce (see CLAUDE.md's "#326's
+    # skip fast path is now VESTIGIAL" paragraph). The measured baseline
+    # (results/325-resume-census.json) is exactly this: `skipped_this_run: 0`
+    # alongside `retention_engaged: true` on a perfectly healthy resume -- 0
+    # here is the expected reading for this probe's own scenario, not
+    # evidence the mechanism failed to engage. Rendered for visibility
+    # regardless, in case a future scenario (a divergent ref) does exercise
+    # it.
+    census["skipped_this_run"] = run.skipped if run is not None else 0
     # Rendered, never gated -- see retention_engaged's own docstring. A run
     # where this reads False is not a failure by itself (the census could
     # still be perfectly clean); it means THIS run proved nothing about

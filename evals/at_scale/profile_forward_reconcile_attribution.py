@@ -102,6 +102,8 @@ os.environ["MINIGRAF_INGEST_WORKERS"] = ARGS.workers
 
 import mcp_server as m  # noqa: E402
 
+from evals.at_scale.commit_census import walk_claimed_from_progress  # noqa: E402
+
 assert os.path.abspath(os.path.dirname(m.__file__)) == os.path.abspath(ARGS.code_root), (
     f"mcp_server resolved to {m.__file__}, not {ARGS.code_root}"
 )
@@ -339,7 +341,10 @@ async def _watch_phase(task: "asyncio.Task[None]", t_start: float) -> None:
             progress_timeline.append({
                 "t": round(now - t_start, 2),
                 "phase": phase,
-                "processed": m._ingest_progress.get("processed"),
+                "retired": (
+                    m._ingest_progress["_run"].retired_count
+                    if m._ingest_progress.get("_run") else None
+                ),
                 "graph_bytes": os.path.getsize(GRAPH_PATH) if os.path.exists(GRAPH_PATH) else 0,
                 "reconciles": counts.get("_forward_reconcile_provisional", 0),
                 "retracts": counts.get("_retract", 0),
@@ -369,7 +374,7 @@ async def _main() -> dict:
     return {
         "wall_clock_seconds": wall,
         "capped": bool(ARGS.max_seconds),
-        "commits_processed": m._ingest_progress.get("processed"),
+        "commits_processed": walk_claimed_from_progress(m._ingest_progress),
         "final_status": m._ingest_progress.get("status"),
         "error": m._ingest_progress.get("error"),
     }

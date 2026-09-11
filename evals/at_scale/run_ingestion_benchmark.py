@@ -28,7 +28,10 @@ REPO_ROOT = Path(__file__).parent.parent.parent.resolve()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from evals.at_scale.commit_census import collect_commit_census  # noqa: E402
+from evals.at_scale.commit_census import (  # noqa: E402
+    collect_commit_census,
+    walk_claimed_from_progress,
+)
 from evals.at_scale.fact_audit import audit_graph_against_index  # noqa: E402
 from evals.at_scale.metrics import latency_stats, throughput_per_minute  # noqa: E402
 from evals.at_scale.stderr_capture import (  # noqa: E402
@@ -259,7 +262,7 @@ async def run_ingestion_benchmark(
     poll_seconds = sum(status_latencies) + sum(query_latencies)
     poll_duty_fraction = (poll_seconds / wall_clock) if wall_clock > 0 else 0.0
 
-    commits_ingested = mcp_server._ingest_progress["processed"]
+    commits_ingested = walk_claimed_from_progress(mcp_server._ingest_progress)
     final_status = mcp_server._ingest_progress["status"]
     # Published by _run_ingestion's two policy-clearing finally blocks just
     # before _ingest_checkpoint_policy is discarded (#241 Task 6) -- the
