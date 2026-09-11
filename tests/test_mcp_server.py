@@ -29029,3 +29029,34 @@ class TestIngestStatusPhase4E2E:
         _phase4_add_commit(repo, 8)
         status, _ = _phase4_run(repo, graph, monkeypatch)
         assert status["processed"] == status["prior_ingested"] + status["this_run"]["retired"]
+
+    def _head(self, repo):
+        return _subprocess.run(["git", "rev-parse", "master"], cwd=repo,
+                               capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_last_commit_is_the_branch_tip_fresh_incremental_and_noop(self, tmp_path, monkeypatch):
+        """Master: the meeting point on a fresh run, the forward watermark on a
+        no-op rerun -- never HEAD."""
+        repo = _phase4_linear_repo(tmp_path, 10)
+        graph = tmp_path / "g.graph"
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        assert status["last_commit"] == self._head(repo)
+        _phase4_add_commit(repo, 10)
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        assert status["last_commit"] == self._head(repo)
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        assert status["last_commit"] == self._head(repo)
+
+    def test_total_ingested_is_the_true_commit_count_after_a_rewalk(self, tmp_path, monkeypatch):
+        """Master persisted the seeded walk counter: 28 on a 20-commit graph."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 20)
+        graph = tmp_path / "g.graph"
+        real_reverse = self._fail_second_reverse_write(monkeypatch)
+        _phase4_run(repo, graph, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_reverse)
+        _, graph_commits = _phase4_run(repo, graph, monkeypatch)
+        with mcp_server.db_lease() as db:
+            persisted = mcp_server._total_ingested_query(db)
+        mcp_server._reset_db_state()
+        assert persisted == graph_commits == 20

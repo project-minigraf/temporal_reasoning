@@ -13142,8 +13142,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _ingest_progress["prior_ingested"] = prior_ingested
         _ingest_progress["positions_skipped"] = 0   # #326: per-run, like prior_ingested
 
-        last_hash = watermark or ""
-
         env_workers = os.environ.get("MINIGRAF_INGEST_WORKERS")
         # CPU-bound-appropriate default: one worker per core, not the
         # I/O-bound ThreadPoolExecutor heuristic (cpu_count() + 4) this used
@@ -13577,7 +13575,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     _trace_await_s = time.perf_counter() - _trace_t_await
                     submit_next()
 
-                    last_hash = commit_hash
                     _ingest_progress["current_commit"] = commit_hash
 
                     # A lease, not a manual acquire/release pair. The old code
@@ -14048,8 +14045,20 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
                     async with db_lease_async() as db:
                         await loop.run_in_executor(write_executor, _ingest_tags, db, repo_path, now, index_con)
+                        # #222 phase 4: the tip this run covered, never
+                        # whichever commit Stage A applied last -- on a
+                        # converging run that was the meeting point, on a
+                        # no-op run the forward watermark, on a no-commits run
+                        # the starting watermark. And the TRUE commit count,
+                        # never the seeded walk counter, which exceeds the repo
+                        # on any re-walk (28 of 20 measured).
+                        graph_commits = await loop.run_in_executor(
+                            write_executor, _count_commit_entities, db,
+                        )
+                        last_hash = linearization[-1] if linearization else (watermark or "")
                         await loop.run_in_executor(
-                            write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"], index_con
+                            write_executor, _last_run_write, db, last_hash, now,
+                            graph_commits, index_con,
                         )
                         # No checkpoint here: the unconditional final
                         # checkpoint in the outer finally below (#241)
