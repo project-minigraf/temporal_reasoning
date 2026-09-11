@@ -92,7 +92,7 @@ def walk_claimed_from_progress(progress: Mapping[str, Any]) -> int:
 
     `prior_ingested` (the graph's commit count at run start) plus the
     positions this run RETIRED -- written, skipped or failed. That is exactly
-    the number the removed `_ingest_progress["processed"]` held, so every gate
+    the number `_ingest_progress["processed"]` held, so every gate
     below keeps its meaning. A run that failed before its RunProgress was
     built (`_run` None or absent) retired nothing.
     """

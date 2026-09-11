@@ -68,16 +68,19 @@ a bounded collection would see only new-vs-new); this probe's bound is the
 opposite trade, accepted for cost, and named here rather than left implicit.
 
 WALK_CLAIMED IS NOT A MANUAL RESET, AND ITS OWN FORMULA IS ALREADY
-ESTABLISHED. `_run_ingestion` builds a fresh `RunProgress` for every call,
-seeded from its own freshly recomputed `prior_ingested`
-(`_count_commit_entities(db)`, run again at the TOP of every call -- see
-`_load_ingestion_preload_state`), and stores it at
-`_ingest_progress["_run"]`; `RunProgress.retired_count` increments for every
-position retired THIS run (written, skipped or failed), including ones
-already inside that seed -- never a cumulative total.
-`walk_claimed_from_progress` (evals/at_scale/commit_census.py, #222 phase 4)
-is `prior_ingested + run.retired_count` for exactly this reason; this probe
-reads `run.retired_count` straight off the `RunProgress` for
+ESTABLISHED. `_run_ingestion` builds a fresh `RunProgress` for every call
+(`_build_run_progress`, mcp_server.py) from the frontier AS LOADED --
+linearization, the allocator's unclaimed count, and the two watermarks --
+NEVER from `prior_ingested`; its `written`/`skipped`/`failed` counts start
+at 0 every run, and `RunProgress.retired_count` increments for every
+position retired THIS run (written, skipped or failed), never a cumulative
+total. `prior_ingested` is a SEPARATE value, recomputed at the top of every
+call (`_count_commit_entities(db)` -- see `_load_ingestion_preload_state`)
+and stored at `_ingest_progress["prior_ingested"]`, untouched by
+`RunProgress` itself. `walk_claimed_from_progress`
+(evals/at_scale/commit_census.py, #222 phase 4) is the one place that
+combines the two: `prior_ingested + run.retired_count`. This probe reads
+`run.retired_count` straight off the `RunProgress` for
 `retired_this_run` rather than re-deriving it by subtraction, and rather
 than the earlier draft's `_ingest_progress["processed"] = 0` reset before
 the resume call -- which would have done nothing under the old mechanism
