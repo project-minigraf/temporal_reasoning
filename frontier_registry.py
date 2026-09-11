@@ -159,6 +159,13 @@ class FrontierAllocator:
     def is_gap_empty(self) -> bool:
         return not self._unclaimed()
 
+    def unclaimed_count(self) -> int:
+        """How many positions this allocator will still hand out -- summed
+        over every hole of the complement, never `gap_hi - gap_lo + 1`,
+        which counts the claimed intervals between holes too (#222 phase 4:
+        RunProgress's `to_retire`)."""
+        return sum(hi - lo + 1 for lo, hi in self._unclaimed())
+
     def intervals(self) -> List[Interval]:
         return list(self._intervals)
 

@@ -104,7 +104,7 @@ dev = [
 # frontier_registry did exactly that from 2026-07-24 until #82.
 # tests/test_packaging.py walks the shipped modules' imports and fails if this
 # list does not cover them.
-py-modules = ["mcp_server", "report_issue", "fact_index", "frontier_registry"]
+py-modules = ["mcp_server", "report_issue", "fact_index", "frontier_registry", "ingest_progress"]
 
 [tool.ruff]
 line-length = 100
