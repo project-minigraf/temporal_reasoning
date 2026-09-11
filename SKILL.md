@@ -310,6 +310,8 @@ Do not write to `:ingestion/watermark` or any `:ingestion/` entity directly.
 
 There is **no migration**. Entity idents are recomputed from `(entity type, file path, name)` on every run rather than read back, so ingesting an old-rule graph with new-rule code would create a second, forked entity for everything already stored, silently and with no error. The supported recovery is to re-ingest into a **fresh graph path**: point `MINIGRAF_GRAPH_PATH` at a new file, or delete the existing graph along with its `.fts.sqlite3` index. Re-running ingestion over the existing file does not repair it.
 
+**Index damage.** Before any other read, ingestion checks that the graph's two indexes agree: it lists entities through the attribute index and re-reads the ingestion-state entities plus a random sample of the rest by entity. If they disagree, the run fails with `status: error` and a message naming project-minigraf/minigraf#370. That is what a process killed mid-save can leave behind: the graph opens cleanly, every count and scan looks healthy, and lookups by ident silently return nothing — so without the check a run would read its own watermark as missing and re-walk, or adopt a mature graph as new. Nothing repairs it in place; re-running ingestion does not. The only recovery is re-ingesting into a **fresh graph path**, as above. `minigraf_ingest_status` reports what the check covered as `index_cross_check` (`population`, `probed`, `control_probed`); `population: 0` means the graph had nothing to check, not that it was verified.
+
 ### minigraf_ingest_status
 
 Poll the current git ingestion progress.
