@@ -135,9 +135,15 @@ the same-transaction dedup amendment under step 3).
    preload lease, so a concurrent `minigraf_retract` of the sampled entity
    between steps 1 and 3 would otherwise read as damage. minigraf rejects
    `[(= ?e #uuid "…")]` (`PRS-070 unsupported expression argument: Uuid`), so
-   the re-confirm is a full re-scan, paid only on the failure path. (Amendment,
-   2026-09-11: the fresh scan replaces the population, so later entities
-   compare against it and a race costs one re-scan, not one per entity.)
+   the re-confirm is a full re-scan. (Amendment, 2026-09-11: the fresh scan
+   replaces the population, so later entities compare against it and a race
+   costs one re-scan, not one per entity.) (Amendment, 2026-09-11, after the
+   final re-review: only an EMPTY-vs-non-empty disagreement is re-read, since
+   it is the only shape that can refuse. The first version re-read every
+   disagreement, so a healthy same-transaction multi-typed entity paid a full
+   re-scan on the SUCCESS path — ~25 s each at 1.6M entities, extrapolated —
+   while this step claimed the re-scan was failure-path only. Pinned by
+   `test_same_transaction_types_cost_no_population_rescan`.)
 5. **Refuse** with `GraphIndexDamageError(RuntimeError)` on a confirmed
    empty-vs-non-empty disagreement (step 3's amendment) — stop at the first
    one. The message names the entity UUID,
@@ -294,12 +300,21 @@ its precondition (which reads are misread) before exercising the check.
   on any sampled entity. A sampled entity is in the population, so AEVT is
   non-empty for it, and under step 3's empty-vs-non-empty rule a PARTIAL AEVT
   loss on it is not refused.)
-* **Same-transaction types, one later retracted** (amendment, 2026-09-11). An
-  entity given two `:entity-type` values in one transact that later has one
-  of them retracted can read empty through one index and the survivor
-  through the other — and is then refused although the graph is healthy.
+* **Same-transaction types, later retracted** (amendment, 2026-09-11,
+  widened after the final re-review). An entity given two `:entity-type`
+  values in one transact that later has ANY of them retracted — one, or both
+  in a single retract, whose retractions share `(e, a, tx, false)` and dedup
+  the same way — can read empty through one index and a value through the
+  other, and is then refused although the graph is healthy. Measured, raw
+  transact, 8 graphs each: retracting one refused 1 (h5); retracting both in
+  one retract refused 1 (h3). `handle_minigraf_retract` reaches the second
+  shape directly.
 * **Partial within-entity loss.** Only `:entity-type` is compared. An EAVT
   range that lost some of an entity's facts but kept `:entity-type` passes.
+  And since refusal needs one side EMPTY (step 3), an entity holding
+  `:entity-type` values from DIFFERENT transactions that loses some but not
+  all of them, in either index, passes too — a case the original equality
+  rule caught.
 * **Light damage** can escape the sample (see Detection power). Random
   selection means repeated runs compound coverage.
 * **Linear scan cost** (~25 s at 1.6M entities, extrapolated, not measured).

@@ -6286,16 +6286,22 @@ def _graph_index_cross_check(
     So each index can return a DIFFERENT single value -- measured 3 of 6
     healthy graphs built through handle_minigraf_transact, e.g. AEVT
     {:type/decision} against EAVT {:type/constraint}. Such entities are
-    counted and summarized in one stderr line, never refused. The residual: an
-    entity given two same-transaction types that later has ONE of them
-    retracted can read empty through one index and the survivor through the
-    other, and is then refused although the graph is healthy.
+    counted and summarized in one stderr line, never refused, and never
+    re-read. Two residuals follow from the same dedup. An entity given two
+    same-transaction types that later has ANY of them retracted -- one, or both
+    in a single retract, whose retractions share the tuple too -- can read empty
+    through one index and a value through the other, and is then refused
+    although the graph is healthy. And since refusal needs one side EMPTY, an
+    entity holding :entity-type values from DIFFERENT transactions that loses
+    some but not all of them, in either index, passes.
 
-    A disagreement is re-read once before it counts, because call_tool can
-    join this lease and retract a sampled entity between scan and probe -- and
-    a false refusal tells the user to discard a healthy graph. The fresh
-    population scan replaces the old one, so later entities compare against
-    it and a race costs one rescan, not one per entity.
+    An empty-vs-non-empty disagreement is re-read once before it refuses,
+    because call_tool can join this lease and retract a sampled entity between
+    scan and probe -- and a false refusal tells the user to discard a healthy
+    graph. Only that shape is re-read: it is the only one that can refuse, and
+    the re-read is a full population scan. The fresh scan replaces the old one,
+    so later entities compare against it and a race costs one rescan, not one
+    per entity.
 
     Returns {"population", "probed", "control_probed"}. "population" is the
     size of the scan the sample was drawn from. A population of 0 is not a
@@ -6318,7 +6324,14 @@ def _graph_index_cross_check(
     selected = sorted(control) + rest
     differing_values = 0
     for entity in selected:
-        if _index_cross_check_probe(db, entity) == population.get(entity, set()):
+        eavt = _index_cross_check_probe(db, entity)
+        aevt = population.get(entity, set())
+        if eavt == aevt:
+            continue
+        if eavt and aevt:
+            # Both non-empty: never refused, so a re-read (a full population
+            # scan) would buy nothing on what is by construction a healthy run.
+            differing_values += 1
             continue
         population = _index_cross_check_population(db)
         aevt = population.get(entity, set())

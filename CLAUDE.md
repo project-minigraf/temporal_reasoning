@@ -501,9 +501,13 @@ not measured), and its memory at 1.6M entities — the population is held as a
 dict of sets — is unmeasured too. Residuals, stated rather than fixed: an
 entity AEVT lost is never sampled unless it is a fixed control ident; only
 `:entity-type` is compared, so partial loss inside one entity's EAVT range
-passes; an entity given two same-transaction types that later has one
-retracted can read empty through one index and the survivor through the
-other, and is then refused on a healthy graph; light damage
+passes — and because refusal needs one side EMPTY, so does an entity holding
+`:entity-type` values from different transactions that loses some but not all
+of them, in either index; an entity given two same-transaction types that
+later has ANY of them retracted (one, or both in a single retract, whose
+retractions dedup the same way) can read empty through one index and a value
+through the other, and is then refused on a healthy graph (measured: 1 of 8
+graphs each way); light damage
 can escape a 512 sample ((1 − f)^512, 0.6% at f = 1%); and readers outside
 ingestion — `minigraf_query`, the memory hooks, `minigraf_ingest_status`'s own
 `:ingestion/last-run-at` read — are unguarded. The rest of #336 (per-file

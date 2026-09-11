@@ -166,6 +166,30 @@ def _build_same_transaction_types_graph(graph, tag):
     return x
 
 
+def _open_graph_with_differing_types(tmp_path):
+    """Open a healthy graph whose AEVT and EAVT return DIFFERENT single
+    :entity-type values for one entity; returns (handle, ident, eavt, aevt).
+
+    Deterministic for a given tag; tag h0 disagrees on minigraf 2.0.0, and the
+    loop only guards against a sort change moving the disagreement to another
+    tag. The precondition is witnessed independently of the functions under
+    test, and fails red rather than passing vacuously if no tag qualifies.
+    """
+    for tag in (f"h{i}" for i in range(6)):
+        graph = tmp_path / f"{tag}.graph"
+        x = _build_same_transaction_types_graph(graph, tag)
+        handle = MiniGrafDb.open(str(graph))
+        eavt, aevt = _eavt_types(handle, x), _aevt_types(handle, x)
+        if eavt and aevt and eavt != aevt:
+            assert eavt | aevt <= {":type/decision", ":type/constraint"}
+            return handle, x, eavt, aevt
+        del handle
+    pytest.fail(
+        "precondition: no tag produced an AEVT/EAVT :entity-type "
+        "disagreement on a healthy graph"
+    )
+
+
 class TestGraphIndexCrossCheck:
     def test_healthy_graph_passes_and_reports_its_denominators(self, tmp_path):
         graph = tmp_path / "g.graph"
@@ -238,29 +262,9 @@ class TestGraphIndexCrossCheck:
         tx_count, asserted), and minigraf keeps one per read -- whichever its
         unstable per-index sort put first -- so AEVT and EAVT can each return
         a DIFFERENT single value on a healthy graph. Refusing that tells the
-        user to discard a healthy graph. Deterministic for a given tag; tag h0
-        disagrees on minigraf 2.0.0, and the loop only guards against a sort
-        change moving the disagreement to another tag.
+        user to discard a healthy graph.
         """
-        chosen = None
-        for tag in (f"h{i}" for i in range(6)):
-            graph = tmp_path / f"{tag}.graph"
-            x = _build_same_transaction_types_graph(graph, tag)
-            handle = MiniGrafDb.open(str(graph))
-            eavt, aevt = _eavt_types(handle, x), _aevt_types(handle, x)
-            if eavt and aevt and eavt != aevt:
-                chosen = handle
-                break
-            del handle
-        # Precondition, witnessed independently of the functions under test:
-        # both indexes answer for x, with different values.
-        assert chosen is not None, (
-            "precondition: no tag produced an AEVT/EAVT :entity-type "
-            "disagreement on a healthy graph"
-        )
-        db = chosen
-        assert eavt and aevt and eavt != aevt
-        assert eavt | aevt <= {":type/decision", ":type/constraint"}
+        db, _x, _eavt, _aevt = _open_graph_with_differing_types(tmp_path)
         capsys.readouterr()
         report = mcp_server._graph_index_cross_check(db, rng=random.Random(0))
         assert report["population"] == 31
@@ -271,6 +275,27 @@ class TestGraphIndexCrossCheck:
             "minigraf keeps one of several same-transaction values per index "
             "(not refused)\n"
         )
+
+    def test_same_transaction_types_cost_no_population_rescan(
+        self, tmp_path, monkeypatch
+    ):
+        """Both-non-empty-but-different can never refuse, so re-reading it
+        buys nothing -- and the re-read is a full population scan, ~25 s at
+        1.6M entities (extrapolated), paid per such entity on a HEALTHY run.
+        Only an empty-vs-non-empty disagreement may cost a rescan.
+        """
+        db, _x, _eavt, _aevt = _open_graph_with_differing_types(tmp_path)
+        real_execute = mcp_server._db_execute
+        population_scans = []
+
+        def counting_execute(handle, datalog):
+            if datalog == mcp_server._INDEX_CROSS_CHECK_POPULATION_QUERY:
+                population_scans.append(datalog)
+            return real_execute(handle, datalog)
+
+        monkeypatch.setattr(mcp_server, "_db_execute", counting_execute)
+        mcp_server._graph_index_cross_check(db, rng=random.Random(0))
+        assert len(population_scans) == 1
 
     def test_damage_confined_to_sampled_entities_is_refused(self, tmp_path):
         """Every other damaged-graph test also damages a control entity,
