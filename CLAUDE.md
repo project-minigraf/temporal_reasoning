@@ -450,6 +450,69 @@ write facts that do not self-heal on a later ingest, so those graphs are condemn
 independently of any one bug. Re-running ingestion over an existing file repairs
 nothing. See `docs/superpowers/specs/2026-08-14-ident-rule-r3-and-format-version-design.md`.
 
+**Ingestion refuses a graph whose EAVT and AEVT disagree, and it checks that
+FIRST (#336, partial).** project-minigraf/minigraf#370: a kill mid-save can
+leave EAVT missing most entities' entries while AEVT keeps them — the graph
+opens clean, scans and counts are right, and every entity-bound lookup returns
+`[]`. `_graph_index_cross_check` (mcp_server.py) is the first read in
+`_load_ingestion_preload_state`'s lease: it lists live entities through AEVT
+(`[?e :entity-type ?t]`) and re-reads each selected one through EAVT
+(`[#uuid "…" :entity-type ?t]`) — minigraf's `selective_fact_fetch` routes an
+entity-literal pattern to `get_facts_by_entity` and an attribute-only one to
+`get_facts_by_attribute`, so the two queries compare the two indexes exactly
+for PRESENCE — but not for which of several same-transaction values each index
+returns. Two `:entity-type` values written in ONE transact share
+`(entity, attribute, tx_count, asserted)`; the index keys carry no value bytes,
+each index is sorted with `sort_unstable_by`, and `selective_fact_fetch` dedups
+on that tuple keeping whichever comes first — so a HEALTHY entity can read
+`{:type/decision}` through AEVT and `{:type/constraint}` through EAVT (3 of 6
+graphs built through `handle_minigraf_transact`, measured). The check therefore
+refuses ONLY when exactly one side is empty; both non-empty but different is
+counted and summarized in one stderr line, never refused, and deliberately has
+no `stderr_capture` pattern. It probes every control entity and up to 512
+random others, and raises `GraphIndexDamageError` on an empty-vs-non-empty
+disagreement that survives one re-read.
+
+**It must precede `_graph_format_version_verify`, not merely the first
+write.** That check and `_graph_has_ingestion_state` are entity-bound reads
+too. Measured on a copy of this repo's 179 MB graph with EAVT damaged: stamp,
+watermark and both frontiers read `None`, `has_state` read False, the format
+check PASSED as "genuinely new" — while AEVT still counted 863 commits. With
+partial damage (stamp lost, watermark kept) the format check instead raises
+`GraphFormatVersionError`, blaming an ident-rule problem the graph does not
+have.
+
+**The fixed control idents are probed whether or not AEVT lists them, and that
+is not redundancy.** Damaging AEVT the same way left the population query
+returning 0 rows while EAVT still answered for the stamp — so a check that
+sampled only what AEVT listed would pass an AEVT-damaged graph as "nothing to
+probe". `index_cross_check.population == 0` is reported, never read as
+verified (#316's denominator idiom).
+
+The tests build real damage, not a fake: `tests/test_index_cross_check.py`'s
+`_keep_rightmost_leaf` points one index's root page in the v7 header at that
+tree's rightmost leaf and re-CRCs the header. minigraf trusts it because
+`index_checksum` covers pages 1..page_count, never the header page. The helper
+asserts every layout fact it uses, so a minigraf format change fails it loudly.
+
+Cost: 0.10 s for the population scan at 6,148 entities, 0.56 ms per EAVT probe
+(~0.4 s total); the scan is linear in entities (~25 s extrapolated at 1.6M,
+not measured), and its memory at 1.6M entities — the population is held as a
+dict of sets — is unmeasured too. Residuals, stated rather than fixed: an
+entity AEVT lost is never sampled unless it is a fixed control ident; only
+`:entity-type` is compared, so partial loss inside one entity's EAVT range
+passes — and because refusal needs one side EMPTY, so does an entity holding
+`:entity-type` values from different transactions that loses some but not all
+of them, in either index; an entity given two same-transaction types that
+later has ANY of them retracted (one, or both in a single retract, whose
+retractions dedup the same way) can read empty through one index and a value
+through the other, and is then refused on a healthy graph (measured: 1 of 8
+graphs each way); light damage
+can escape a 512 sample ((1 − f)^512, 0.6% at f = 1%); and readers outside
+ingestion — `minigraf_query`, the memory hooks, `minigraf_ingest_status`'s own
+`:ingestion/last-run-at` read — are unguarded. The rest of #336 (per-file
+batched marker probe → #239; watermark singletons → minigraf#323) is open.
+
 **Single-handle invariant.** At most one live `MiniGrafDb` handle may exist per
 process. Two handles on one file each cache their own `page_count` and corrupt
 each other — the flaky `Page N out of bounds (total pages: M)` (#251, #253,
