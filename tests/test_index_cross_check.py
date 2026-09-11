@@ -226,3 +226,116 @@ class TestGraphIndexCrossCheck:
             mcp_server._COMPLETED_REGION_ENTITY_TYPE
             in mcp_server._INDEX_CROSS_CHECK_CONTROL_TYPES
         )
+
+
+# Fixed identity and dates, and no user/system git config (a global
+# commit.gpgsign would add a timestamped signature): commit hashes, hence
+# :commit/<hash> entity UUIDs, hence which entities survive in the kept leaf,
+# are then identical on every run and every machine.
+_GIT_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@t.com",
+    "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@t.com",
+    "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
+    "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+
+
+@pytest.fixture
+def repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, env=_GIT_ENV
+        )
+
+    git("init", "-q")
+    (repo / "auth.py").write_text("def login(): pass\n")
+    git("add", ".")
+    git("commit", "-q", "-m", "add auth")
+    (repo / "models.py").write_text("class User: pass\n")
+    git("add", ".")
+    git("commit", "-q", "-m", "add models")
+    return repo
+
+
+async def _ingest(repo, graph_path):
+    """One real _run_ingestion against graph_path; returns its final progress.
+
+    Releases every handle afterwards, so the caller may open a raw MiniGrafDb
+    on the same file (single-handle invariant).
+    """
+    mcp_server._reset_db_state()
+    mcp_server.open_db(str(graph_path))
+    mcp_server._ingest_progress = {
+        "status": "idle", "processed": 0, "total": 0,
+        "current_commit": "", "error": None,
+    }
+    await mcp_server._run_ingestion(str(repo), "HEAD")
+    progress = dict(mcp_server._ingest_progress)
+    mcp_server._reset_db_state()
+    return progress
+
+
+class TestIndexCrossCheckAtRunStart:
+    async def test_every_run_reports_the_check(self, repo, tmp_path):
+        graph = tmp_path / "memory.graph"
+        first = await _ingest(repo, graph)
+        assert first["status"] == "complete", first.get("error")
+        # A fresh graph: nothing to disagree about, and the report says so.
+        assert first["index_cross_check"]["population"] == 0
+        second = await _ingest(repo, graph)
+        assert second["status"] == "complete", second.get("error")
+        assert second["index_cross_check"]["population"] > 0
+        assert second["index_cross_check"]["control_probed"] >= _fixed_count()
+
+    async def test_damaged_mature_graph_is_refused_not_adopted_as_fresh(
+        self, repo, tmp_path
+    ):
+        graph = tmp_path / "memory.graph"
+        assert (await _ingest(repo, graph))["status"] == "complete"
+        _write_facts(graph, _filler_facts(_filler_idents(400)))
+        _keep_rightmost_leaf(graph, _EAVT_ROOT_OFFSET)
+        # Precondition: #336's misread. Through EAVT the graph looks never
+        # ingested; through AEVT it still holds both commits.
+        db = MiniGrafDb.open(str(graph))
+        assert mcp_server._graph_has_ingestion_state(db) is False
+        assert mcp_server._graph_format_version_read(db) is None
+        assert mcp_server._count_commit_entities(db) == 2
+        del db
+
+        progress = await _ingest(repo, graph)
+        assert progress["status"] == "error"
+        assert "minigraf#370" in progress["error"]
+        assert progress["index_cross_check"] is None
+
+    async def test_partial_damage_is_named_as_index_damage_not_format(
+        self, repo, tmp_path
+    ):
+        """Damage that loses the stamp but keeps the watermark makes
+        _graph_format_version_verify blame the #263 ident rule. Running the
+        cross-check first is what names the real cause."""
+        graph = tmp_path / "memory.graph"
+        assert (await _ingest(repo, graph))["status"] == "complete"
+        watermark = _entity_uuid(":ingestion/watermark")
+        # Filler strictly below the watermark's UUID, so the watermark's own
+        # facts are the highest EAVT keys and land in the kept leaf.
+        _write_facts(
+            graph, _filler_facts(_filler_idents(400, keep=lambda u: u < watermark))
+        )
+        _keep_rightmost_leaf(graph, _EAVT_ROOT_OFFSET)
+        # Precondition: stamp lost, watermark kept -- the shape in which
+        # _graph_format_version_verify raises GraphFormatVersionError.
+        db = MiniGrafDb.open(str(graph))
+        assert mcp_server._watermark_query(db) is not None
+        assert mcp_server._graph_format_version_read(db) is None
+        del db
+
+        progress = await _ingest(repo, graph)
+        assert progress["status"] == "error"
+        assert "minigraf#370" in progress["error"]
+        assert "graph format version" not in progress["error"]

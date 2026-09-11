@@ -10547,13 +10547,21 @@ def _load_ingestion_preload_state(
     permuting hashes across positions.
     """
     with db_lease(extended=True) as db:
-        # FIRST thing after the handle exists, and deliberately here rather than
-        # anywhere later: this is the earliest point in a run that has a db, and
-        # everything below it (and every write in _frontier_load and the walks
-        # after it) would be written under the current ident rule. A refusal that
-        # fired later would leave a graph half-written under two rules. Read-only;
-        # the matching stamp write is _run_ingestion's first write. Raises
-        # GraphFormatVersionError, which _run_ingestion surfaces as a failed run.
+        # FIRST thing after the handle exists (#336), ahead even of the format
+        # check below, because that check is itself an entity-bound read: on a
+        # graph with a damaged EAVT index (project-minigraf/minigraf#370) the
+        # stamp, watermark and frontiers all read as absent and a mature graph
+        # is adopted as fresh -- or, with partial damage, refused for an ident-
+        # rule problem it does not have. Read-only. Raises GraphIndexDamageError,
+        # which _run_ingestion surfaces as a failed run.
+        _ingest_progress["index_cross_check"] = _graph_index_cross_check(db)
+        # Second, and still ahead of everything else: this is the earliest point
+        # after the index check, and everything below it (and every write in
+        # _frontier_load and the walks after it) would be written under the
+        # current ident rule. A refusal that fired later would leave a graph
+        # half-written under two rules. Read-only; the matching stamp write is
+        # _run_ingestion's first write. Raises GraphFormatVersionError, which
+        # _run_ingestion surfaces as a failed run.
         _graph_format_version_verify(db)
         watermark = _watermark_query(db)
         if len(commit_metadata) != len(linearization):
@@ -12894,6 +12902,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # Reset HERE, not at module import, because this server is long-lived:
     # see _reset_introduced_by_ambiguity_log_budget.
     _reset_introduced_by_ambiguity_log_budget()
+    # #336. None until this run's index cross-check passes, so a run that was
+    # refused, or failed before reaching it, never reports a previous run's
+    # clean check. Here rather than in the _ingest_progress initializers:
+    # tests and the at-scale harness call _run_ingestion with their own dicts.
+    _ingest_progress["index_cross_check"] = None
     # Bound BEFORE the try so the outermost finally can shut it down no matter
     # where a failure lands, including the two awaited calls
     # (_open_index_writer_safe, _frontier_load) that sit above the inner try
