@@ -169,16 +169,9 @@ except ValueError:
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
-    "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+    "status": "idle", "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     "phase": None,
-    # #326. Deliberately NOT named "skipped": _ingest_progress["status"] already
-    # takes the value "skipped" (the whole run declined because another process
-    # owns the graph) and stderr_capture already reports skipped_commits (gated
-    # by run_ingestion_benchmark._exit_code; commits dropped for extraction OR
-    # write failure -- _SKIPPED_COMMIT_RE matches both log lines). A third bare
-    # "skipped" reads as one of those two on sight.
-    "positions_skipped": 0,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -13138,9 +13131,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _ingest_progress["total"] = repo_total
         _ingest_progress["status"] = "running"
         _ingest_progress["phase"] = "converging"
-        _ingest_progress["processed"] = prior_ingested
         _ingest_progress["prior_ingested"] = prior_ingested
-        _ingest_progress["positions_skipped"] = 0   # #326: per-run, like prior_ingested
 
         env_workers = os.environ.get("MINIGRAF_INGEST_WORKERS")
         # CPU-bound-appropriate default: one worker per core, not the
@@ -13264,18 +13255,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # differ on exactly the case that matters. `highest_rev_pos`
                 # was updated for every rev claim BEFORE the skip test, so it
                 # includes positions that were claimed, walked, and whose
-                # write FAILED -- the per-commit `except` does
-                # `processed += 1` and persists no claim, and `completed_all`
-                # stays True. _frontier_persist_span moves :hi-hash UP (while
-                # _frontier_persist_claim never does for the high interval),
-                # so passing highest_rev_pos would raise the persisted top
-                # bound over those failed positions. Once :hi-hash reaches the
-                # tip the interval is REPRESENTABLE, so the next
-                # _frontier_load retains it instead of discarding it, and
-                # those positions are never re-walked: permanent silent loss.
-                # The skipped span is the only thing this flush is entitled to
-                # assert; positions above it either persisted their own claim
-                # or legitimately did not.
+                # write FAILED -- the per-commit `except` retires the
+                # position as failed and persists no claim, and
+                # `completed_all` stays True. _frontier_persist_span moves
+                # :hi-hash UP (while _frontier_persist_claim never does for
+                # the high interval), so passing highest_rev_pos would raise
+                # the persisted top bound over those failed positions. Once
+                # :hi-hash reaches the tip the interval is REPRESENTABLE, so
+                # the next _frontier_load retains it instead of discarding
+                # it, and those positions are never re-walked: permanent
+                # silent loss. The skipped span is the only thing this flush
+                # is entitled to assert; positions above it either persisted
+                # their own claim or legitimately did not.
                 #
                 # #325: keyed by target ident, not a run-global pair. A skipped
                 # claim still came out of the allocator, so it still extended
@@ -13499,14 +13490,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             break
                         lo, hi = skipped_span.get(target_ident, (pos, pos))
                         skipped_span[target_ident] = (min(lo, pos), max(hi, pos))
-                        _ingest_progress["positions_skipped"] += 1
-                        # `processed` keeps its meaning -- positions retired by
-                        # the walk -- which is what #317's commit_census reads
-                        # as walk_claimed. Excluding skips would silently
-                        # redefine the number that gate compares against
-                        # git rev-list, turning a clean skip-heavy resume into
-                        # a reported lost commit.
-                        _ingest_progress["processed"] += 1
+                        # A skipped position is still RETIRED (RunProgress
+                        # "skipped"), which is what #317's commit_census reads
+                        # through walk_claimed_from_progress -- excluding it
+                        # would redefine walk_claimed.
                         run_progress.retired(tag, "skipped", pos)
                     claim_ident, absorbed_idents = target_ident, absorbed
                     fut = loop.run_in_executor(
@@ -13560,7 +13547,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         _note_incomplete_rev(tag, pos, claim_ident)
                         submit_next()
                         _ingest_progress["current_commit"] = commit_hash
-                        _ingest_progress["processed"] += 1
                         run_progress.retired(tag, "failed", pos)
                         await asyncio.sleep(0)  # yield to event loop
                         continue
@@ -13687,7 +13673,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             extracted_files,
                             _ingest_checkpoint_policy,
                         )
-                    _ingest_progress["processed"] += 1
                     run_progress.retired(tag, "written" if _trace_write_ok else "failed", pos)
                     await asyncio.sleep(0)  # yield to event loop
 
@@ -14229,6 +14214,10 @@ async def handle_minigraf_ingest_git(
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "skipped"
         _ingest_progress["owner_pid"] = holder_pid
+        # A declined start must not echo the previous in-process run's
+        # this_run/streams/visibility/lineage numbers -- there is no run this
+        # time, so there is nothing to report them for.
+        _ingest_progress["_run"] = None
         return {
             "ok": False,
             "error": f"ingestion already owned by live process (pid {holder_pid})",
@@ -14249,9 +14238,9 @@ async def handle_minigraf_ingest_git(
             "error": f"Not a git repository (or git not found): {repo}",
         }
     _ingest_progress = {
-        "status": "starting", "processed": 0, "total": 0, "prior_ingested": 0,
+        "status": "starting", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-        "phase": None, "positions_skipped": 0,
+        "phase": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch or _default_git_branch(repo)))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
@@ -14268,17 +14257,6 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
     run = _ingest_progress.get("_run")
     if run is not None:
         result.update(run.snapshot())
-    # processed_this_run is derived in-memory (no extra DB query) so it stays
-    # accurate even mid-run, distinguishing "this attempt's progress" from the
-    # cumulative total in `processed` — see issue #85.
-    result["processed_this_run"] = (
-        _ingest_progress["processed"] - _ingest_progress.get("prior_ingested", 0)
-    )
-    # #326: a run whose positions_skipped_this_run climbs alongside
-    # processed_this_run is REPLAYING an already-ingested region, not making
-    # progress. #325's incident looked healthy for 98 minutes because
-    # `processed` advances on replayed positions and nothing else did.
-    result["positions_skipped_this_run"] = _ingest_progress.get("positions_skipped", 0)
     # Staleness: a terminal error/skipped state can outlive the condition
     # that caused it (e.g. the orphaned holder it names has since died) —
     # re-check liveness on every poll instead of echoing a dead PID forever.
@@ -14601,7 +14579,7 @@ _TOOLS: List[Tool] = [
             "Return the current git ingestion progress. status is one of: idle, "
             "starting, running, complete, error, stopped, skipped. starting means "
             "a background task exists but has not finished its preload phase, so "
-            "processed/total are not populated yet. stopped means a graceful "
+            "this_run/total are not populated yet. stopped means a graceful "
             "shutdown paused ingestion between commits — not a failure; the next "
             "run resumes from the watermark. skipped means another live process "
             "already owns the graph (see owner_pid) — this server will not start "
@@ -14612,11 +14590,11 @@ _TOOLS: List[Tool] = [
             "by scraping a holder PID out of minigraf's lock-contention message, "
             "and minigraf 2.0.0 removed that PID from the text (#284) — but it "
             "does include error_at, the timestamp the failure occurred. "
-            "positions_skipped_this_run counts positions retired without "
-            "parsing or writing them because an earlier run had already "
-            "written them completely (#326); it climbing while the commit "
-            "count stays flat means the run is replaying an already-ingested "
-            "region."
+            "this_run.skipped counts positions retired without parsing or "
+            "writing them because an earlier run had already written them "
+            "completely (#326); it climbing while this_run.retired matches "
+            "it and the commit count stays flat means the run is replaying "
+            "an already-ingested region."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
@@ -14731,9 +14709,9 @@ async def main() -> None:
     # asyncio task — never blocks the message loop.
     # Set MINIGRAF_NO_AUTO_INGEST=1 to skip auto-start (used by eval sandboxes).
     _ingest_progress = {
-        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+        "status": "idle", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-        "phase": None, "positions_skipped": 0,
+        "phase": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         # Proactive check-before-attempt: if another live process already

@@ -187,13 +187,13 @@ __all__ = ["run_resume_census", "resume_ok", "retention_engaged", "main"]
 # the same process (this file's own multi-test suite runs several in one
 # pytest session) would start from whatever the FIRST call's run left behind
 # -- e.g. an empty second repo's failed `_run_ingestion` calls touch
-# `processed` and `prior_ingested` not at all, so a prior test's real counts
+# `prior_ingested` and `_run` not at all, so a prior test's real counts
 # would leak straight through as this run's numbers. See
 # test_ingest_progress_does_not_leak_across_calls.
 _CLEAN_INGEST_PROGRESS: Dict[str, Any] = {
-    "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+    "status": "idle", "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-    "phase": None, "positions_skipped": 0,
+    "phase": None,
 }
 
 

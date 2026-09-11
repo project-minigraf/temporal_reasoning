@@ -416,7 +416,7 @@ async def _ingest(repo, graph_path):
     mcp_server._reset_db_state()
     mcp_server.open_db(str(graph_path))
     mcp_server._ingest_progress = {
-        "status": "idle", "processed": 0, "total": 0,
+        "status": "idle", "total": 0,
         "current_commit": "", "error": None,
     }
     await mcp_server._run_ingestion(str(repo), "HEAD")

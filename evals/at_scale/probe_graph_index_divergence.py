@@ -160,9 +160,11 @@ def _ingest(repo_path: str, ref: str, graph_path: str) -> dict[str, Any]:
     with m.db_lease() as db:
         db.checkpoint()
     m._reset_db_state()
+    from evals.at_scale.commit_census import walk_claimed_from_progress
+
     return {
         "wall_seconds": wall,
-        "commits_ingested": m._ingest_progress["processed"],
+        "commits_ingested": walk_claimed_from_progress(m._ingest_progress),
         "final_status": m._ingest_progress["status"],
     }
 

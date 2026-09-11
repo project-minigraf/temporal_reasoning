@@ -55,6 +55,12 @@ class _Stream:
     def __init__(self, state: str):
         self.state = state
         self.written = 0
+        # Deliberately not a top-level "skipped" key in the status response:
+        # _ingest_progress["status"] already takes the value "skipped" (the
+        # whole run declined because another process owns the graph), and
+        # stderr_capture already reports skipped_commits (extraction OR
+        # write failure). This one lives nested under this_run/streams so it
+        # never collides with either (#326, #222 phase 4).
         self.skipped = 0
         self.failed = 0
         self.last_at: Optional[str] = None

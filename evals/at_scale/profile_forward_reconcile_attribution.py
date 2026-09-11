@@ -362,7 +362,7 @@ async def _main() -> dict:
     m._reset_db_state()
     m.open_db(GRAPH_PATH)
     m._ingest_progress = {
-        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+        "status": "idle", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
         "phase": None,
     }

@@ -150,7 +150,7 @@ async def run_ingestion_benchmark(
     mcp_server._reset_db_state()
     mcp_server.open_db(str(graph_path))
     mcp_server._ingest_progress = {
-        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+        "status": "idle", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     }
 
@@ -418,7 +418,7 @@ async def run_ingestion_benchmark(
             mcp_server._reset_db_state()
             mcp_server.open_db(str(no_ignore_graph_path))
             mcp_server._ingest_progress = {
-                "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+                "status": "idle", "total": 0, "prior_ingested": 0,
                 "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
             }
             await mcp_server._run_ingestion(repo_path, resolved_branch)
