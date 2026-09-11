@@ -28762,3 +28762,98 @@ class TestFrontierLoadCoalescesProvisionalIntervals:
         assert [(iv.lo_pos, iv.hi_pos) for iv in prov2] == [(0, 5), (10, 20)], (
             "the merged extra must be RETAINED on reload"
         )
+
+
+class TestCorrectionSweepNextReasons:
+    """#222 phase 4: _correction_sweep_select_position returns None for
+    seven reasons a caller cannot tell apart. _correction_sweep_next names
+    them, so Stage B can report WHY it declined (C1: a reverse floor keeps
+    the gap open and the sweep never runs, on a run reporting complete)."""
+
+    LIN = [f"h{i}" for i in range(6)]
+    META = [(h, "2026-09-04T00:00:00Z", "a", f"s{i}") for i, h in enumerate(LIN)]
+
+    def _seed(self, db, ident, lo, hi, tag=":provisional"):
+        import mcp_server
+        facts = [
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag {tag}]",
+            f'[{ident} :lo-hash "{self.LIN[lo]}"]',
+            f'[{ident} :hi-hash "{self.LIN[hi]}"]',
+            f"[{ident} :pos-count {hi - lo + 1}]",
+        ]
+        mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-09-04T00:00:00Z")
+
+    def _seed_closed(self, db):
+        """frontier-low [0,2] meets frontier-high [3,5]: the gap is closed."""
+        import mcp_server
+        self._seed(db, mcp_server._FRONTIER_LOW_IDENT, 0, 2, tag=":authoritative")
+        self._seed(db, mcp_server._FRONTIER_HIGH_IDENT, 3, 5)
+
+    def _seed_gap(self, db):
+        """frontier-low [0,0], frontier-high [3,5]: positions 1-2 unclaimed."""
+        import mcp_server
+        self._seed(db, mcp_server._FRONTIER_LOW_IDENT, 0, 0, tag=":authoritative")
+        self._seed(db, mcp_server._FRONTIER_HIGH_IDENT, 3, 5)
+
+    def _next(self, db, lin=None, meta=None, fragmented=None):
+        import mcp_server
+        return mcp_server._correction_sweep_next(
+            db, self.LIN if lin is None else lin, self.META if meta is None else meta,
+            None, fragmented,
+        )
+
+    def test_no_frontier_high(self, real_db):
+        r = self._next(real_db)
+        assert (r.selected, r.reason) == (None, "no-frontier-high")
+
+    def test_gap_open(self, real_db):
+        self._seed_gap(real_db)
+        r = self._next(real_db)
+        assert (r.selected, r.reason, r.region_lo) == (None, "gap-open", 3)
+
+    def test_selected_then_reached_ceiling(self, real_db):
+        import mcp_server
+        self._seed_closed(real_db)
+        r = self._next(real_db)
+        assert r.reason == "selected"
+        assert r.selected == (self.LIN[3], self.META[3][1])
+        assert (r.region_lo, r.start_pos, r.ceiling_pos) == (3, 3, 5)
+        mcp_server._correction_sweep_through_update(real_db, self.LIN[5], self.META[5][1])
+        r = self._next(real_db)
+        assert (r.selected, r.reason, r.region_lo, r.start_pos, r.ceiling_pos) == (
+            None, "reached-ceiling", 3, 6, 5,
+        )
+
+    def test_stale_bound(self, real_db):
+        """frontier-high's :lo-hash no longer resolves (rewritten history)."""
+        self._seed_closed(real_db)
+        lin = ["rewritten" if i == 3 else h for i, h in enumerate(self.LIN)]
+        meta = [(h, *m[1:]) for h, m in zip(lin, self.META)]
+        r = self._next(real_db, lin=lin, meta=meta)
+        assert (r.selected, r.reason) == (None, "stale-bound")
+
+    def test_fragmented(self, real_db):
+        self._seed_closed(real_db)
+        r = self._next(real_db, fragmented=True)
+        assert (r.selected, r.reason, r.region_lo) == (None, "fragmented", 3)
+
+    def test_metadata_mismatch(self, real_db):
+        self._seed_closed(real_db)
+        r = self._next(real_db, meta=self.META[:-1])
+        assert (r.selected, r.reason, r.start_pos, r.ceiling_pos) == (
+            None, "metadata-mismatch", 3, 5,
+        )
+
+    @pytest.mark.parametrize("seed", ["none", "gap", "closed", "swept"])
+    def test_wrapper_returns_exactly_selected(self, real_db, seed):
+        import mcp_server
+        if seed == "gap":
+            self._seed_gap(real_db)
+        elif seed in ("closed", "swept"):
+            self._seed_closed(real_db)
+        if seed == "swept":
+            mcp_server._correction_sweep_through_update(real_db, self.LIN[5], self.META[5][1])
+        assert mcp_server._correction_sweep_select_position(
+            real_db, self.LIN, self.META,
+        ) == self._next(real_db).selected

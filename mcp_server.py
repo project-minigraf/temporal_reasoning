@@ -31,7 +31,7 @@ import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -12224,6 +12224,94 @@ def _correction_sweep_through_update(
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
 
 
+class _SweepNext(NamedTuple):
+    """_correction_sweep_next's answer: the next commit to sweep, or why
+    there is none. `reason` is "selected" or one of
+    ingest_progress.SWEEP_STATE_FOR_REASON's keys. The positions are filled
+    wherever the function got far enough to know them, so a caller can plan
+    `to_sweep` (ceiling - start + 1) from the same call that selects."""
+    selected: Optional[Tuple[str, str]]
+    reason: str
+    region_lo: Optional[int] = None
+    start_pos: Optional[int] = None
+    ceiling_pos: Optional[int] = None
+
+
+def _correction_sweep_next(
+    db: Any,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    hash_to_pos: Optional[Dict[str, int]] = None,
+    fragmented: Optional[bool] = None,
+) -> _SweepNext:
+    """_correction_sweep_select_position's body, returning WHY as well as
+    WHAT (#222 phase 4). Every gate, and the order of the gates, is
+    unchanged -- see _correction_sweep_select_position's docstring for what
+    each one guards."""
+    low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
+    high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
+    if high_bounds is None:
+        return _SweepNext(None, "no-frontier-high")  # Stream 2 hasn't claimed anything -- nothing to correct
+
+    if hash_to_pos is None:
+        hash_to_pos = {h: i for i, h in enumerate(linearization)}
+
+    if high_bounds[0] not in hash_to_pos:
+        return _SweepNext(None, "stale-bound")  # a boundary hash is stale (rewritten history); nothing safe to do
+
+    region_lo = hash_to_pos[high_bounds[0]]
+
+    if low_bounds is None:
+        # An ABSENT frontier-low means an EMPTY low region, not an unknown
+        # one, so its highest claimed position is -1 -- exactly how
+        # FrontierAllocator.gap_lo treats "no interval covers position 0".
+        # A fresh graph seeds neither side, and frontier-low is only created
+        # once the forward stream persists its first claim, so reading
+        # absent as "nothing safe to do" would strand every entity
+        # provisional forever whenever Stream 2 claims the whole history
+        # before Stream 1 claims anything -- reachable in 2d, where the
+        # forward stream does a large preload before its first claim.
+        low_hi_pos = -1
+    else:
+        if low_bounds[1] not in hash_to_pos:
+            return _SweepNext(None, "stale-bound", region_lo)  # a boundary hash is stale (rewritten history)
+        low_hi_pos = hash_to_pos[low_bounds[1]]
+
+    if low_hi_pos + 1 != region_lo:
+        return _SweepNext(None, "gap-open", region_lo)  # gap still open -- Stream 2 may still descend past a position
+                                                          # this sweep would otherwise confirm
+
+    if fragmented if fragmented is not None else _intervals_read_extra(db):
+        return _SweepNext(None, "fragmented", region_lo)  # #325: a hole remains above frontier-high, so Stream 2 can
+                                                            # still descend past a position this sweep would confirm.
+                                                            # Once everything coalesces there is exactly one provisional
+                                                            # interval and the gap-closed test above is exact again.
+
+    if high_bounds[1] not in hash_to_pos:
+        return _SweepNext(None, "stale-bound", region_lo)  # frontier-high's :hi-hash is stale; nothing safe to do
+    ceiling_pos = hash_to_pos[high_bounds[1]]
+
+    through_hash = _correction_sweep_through_query(db)
+    if through_hash is not None and through_hash in hash_to_pos:
+        pos = hash_to_pos[through_hash] + 1
+    else:
+        # Unset (first-ever call), or a stale hash from rewritten/rebased
+        # history -- (re)start from frontier-high's current lo-hash,
+        # mirroring _frontier_load's own precedent of dropping a bound
+        # that no longer resolves rather than erroring.
+        pos = region_lo  # already validated above
+
+    if pos > ceiling_pos:
+        return _SweepNext(None, "reached-ceiling", region_lo, pos, ceiling_pos)  # reached frontier-high's own :hi-hash; nothing left to correct
+
+    if len(commit_metadata) != len(linearization) or commit_metadata[pos][0] != linearization[pos]:
+        return _SweepNext(None, "metadata-mismatch", region_lo, pos, ceiling_pos)  # commit_metadata violates its stated contract -- nothing safe to
+                                                                                     # do, rather than an IndexError or a wrong-commit read
+
+    commit_hash, commit_ts_iso, _author, _subject = commit_metadata[pos]
+    return _SweepNext((commit_hash, commit_ts_iso), "selected", region_lo, pos, ceiling_pos)
+
+
 def _correction_sweep_select_position(
     db: Any,
     linearization: List[str],
@@ -12263,66 +12351,9 @@ def _correction_sweep_select_position(
     caller that cannot prove the no-mid-loop-mutation invariant for its own
     situation) gets the always-correct, always-fresh read.
     """
-    low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
-    high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
-    if high_bounds is None:
-        return None  # Stream 2 hasn't claimed anything -- nothing to correct
-
-    if hash_to_pos is None:
-        hash_to_pos = {h: i for i, h in enumerate(linearization)}
-
-    if high_bounds[0] not in hash_to_pos:
-        return None  # a boundary hash is stale (rewritten history); nothing safe to do
-
-    if low_bounds is None:
-        # An ABSENT frontier-low means an EMPTY low region, not an unknown
-        # one, so its highest claimed position is -1 -- exactly how
-        # FrontierAllocator.gap_lo treats "no interval covers position 0".
-        # A fresh graph seeds neither side, and frontier-low is only created
-        # once the forward stream persists its first claim, so reading
-        # absent as "nothing safe to do" would strand every entity
-        # provisional forever whenever Stream 2 claims the whole history
-        # before Stream 1 claims anything -- reachable in 2d, where the
-        # forward stream does a large preload before its first claim.
-        low_hi_pos = -1
-    else:
-        if low_bounds[1] not in hash_to_pos:
-            return None  # a boundary hash is stale (rewritten history)
-        low_hi_pos = hash_to_pos[low_bounds[1]]
-
-    if low_hi_pos + 1 != hash_to_pos[high_bounds[0]]:
-        return None  # gap still open -- Stream 2 may still descend past a position
-                     # this sweep would otherwise confirm
-
-    if fragmented if fragmented is not None else _intervals_read_extra(db):
-        return None  # #325: a hole remains above frontier-high, so Stream 2 can
-                     # still descend past a position this sweep would confirm.
-                     # Once everything coalesces there is exactly one provisional
-                     # interval and the gap-closed test above is exact again.
-
-    if high_bounds[1] not in hash_to_pos:
-        return None  # frontier-high's :hi-hash is stale; nothing safe to do
-    ceiling_pos = hash_to_pos[high_bounds[1]]
-
-    through_hash = _correction_sweep_through_query(db)
-    if through_hash is not None and through_hash in hash_to_pos:
-        pos = hash_to_pos[through_hash] + 1
-    else:
-        # Unset (first-ever call), or a stale hash from rewritten/rebased
-        # history -- (re)start from frontier-high's current lo-hash,
-        # mirroring _frontier_load's own precedent of dropping a bound
-        # that no longer resolves rather than erroring.
-        pos = hash_to_pos[high_bounds[0]]  # already validated above
-
-    if pos > ceiling_pos:
-        return None  # reached frontier-high's own :hi-hash; nothing left to correct
-
-    if len(commit_metadata) != len(linearization) or commit_metadata[pos][0] != linearization[pos]:
-        return None  # commit_metadata violates its stated contract -- nothing safe to
-                     # do, rather than an IndexError or a wrong-commit read
-
-    commit_hash, commit_ts_iso, _author, _subject = commit_metadata[pos]
-    return commit_hash, commit_ts_iso
+    return _correction_sweep_next(
+        db, linearization, commit_metadata, hash_to_pos, fragmented,
+    ).selected
 
 
 def _correction_sweep_apply(
