@@ -28857,3 +28857,175 @@ class TestCorrectionSweepNextReasons:
         assert mcp_server._correction_sweep_select_position(
             real_db, self.LIN, self.META,
         ) == self._next(real_db).selected
+
+
+# ---------------------------------------------------------------------------
+# #222 phase 4: status observability, end to end (real backend, real git)
+# ---------------------------------------------------------------------------
+
+def _phase4_add_commit(repo, i):
+    (repo / f"m{i}.py").write_text(f"def f{i}():\n    return {i}\n")
+    ts = (
+        datetime.datetime(2021, 3, 1, tzinfo=datetime.timezone.utc)
+        + datetime.timedelta(days=i)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    env = {**os.environ, "GIT_AUTHOR_DATE": ts, "GIT_COMMITTER_DATE": ts}
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True,
+                    capture_output=True, env=env)
+
+
+def _phase4_linear_repo(tmp_path, n, name="repo"):
+    repo = tmp_path / name
+    repo.mkdir()
+    for args in (["init", "-b", "master"], ["config", "user.email", "t@t.com"],
+                 ["config", "user.name", "T"]):
+        _subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    for i in range(n):
+        _phase4_add_commit(repo, i)
+    return repo
+
+
+def _phase4_run(repo, graph_path, monkeypatch, branch="master"):
+    """One real _run_ingestion against an on-disk graph, then the status the
+    handler reports and the graph's true commit count. Leases are released
+    around it (docs/testing-conventions.md, pattern 2)."""
+    import mcp_server
+    monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(graph_path))
+    mcp_server._reset_db_state()
+    mcp_server._ingest_progress = {
+        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+        "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        "phase": None, "positions_skipped": 0,
+    }
+    asyncio.run(mcp_server._run_ingestion(str(repo), branch))
+    mcp_server._reset_db_state()
+    status = mcp_server.handle_minigraf_ingest_status()
+    with mcp_server.db_lease() as db:
+        graph_commits = mcp_server._count_commit_entities(db)
+    mcp_server._reset_db_state()
+    return status, graph_commits
+
+
+class TestIngestStatusPhase4E2E:
+    def test_status_carries_the_phase4_blocks_after_a_fresh_run(self, tmp_path, monkeypatch):
+        repo = _phase4_linear_repo(tmp_path, 10)
+        status, graph_commits = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        assert status["status"] == "complete"
+        assert graph_commits == 10
+        run = status["this_run"]
+        assert (run["to_retire"], run["retired"], run["written"], run["failed"]) == (10, 10, 10, 0)
+        assert status["visibility"] == {"verified": 10, "total": 10, "complete": True}
+        assert status["lineage"]["complete"] is True
+        assert status["streams"]["sweep"]["state"] == "done"
+        assert status["streams"]["forward"]["state"] == "done"
+        assert status["streams"]["reverse"]["state"] == "done"
+        json.dumps(status)  # the RunProgress object itself must never leak into the response
+
+    def test_a_no_op_rerun_reports_not_needed_streams(self, tmp_path, monkeypatch):
+        repo = _phase4_linear_repo(tmp_path, 6)
+        graph = tmp_path / "g.graph"
+        _phase4_run(repo, graph, monkeypatch)
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        assert status["this_run"]["to_retire"] == 0
+        assert status["streams"]["forward"]["state"] == "not-needed"
+        assert status["streams"]["reverse"]["state"] == "not-needed"
+        assert status["visibility"]["complete"] is True
+        assert status["lineage"]["complete"] is True
+
+    def test_stage_b_reports_sweep_progress_instead_of_freezing(self, tmp_path, monkeypatch):
+        """Master: every sweep step sampled processed == total (20/20) with no
+        sweep counter at all. Now `swept` climbs to `to_sweep`."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 12)
+        samples = []
+        real_apply = mcp_server._correction_sweep_apply
+
+        def spy(*args, **kwargs):
+            run = mcp_server._ingest_progress["_run"]
+            sw = run.snapshot()["streams"]["sweep"]
+            samples.append((mcp_server._ingest_progress["phase"], sw["state"], sw["swept"], sw["to_sweep"]))
+            return real_apply(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", spy)
+        status, _ = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        assert samples, "Stage B must sweep something on a fresh 1:1 run"
+        to_sweep = samples[0][3]
+        assert to_sweep == len(samples)
+        assert [s[2] for s in samples] == list(range(len(samples)))
+        assert all(s[0] == "sweeping" and s[1] == "running" for s in samples)
+        sw = status["streams"]["sweep"]
+        assert (sw["state"], sw["swept"], sw["to_sweep"]) == ("done", to_sweep, to_sweep)
+
+    def _fail_second_reverse_write(self, monkeypatch):
+        import mcp_server
+        real = mcp_server._reverse_apply
+        calls = {"n": 0}
+
+        def failing(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("injected write failure")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", failing)
+        return real
+
+    def test_a_lost_commit_is_no_longer_reported_as_complete(self, tmp_path, monkeypatch):
+        """C1. Master reported `complete` at 20/20 while the graph held 19
+        commits and Stage B never ran."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 20)
+        self._fail_second_reverse_write(monkeypatch)
+        status, graph_commits = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        assert graph_commits == 19
+        assert status["status"] == "complete"  # the run itself finished
+        assert status["this_run"]["failed"] == 1
+        assert status["visibility"] == {"verified": 19, "total": 20, "complete": False}
+        sw = status["streams"]["sweep"]
+        assert (sw["state"], sw["blocked_reason"]) == ("blocked", "gap-open")
+        assert status["lineage"]["complete"] is False
+
+    def test_a_rewalk_never_reports_more_than_it_had_to_do(self, tmp_path, monkeypatch):
+        """C2. The re-walk below C1's reverse floor. Master's seeded counter
+        read 28/20 here; this also recomputes that old formula on the same
+        samples, so the scenario provably reaches the defect."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 20)
+        graph = tmp_path / "g.graph"
+        real_reverse = self._fail_second_reverse_write(monkeypatch)
+        _phase4_run(repo, graph, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_reverse)
+
+        samples = []
+
+        def sampling(*args, **kwargs):
+            p = mcp_server._ingest_progress
+            run = p["_run"].snapshot()["this_run"]
+            samples.append((run["retired"], run["to_retire"], p["prior_ingested"]))
+            return real_reverse(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", sampling)
+        status, graph_commits = _phase4_run(repo, graph, monkeypatch)
+        assert graph_commits == 20
+        assert all(retired <= to_retire for retired, to_retire, _ in samples)
+        run = status["this_run"]
+        assert run["retired"] == run["to_retire"]
+        old_processed = status["prior_ingested"] + run["retired"]
+        assert old_processed > status["total"], (
+            f"scenario no longer reaches the #222-phase-4 defect: old formula "
+            f"{old_processed} <= total {status['total']}"
+        )
+        assert status["visibility"]["complete"] is True
+        assert status["lineage"]["complete"] is True
+
+    def test_new_counter_equals_old_processed_census_parity(self, tmp_path, monkeypatch):
+        """#317's commit_census reads walk_claimed; after Task 6 it is
+        prior_ingested + this_run.retired. It must be the SAME number
+        `processed` held, or the census gates change meaning."""
+        repo = _phase4_linear_repo(tmp_path, 8)
+        graph = tmp_path / "g.graph"
+        _phase4_run(repo, graph, monkeypatch)
+        _phase4_add_commit(repo, 8)
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        assert status["processed"] == status["prior_ingested"] + status["this_run"]["retired"]

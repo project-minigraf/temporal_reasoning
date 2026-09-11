@@ -38,6 +38,7 @@ from mcp.server.stdio import stdio_server
 from minigraf import MiniGrafDb, MiniGrafError
 import fact_index
 import frontier_registry
+import ingest_progress
 
 # ---------------------------------------------------------------------------
 # Session-scoped rules — registered once at startup, cached in RuleRegistry
@@ -12954,6 +12955,38 @@ class _ForwardWalkState:
     entity_introduced_by: Dict[str, str] = field(default_factory=dict)
 
 
+def _build_run_progress(
+    linearization: List[str],
+    allocator: "frontier_registry.FrontierAllocator",
+    lct_hash: Optional[str],
+    sweep_through_hash: Optional[str],
+) -> "ingest_progress.RunProgress":
+    """#222 phase 4: the run's progress model, from the frontier AS LOADED.
+
+    `to_retire` is the allocator's gap at load -- every position this run
+    will claim, each retired at most once. The two watermarks are mapped
+    into this run's position space: an unset lineage watermark is -1
+    (nothing confirmed), one whose hash no longer resolves is None (reported
+    as null, never guessed). The sweep watermark only counts when it falls
+    inside the base provisional interval, the region the sweep confirms.
+    """
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    lineage_pos: Optional[int] = -1 if lct_hash is None else hash_to_pos.get(lct_hash)
+    base = next(
+        (iv for iv in allocator.intervals()
+         if iv.tag == frontier_registry.TAG_PROVISIONAL and iv.is_base),
+        None,
+    )
+    sweep_lo = sweep_through = None
+    if base is not None and sweep_through_hash is not None:
+        p = hash_to_pos.get(sweep_through_hash)
+        if p is not None and base.lo_pos <= p <= base.hi_pos:
+            sweep_lo, sweep_through = base.lo_pos, p
+    return ingest_progress.RunProgress(
+        linearization, allocator.unclaimed_count(), lineage_pos, sweep_lo, sweep_through,
+    )
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 
@@ -12991,6 +13024,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # clean check. Here rather than in the _ingest_progress initializers:
     # tests and the at-scale harness call _run_ingestion with their own dicts.
     _ingest_progress["index_cross_check"] = None
+    # #222 phase 4: this run's progress model. None until it is built from
+    # the loaded frontier below, for the same reason as index_cross_check: a
+    # run refused or failing before that point must never show a previous
+    # run's numbers. It lives in the dict, not a module global, so every
+    # site that resets _ingest_progress by assignment clears it too.
+    _ingest_progress["_run"] = None
     # Bound BEFORE the try so the outermost finally can shut it down no matter
     # where a failure lands, including the two awaited calls
     # (_open_index_writer_safe, _frontier_load) that sit above the inner try
@@ -13178,6 +13217,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             completed_regions = await loop.run_in_executor(
                 write_executor, _completed_regions_load, db, linearization, allocator, index_con,
             )
+            lct_hash = await loop.run_in_executor(
+                write_executor, _lineage_confirmed_through_query, db,
+            )
+            sweep_through_hash = await loop.run_in_executor(
+                write_executor, _correction_sweep_through_query, db,
+            )
+        run_progress = _build_run_progress(
+            linearization, allocator, lct_hash, sweep_through_hash,
+        )
+        _ingest_progress["_run"] = run_progress
         claimer = _RoundRobinClaimer(
             allocator, *_parse_stream_ratio(os.environ.get("MINIGRAF_INGEST_STREAM_RATIO"))
         )
@@ -13460,6 +13509,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         # git rev-list, turning a clean skip-heavy resume into
                         # a reported lost commit.
                         _ingest_progress["processed"] += 1
+                        run_progress.retired(tag, "skipped", pos)
                     claim_ident, absorbed_idents = target_ident, absorbed
                     fut = loop.run_in_executor(
                         executor, _extract_commit, repo_path, linearization[pos], ignore_patterns
@@ -13467,6 +13517,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     pending.append((tag, pos, fut, claim_ident, absorbed_idents))
                     return True
 
+                run_progress.stage_a_started()
                 for _ in range(pipeline_depth):
                     if not submit_next():
                         break
@@ -13512,6 +13563,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         submit_next()
                         _ingest_progress["current_commit"] = commit_hash
                         _ingest_progress["processed"] += 1
+                        run_progress.retired(tag, "failed", pos)
                         await asyncio.sleep(0)  # yield to event loop
                         continue
                     # #260 M1: read BEFORE submit_next(), not after -- await_s
@@ -13639,7 +13691,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             _ingest_checkpoint_policy,
                         )
                     _ingest_progress["processed"] += 1
+                    run_progress.retired(tag, "written" if _trace_write_ok else "failed", pos)
                     await asyncio.sleep(0)  # yield to event loop
+
+                run_progress.stage_a_finished(completed_all)
 
                 # #326: the walk may have ended with the gap empty while still
                 # inside a run of skips, which nothing below persisted. Not
@@ -13874,15 +13929,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         sweep_fragmented = bool(await loop.run_in_executor(
                             write_executor, _intervals_read_extra, db,
                         ))
+                        # #222 phase 4: the first call both PLANS the sweep
+                        # (to_sweep, or why it declines) and is the loop's
+                        # first iteration, so planning costs no query.
+                        nxt = await loop.run_in_executor(
+                            write_executor, _correction_sweep_next,
+                            db, linearization, commit_metadata, hash_to_pos,
+                            sweep_fragmented,
+                        )
+                        run_progress.sweep_planned(
+                            nxt.reason, nxt.region_lo, nxt.start_pos, nxt.ceiling_pos,
+                        )
                         while not _shutdown_requested.is_set():
-                            selected = await loop.run_in_executor(
-                                write_executor, _correction_sweep_select_position,
-                                db, linearization, commit_metadata, hash_to_pos,
-                                sweep_fragmented,
-                            )
-                            if selected is None:
+                            if nxt.selected is None:
+                                run_progress.sweep_ended(nxt.reason)
                                 break
-                            sweep_hash, sweep_ts = selected
+                            sweep_hash, sweep_ts = nxt.selected
                             try:
                                 sweep_extracted = await loop.run_in_executor(
                                     executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
@@ -13919,6 +13981,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     write_executor, _correction_sweep_through_update,
                                     db, sweep_hash, sweep_ts, index_con,
                                 )
+                                run_progress.swept(hash_to_pos[sweep_hash])
                                 await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
                             except concurrent.futures.process.BrokenProcessPool:
                                 raise
@@ -13954,10 +14017,17 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 # lost by dropping the traceback.
                                 e.__traceback__ = None
                                 completed_all = False
+                                run_progress.sweep_ended("aborted")
                                 break
                             await asyncio.sleep(0)  # yield to event loop
+                            nxt = await loop.run_in_executor(
+                                write_executor, _correction_sweep_next,
+                                db, linearization, commit_metadata, hash_to_pos,
+                                sweep_fragmented,
+                            )
                         if _shutdown_requested.is_set():
                             completed_all = False
+                            run_progress.sweep_ended("stopped")
                         _correction_sweep_log_summary(skipped)
                         # DB-bound like everything else here, so it runs on
                         # write_executor rather than inline on the event loop.
@@ -13969,6 +14039,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 write_executor, _lineage_confirmed_through_update,
                                 db, linearization[-1], commit_metadata[-1][1], index_con,
                             )
+                            run_progress.folded()
                             await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
 
                 # Call _ingest_tags and _last_run_write before closing index_con
@@ -14028,6 +14099,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 _ingest_progress["status"] = "complete"
             else:
                 _ingest_progress["status"] = "stopped"
+            run_progress.ended(_ingest_progress["status"])
         finally:
             # Publish realised checkpoint duty into _ingest_progress BEFORE
             # discarding the policy below -- its counters do not survive
@@ -14066,6 +14138,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _ingest_progress["error_at"] = _now_utc_ms()
+        if _ingest_progress.get("_run") is not None:
+            _ingest_progress["_run"].ended("error")
         # #270. Until this print, _ingest_progress was the ONLY record of
         # what killed the run: this handler swallows the exception and
         # returns normally, so a background run started through
@@ -14176,7 +14250,15 @@ async def handle_minigraf_ingest_git(
 
 def handle_minigraf_ingest_status() -> Dict[str, Any]:
     """Return current ingestion progress, augmented with graph-backed last-run info."""
-    result: Dict[str, Any] = {"ok": True, **_ingest_progress}
+    # Keys starting with "_" are in-process objects (#222 phase 4's "_run"),
+    # never response fields -- call_tool json.dumps this dict.
+    result: Dict[str, Any] = {
+        "ok": True,
+        **{k: v for k, v in _ingest_progress.items() if not k.startswith("_")},
+    }
+    run = _ingest_progress.get("_run")
+    if run is not None:
+        result.update(run.snapshot())
     # processed_this_run is derived in-memory (no extra DB query) so it stays
     # accurate even mid-run, distinguishing "this attempt's progress" from the
     # cumulative total in `processed` — see issue #85.
