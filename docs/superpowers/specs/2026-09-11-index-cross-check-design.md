@@ -79,6 +79,21 @@ facts. Comparing them is an exact two-index comparison.
      the format stamp, watermark, lineage-confirmed-through,
      correction-sweep-through, frontier intervals and archived regions. Few,
      and their misread is the one above.
+   * **Plus the fixed control idents, whether or not AEVT listed them:**
+     `:ingestion/format-version`, `:ingestion/watermark`,
+     `:ingestion/frontier-low`, `:ingestion/frontier-high`,
+     `:ingestion/lineage-confirmed-through`,
+     `:ingestion/correction-sweep-through`, `:ingestion/last-run-at`, each at
+     `uuid5(NAMESPACE_OID, ident)`. AEVT's view of one it did not list is the
+     empty set. This is what keeps the check from failing open on AEVT damage
+     (amendment, 2026-09-11, measured): redirecting `aevt_root_page` to its
+     rightmost leaf on a stamped graph left the population query returning
+     **0 rows** while EAVT still answered `:type/ingestion` for the stamp —
+     so without the fixed idents, a graph whose AEVT lost the whole
+     `:entity-type` block would pass as "nothing to probe". An ident absent
+     from both indexes compares empty to empty and passes, so a fresh graph is
+     unaffected. The tuple is built at call time: several of these constants
+     are defined further down `mcp_server.py` than the check.
    * **A uniform random sample** of `sample_size` from the rest (or all of them
      if fewer). `rng` defaults to a fresh `random.Random()`, so successive runs
      cover different entities; tests inject a seeded one.
@@ -101,8 +116,8 @@ facts. Comparing them is an exact two-index comparison.
    `checkpoint()` repair nothing.
 6. **Return** `{"population": N, "probed": n, "control_probed": c}`.
 
-A population of 0 passes: a graph with no entities has nothing to disagree
-about. It is not reported as verified — the returned `population: 0` says it
+A population of 0 passes only if every fixed control ident also reads empty
+through EAVT: a graph with no entities has nothing to disagree about. It is not reported as verified — the returned `population: 0` says it
 proved nothing, the `code_entities_scanned` idiom from #316.
 
 ### Placement
@@ -127,9 +142,12 @@ per-server-start check would pay the population scan on every launch.
   `ingestion_failed` pattern already matches. No new pattern.
 * On success the returned dict is stored as
   `_ingest_progress["index_cross_check"]`, which `handle_minigraf_ingest_status`
-  already spreads into its result. Both `_ingest_progress` initializers gain
-  the key as `None`, so a run that never reached the check reads as "not run",
-  never as a clean zero.
+  already spreads into its result. `_run_ingestion` sets the key to `None` as
+  its first action, so a run that never reached the check — refused, or failed
+  earlier — reads as "not run", never as a clean zero or a previous run's
+  report. (Amended from "both initializers gain the key": tests and the
+  at-scale harness call `_run_ingestion` directly with their own dicts, so
+  only a reset inside the run covers every caller.)
 
 ### Cost
 
@@ -179,11 +197,13 @@ watch it fail, restore):
    `status: error` naming `GraphIndexDamageError`, and
    `_ingest_progress["index_cross_check"]` stays `None`. "Before any write" is
    structural — the call precedes the read-only format check, which precedes
-   every write — so the test asserts the refusal, not a byte comparison: file
-   bytes are unusable (dropping a handle runs a checkpoint), and a re-walk of
-   the same history re-asserts identical triples, which minigraf's net-asserted
-   view collapses, so fact counts cannot see it either. Ablation: remove the
-   call — the run adopts the graph as fresh and reaches `complete`.
+   every write — so the test asserts the refusal, not a byte comparison. File
+   bytes are unusable (dropping a handle runs a checkpoint), and fact counts
+   are an unreliable witness: commit triples re-written at their own
+   `commit_ts_iso` collapse, while run-stamped facts written at a new
+   valid-from duplicate (#156), so what a count shows depends on which facts a
+   run happens to touch. Ablation: remove the call — the test must go red
+   (the run is no longer refused).
 2. **Diagnosis: partial damage names the index, not the format.** Damage that
    keeps the watermark's EAVT entries but loses the stamp's. Deterministic:
    filler idents are chosen with UUIDs below the watermark's, so the watermark
@@ -201,6 +221,17 @@ watch it fail, restore):
    Ablation: remove the re-confirm — it must refuse.
 6. **Sample bound.** A population larger than `sample_size` probes exactly
    `sample_size + control_probed`.
+7. **AEVT damage does not fail open.** A stamped graph with
+   `aevt_root_page` redirected to its rightmost leaf (precondition asserted:
+   the population query returns 0 rows). The check raises. Ablation: drop the
+   fixed-ident union — it passes as population 0.
+
+Tests 1–2 need deterministic commit hashes (which entities survive in the
+kept leaf depends on UUID order), so their repo fixes
+`GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`, and every damaged-graph test asserts
+its precondition (which reads are misread) before exercising the check.
+They live in a new `tests/test_index_cross_check.py`, not the 26k-line
+`tests/test_mcp_server.py`.
 
 ## Docs
 
@@ -212,9 +243,10 @@ watch it fail, restore):
 
 ## Residuals (stated, not fixed)
 
-* **AEVT damage.** An entity missing from AEVT is never in the population, so
-  it is never sampled. The both-directions comparison only catches AEVT loss
-  on entities that are sampled.
+* **AEVT damage, beyond the fixed control idents.** An entity missing from
+  AEVT is never in the population, so it is never sampled. The fixed control
+  idents are probed regardless, and the both-directions comparison catches
+  AEVT loss on any entity that is sampled; nothing else.
 * **Partial within-entity loss.** Only `:entity-type` is compared. An EAVT
   range that lost some of an entity's facts but kept `:entity-type` passes.
 * **Light damage** can escape the sample (see Detection power). Random
