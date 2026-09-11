@@ -472,6 +472,39 @@ def _another_process_can_open(path):
     return proc.returncode == 0
 
 
+def _forbid_blocking_sleep_on_event_loop(monkeypatch):
+    """Fail any ``time.sleep`` made while an asyncio event loop is running on
+    the calling thread; let every other call through to the real sleep.
+
+    This is #99's guarantee stated exactly: a blocking sleep must never freeze
+    the loop. Patching ``mcp_server.time.sleep`` patches the ``time`` module
+    itself, so a guard that fires unconditionally fires process-wide -- on
+    worker threads that sleep by design (``_open_index_writer_safe``,
+    fact_index's SQLite retry), and on the test thread after ``asyncio.run``
+    has returned, where ``_hold_lock_subprocess``'s cleanup reaps the holder
+    child with ``Popen.wait(timeout=...)``, a ``time.sleep`` polling loop on
+    POSIX. That last one is what flaked (#334): under load the child has
+    released the lock but not yet exited when the ``with`` block ends.
+
+    ``asyncio.get_running_loop()`` answers the right question because the
+    running loop is thread-local: it succeeds only on the loop's own thread and
+    only while the loop runs. Comparing ``threading.get_ident()`` would not --
+    the loop and that cleanup share the main thread.
+    """
+    real_sleep = time.sleep
+
+    def guarded_sleep(delay):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return real_sleep(delay)
+        raise AssertionError(
+            "time.sleep() must not be called on the event-loop retry path (see #99)"
+        )
+
+    monkeypatch.setattr(time, "sleep", guarded_sleep)
+
+
 class TestAnotherProcessCanOpenIsHonest:
     """Positive control for _another_process_can_open itself.
 
@@ -498,6 +531,64 @@ class TestAnotherProcessCanOpenIsHonest:
 
         assert mcp_server._lease_manager.lease_count == 0
         assert _another_process_can_open(graph) is True
+
+
+class TestForbidBlockingSleepOnEventLoopIsHonest:
+    """Positive control for _forbid_blocking_sleep_on_event_loop (#334).
+
+    The #99 regression tests rest on this guard, so it must be shown to fire
+    where #99 forbids a blocking sleep AND to stay quiet everywhere else. The
+    process-wide tripwire it replaced got the second half wrong: patching
+    ``mcp_server.time.sleep`` patches the ``time`` module itself, so it also
+    fired inside ``subprocess.Popen.wait(timeout=...)``, which CPython
+    implements on POSIX as a ``time.sleep`` polling loop. That is exactly the
+    cleanup ``_hold_lock_subprocess`` runs on the test thread when the holder
+    child has released the lock but not yet exited.
+    """
+
+    def test_fires_on_a_running_event_loop(self, monkeypatch):
+        _forbid_blocking_sleep_on_event_loop(monkeypatch)
+
+        async def blocks_the_loop():
+            time.sleep(0)
+
+        with pytest.raises(AssertionError, match="#99"):
+            asyncio.run(blocks_the_loop())
+
+    def test_lets_a_worker_thread_sleep_while_the_loop_runs(self, monkeypatch):
+        # _open_index_writer_safe and fact_index's SQLite retry both sleep on
+        # worker threads by design; #99 says nothing about them.
+        _forbid_blocking_sleep_on_event_loop(monkeypatch)
+
+        async def sleeps_off_the_loop():
+            await asyncio.to_thread(time.sleep, 0.001)
+
+        asyncio.run(sleeps_off_the_loop())
+
+    def test_lets_subprocess_cleanup_poll_on_the_test_thread(self, monkeypatch):
+        # The mechanism #334 actually hit. The child outlives the parent's
+        # first WNOHANG check by construction (interpreter startup alone is
+        # longer than that check), so wait(timeout=...) must poll.
+        child = [sys.executable, "-c", "import time; time.sleep(0.3)"]
+
+        # First half: the process-wide tripwire DOES fire in this exact
+        # scenario. Without this, a CPython that stopped polling with
+        # time.sleep would leave the second half passing for no reason.
+        proc = _subprocess.Popen(child)
+        try:
+            with monkeypatch.context() as m:
+                def process_wide_tripwire(_delay):
+                    raise AssertionError("process-wide tripwire fired")
+                m.setattr(time, "sleep", process_wide_tripwire)
+                with pytest.raises(AssertionError, match="process-wide tripwire"):
+                    proc.wait(timeout=5)
+        finally:
+            proc.wait(timeout=5)
+
+        # Second half: the narrowed guard does not.
+        _forbid_blocking_sleep_on_event_loop(monkeypatch)
+        proc = _subprocess.Popen(child)
+        assert proc.wait(timeout=5) == 0
 
 
 class TestGetDbLockRetry:
@@ -3693,27 +3784,51 @@ class TestMcpToolWiring:
         Uses a real subprocess (_hold_lock_subprocess, see TestGetDbLockRetry)
         to manufacture genuine cross-process lock contention rather than
         mocking MiniGrafDb.open, since this test specifically exercises the
-        real lock-retry backoff path (db_lease_async), not general dispatch."""
+        real lock-retry backoff path (db_lease_async), not general dispatch.
+
+        The hold has to outlast minigraf's OWN lock wait, or the backoff this
+        test exists for never runs (#334). Since 2.0.0, ``MiniGrafDb.open``
+        retries ``try_lock`` 10 times at 5 -> 50 ms before raising (~375 ms,
+        ``src/storage/backend/file.rs``), so the 0.1 s hold this test used to
+        use cleared inside the first ``try_acquire`` and the test passed with a
+        blocking ``time.sleep`` reintroduced into db_lease_async. 1.0 s fails
+        the first attempt with margin and still clears well inside
+        db_lease_async's ~2.6 s tolerance; ``refused`` re-proves that every run.
+        """
         import asyncio
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
         mcp_server._reset_db_state()
         mcp_server.open_db(graph_path)
 
-        def fail_if_called(_delay):
-            raise AssertionError("time.sleep() must not be called on the event-loop retry path (see #99)")
-        monkeypatch.setattr(mcp_server.time, "sleep", fail_if_called)
+        real_try_acquire = mcp_server._DbLeaseManager.try_acquire
+        refused = []
+
+        def counting_try_acquire(self, *args, **kwargs):
+            handle = real_try_acquire(self, *args, **kwargs)
+            if handle is None:
+                refused.append(1)
+            return handle
+        # The class, not the singleton -- see #272.
+        monkeypatch.setattr(mcp_server._DbLeaseManager, "try_acquire", counting_try_acquire)
+
+        _forbid_blocking_sleep_on_event_loop(monkeypatch)
 
         # Real backoff (not mocked) — the subprocess needs genuine wall-clock
         # time to hold the lock and then exit before a later retry attempt
         # observes it free again.
-        with _hold_lock_subprocess(graph_path, hold_seconds=0.1):
+        with _hold_lock_subprocess(graph_path, hold_seconds=1.0):
             result = asyncio.run(mcp_server.call_tool(
                 "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
             ))
 
         data = json.loads(result[0].text)
         assert data["ok"] is True
+        assert refused, (
+            "the first lease attempt succeeded, so db_lease_async's backoff never "
+            "ran and this test proved nothing -- the hold no longer outlasts "
+            "minigraf's internal lock wait"
+        )
 
 
 class TestParseValidAtHint:
@@ -15698,9 +15813,7 @@ class TestRunIngestion:
             "current_commit": "", "error": None,
         }
 
-        def fail_if_called(_delay):
-            raise AssertionError("time.sleep() must not be called on the event-loop retry path (see #99)")
-        monkeypatch.setattr(mcp_server.time, "sleep", fail_if_called)
+        _forbid_blocking_sleep_on_event_loop(monkeypatch)
 
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
