@@ -28880,6 +28880,44 @@ class TestCorrectionSweepNextReasons:
             real_db, self.LIN, self.META,
         ) == self._next(real_db).selected
 
+    def test_reason_literals_match_ingest_progress_vocabulary(self):
+        """(#222 phase 4 fix wave, item 2b) Nothing else couples the reason
+        strings _correction_sweep_next actually returns to
+        ingest_progress.SWEEP_STATE_FOR_REASON's keys: each test above pins
+        ONE reason via an end-to-end seeded call, and
+        TestSweep.test_reason_table_covers_every_decline_reason
+        (tests/test_ingest_progress.py) only pins the literal
+        SWEEP_STATE_FOR_REASON dict against itself. Neither reddens if a
+        seventh `_SweepNext(None, "new-reason", ...)` is added to
+        _correction_sweep_next without updating the other side.
+
+        Extracted with ast over just this function's source, not a regex
+        over the whole file, so a same-spelled string appearing elsewhere in
+        mcp_server.py (e.g. in a comment or an unrelated call) can't be
+        mistaken for one of _SweepNext's own reason arguments.
+        """
+        import ast
+        import inspect
+        import mcp_server
+        import ingest_progress
+
+        source = inspect.getsource(mcp_server._correction_sweep_next)
+        tree = ast.parse(source)
+
+        reasons = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_SweepNext"
+                and len(node.args) > 1
+                and isinstance(node.args[1], ast.Constant)
+            ):
+                reasons.add(node.args[1].value)
+
+        assert reasons, "found no _SweepNext(...) reason literals -- ast walk broken?"
+        assert reasons == set(ingest_progress.SWEEP_STATE_FOR_REASON) | {"selected"}
+
 
 # ---------------------------------------------------------------------------
 # #222 phase 4: status observability, end to end (real backend, real git)

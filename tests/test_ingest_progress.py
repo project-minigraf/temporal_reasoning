@@ -176,10 +176,44 @@ class TestSweep:
         m.sweep_ended(outcome)
         assert m.snapshot()["streams"]["sweep"]["state"] == outcome
 
-    def test_unknown_sweep_outcome_is_rejected(self):
+    def test_a_stopped_call_does_not_overwrite_an_already_aborted_sweep(self):
+        """(#222 phase 4 fix wave, item 4) _run_ingestion's Stage B calls
+        sweep_ended("aborted") on a step failure and breaks out of its loop;
+        the post-loop shutdown check then calls sweep_ended("stopped")
+        UNCONDITIONALLY. Without a guard the second call clobbers the more
+        specific "aborted" outcome."""
         m, _ = _model()
-        with pytest.raises(ValueError):
-            m.sweep_ended("finished")
+        m.sweep_planned("selected", 5, 5, 9)
+        m.sweep_ended("aborted")
+        m.sweep_ended("stopped")
+        assert m.snapshot()["streams"]["sweep"]["state"] == "aborted"
+
+    def test_stopped_still_applies_when_nothing_was_aborted(self):
+        m, _ = _model()
+        m.sweep_planned("selected", 5, 5, 9)
+        m.sweep_ended("stopped")
+        assert m.snapshot()["streams"]["sweep"]["state"] == "stopped"
+
+    def test_unrecognized_sweep_plan_reason_degrades_to_blocked_not_raise(self):
+        """(#222 phase 4 fix wave, item 2a) sweep_planned/sweep_ended are
+        called from Stage B of _run_ingestion OUTSIDE its per-step
+        try/except, so a raise on an unrecognized reason would reach the
+        run-level handler and end a real run as status: error -- the same
+        reason retired() does not raise on its own fixed vocabulary. An
+        unknown reason must degrade instead: state "blocked", with the raw
+        reason string surfaced as blocked_reason so it is still reported,
+        just oddly."""
+        m, _ = _model()
+        m.sweep_planned("mystery-reason", None, None, None)
+        sw = m.snapshot()["streams"]["sweep"]
+        assert (sw["state"], sw["blocked_reason"]) == ("blocked", "mystery-reason")
+
+    def test_unrecognized_sweep_outcome_degrades_to_blocked_not_raise(self):
+        m, _ = _model()
+        m.sweep_planned("selected", 5, 5, 9)
+        m.sweep_ended("finished")
+        sw = m.snapshot()["streams"]["sweep"]
+        assert (sw["state"], sw["blocked_reason"]) == ("blocked", "finished")
 
 
 class TestLineage:

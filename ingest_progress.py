@@ -180,7 +180,16 @@ class RunProgress:
                 self._sweep_lo = region_lo
             return
         if reason not in SWEEP_STATE_FOR_REASON:
-            raise ValueError(f"unknown sweep reason {reason!r}")
+            # Degrade, never raise (#222 phase 4 fix wave, item 2a): this is
+            # called from Stage B of _run_ingestion OUTSIDE its per-step
+            # try/except, so a raise here would reach the run-level handler
+            # and end a real ingestion run as status: error over a status
+            # model's own vocabulary gap -- the same reason retired() does
+            # not raise on its fixed stream/outcome vocabulary either. An
+            # unrecognized reason is reported oddly (state "blocked", with
+            # the raw reason string as blocked_reason) rather than fatally.
+            self._sweep_state, self._sweep_blocked = "blocked", reason
+            return
         self._sweep_state, self._sweep_blocked = SWEEP_STATE_FOR_REASON[reason]
         if self._sweep_state == "done":
             self._to_sweep = 0
@@ -192,10 +201,21 @@ class RunProgress:
 
     def sweep_ended(self, outcome: str) -> None:
         if outcome in _SWEEP_END_STATES:
+            # (#222 phase 4 fix wave, item 4): the post-loop shutdown check
+            # in _run_ingestion's Stage B calls sweep_ended("stopped")
+            # unconditionally, even when a step already aborted and broke
+            # out of the loop first. An abort is the more specific, more
+            # informative outcome -- do not let a shutdown flag that merely
+            # happened to also be set overwrite it.
+            if outcome == "stopped" and self._sweep_state == "aborted":
+                return
             self._sweep_state = outcome
             return
         if outcome not in SWEEP_STATE_FOR_REASON:
-            raise ValueError(f"unknown sweep outcome {outcome!r}")
+            # Degrade, never raise -- see the matching comment in
+            # sweep_planned for why (#222 phase 4 fix wave, item 2a).
+            self._sweep_state, self._sweep_blocked = "blocked", outcome
+            return
         self._sweep_state, self._sweep_blocked = SWEEP_STATE_FOR_REASON[outcome]
 
     def folded(self) -> None:
@@ -242,6 +262,11 @@ class RunProgress:
                 "last_at": s.last_at,
             }
             if tag == "rev":
+                # "skipped" is exposed only under the reverse stream here,
+                # while this_run.skipped below sums both streams -- because
+                # mcp_server._skip_claim returns False for any tag other
+                # than "rev", so a forward skip cannot occur today. If that
+                # ever changes, this branch needs widening to match.
                 d["skipped"] = s.skipped
             streams[_STREAM_NAMES[tag]] = d
         streams["sweep"] = {

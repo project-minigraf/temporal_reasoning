@@ -334,9 +334,13 @@ minigraf_ingest_status()
 `status` is one of: `idle`, `starting`, `running`, `complete`, `error`, `stopped`, `skipped`.
 `starting` means a background ingestion task has been created (auto-started at
 server boot, or via `minigraf_ingest_git`) but hasn't finished its preload phase
-(re-scanning already-known entities/dependencies) yet, so `this_run`/`total`
-aren't populated — a subsequent `minigraf_ingest_git` call will still be
-rejected with "already in progress" during this window, same as `running`.
+(re-scanning already-known entities/dependencies) yet, so `total` isn't
+populated — a subsequent `minigraf_ingest_git` call will still be rejected
+with "already in progress" during this window, same as `running`. `this_run`
+appears once the run's frontier is loaded, which can lag `status: running`:
+`total` is set as soon as the walk starts, so a `status: running,
+phase: converging` window with `total` set but no `this_run` yet (the rest of
+preload) is normal, not a bug.
 `stopped` means a graceful shutdown (session end) paused ingestion between commits —
 not a failure; the next `minigraf_ingest_git` call (or server auto-start)
 resumes from the watermark — and from `:ingestion/correction-sweep-through` for
