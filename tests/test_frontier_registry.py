@@ -451,3 +451,27 @@ class TestCoalesceIntervalsModuleLevel:
             "the merging claim must still report what it swallowed, or "
             "_reverse_claim_persist_target has nothing to retract"
         )
+
+
+class TestUnclaimedCount:
+    """#222 phase 4: RunProgress's `to_retire` is the gap AT LOAD, so the
+    allocator must say how many positions it will hand out -- counted over
+    every hole, not gap_hi - gap_lo, which overcounts a fragmented gap."""
+
+    def test_empty_allocator_counts_every_position(self):
+        from frontier_registry import FrontierAllocator
+        assert FrontierAllocator(7).unclaimed_count() == 7
+
+    def test_counts_every_hole_of_a_fragmented_gap(self):
+        from frontier_registry import FrontierAllocator, Interval, TAG_AUTHORITATIVE, TAG_PROVISIONAL
+        a = FrontierAllocator(10, [
+            Interval(0, 2, TAG_AUTHORITATIVE),
+            Interval(5, 5, TAG_PROVISIONAL, anchor_pos=5, is_base=True),
+            Interval(8, 8, TAG_PROVISIONAL, anchor_pos=8),
+        ])
+        # holes: 3-4, 6-7, 9 -> 5 positions; gap_hi - gap_lo + 1 would say 7
+        assert a.unclaimed_count() == 5
+
+    def test_zero_once_every_position_is_claimed(self):
+        from frontier_registry import FrontierAllocator, Interval, TAG_AUTHORITATIVE
+        assert FrontierAllocator(4, [Interval(0, 3, TAG_AUTHORITATIVE)]).unclaimed_count() == 0

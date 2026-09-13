@@ -31,13 +31,14 @@ import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from minigraf import MiniGrafDb, MiniGrafError
 import fact_index
 import frontier_registry
+import ingest_progress
 
 # ---------------------------------------------------------------------------
 # Session-scoped rules — registered once at startup, cached in RuleRegistry
@@ -168,16 +169,9 @@ except ValueError:
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
-    "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+    "status": "idle", "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     "phase": None,
-    # #326. Deliberately NOT named "skipped": _ingest_progress["status"] already
-    # takes the value "skipped" (the whole run declined because another process
-    # owns the graph) and stderr_capture already reports skipped_commits (gated
-    # by run_ingestion_benchmark._exit_code; commits dropped for extraction OR
-    # write failure -- _SKIPPED_COMMIT_RE matches both log lines). A third bare
-    # "skipped" reads as one of those two on sight.
-    "positions_skipped": 0,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -12224,6 +12218,94 @@ def _correction_sweep_through_update(
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
 
 
+class _SweepNext(NamedTuple):
+    """_correction_sweep_next's answer: the next commit to sweep, or why
+    there is none. `reason` is "selected" or one of
+    ingest_progress.SWEEP_STATE_FOR_REASON's keys. The positions are filled
+    wherever the function got far enough to know them, so a caller can plan
+    `to_sweep` (ceiling - start + 1) from the same call that selects."""
+    selected: Optional[Tuple[str, str]]
+    reason: str
+    region_lo: Optional[int] = None
+    start_pos: Optional[int] = None
+    ceiling_pos: Optional[int] = None
+
+
+def _correction_sweep_next(
+    db: Any,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    hash_to_pos: Optional[Dict[str, int]] = None,
+    fragmented: Optional[bool] = None,
+) -> _SweepNext:
+    """_correction_sweep_select_position's body, returning WHY as well as
+    WHAT (#222 phase 4). Every gate, and the order of the gates, is
+    unchanged -- see _correction_sweep_select_position's docstring for what
+    each one guards."""
+    low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
+    high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
+    if high_bounds is None:
+        return _SweepNext(None, "no-frontier-high")  # Stream 2 hasn't claimed anything -- nothing to correct
+
+    if hash_to_pos is None:
+        hash_to_pos = {h: i for i, h in enumerate(linearization)}
+
+    if high_bounds[0] not in hash_to_pos:
+        return _SweepNext(None, "stale-bound")  # a boundary hash is stale (rewritten history); nothing safe to do
+
+    region_lo = hash_to_pos[high_bounds[0]]
+
+    if low_bounds is None:
+        # An ABSENT frontier-low means an EMPTY low region, not an unknown
+        # one, so its highest claimed position is -1 -- exactly how
+        # FrontierAllocator.gap_lo treats "no interval covers position 0".
+        # A fresh graph seeds neither side, and frontier-low is only created
+        # once the forward stream persists its first claim, so reading
+        # absent as "nothing safe to do" would strand every entity
+        # provisional forever whenever Stream 2 claims the whole history
+        # before Stream 1 claims anything -- reachable in 2d, where the
+        # forward stream does a large preload before its first claim.
+        low_hi_pos = -1
+    else:
+        if low_bounds[1] not in hash_to_pos:
+            return _SweepNext(None, "stale-bound", region_lo)  # a boundary hash is stale (rewritten history)
+        low_hi_pos = hash_to_pos[low_bounds[1]]
+
+    if low_hi_pos + 1 != region_lo:
+        return _SweepNext(None, "gap-open", region_lo)  # gap still open -- Stream 2 may still descend past a position
+                                                          # this sweep would otherwise confirm
+
+    if fragmented if fragmented is not None else _intervals_read_extra(db):
+        return _SweepNext(None, "fragmented", region_lo)  # #325: a hole remains above frontier-high, so Stream 2 can
+                                                            # still descend past a position this sweep would confirm.
+                                                            # Once everything coalesces there is exactly one provisional
+                                                            # interval and the gap-closed test above is exact again.
+
+    if high_bounds[1] not in hash_to_pos:
+        return _SweepNext(None, "stale-bound", region_lo)  # frontier-high's :hi-hash is stale; nothing safe to do
+    ceiling_pos = hash_to_pos[high_bounds[1]]
+
+    through_hash = _correction_sweep_through_query(db)
+    if through_hash is not None and through_hash in hash_to_pos:
+        pos = hash_to_pos[through_hash] + 1
+    else:
+        # Unset (first-ever call), or a stale hash from rewritten/rebased
+        # history -- (re)start from frontier-high's current lo-hash,
+        # mirroring _frontier_load's own precedent of dropping a bound
+        # that no longer resolves rather than erroring.
+        pos = region_lo  # already validated above
+
+    if pos > ceiling_pos:
+        return _SweepNext(None, "reached-ceiling", region_lo, pos, ceiling_pos)  # reached frontier-high's own :hi-hash; nothing left to correct
+
+    if len(commit_metadata) != len(linearization) or commit_metadata[pos][0] != linearization[pos]:
+        return _SweepNext(None, "metadata-mismatch", region_lo, pos, ceiling_pos)  # commit_metadata violates its stated contract -- nothing safe to
+                                                                                     # do, rather than an IndexError or a wrong-commit read
+
+    commit_hash, commit_ts_iso, _author, _subject = commit_metadata[pos]
+    return _SweepNext((commit_hash, commit_ts_iso), "selected", region_lo, pos, ceiling_pos)
+
+
 def _correction_sweep_select_position(
     db: Any,
     linearization: List[str],
@@ -12263,66 +12345,9 @@ def _correction_sweep_select_position(
     caller that cannot prove the no-mid-loop-mutation invariant for its own
     situation) gets the always-correct, always-fresh read.
     """
-    low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
-    high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
-    if high_bounds is None:
-        return None  # Stream 2 hasn't claimed anything -- nothing to correct
-
-    if hash_to_pos is None:
-        hash_to_pos = {h: i for i, h in enumerate(linearization)}
-
-    if high_bounds[0] not in hash_to_pos:
-        return None  # a boundary hash is stale (rewritten history); nothing safe to do
-
-    if low_bounds is None:
-        # An ABSENT frontier-low means an EMPTY low region, not an unknown
-        # one, so its highest claimed position is -1 -- exactly how
-        # FrontierAllocator.gap_lo treats "no interval covers position 0".
-        # A fresh graph seeds neither side, and frontier-low is only created
-        # once the forward stream persists its first claim, so reading
-        # absent as "nothing safe to do" would strand every entity
-        # provisional forever whenever Stream 2 claims the whole history
-        # before Stream 1 claims anything -- reachable in 2d, where the
-        # forward stream does a large preload before its first claim.
-        low_hi_pos = -1
-    else:
-        if low_bounds[1] not in hash_to_pos:
-            return None  # a boundary hash is stale (rewritten history)
-        low_hi_pos = hash_to_pos[low_bounds[1]]
-
-    if low_hi_pos + 1 != hash_to_pos[high_bounds[0]]:
-        return None  # gap still open -- Stream 2 may still descend past a position
-                     # this sweep would otherwise confirm
-
-    if fragmented if fragmented is not None else _intervals_read_extra(db):
-        return None  # #325: a hole remains above frontier-high, so Stream 2 can
-                     # still descend past a position this sweep would confirm.
-                     # Once everything coalesces there is exactly one provisional
-                     # interval and the gap-closed test above is exact again.
-
-    if high_bounds[1] not in hash_to_pos:
-        return None  # frontier-high's :hi-hash is stale; nothing safe to do
-    ceiling_pos = hash_to_pos[high_bounds[1]]
-
-    through_hash = _correction_sweep_through_query(db)
-    if through_hash is not None and through_hash in hash_to_pos:
-        pos = hash_to_pos[through_hash] + 1
-    else:
-        # Unset (first-ever call), or a stale hash from rewritten/rebased
-        # history -- (re)start from frontier-high's current lo-hash,
-        # mirroring _frontier_load's own precedent of dropping a bound
-        # that no longer resolves rather than erroring.
-        pos = hash_to_pos[high_bounds[0]]  # already validated above
-
-    if pos > ceiling_pos:
-        return None  # reached frontier-high's own :hi-hash; nothing left to correct
-
-    if len(commit_metadata) != len(linearization) or commit_metadata[pos][0] != linearization[pos]:
-        return None  # commit_metadata violates its stated contract -- nothing safe to
-                     # do, rather than an IndexError or a wrong-commit read
-
-    commit_hash, commit_ts_iso, _author, _subject = commit_metadata[pos]
-    return commit_hash, commit_ts_iso
+    return _correction_sweep_next(
+        db, linearization, commit_metadata, hash_to_pos, fragmented,
+    ).selected
 
 
 def _correction_sweep_apply(
@@ -12923,6 +12948,38 @@ class _ForwardWalkState:
     entity_introduced_by: Dict[str, str] = field(default_factory=dict)
 
 
+def _build_run_progress(
+    linearization: List[str],
+    allocator: "frontier_registry.FrontierAllocator",
+    lct_hash: Optional[str],
+    sweep_through_hash: Optional[str],
+) -> "ingest_progress.RunProgress":
+    """#222 phase 4: the run's progress model, from the frontier AS LOADED.
+
+    `to_retire` is the allocator's gap at load -- every position this run
+    will claim, each retired at most once. The two watermarks are mapped
+    into this run's position space: an unset lineage watermark is -1
+    (nothing confirmed), one whose hash no longer resolves is None (reported
+    as null, never guessed). The sweep watermark only counts when it falls
+    inside the base provisional interval, the region the sweep confirms.
+    """
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    lineage_pos: Optional[int] = -1 if lct_hash is None else hash_to_pos.get(lct_hash)
+    base = next(
+        (iv for iv in allocator.intervals()
+         if iv.tag == frontier_registry.TAG_PROVISIONAL and iv.is_base),
+        None,
+    )
+    sweep_lo = sweep_through = None
+    if base is not None and sweep_through_hash is not None:
+        p = hash_to_pos.get(sweep_through_hash)
+        if p is not None and base.lo_pos <= p <= base.hi_pos:
+            sweep_lo, sweep_through = base.lo_pos, p
+    return ingest_progress.RunProgress(
+        linearization, allocator.unclaimed_count(), lineage_pos, sweep_lo, sweep_through,
+    )
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 
@@ -12960,6 +13017,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # clean check. Here rather than in the _ingest_progress initializers:
     # tests and the at-scale harness call _run_ingestion with their own dicts.
     _ingest_progress["index_cross_check"] = None
+    # #222 phase 4: this run's progress model. None until it is built from
+    # the loaded frontier below, for the same reason as index_cross_check: a
+    # run refused or failing before that point must never show a previous
+    # run's numbers. It lives in the dict, not a module global, so every
+    # site that resets _ingest_progress by assignment clears it too.
+    _ingest_progress["_run"] = None
     # Bound BEFORE the try so the outermost finally can shut it down no matter
     # where a failure lands, including the two awaited calls
     # (_open_index_writer_safe, _frontier_load) that sit above the inner try
@@ -13068,11 +13131,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _ingest_progress["total"] = repo_total
         _ingest_progress["status"] = "running"
         _ingest_progress["phase"] = "converging"
-        _ingest_progress["processed"] = prior_ingested
         _ingest_progress["prior_ingested"] = prior_ingested
-        _ingest_progress["positions_skipped"] = 0   # #326: per-run, like prior_ingested
-
-        last_hash = watermark or ""
 
         env_workers = os.environ.get("MINIGRAF_INGEST_WORKERS")
         # CPU-bound-appropriate default: one worker per core, not the
@@ -13147,6 +13206,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             completed_regions = await loop.run_in_executor(
                 write_executor, _completed_regions_load, db, linearization, allocator, index_con,
             )
+            lct_hash = await loop.run_in_executor(
+                write_executor, _lineage_confirmed_through_query, db,
+            )
+            sweep_through_hash = await loop.run_in_executor(
+                write_executor, _correction_sweep_through_query, db,
+            )
+        run_progress = _build_run_progress(
+            linearization, allocator, lct_hash, sweep_through_hash,
+        )
+        _ingest_progress["_run"] = run_progress
         claimer = _RoundRobinClaimer(
             allocator, *_parse_stream_ratio(os.environ.get("MINIGRAF_INGEST_STREAM_RATIO"))
         )
@@ -13186,18 +13255,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # differ on exactly the case that matters. `highest_rev_pos`
                 # was updated for every rev claim BEFORE the skip test, so it
                 # includes positions that were claimed, walked, and whose
-                # write FAILED -- the per-commit `except` does
-                # `processed += 1` and persists no claim, and `completed_all`
-                # stays True. _frontier_persist_span moves :hi-hash UP (while
-                # _frontier_persist_claim never does for the high interval),
-                # so passing highest_rev_pos would raise the persisted top
-                # bound over those failed positions. Once :hi-hash reaches the
-                # tip the interval is REPRESENTABLE, so the next
-                # _frontier_load retains it instead of discarding it, and
-                # those positions are never re-walked: permanent silent loss.
-                # The skipped span is the only thing this flush is entitled to
-                # assert; positions above it either persisted their own claim
-                # or legitimately did not.
+                # write FAILED -- the per-commit `except` retires the
+                # position as failed and persists no claim, and
+                # `completed_all` stays True. _frontier_persist_span moves
+                # :hi-hash UP (while _frontier_persist_claim never does for
+                # the high interval), so passing highest_rev_pos would raise
+                # the persisted top bound over those failed positions. Once
+                # :hi-hash reaches the tip the interval is REPRESENTABLE, so
+                # the next _frontier_load retains it instead of discarding
+                # it, and those positions are never re-walked: permanent
+                # silent loss. The skipped span is the only thing this flush
+                # is entitled to assert; positions above it either persisted
+                # their own claim or legitimately did not.
                 #
                 # #325: keyed by target ident, not a run-global pair. A skipped
                 # claim still came out of the allocator, so it still extended
@@ -13421,14 +13490,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             break
                         lo, hi = skipped_span.get(target_ident, (pos, pos))
                         skipped_span[target_ident] = (min(lo, pos), max(hi, pos))
-                        _ingest_progress["positions_skipped"] += 1
-                        # `processed` keeps its meaning -- positions retired by
-                        # the walk -- which is what #317's commit_census reads
-                        # as walk_claimed. Excluding skips would silently
-                        # redefine the number that gate compares against
-                        # git rev-list, turning a clean skip-heavy resume into
-                        # a reported lost commit.
-                        _ingest_progress["processed"] += 1
+                        # A skipped position is still RETIRED (RunProgress
+                        # "skipped"), which is what #317's commit_census reads
+                        # through walk_claimed_from_progress -- excluding it
+                        # would redefine walk_claimed.
+                        run_progress.retired(tag, "skipped", pos)
                     claim_ident, absorbed_idents = target_ident, absorbed
                     fut = loop.run_in_executor(
                         executor, _extract_commit, repo_path, linearization[pos], ignore_patterns
@@ -13436,6 +13502,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     pending.append((tag, pos, fut, claim_ident, absorbed_idents))
                     return True
 
+                run_progress.stage_a_started()
                 for _ in range(pipeline_depth):
                     if not submit_next():
                         break
@@ -13480,7 +13547,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         _note_incomplete_rev(tag, pos, claim_ident)
                         submit_next()
                         _ingest_progress["current_commit"] = commit_hash
-                        _ingest_progress["processed"] += 1
+                        run_progress.retired(tag, "failed", pos)
                         await asyncio.sleep(0)  # yield to event loop
                         continue
                     # #260 M1: read BEFORE submit_next(), not after -- await_s
@@ -13494,7 +13561,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     _trace_await_s = time.perf_counter() - _trace_t_await
                     submit_next()
 
-                    last_hash = commit_hash
                     _ingest_progress["current_commit"] = commit_hash
 
                     # A lease, not a manual acquire/release pair. The old code
@@ -13607,8 +13673,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             extracted_files,
                             _ingest_checkpoint_policy,
                         )
-                    _ingest_progress["processed"] += 1
+                    run_progress.retired(tag, "written" if _trace_write_ok else "failed", pos)
                     await asyncio.sleep(0)  # yield to event loop
+
+                run_progress.stage_a_finished(completed_all)
 
                 # #326: the walk may have ended with the gap empty while still
                 # inside a run of skips, which nothing below persisted. Not
@@ -13843,15 +13911,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         sweep_fragmented = bool(await loop.run_in_executor(
                             write_executor, _intervals_read_extra, db,
                         ))
+                        # #222 phase 4: the first call both PLANS the sweep
+                        # (to_sweep, or why it declines) and is the loop's
+                        # first iteration, so planning costs no query.
+                        nxt = await loop.run_in_executor(
+                            write_executor, _correction_sweep_next,
+                            db, linearization, commit_metadata, hash_to_pos,
+                            sweep_fragmented,
+                        )
+                        run_progress.sweep_planned(
+                            nxt.reason, nxt.region_lo, nxt.start_pos, nxt.ceiling_pos,
+                        )
                         while not _shutdown_requested.is_set():
-                            selected = await loop.run_in_executor(
-                                write_executor, _correction_sweep_select_position,
-                                db, linearization, commit_metadata, hash_to_pos,
-                                sweep_fragmented,
-                            )
-                            if selected is None:
+                            if nxt.selected is None:
+                                run_progress.sweep_ended(nxt.reason)
                                 break
-                            sweep_hash, sweep_ts = selected
+                            sweep_hash, sweep_ts = nxt.selected
                             try:
                                 sweep_extracted = await loop.run_in_executor(
                                     executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
@@ -13888,6 +13963,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     write_executor, _correction_sweep_through_update,
                                     db, sweep_hash, sweep_ts, index_con,
                                 )
+                                run_progress.swept(hash_to_pos[sweep_hash])
                                 await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
                             except concurrent.futures.process.BrokenProcessPool:
                                 raise
@@ -13923,10 +13999,17 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 # lost by dropping the traceback.
                                 e.__traceback__ = None
                                 completed_all = False
+                                run_progress.sweep_ended("aborted")
                                 break
                             await asyncio.sleep(0)  # yield to event loop
+                            nxt = await loop.run_in_executor(
+                                write_executor, _correction_sweep_next,
+                                db, linearization, commit_metadata, hash_to_pos,
+                                sweep_fragmented,
+                            )
                         if _shutdown_requested.is_set():
                             completed_all = False
+                            run_progress.sweep_ended("stopped")
                         _correction_sweep_log_summary(skipped)
                         # DB-bound like everything else here, so it runs on
                         # write_executor rather than inline on the event loop.
@@ -13938,6 +14021,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 write_executor, _lineage_confirmed_through_update,
                                 db, linearization[-1], commit_metadata[-1][1], index_con,
                             )
+                            run_progress.folded()
                             await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
 
                 # Call _ingest_tags and _last_run_write before closing index_con
@@ -13946,8 +14030,20 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
                     async with db_lease_async() as db:
                         await loop.run_in_executor(write_executor, _ingest_tags, db, repo_path, now, index_con)
+                        # #222 phase 4: the tip this run covered, never
+                        # whichever commit Stage A applied last -- on a
+                        # converging run that was the meeting point, on a
+                        # no-op run the forward watermark, on a no-commits run
+                        # the starting watermark. And the TRUE commit count,
+                        # never the seeded walk counter, which exceeds the repo
+                        # on any re-walk (28 of 20 measured).
+                        graph_commits = await loop.run_in_executor(
+                            write_executor, _count_commit_entities, db,
+                        )
+                        last_hash = linearization[-1] if linearization else (watermark or "")
                         await loop.run_in_executor(
-                            write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"], index_con
+                            write_executor, _last_run_write, db, last_hash, now,
+                            graph_commits, index_con,
                         )
                         # No checkpoint here: the unconditional final
                         # checkpoint in the outer finally below (#241)
@@ -13997,6 +14093,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 _ingest_progress["status"] = "complete"
             else:
                 _ingest_progress["status"] = "stopped"
+            run_progress.ended(_ingest_progress["status"])
         finally:
             # Publish realised checkpoint duty into _ingest_progress BEFORE
             # discarding the policy below -- its counters do not survive
@@ -14035,6 +14132,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _ingest_progress["error_at"] = _now_utc_ms()
+        if _ingest_progress.get("_run") is not None:
+            _ingest_progress["_run"].ended("error")
         # #270. Until this print, _ingest_progress was the ONLY record of
         # what killed the run: this handler swallows the exception and
         # returns normally, so a background run started through
@@ -14115,6 +14214,10 @@ async def handle_minigraf_ingest_git(
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "skipped"
         _ingest_progress["owner_pid"] = holder_pid
+        # A declined start must not echo the previous in-process run's
+        # this_run/streams/visibility/lineage numbers -- there is no run this
+        # time, so there is nothing to report them for.
+        _ingest_progress["_run"] = None
         return {
             "ok": False,
             "error": f"ingestion already owned by live process (pid {holder_pid})",
@@ -14135,9 +14238,9 @@ async def handle_minigraf_ingest_git(
             "error": f"Not a git repository (or git not found): {repo}",
         }
     _ingest_progress = {
-        "status": "starting", "processed": 0, "total": 0, "prior_ingested": 0,
+        "status": "starting", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-        "phase": None, "positions_skipped": 0,
+        "phase": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch or _default_git_branch(repo)))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
@@ -14145,18 +14248,15 @@ async def handle_minigraf_ingest_git(
 
 def handle_minigraf_ingest_status() -> Dict[str, Any]:
     """Return current ingestion progress, augmented with graph-backed last-run info."""
-    result: Dict[str, Any] = {"ok": True, **_ingest_progress}
-    # processed_this_run is derived in-memory (no extra DB query) so it stays
-    # accurate even mid-run, distinguishing "this attempt's progress" from the
-    # cumulative total in `processed` — see issue #85.
-    result["processed_this_run"] = (
-        _ingest_progress["processed"] - _ingest_progress.get("prior_ingested", 0)
-    )
-    # #326: a run whose positions_skipped_this_run climbs alongside
-    # processed_this_run is REPLAYING an already-ingested region, not making
-    # progress. #325's incident looked healthy for 98 minutes because
-    # `processed` advances on replayed positions and nothing else did.
-    result["positions_skipped_this_run"] = _ingest_progress.get("positions_skipped", 0)
+    # Keys starting with "_" are in-process objects (#222 phase 4's "_run"),
+    # never response fields -- call_tool json.dumps this dict.
+    result: Dict[str, Any] = {
+        "ok": True,
+        **{k: v for k, v in _ingest_progress.items() if not k.startswith("_")},
+    }
+    run = _ingest_progress.get("_run")
+    if run is not None:
+        result.update(run.snapshot())
     # Staleness: a terminal error/skipped state can outlive the condition
     # that caused it (e.g. the orphaned holder it names has since died) —
     # re-check liveness on every poll instead of echoing a dead PID forever.
@@ -14202,10 +14302,12 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
                 # mid-way (see issue #85).
                 n = _count_commit_entities(db)
                 result["total_ingested"] = n if n > 0 else None
+                result["lineage_confirmed_through"] = _lineage_confirmed_through_query(db)
         except Exception:
             result["last_run_at"] = None
             result["last_commit"] = None
             result["total_ingested"] = None
+            result["lineage_confirmed_through"] = None
     return result
 
 
@@ -14479,7 +14581,9 @@ _TOOLS: List[Tool] = [
             "Return the current git ingestion progress. status is one of: idle, "
             "starting, running, complete, error, stopped, skipped. starting means "
             "a background task exists but has not finished its preload phase, so "
-            "processed/total are not populated yet. stopped means a graceful "
+            "total is not populated yet. this_run appears once the run's "
+            "frontier is loaded, which can lag status: running, so a running "
+            "status can show total set with this_run still absent. stopped means a graceful "
             "shutdown paused ingestion between commits — not a failure; the next "
             "run resumes from the watermark. skipped means another live process "
             "already owns the graph (see owner_pid) — this server will not start "
@@ -14490,11 +14594,15 @@ _TOOLS: List[Tool] = [
             "by scraping a holder PID out of minigraf's lock-contention message, "
             "and minigraf 2.0.0 removed that PID from the text (#284) — but it "
             "does include error_at, the timestamp the failure occurred. "
-            "positions_skipped_this_run counts positions retired without "
-            "parsing or writing them because an earlier run had already "
-            "written them completely (#326); it climbing while the commit "
-            "count stays flat means the run is replaying an already-ingested "
-            "region."
+            "this_run reports this run's own work: to_retire (positions in "
+            "the gap at load) and retired (written + skipped + failed), which "
+            "never exceeds to_retire; this_run.skipped climbing while the "
+            "commit count stays flat means the run is replaying an "
+            "already-ingested region (#326). streams gives forward, reverse "
+            "and sweep state, counts and rate_per_min; sweep.blocked_reason "
+            "says why the confirmation pass declined. status=complete means "
+            "only that the run finished: ingestion is done when "
+            "visibility.complete and lineage.complete are both true."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
@@ -14609,9 +14717,9 @@ async def main() -> None:
     # asyncio task — never blocks the message loop.
     # Set MINIGRAF_NO_AUTO_INGEST=1 to skip auto-start (used by eval sandboxes).
     _ingest_progress = {
-        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+        "status": "idle", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-        "phase": None, "positions_skipped": 0,
+        "phase": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         # Proactive check-before-attempt: if another live process already

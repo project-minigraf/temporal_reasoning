@@ -891,7 +891,7 @@ async def _ingest_into(repo_path: str, branch: Optional[str], graph_path) -> Tup
     mcp_server._reset_db_state()
     mcp_server.open_db(str(graph_path))
     mcp_server._ingest_progress = {
-        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+        "status": "idle", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     }
     resolved_branch = branch or mcp_server._default_git_branch(repo_path)

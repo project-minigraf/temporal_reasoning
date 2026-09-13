@@ -54,10 +54,10 @@ def _repo(tmp_path, n, start=0):
 def _census(**overrides):
     """A clean 15-commit resume census, before overrides -- mirrors
     test_at_scale_commit_census.py's own `_clean` helper, extended with the
-    resume-specific fields (prior_ingested/processed_this_run) this probe
+    resume-specific fields (prior_ingested/retired_this_run) this probe
     adds on top of collect_commit_census's own dict. prior_ingested=12,
-    processed_this_run=3 is the split
-    test_prior_ingested_and_processed_this_run_attribute_correctly measures
+    retired_this_run=3 is the split
+    test_prior_ingested_and_retired_this_run_attribute_correctly measures
     for a real 12-then-3 resume."""
     kwargs = dict(
         ref="main", repo_commits=15, walk_claimed=15, graph_commit_entities=15,
@@ -66,8 +66,8 @@ def _census(**overrides):
         proved_nothing=False, ok=True,
         interpretation="repo, walk and graph agree at 15 commits.",
         census_error=None,
-        prior_ingested=12, processed_this_run=3, truncate_by=3,
-        positions_skipped_this_run=0, retention_engaged=True,
+        prior_ingested=12, retired_this_run=3, truncate_by=3,
+        skipped_this_run=0, retention_engaged=True,
     )
     kwargs.update(overrides)
     return kwargs
@@ -90,10 +90,11 @@ class TestResumeOk:
         nonzero walk_vs_graph with repo_vs_graph still 0 must NOT fail this
         probe's gate. The constructed numbers (walk_vs_graph=5,
         repo_vs_walk=-5) encode an OVER-count, not an undercount:
-        `_ingest_progress["processed"]` counts positions retired this run,
-        not commits written, and is seeded with `prior_ingested` at run
-        start, so a resume that retires an already-graphed position again
-        this run drives `walk_claimed` -- and walk_vs_graph -- POSITIVE
+        the run's `RunProgress.retired_count` counts positions retired this
+        run (written, skipped or failed), not commits written, and
+        `walk_claimed_from_progress` adds it to `prior_ingested`, so a resume
+        that retires an already-graphed position again this run drives
+        `walk_claimed` -- and walk_vs_graph -- POSITIVE
         (walk_claimed exceeds both graph_commit_entities and repo_commits,
         hence repo_vs_walk's negative sign here), while the graph itself
         stays complete. `collect_commit_census` gates walk_vs_graph BEFORE
@@ -119,7 +120,7 @@ class TestResumeOk:
         only thing standing between this and a green log."""
         census = _census(
             repo_commits=0, graph_commit_entities=0, repo_vs_graph=0,
-            prior_ingested=0, processed_this_run=0,
+            prior_ingested=0, retired_this_run=0,
             census_error="CalledProcessError: ...", proved_nothing=False, ok=False,
         )
         assert resume_ok(census) is False
@@ -167,28 +168,28 @@ class TestRetentionEngaged:
         the first pass and `prior_ingested` comes back as the full count,
         still > 0 -- see probe_resume_census.py's own retention_engaged
         docstring, corrected alongside this one. Isolated from the other
-        clause: processed_this_run stays well below repo_commits (3 < 15),
+        clause: retired_this_run stays well below repo_commits (3 < 15),
         so only `prior_ingested > 0` being False can be responsible for the
         result -- must read False rather than True by coincidence of the
         arithmetic."""
-        census = _census(prior_ingested=0, processed_this_run=3)
+        census = _census(prior_ingested=0, retired_this_run=3)
         assert retention_engaged(census) is False
 
     def test_a_full_rewalk_that_still_lands_clean_reads_false(self):
         """The exact regression this field exists to catch: pre-#325
         discard-on-tip-growth behaviour re-walks every position on the
-        "resume", so processed_this_run climbs to meet repo_commits even
+        "resume", so retired_this_run climbs to meet repo_commits even
         though the graph ends up complete either way. ok alone cannot tell
         this apart from the healthy case above -- both have repo_vs_graph ==
         0 -- which is exactly why this is a separate, rendered field."""
-        census = _census(processed_this_run=15)  # prior_ingested stays 12
+        census = _census(retired_this_run=15)  # prior_ingested stays 12
         assert retention_engaged(census) is False
 
-    def test_processed_this_run_exactly_matching_repo_commits_is_not_engaged(self):
+    def test_retired_this_run_exactly_matching_repo_commits_is_not_engaged(self):
         """Boundary case for the strict '<': a resume that reprocessed
         EXACTLY repo_commits positions re-walked everything, even if
         prior_ingested was nonzero (e.g. a duplicate-tolerant re-walk)."""
-        census = _census(prior_ingested=1, processed_this_run=15)
+        census = _census(prior_ingested=1, retired_this_run=15)
         assert retention_engaged(census) is False
 
 
@@ -218,14 +219,14 @@ class TestResumeCensus:
             "rather than reading as a pass"
         )
         assert result["retention_engaged"] is True, (
-            "prior_ingested=12 > 0 and processed_this_run=3 < repo_commits=15 "
+            "prior_ingested=12 > 0 and retired_this_run=3 < repo_commits=15 "
             "-- the resume genuinely skipped the already-ingested region "
             "rather than re-walking everything and coincidentally landing "
             "clean"
         )
 
     @pytest.mark.asyncio
-    async def test_prior_ingested_and_processed_this_run_attribute_correctly(
+    async def test_prior_ingested_and_retired_this_run_attribute_correctly(
         self, tmp_path, monkeypatch
     ):
         """The specific bug the controller ruling corrected in the brief's
@@ -242,7 +243,7 @@ class TestResumeCensus:
             str(repo), "main", str(tmp_path / "memory.graph"), truncate_by=3,
         )
         assert result["prior_ingested"] == 12
-        assert result["processed_this_run"] == 3
+        assert result["retired_this_run"] == 3
         assert result["walk_claimed"] == 15
 
     @pytest.mark.asyncio

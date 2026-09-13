@@ -21,8 +21,9 @@ at all is invisible to all of them:
 THREE NUMBERS, NOT ONE DELTA, so a mismatch says WHERE it happened:
 
   1. `repo_commits` -- `git rev-list --count <ref>`, what the repo holds.
-  2. `walk_claimed` -- `_ingest_progress["processed"]`, what the walk CLAIMS
-     it applied. An in-process counter, never read back from the graph.
+  2. `walk_claimed` -- `walk_claimed_from_progress(_ingest_progress)`, what
+     the walk CLAIMS it applied. An in-process counter, never read back from
+     the graph.
   3. `graph_commit_entities` -- `mcp_server._count_commit_entities`, what the
      graph can actually produce.
 
@@ -54,8 +55,8 @@ confirmed on a real run rather than assumed:
     file is looked at, so a commit touching only ignored paths still gets its
     entity.
   * AN EXTRACTION-SKIPPED COMMIT RAISES 2 WITHOUT RAISING 3. `_run_ingestion`'s
-    per-commit `except` does `_ingest_progress["processed"] += 1` and
-    `continue` from ABOVE the lease, so nothing is written. Such a run is
+    per-commit `except` retires the position as `failed` and `continue`s from
+    ABOVE the lease, so nothing is written. Such a run is
     already failed by `_exit_code`'s `skipped_commits` clause; the census fires
     too, independently, which is the point -- that clause is stderr-derived and
     reads clean when the capture itself fails.
@@ -76,7 +77,7 @@ walk claimed, the graph must hold that many.
 from __future__ import annotations
 
 import subprocess
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 # `:commit/{hash[:12]}` -- mcp_server's commit ident rule, in _forward_apply,
 # _reverse_apply and every pos_by_commit_ident map. Mirrored rather than
@@ -84,6 +85,19 @@ from typing import Any, Optional
 # collector below asserts nothing about it, it only counts prefixes of this
 # length.
 COMMIT_IDENT_PREFIX_LEN = 12
+
+
+def walk_claimed_from_progress(progress: Mapping[str, Any]) -> int:
+    """`walk_claimed` from `mcp_server._ingest_progress` (#222 phase 4).
+
+    `prior_ingested` (the graph's commit count at run start) plus the
+    positions this run RETIRED -- written, skipped or failed. That is exactly
+    the number `_ingest_progress["processed"]` held, so every gate
+    below keeps its meaning. A run that failed before its RunProgress was
+    built (`_run` None or absent) retired nothing.
+    """
+    run = progress.get("_run")
+    return progress.get("prior_ingested", 0) + (run.retired_count if run is not None else 0)
 
 
 def commit_census(

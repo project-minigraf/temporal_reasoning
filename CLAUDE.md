@@ -330,7 +330,7 @@ back COMPLETELY empty — one commit in 847 is not zero facts. So
 `evals/at_scale/commit_census.py` compares THREE numbers, not one delta, and
 is wired beside the audit rather than inside it (it needs a repo handle
 `fact_audit` deliberately does not take): `git rev-list --count <branch>`,
-`_ingest_progress["processed"]`, and `_count_commit_entities`. **`walk_vs_graph`
+`walk_claimed_from_progress(_ingest_progress)`, and `_count_commit_entities`. **`walk_vs_graph`
 catches a commit walked and then lost; `repo_vs_walk` catches one NEVER
 WALKED** — the case no in-process counter can see, because the counter and the
 walk share the bug. Gated as clause 8.
@@ -696,8 +696,8 @@ claim` is the LAST write of a position, so membership in a persisted interval
 proves that position completed" — is FALSE as written, and an earlier draft of
 this section said it.** `:lo-hash` is a closed RANGE bound, so membership was
 only ever implied by a NEIGHBOUR's claim, not by the position's own. A write
-that RAISES takes `_run_ingestion`'s per-commit `except`, which logs, does
-`processed += 1`, and CONTINUES THE DESCENT — the next lower position that
+that RAISES takes `_run_ingestion`'s per-commit `except`, which logs, retires
+the position as failed, and CONTINUES THE DESCENT — the next lower position that
 succeeds moves `:lo-hash` beneath the failed one and sweeps it into the interval.
 #313's SIGKILL is safe only because the process STOPS there; the `except` path
 does not. The interval was always this imprecise, master included; the archive
@@ -754,23 +754,23 @@ the internal `_transact`/`_retract`, since the public handler rejects an
 unregistered type outright. Regions carry a string-valued `:ident` because
 enumerating by `:entity-type` binds the entity in UUID space.
 
-**A skipped position still costs `processed`, and that is not sloppiness.**
-#317's `commit_census` reads `_ingest_progress["processed"]` as `walk_claimed`,
-so excluding skips would silently redefine the number that gate compares against
-`git rev-list` and turn a clean skip-heavy resume into a reported lost commit.
-The counter is `positions_skipped`, never `skipped`: `status` already takes the
-value `"skipped"` (run declined, another process owns the graph) and
-`stderr_capture` already reports `skipped_commits` (extraction AND write
-failures — `_SKIPPED_COMMIT_RE` matches both log lines).
+**A skipped position is still RETIRED, and that is not sloppiness.**
+#317's `commit_census` reads `walk_claimed = prior_ingested + this_run.retired`
+(`walk_claimed_from_progress`), so excluding skips would silently redefine the
+number that gate compares against `git rev-list` and turn a clean skip-heavy
+resume into a reported lost commit. The counter is `this_run.skipped`, never a
+bare `skipped`: `status` already takes the value `"skipped"` (run declined,
+another process owns the graph) and `stderr_capture` already reports
+`skipped_commits` (extraction AND write failures — `_SKIPPED_COMMIT_RE`
+matches both log lines).
 
 **`walk_vs_graph` is NOT a backstop on the skip predicate, and an earlier draft
-of this section said it was.** `_ingest_progress["processed"]` is SEEDED with
-`prior_ingested = _count_commit_entities(db)` and then incremented for every
-position retired this run, including positions already counted in that seed. So
-`walk_vs_graph` is nonzero on ANY resume that touches already-ingested
-territory, skip or no skip — measured 10 with the fast path against 9 without,
-on the same scenario. It cannot discriminate a wrong skip from an ordinary
-resume.
+of this section said it was.** `prior_ingested` is the seed (the graph's commit
+count at run start) and the retired count re-counts every position retired
+this run, including positions already counted in that seed. So `walk_vs_graph`
+is nonzero on ANY resume that touches already-ingested territory, skip or no
+skip — measured 10 with the fast path against 9 without, on the same scenario.
+It cannot discriminate a wrong skip from an ordinary resume.
 
 State plainly what follows: **no existing gate catches a wrong skip.**
 `fact_audit`'s `divergence` reads 0 because a skipped commit reaches neither
@@ -821,8 +821,8 @@ one fact per commit on the write path this issue exists to make cheaper.
 **The end-of-walk flush's hi bound is the highest SKIPPED position, never the
 highest reverse position claimed.** `_frontier_persist_span` moves `:hi-hash`
 UP, which `_frontier_persist_claim` never does for the high interval. A reverse
-position whose write FAILS takes the per-commit `except`, which does
-`processed += 1`, persists no claim, and leaves `completed_all` True — so a
+position whose write FAILS takes the per-commit `except`, which retires the
+position as failed, persists no claim, and leaves `completed_all` True — so a
 flush bounded by the highest claim would raise the persisted top bound over it.
 Once `:hi-hash` reaches the tip the interval is representable, so the next
 `_frontier_load` RETAINS it instead of discarding it and nothing ever re-walks
@@ -847,17 +847,17 @@ history happens to regain those exact hashes — which ordinary history
 rewrites never do in practice).** See the #325 section's "skip fast path is
 now VESTIGIAL" paragraph for the corrected, general statement.
 
-`handle_minigraf_ingest_status`'s report carries `positions_skipped_this_run`
-alongside a bare `positions_skipped` that is always the same number today — the
-counter resets at the start of every run rather than being derived from a
-process-lifetime total the way `processed_this_run` is derived from
-`prior_ingested`, so there is no separate lifetime figure to look for under the
-unqualified name. The per-run figure is the one worth watching: #325's incident
-read as healthy for 98 minutes because `processed` climbs on a replayed
+`handle_minigraf_ingest_status`'s report carries `this_run.skipped`; the old
+bare/per-run pair (`positions_skipped`/`positions_skipped_this_run`) is gone —
+there was never a separate lifetime figure behind the unqualified name, since
+that counter reset at the start of every run rather than accumulating across
+runs, and `this_run` says so by construction: it is this run's own work,
+nothing more. The per-run figure is the one worth watching: #325's incident
+read as healthy for 98 minutes because `walk_claimed` climbs on a replayed
 position exactly as it does on a new one, and nothing distinguished the two. A
-run whose `positions_skipped_this_run` climbs alongside `processed_this_run`
-while the graph's own commit count stays flat is re-walking territory it
-already holds, not making progress.
+run whose `this_run.skipped` climbs alongside `this_run.retired` while the
+graph's own commit count stays flat is re-walking territory it already holds,
+not making progress.
 
 **A provisional frontier is now a SET of intervals, not one scalar pair, and
 #325 is what makes that safe under a growing branch tip.**
@@ -1092,12 +1092,14 @@ includes the #326 same-run skip fast path, #313's torn-position repair
 re-walk, and this branch's own below-`rev_claim_floor` re-walk — **all
 three are CORRECT behaviour, not degraded resumes**, which is exactly what
 makes a nonzero `walk_vs_graph` on any of them a FALSE positive rather than
-a real one. `_ingest_progress["processed"]` counts positions RETIRED this
-run (skip, extraction failure, or reaching write dispatch — three increment
-sites, `mcp_server.py:12949, 13001, 13128`), never commits newly WRITTEN,
-and is SEEDED with `prior_ingested = _count_commit_entities(db)` at run
-start, so re-touching a position already inside that seed double-counts it
-and drives `walk_claimed` — and `walk_vs_graph = walk_claimed -
+a real one. `walk_claimed_from_progress` counts positions RETIRED this
+run (skip, extraction failure, or reaching write dispatch — three
+`run_progress.retired(...)` call sites in `_run_ingestion`: the `_skip_claim`
+branch of its per-position claim loop, the per-commit extraction-failure
+`except`, and the per-commit write-dispatch after the apply attempt), never
+commits newly WRITTEN, added to `prior_ingested = _count_commit_entities(db)`
+seeded at run start, so re-touching a position already inside that seed
+double-counts it and drives `walk_claimed` — and `walk_vs_graph = walk_claimed -
 graph_commit_entities` — positive on a perfectly healthy run.
 `collect_commit_census` gates `walk_vs_graph` strictly BEFORE `repo_vs_walk`
 (an `elif` chain, `commit_census.py`), so `walk_vs_graph` is the clause that
@@ -1111,7 +1113,7 @@ repo_vs_graph`, zero on an intact graph, so the clause is falsy there too.
 exercise this failure mode regardless, for a simpler reason than any of
 that: it runs once on a fresh graph, which has no interval to retain in the
 first place. `retention_engaged`
-(`prior_ingested > 0 and processed_this_run < repo_commits`) is the probe's
+(`prior_ingested > 0 and retired_this_run < repo_commits`) is the probe's
 positive control, RENDERED never gated: without it, a full regression back
 to pre-#325 discard-on-tip-growth would re-walk everything on the "resume"
 and still land on `repo_vs_graph == 0` (minigraf collapses a re-transacted
@@ -1194,6 +1196,18 @@ exist, using the attributes `_frontier_persist_claim` already writes. This
 is the one case in this arc that DOES self-heal an affected graph, because
 the defective state is by definition present at load time and the fix runs
 at load time.
+
+**Ingestion status (#222 phase 4).** `processed` is gone. It was the graph's
+commit count at run start plus every position retired, so it passed `total`
+on any re-walk (28/20 measured) and read 20/20 on a run that had lost a
+commit. `ingest_progress.RunProgress` now reports `this_run` (work, `retired
+<= to_retire`), per-stream state and rate, `visibility` (what the frontier
+can prove, which can dip between runs) and `lineage`. **Done is
+`visibility.complete and lineage.complete`, never `status: complete`
+alone.** Residual: a failed FORWARD write is swallowed by frontier-low's
+range on the next forward claim (#326 left forward failure semantics out of
+scope), so the next run's `visibility` counts it. The failing run itself
+reports `complete: false`, and `skipped_commits` stays loud.
 
 ## Claude Code Plugin Publishing
 

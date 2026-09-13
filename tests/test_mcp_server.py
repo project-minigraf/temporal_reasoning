@@ -133,6 +133,14 @@ def execute_spy():
         mcp_server._db_execute = real_execute
 
 
+def _walk_claimed():
+    """What `_ingest_progress["processed"]` used to read: prior_ingested plus
+    this run's retired count (#222 phase 4)."""
+    from evals.at_scale.commit_census import walk_claimed_from_progress
+    import mcp_server
+    return walk_claimed_from_progress(mcp_server._ingest_progress)
+
+
 class TestOpenDb:
     def test_opens_db_at_given_path(self, monkeypatch, tmp_path):
         from minigraf import MiniGrafDb
@@ -1787,7 +1795,7 @@ class TestOwnerHintDrivesTheIngestionPreCheck:
         try:
             mcp_server._ingest_task = None
             mcp_server._ingest_progress = {
-                "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+                "status": "idle", "total": 0, "prior_ingested": 0,
                 "current_commit": "", "error": None, "owner_pid": None,
             }
             result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
@@ -1816,7 +1824,7 @@ class TestOwnerHintDrivesTheIngestionPreCheck:
         try:
             mcp_server._ingest_task = None
             mcp_server._ingest_progress = {
-                "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+                "status": "idle", "total": 0, "prior_ingested": 0,
                 "current_commit": "", "error": None, "owner_pid": None,
             }
             result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
@@ -7227,13 +7235,13 @@ class TestMinigrafIngestStatus:
     def test_returns_idle_before_ingestion(self, real_db):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["ok"] is True
         assert result["status"] == "idle"
-        assert result["processed"] == 0
+        assert "processed" not in result
         assert result["last_run_at"] is None
         assert result["last_commit"] is None
         assert result["total_ingested"] is None
@@ -7241,7 +7249,7 @@ class TestMinigrafIngestStatus:
     def test_returns_last_run_at_from_graph(self, real_db):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         real_db.execute(
@@ -7258,14 +7266,13 @@ class TestMinigrafIngestStatus:
     def test_running_status_skips_graph_query(self, real_db):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "running", "processed": 3, "total": 10,
+            "status": "running", "total": 10,
             "current_commit": "abc123", "error": None,
         }
         with execute_spy() as calls:
             result = mcp_server.handle_minigraf_ingest_status()
 
         assert result["status"] == "running"
-        assert result["processed"] == 3
         assert result["total"] == 10
         assert result["current_commit"] == "abc123"
         # Must not query the graph while running
@@ -7278,7 +7285,7 @@ class TestMinigrafIngestStatus:
         only one that is portable."""
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "skipped", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
         }
         monkeypatch.setattr(mcp_server, "_graph_owner_hint_is_fresh", lambda path: True)
@@ -7290,7 +7297,7 @@ class TestMinigrafIngestStatus:
     def test_skipped_status_is_stale_when_the_hint_has_expired(self, real_db, monkeypatch):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "skipped", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
         }
         monkeypatch.setattr(mcp_server, "_graph_owner_hint_is_fresh", lambda path: False)
@@ -7308,7 +7315,7 @@ class TestMinigrafIngestStatus:
         graph_path = mcp_server._graph_path_current()
         hint_path = mcp_server._owner_hint_path(graph_path)
         mcp_server._ingest_progress = {
-            "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "skipped", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
         }
         try:
@@ -7332,7 +7339,7 @@ class TestMinigrafIngestStatus:
         """
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "error", "total": 0, "prior_ingested": 0,
             "current_commit": "",
             "error": "[STG-026] Database is locked by another process (/tmp/x.graph).",
             "owner_pid": None,
@@ -7344,7 +7351,7 @@ class TestMinigrafIngestStatus:
     def test_error_status_omits_stale_when_no_pid_in_message(self, real_db):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "error", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": "corrupt graph file", "owner_pid": None,
         }
         result = mcp_server.handle_minigraf_ingest_status()
@@ -7353,7 +7360,7 @@ class TestMinigrafIngestStatus:
     def test_returns_total_ingested_from_graph(self, real_db):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         real_db.execute(
@@ -7387,7 +7394,7 @@ class TestMinigrafIngestStatus:
         arbitrary 21715."""
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         real_db.execute(
@@ -7409,7 +7416,7 @@ class TestMinigrafIngestStatus:
     def test_total_ingested_absent_returns_none(self, real_db):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         result = mcp_server.handle_minigraf_ingest_status()
@@ -7424,7 +7431,7 @@ class TestMinigrafIngestStatus:
         should be reported."""
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         mcp_server._last_run_write(real_db, "hashA_run1", "2026-01-01T00:00:00.000Z", 10)
@@ -7435,6 +7442,13 @@ class TestMinigrafIngestStatus:
 
         assert result["last_run_at"] == "2026-01-03T00:00:00.000Z"
         assert result["last_commit"] == "hashC_run3_LATEST"
+
+    def test_idle_reports_the_lineage_watermark(self, real_db):
+        import mcp_server
+        mcp_server._ingest_progress = {"status": "idle", "total": 0,
+                                       "current_commit": "", "error": None}
+        mcp_server._lineage_confirmed_through_update(real_db, "abc123", "2026-01-01T00:00:00.000Z")
+        assert mcp_server.handle_minigraf_ingest_status()["lineage_confirmed_through"] == "abc123"
 
 
 class TestCodeIdent:
@@ -9432,7 +9446,7 @@ class TestSkipClaimFastPathStillFiresForAResolvableRegion:
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
         status = mcp_server.handle_minigraf_ingest_status()
-        assert status["positions_skipped_this_run"] > 0, (
+        assert status["this_run"]["skipped"] > 0, (
             "a resolvable, count-matching archived region must still drive "
             "submit_next's skip branch"
         )
@@ -9472,8 +9486,8 @@ class TestDivergentRefEndToEnd:
     unresolvable bounds (a history rewrite), STILL cannot make _skip_claim's
     fast path fire in a two-run scenario -- proven, not assumed, in
     test_divergent_ref_forces_a_full_correct_rewalk_not_a_skip's docstring
-    below, with an empirical reproduction to back it. So `positions_skipped_
-    this_run > 0` is not achievable end-to-end any more under a correct
+    below, with an empirical reproduction to back it. So `status["this_run"]
+    ["skipped"] > 0` is not achievable end-to-end any more under a correct
     #325 implementation; every test below asserts it stays 0 instead, as a
     documented, load-bearing fact rather than a silently dropped check.
 
@@ -9543,7 +9557,7 @@ class TestDivergentRefEndToEnd:
         hashes, which no ordinary git operation produces (a rebase or
         amend always replaces a hash, never reproduces an old one). This was
         verified empirically with a real rebase (not merely reasoned): after
-        one, positions_skipped_this_run reliably stayed 0 and the trace
+        one, status["this_run"]["skipped"] reliably stayed 0 and the trace
         showed every diverged position genuinely re-applied.
 
         So what #326's machinery still guarantees, and what this test
@@ -9579,7 +9593,7 @@ class TestDivergentRefEndToEnd:
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
         status = mcp_server.handle_minigraf_ingest_status()
-        assert status["positions_skipped_this_run"] == 0, (
+        assert status["this_run"]["skipped"] == 0, (
             "an unresolvable-bounds archive can never be skip-fast-pathed in "
             "the same run that discovers it -- see this test's own docstring"
         )
@@ -9648,8 +9662,8 @@ class TestDivergentRefEndToEnd:
         self._repo(tmp_path, 2, start=12)
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        assert mcp_server.handle_minigraf_ingest_status()[
-            "positions_skipped_this_run"
+        assert mcp_server.handle_minigraf_ingest_status()["this_run"][
+            "skipped"
         ] == 0, (
             "if this ever becomes nonzero, _skip_claim has become reachable "
             "again and the reasoning in this class's docstring needs "
@@ -10009,7 +10023,7 @@ class TestSkipFlushNeverCoversFailedWrites:
         await mcp_server._run_ingestion(str(repo), "HEAD")
         monkeypatch.setattr(mcp_server, "_reverse_apply", real_reverse_apply)
 
-        # #325 review round 2: no longer asserting positions_skipped_this_run
+        # #325 review round 2: no longer asserting status["this_run"]["skipped"]
         # > 0 here. _skip_claim's fast path is structurally unreachable in a
         # two-run scenario under #325's corrected retain/archive gating --
         # see TestDivergentRefEndToEnd's
@@ -10645,7 +10659,7 @@ class TestSkippedSpanTransferredOnMerge:
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
         status = mcp_server.handle_minigraf_ingest_status()
-        assert status["positions_skipped_this_run"] > 0, (
+        assert status["this_run"]["skipped"] > 0, (
             "precondition: the seeded region must actually have driven the "
             "skip branch, or this test proves nothing about the transfer"
         )
@@ -15580,7 +15594,7 @@ class TestPreloadStateLinearizationWiring:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
@@ -15678,18 +15692,18 @@ class TestRunIngestion:
     async def test_ingestion_processes_all_commits(self, real_db, git_repo, monkeypatch):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 2
+        assert _walk_claimed() == 2
 
     @pytest.mark.asyncio
     async def test_sets_error_at_timestamp_on_failure(self, real_db, git_repo, monkeypatch):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
         }
 
@@ -15722,7 +15736,7 @@ class TestRunIngestion:
         """
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
         }
 
@@ -15752,7 +15766,7 @@ class TestRunIngestion:
         # than a statement about the 1:1 split.
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         with execute_spy() as calls:
@@ -15809,7 +15823,7 @@ class TestRunIngestion:
 
         monkeypatch.setattr(MiniGrafDb, "open", staticmethod(flaky_open))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
 
@@ -15818,7 +15832,7 @@ class TestRunIngestion:
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 2
+        assert _walk_claimed() == 2
         assert call_count["n"] >= 2, "expected the flaky open() to actually be exercised"
 
     @pytest.mark.asyncio
@@ -15842,7 +15856,7 @@ class TestRunIngestion:
 
         monkeypatch.setattr(mcp_server, "_preload_known_entities", slow_preload)
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
 
@@ -15869,7 +15883,7 @@ class TestRunIngestion:
     async def test_db_released_between_commits(self, real_db, git_repo, monkeypatch):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         # real_db holds its own lease for the test's duration (the shim's,
@@ -15953,7 +15967,7 @@ class TestRunIngestion:
         monkeypatch.setattr(MiniGrafDb, "open", staticmethod(_open))
         mcp_server._reset_db_state()
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
 
@@ -16008,7 +16022,7 @@ class TestRunIngestion:
         monkeypatch.setattr(MiniGrafDb, "open", staticmethod(_open))
         mcp_server._reset_db_state()
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
 
@@ -16033,7 +16047,7 @@ class TestRunIngestion:
         monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
         }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
@@ -16050,7 +16064,7 @@ class TestRunIngestion:
         monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
         }
         await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
@@ -16068,7 +16082,7 @@ class TestRunIngestion:
         monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
         }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path="/nonexistent/path")
@@ -16084,7 +16098,7 @@ class TestRunIngestion:
         import mcp_server
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
         }
         monkeypatch.setattr(
@@ -16109,7 +16123,7 @@ class TestRunIngestion:
         monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
         }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
@@ -16133,7 +16147,7 @@ class TestRunIngestion:
         monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
         }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
@@ -16158,7 +16172,7 @@ class TestRunIngestion:
         monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
         }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
@@ -16187,7 +16201,7 @@ class TestRunIngestion:
         monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
         }
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo), branch="feature-x")
@@ -16196,38 +16210,43 @@ class TestRunIngestion:
         assert captured["branch"] == "feature-x"
 
     @pytest.mark.asyncio
-    async def test_processed_seeded_from_prior_ingested(self, real_db, git_repo, monkeypatch):
-        """processed starts at the true persisted commit count and increments
-        cumulatively — regression test for #85 (seeding must not rely on the
-        :total-ingested watermark, which goes stale after an interrupted run).
+    async def test_walk_claimed_is_prior_plus_retired_seeded_from_prior_ingested(
+        self, real_db, git_repo, monkeypatch
+    ):
+        """walk_claimed_from_progress (prior_ingested + this run's retired
+        count, #222 phase 4) starts from the true persisted commit count —
+        regression test for #85 (seeding must not rely on the :total-ingested
+        watermark, which goes stale after an interrupted run).
 
         _count_commit_entities is monkeypatched directly to the desired prior
         count rather than seeded via 462 real :type/commit entities — this
         test is about _run_ingestion's seeding arithmetic (prior_ingested +
-        newly-processed commits), not about _count_commit_entities' own query
+        newly-retired commits), not about _count_commit_entities' own query
         correctness, which has its own coverage (TestTotalIngestedQuery and
         friends)."""
         import mcp_server
         monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 462)
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         # git_repo fixture has 2 commits; prior was 462 → final should be 464
-        assert mcp_server._ingest_progress["processed"] == 464
+        assert _walk_claimed() == 464
+        assert mcp_server._ingest_progress["_run"].retired_count == 2
         assert mcp_server._ingest_progress["total"] == 2  # git_repo has 2 commits
         assert mcp_server._ingest_progress["prior_ingested"] == 462
 
     @pytest.mark.asyncio
-    async def test_processed_seed_ignores_stale_total_ingested_watermark(
+    async def test_walk_claimed_is_prior_plus_retired_ignores_stale_total_ingested_watermark(
         self, real_db, git_repo, monkeypatch
     ):
         """A stale :total-ingested watermark (left behind by a prior run that
         was interrupted before writing its completion record) must not affect
         seeding — only the true :type/commit count matters.
 
-        Same rationale as test_processed_seeded_from_prior_ingested for
+        Same rationale as
+        test_walk_claimed_is_prior_plus_retired_seeded_from_prior_ingested for
         monkeypatching _count_commit_entities directly rather than seeding
         21715 real entities; _total_ingested_query is likewise monkeypatched
         to a stale value to prove _run_ingestion's seeding never even
@@ -16236,12 +16255,13 @@ class TestRunIngestion:
         monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 21715)
         monkeypatch.setattr(mcp_server, "_total_ingested_query", lambda db: 104)  # stale, must be ignored
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         assert mcp_server._ingest_progress["prior_ingested"] == 21715
-        assert mcp_server._ingest_progress["processed"] == 21717  # 21715 + 2 commits
+        assert _walk_claimed() == 21717  # 21715 + 2 commits
+        assert mcp_server._ingest_progress["_run"].retired_count == 2
 
     @pytest.mark.asyncio
     async def test_whitespace_reformat_commit_produces_no_modified_in_fact(self, tmp_path):
@@ -16271,7 +16291,7 @@ class TestRunIngestion:
             mcp_server._reset_db_state()
             mcp_server.open_db(str(tmp_path / "memory.graph"))
             mcp_server._ingest_progress = {
-                "status": "idle", "processed": 0, "total": 0,
+                "status": "idle", "total": 0,
                 "current_commit": "", "error": None,
             }
             await mcp_server._run_ingestion(str(repo), "main")
@@ -16308,7 +16328,7 @@ class TestRunIngestion:
             mcp_server._reset_db_state()
             mcp_server.open_db(str(tmp_path / "memory.graph"))
             mcp_server._ingest_progress = {
-                "status": "idle", "processed": 0, "total": 0,
+                "status": "idle", "total": 0,
                 "current_commit": "", "error": None,
             }
             await mcp_server._run_ingestion(str(repo), "main")
@@ -16350,7 +16370,7 @@ class TestRunIngestion:
             mcp_server._reset_db_state()
             mcp_server.open_db(str(tmp_path / "memory.graph"))
             mcp_server._ingest_progress = {
-                "status": "idle", "processed": 0, "total": 0,
+                "status": "idle", "total": 0,
                 "current_commit": "", "error": None,
             }
             await mcp_server._run_ingestion(str(repo), "main")
@@ -16412,14 +16432,14 @@ class TestRunIngestionCommitFaultIsolation:
         monkeypatch.setattr(mcp_server, "_git_commits", poisoned_git_commits)
         monkeypatch.setattr(frontier_registry, "build_linearization", poisoned_linearization)
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         assert mcp_server._ingest_progress["status"] == "complete"
         # 2 real commits from git_repo + 1 skipped poisoned commit
-        assert mcp_server._ingest_progress["processed"] == 3
+        assert _walk_claimed() == 3
         assert "deadbeef" in capsys.readouterr().err
 
     @pytest.mark.asyncio
@@ -16444,7 +16464,7 @@ class TestRunIngestionCommitFaultIsolation:
         monkeypatch.setattr(mcp_server, "_git_commits", poisoned_git_commits)
         monkeypatch.setattr(frontier_registry, "build_linearization", poisoned_linearization)
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
@@ -16483,13 +16503,13 @@ class TestRunIngestionCommitFaultIsolation:
 
         monkeypatch.setattr(mcp_server, "_watermark_update", failing_once_watermark_update)
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 2  # git_repo's 2 real commits
+        assert _walk_claimed() == 2  # git_repo's 2 real commits
         assert "write failed" in capsys.readouterr().err
 
         # Second commit (models.py) still got ingested despite the first
@@ -16672,13 +16692,13 @@ class TestRunIngestionIndexFaultIsolation:
 
         monkeypatch.setattr(fact_index, "open_writer", lambda path: (_ for _ in ()).throw(OSError("disk full")))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 2
+        assert _walk_claimed() == 2
         assert "open_writer failed" in capsys.readouterr().err
 
     @pytest.mark.asyncio
@@ -16701,13 +16721,13 @@ class TestRunIngestionIndexFaultIsolation:
 
         monkeypatch.setattr(fact_index, "open_writer", failing_commit_open_writer)
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 2
+        assert _walk_claimed() == 2
         assert "commit failed" in capsys.readouterr().err
 
     @pytest.mark.asyncio
@@ -16717,13 +16737,13 @@ class TestRunIngestionIndexFaultIsolation:
 
         monkeypatch.setattr(fact_index, "close_writer", lambda con: (_ for _ in ()).throw(OSError("disk full")))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 2
+        assert _walk_claimed() == 2
         assert "close_writer failed" in capsys.readouterr().err
 
 
@@ -16744,7 +16764,7 @@ class TestRunIngestionParentEdgeFactIndex:
         import mcp_server
         import fact_index
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
@@ -16780,7 +16800,7 @@ class TestMergeCommitKeepsBothParentEdges:
 
         repo = git_repo_diamond_clock_skewed
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(repo), "HEAD")
@@ -16856,7 +16876,7 @@ class TestRunIngestionConcurrency:
             mcp_server._reset_db_state()
             mcp_server.open_db(str(graph_path))
             mcp_server._ingest_progress = {
-                "status": "idle", "processed": 0, "total": 0,
+                "status": "idle", "total": 0,
                 "current_commit": "", "error": None,
             }
             mcp_server._shutdown_requested.clear()
@@ -16870,7 +16890,7 @@ class TestRunIngestionConcurrency:
             monkeypatch.setattr(mcp_server, "_ingest_transact", capture)
             await mcp_server._run_ingestion(str(git_repo_with_deps), "HEAD")
             assert mcp_server._ingest_progress["status"] == "complete"
-            assert mcp_server._ingest_progress["processed"] == 1
+            assert _walk_claimed() == 1
 
             # Query the real, persisted graph for every currently-valid fact.
             # The :last-run-at value is excluded: it legitimately carries a
@@ -16917,12 +16937,12 @@ class TestRunIngestionConcurrency:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 2
+        assert _walk_claimed() == 2
 
     @pytest.mark.asyncio
     async def test_one_commits_file_failure_does_not_affect_other_commits(
@@ -16942,7 +16962,7 @@ class TestRunIngestionConcurrency:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
 
@@ -16963,7 +16983,7 @@ class TestRunIngestionConcurrency:
         # Both commits still get counted as processed even though the first
         # commit's only changed file failed to fetch.
         assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 2
+        assert _walk_claimed() == 2
 
 
 class TestRunIngestionEventLoopResponsiveness:
@@ -17008,7 +17028,7 @@ class TestRunIngestionEventLoopResponsiveness:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
 
@@ -17052,7 +17072,7 @@ class TestRunIngestionShutdown:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
 
@@ -17068,7 +17088,7 @@ class TestRunIngestionShutdown:
             await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         assert mcp_server._ingest_progress["status"] == "stopped"
-        assert mcp_server._ingest_progress["processed"] == 1
+        assert _walk_claimed() == 1
 
     @pytest.mark.asyncio
     async def test_resumes_from_watermark_after_shutdown(self, git_repo, monkeypatch):
@@ -17091,7 +17111,7 @@ class TestRunIngestionShutdown:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
 
@@ -17116,7 +17136,7 @@ class TestRunIngestionShutdown:
         with patch("mcp_server.asyncio.sleep", stop_after_first):
             await mcp_server._run_ingestion(str(git_repo), "HEAD")
         assert mcp_server._ingest_progress["status"] == "stopped"
-        first_run_processed = mcp_server._ingest_progress["processed"]
+        first_run_processed = _walk_claimed()
         assert first_run_processed == 1
 
         # Prove the watermark and the first commit's entity were genuinely
@@ -17142,7 +17162,7 @@ class TestRunIngestionShutdown:
         mcp_server.open_db(str(git_repo / "memory.graph"))
 
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
@@ -17154,7 +17174,7 @@ class TestRunIngestionShutdown:
         # + the 1 remaining commit this run itself completes = 2. This is
         # also proof the watermark actually gated re-processing: git_repo
         # has 2 commits total, and only 1 was processed in each run.
-        assert mcp_server._ingest_progress["processed"] == 2
+        assert _walk_claimed() == 2
         assert mcp_server._count_commit_entities(mcp_server.get_db()) == 2
 
         mcp_server._reset_db_state()  # release the real file lock for subsequent tests
@@ -17199,7 +17219,7 @@ class TestRepoTotalCountsTheBranchNotHead:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(tmp_path / "branch-total.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
         }
         try:
@@ -18263,7 +18283,7 @@ class TestIndexCacheInvalidation:
         import mcp_server
         import fact_index
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
         asyncio.run(mcp_server._run_ingestion(str(git_repo), "HEAD"))
@@ -18597,7 +18617,7 @@ class TestClosedEntityLifecyclePurge:
     """
 
     def _make_progress(self):
-        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "",
+        return {"status": "idle", "total": 0, "current_commit": "",
                 "error": None, "prior_ingested": 0}
 
     async def _ingest_and_open(self, repo, monkeypatch):
@@ -18744,7 +18764,7 @@ class TestCloseDiscardsLineageMarker:
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         mcp_server._reset_db_state()
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None, "prior_ingested": 0,
         }
         await mcp_server._run_ingestion(str(repo), "HEAD")
@@ -18761,7 +18781,7 @@ class TestRunIngestionBitemporalClose:
     """Integration tests verifying bi-temporal correctness of entity lifecycle handling."""
 
     def _make_progress(self):
-        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+        return {"status": "idle", "total": 0, "current_commit": "", "error": None}
 
     @pytest.mark.asyncio
     async def test_file_deletion_closes_with_real_description_not_empty_string(
@@ -19706,7 +19726,7 @@ class TestRunIngestionBitemporalDeps:
     """Tests verifying that :depends-on edges are written/closed bi-temporally in the commit loop."""
 
     def _make_progress(self):
-        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+        return {"status": "idle", "total": 0, "current_commit": "", "error": None}
 
     @pytest.mark.asyncio
     async def test_new_import_writes_depends_on_via_ingest_transact(
@@ -19800,7 +19820,7 @@ class TestRunIngestionBitemporalDeps:
 
 class TestUnresolvedImportTagging:
     def _make_progress(self):
-        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+        return {"status": "idle", "total": 0, "current_commit": "", "error": None}
 
     def test_resolve_module_import_returns_bool_flag(self):
         import mcp_server
@@ -19867,7 +19887,7 @@ class TestUnresolvedImportTagging:
 
         mcp_server._reset_db_state()
         mcp_server.open_db(str(repo / "memory.graph"))
-        mcp_server._ingest_progress = {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+        mcp_server._ingest_progress = {"status": "idle", "total": 0, "current_commit": "", "error": None}
 
         transact_calls: list = []
         real_ingest_transact = mcp_server._ingest_transact
@@ -19900,7 +19920,7 @@ class TestUnresolvedImportTagging:
 
 class TestGitIngestionPathIgnore:
     def _make_progress(self):
-        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+        return {"status": "idle", "total": 0, "current_commit": "", "error": None}
 
     @pytest.mark.asyncio
     async def test_default_ignored_directory_produces_no_code_entities(
@@ -20275,7 +20295,7 @@ class TestPerCommitAccurateImportResolution:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(git_repo_with_future_dep / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None,
+            "status": "idle", "total": 0, "current_commit": "", "error": None,
         }
 
         transact_calls: list = []
@@ -20382,7 +20402,7 @@ class TestRunIngestionGitlinks:
     """End-to-end tests for submodule add/bump/remove/flip via _run_ingestion."""
 
     def _make_progress(self):
-        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+        return {"status": "idle", "total": 0, "current_commit": "", "error": None}
 
     def _add_submodule_commit(self, repo, path="modules/lib", name="lib", url="https://example.com/lib.git"):
         sub = repo.parent / f"{repo.name}-sub"
@@ -20674,7 +20694,7 @@ class TestSubmoduleDependencyLinking:
     """
 
     def _make_progress(self):
-        return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
+        return {"status": "idle", "total": 0, "current_commit": "", "error": None}
 
     def _add_submodule_commit(self, repo, path="modules/libX", name="libX", url="https://example.com/libX.git"):
         sub = repo.parent / f"{repo.name}-sub"
@@ -24928,7 +24948,7 @@ class TestStageBRepairsLifecycleFacts:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(graph_path))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
         }
         await mcp_server._run_ingestion(str(repo), "master")
@@ -25205,7 +25225,7 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
     def _reset_progress(self):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
         }
 
@@ -25518,7 +25538,7 @@ class TestMultiStreamParityWithForwardOnly:
     def _reset_progress(self):
         import mcp_server
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
         }
 
@@ -25921,9 +25941,10 @@ class TestStagingAndShutdown:
         return repo
 
     @pytest.mark.asyncio
-    async def test_phase_reaches_sweeping_and_processed_never_exceeds_total(self, tmp_path, monkeypatch):
+    async def test_phase_reaches_sweeping_and_retired_never_exceeds_to_retire(self, tmp_path, monkeypatch):
         """Stage B's commits are re-visits of positions Stage A already
-        counted -- counting them again would push processed past total.
+        counted -- counting them again would push this_run.retired past
+        this_run.to_retire.
 
         NOTE on a deviation from the brief's literal assertion: the brief
         reads `_ingest_progress["phase"] == "sweeping"` AFTER `_run_ingestion`
@@ -25957,7 +25978,8 @@ class TestStagingAndShutdown:
         assert observed_sweeping, "phase must reach 'sweeping' at some point during Stage B"
         assert mcp_server._ingest_progress["phase"] is None, \
             "phase must not outlive the run (Task 9 review fix, de0a062)"
-        assert mcp_server._ingest_progress["processed"] <= mcp_server._ingest_progress["total"]
+        run = mcp_server._ingest_progress["_run"].snapshot()["this_run"]
+        assert run["retired"] <= run["to_retire"]
 
     @pytest.mark.asyncio
     async def test_sweep_does_not_start_before_stage_a_drains(self, tmp_path, monkeypatch):
@@ -26186,7 +26208,7 @@ class TestResumeWithInvertedAuthorDates:
     """
 
     def _progress(self):
-        return {"status": "idle", "processed": 0, "total": 0,
+        return {"status": "idle", "total": 0,
                 "current_commit": "", "error": None, "prior_ingested": 0}
 
     @staticmethod
@@ -26236,7 +26258,7 @@ class TestResumeWithInvertedAuthorDates:
         with patch("mcp_server.asyncio.sleep", stop_after_fourth):
             await mcp_server._run_ingestion(str(repo), "HEAD")
         assert mcp_server._ingest_progress["status"] == "stopped"
-        assert mcp_server._ingest_progress["processed"] == 4
+        assert _walk_claimed() == 4
 
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         mcp_server._ingest_progress = self._progress()
@@ -26494,7 +26516,7 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
 
         await drive("2:1000000", 4)
         assert mcp_server._ingest_progress["status"] == "stopped"
-        assert mcp_server._ingest_progress["processed"] == 4
+        assert _walk_claimed() == 4
 
         await drive(f"{10**6}:1", 2)
         assert mcp_server._ingest_progress["status"] == "stopped"
@@ -26904,7 +26926,7 @@ class TestGatedWrapperIsInertWithoutAPolicy:
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
             "error_at": None, "phase": None,
         }
@@ -26952,7 +26974,7 @@ class TestFinalCheckpointOnEveryTerminalPath:
 
     def _fresh_progress(self):
         return {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
             "error_at": None, "phase": None,
         }
@@ -27084,7 +27106,7 @@ class TestStageBDoesNotDoubleCheckpoint:
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
             "error_at": None, "phase": None,
         }
@@ -27118,7 +27140,7 @@ class TestCheckpointPolicyLifecycle:
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
             "error_at": None, "phase": None,
         }
@@ -27138,7 +27160,7 @@ class TestCheckpointPolicyLifecycle:
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
             "error_at": None, "phase": None,
         }
@@ -27178,7 +27200,7 @@ class TestCheckpointPolicyLifecycle:
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
             "error_at": None, "phase": None,
         }
@@ -27208,7 +27230,7 @@ class TestCheckpointPolicyLifecycle:
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
             "error_at": None, "phase": None,
         }
@@ -27248,7 +27270,7 @@ class TestCheckpointDutySummaryPublication:
 
     def _fresh_progress(self):
         return {
-            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "status": "idle", "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
             "error_at": None, "phase": None,
         }
@@ -28192,7 +28214,7 @@ class TestIngestTraceWiring:
         mcp_server._reset_db_state()
         mcp_server.open_db(str(graph_path))
         mcp_server._ingest_progress = {
-            "status": "idle", "processed": 0, "total": 0,
+            "status": "idle", "total": 0,
             "current_commit": "", "error": None,
         }
 
@@ -28286,7 +28308,7 @@ class TestIngestTraceWiring:
         # The isolation contract is unchanged: one commit's write failing
         # does not abort the run, and both commits still count as processed.
         assert mcp_server._ingest_progress["status"] == "complete"
-        assert mcp_server._ingest_progress["processed"] == 2
+        assert _walk_claimed() == 2
 
         records = [json.loads(l) for l in trace_path.read_text().splitlines() if l.strip()]
         assert len(records) == 1, "the failed commit must not produce a trace record"
@@ -28762,3 +28784,380 @@ class TestFrontierLoadCoalescesProvisionalIntervals:
         assert [(iv.lo_pos, iv.hi_pos) for iv in prov2] == [(0, 5), (10, 20)], (
             "the merged extra must be RETAINED on reload"
         )
+
+
+class TestCorrectionSweepNextReasons:
+    """#222 phase 4: _correction_sweep_select_position returns None for
+    seven reasons a caller cannot tell apart. _correction_sweep_next names
+    them, so Stage B can report WHY it declined (C1: a reverse floor keeps
+    the gap open and the sweep never runs, on a run reporting complete)."""
+
+    LIN = [f"h{i}" for i in range(6)]
+    META = [(h, "2026-09-04T00:00:00Z", "a", f"s{i}") for i, h in enumerate(LIN)]
+
+    def _seed(self, db, ident, lo, hi, tag=":provisional"):
+        import mcp_server
+        facts = [
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag {tag}]",
+            f'[{ident} :lo-hash "{self.LIN[lo]}"]',
+            f'[{ident} :hi-hash "{self.LIN[hi]}"]',
+            f"[{ident} :pos-count {hi - lo + 1}]",
+        ]
+        mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-09-04T00:00:00Z")
+
+    def _seed_closed(self, db):
+        """frontier-low [0,2] meets frontier-high [3,5]: the gap is closed."""
+        import mcp_server
+        self._seed(db, mcp_server._FRONTIER_LOW_IDENT, 0, 2, tag=":authoritative")
+        self._seed(db, mcp_server._FRONTIER_HIGH_IDENT, 3, 5)
+
+    def _seed_gap(self, db):
+        """frontier-low [0,0], frontier-high [3,5]: positions 1-2 unclaimed."""
+        import mcp_server
+        self._seed(db, mcp_server._FRONTIER_LOW_IDENT, 0, 0, tag=":authoritative")
+        self._seed(db, mcp_server._FRONTIER_HIGH_IDENT, 3, 5)
+
+    def _next(self, db, lin=None, meta=None, fragmented=None):
+        import mcp_server
+        return mcp_server._correction_sweep_next(
+            db, self.LIN if lin is None else lin, self.META if meta is None else meta,
+            None, fragmented,
+        )
+
+    def test_no_frontier_high(self, real_db):
+        r = self._next(real_db)
+        assert (r.selected, r.reason) == (None, "no-frontier-high")
+
+    def test_gap_open(self, real_db):
+        self._seed_gap(real_db)
+        r = self._next(real_db)
+        assert (r.selected, r.reason, r.region_lo) == (None, "gap-open", 3)
+
+    def test_selected_then_reached_ceiling(self, real_db):
+        import mcp_server
+        self._seed_closed(real_db)
+        r = self._next(real_db)
+        assert r.reason == "selected"
+        assert r.selected == (self.LIN[3], self.META[3][1])
+        assert (r.region_lo, r.start_pos, r.ceiling_pos) == (3, 3, 5)
+        mcp_server._correction_sweep_through_update(real_db, self.LIN[5], self.META[5][1])
+        r = self._next(real_db)
+        assert (r.selected, r.reason, r.region_lo, r.start_pos, r.ceiling_pos) == (
+            None, "reached-ceiling", 3, 6, 5,
+        )
+
+    def test_stale_bound(self, real_db):
+        """frontier-high's :lo-hash no longer resolves (rewritten history)."""
+        self._seed_closed(real_db)
+        lin = ["rewritten" if i == 3 else h for i, h in enumerate(self.LIN)]
+        meta = [(h, *m[1:]) for h, m in zip(lin, self.META)]
+        r = self._next(real_db, lin=lin, meta=meta)
+        assert (r.selected, r.reason) == (None, "stale-bound")
+
+    def test_fragmented(self, real_db):
+        self._seed_closed(real_db)
+        r = self._next(real_db, fragmented=True)
+        assert (r.selected, r.reason, r.region_lo) == (None, "fragmented", 3)
+
+    def test_metadata_mismatch(self, real_db):
+        self._seed_closed(real_db)
+        r = self._next(real_db, meta=self.META[:-1])
+        assert (r.selected, r.reason, r.start_pos, r.ceiling_pos) == (
+            None, "metadata-mismatch", 3, 5,
+        )
+
+    @pytest.mark.parametrize("seed", ["none", "gap", "closed", "swept"])
+    def test_wrapper_returns_exactly_selected(self, real_db, seed):
+        import mcp_server
+        if seed == "gap":
+            self._seed_gap(real_db)
+        elif seed in ("closed", "swept"):
+            self._seed_closed(real_db)
+        if seed == "swept":
+            mcp_server._correction_sweep_through_update(real_db, self.LIN[5], self.META[5][1])
+        assert mcp_server._correction_sweep_select_position(
+            real_db, self.LIN, self.META,
+        ) == self._next(real_db).selected
+
+    def test_reason_literals_match_ingest_progress_vocabulary(self):
+        """(#222 phase 4 fix wave, item 2b) Nothing else couples the reason
+        strings _correction_sweep_next actually returns to
+        ingest_progress.SWEEP_STATE_FOR_REASON's keys: each test above pins
+        ONE reason via an end-to-end seeded call, and
+        TestSweep.test_reason_table_covers_every_decline_reason
+        (tests/test_ingest_progress.py) only pins the literal
+        SWEEP_STATE_FOR_REASON dict against itself. Neither reddens if a
+        seventh `_SweepNext(None, "new-reason", ...)` is added to
+        _correction_sweep_next without updating the other side.
+
+        Extracted with ast over just this function's source, not a regex
+        over the whole file, so a same-spelled string appearing elsewhere in
+        mcp_server.py (e.g. in a comment or an unrelated call) can't be
+        mistaken for one of _SweepNext's own reason arguments.
+        """
+        import ast
+        import inspect
+        import mcp_server
+        import ingest_progress
+
+        source = inspect.getsource(mcp_server._correction_sweep_next)
+        tree = ast.parse(source)
+
+        reasons = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_SweepNext"
+                and len(node.args) > 1
+                and isinstance(node.args[1], ast.Constant)
+            ):
+                reasons.add(node.args[1].value)
+
+        assert reasons, "found no _SweepNext(...) reason literals -- ast walk broken?"
+        assert reasons == set(ingest_progress.SWEEP_STATE_FOR_REASON) | {"selected"}
+
+
+# ---------------------------------------------------------------------------
+# #222 phase 4: status observability, end to end (real backend, real git)
+# ---------------------------------------------------------------------------
+
+def _phase4_add_commit(repo, i):
+    (repo / f"m{i}.py").write_text(f"def f{i}():\n    return {i}\n")
+    ts = (
+        datetime.datetime(2021, 3, 1, tzinfo=datetime.timezone.utc)
+        + datetime.timedelta(days=i)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    env = {**os.environ, "GIT_AUTHOR_DATE": ts, "GIT_COMMITTER_DATE": ts}
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True,
+                    capture_output=True, env=env)
+
+
+def _phase4_linear_repo(tmp_path, n, name="repo"):
+    repo = tmp_path / name
+    repo.mkdir()
+    for args in (["init", "-b", "master"], ["config", "user.email", "t@t.com"],
+                 ["config", "user.name", "T"]):
+        _subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    for i in range(n):
+        _phase4_add_commit(repo, i)
+    return repo
+
+
+def _phase4_run(repo, graph_path, monkeypatch, branch="master"):
+    """One real _run_ingestion against an on-disk graph, then the status the
+    handler reports and the graph's true commit count. Leases are released
+    around it (docs/testing-conventions.md, pattern 2)."""
+    import mcp_server
+    monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(graph_path))
+    mcp_server._reset_db_state()
+    mcp_server._ingest_progress = {
+        "status": "idle", "total": 0, "prior_ingested": 0,
+        "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        "phase": None,
+    }
+    asyncio.run(mcp_server._run_ingestion(str(repo), branch))
+    mcp_server._reset_db_state()
+    status = mcp_server.handle_minigraf_ingest_status()
+    with mcp_server.db_lease() as db:
+        graph_commits = mcp_server._count_commit_entities(db)
+    mcp_server._reset_db_state()
+    return status, graph_commits
+
+
+class TestIngestStatusPhase4E2E:
+    def test_status_carries_the_phase4_blocks_after_a_fresh_run(self, tmp_path, monkeypatch):
+        repo = _phase4_linear_repo(tmp_path, 10)
+        status, graph_commits = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        assert status["status"] == "complete"
+        assert graph_commits == 10
+        run = status["this_run"]
+        assert (run["to_retire"], run["retired"], run["written"], run["failed"]) == (10, 10, 10, 0)
+        assert status["visibility"] == {"verified": 10, "total": 10, "complete": True}
+        assert status["lineage"]["complete"] is True
+        assert status["streams"]["sweep"]["state"] == "done"
+        assert status["streams"]["forward"]["state"] == "done"
+        assert status["streams"]["reverse"]["state"] == "done"
+        json.dumps(status)  # the RunProgress object itself must never leak into the response
+
+    def test_a_no_op_rerun_reports_not_needed_streams(self, tmp_path, monkeypatch):
+        repo = _phase4_linear_repo(tmp_path, 6)
+        graph = tmp_path / "g.graph"
+        _phase4_run(repo, graph, monkeypatch)
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        assert status["this_run"]["to_retire"] == 0
+        assert status["streams"]["forward"]["state"] == "not-needed"
+        assert status["streams"]["reverse"]["state"] == "not-needed"
+        assert status["visibility"]["complete"] is True
+        assert status["lineage"]["complete"] is True
+
+    def test_stage_b_reports_sweep_progress_instead_of_freezing(self, tmp_path, monkeypatch):
+        """Master: every sweep step sampled processed == total (20/20) with no
+        sweep counter at all. Now `swept` climbs to `to_sweep`."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 12)
+        samples = []
+        real_apply = mcp_server._correction_sweep_apply
+
+        def spy(*args, **kwargs):
+            run = mcp_server._ingest_progress["_run"]
+            sw = run.snapshot()["streams"]["sweep"]
+            samples.append((mcp_server._ingest_progress["phase"], sw["state"], sw["swept"], sw["to_sweep"]))
+            return real_apply(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", spy)
+        status, _ = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        assert samples, "Stage B must sweep something on a fresh 1:1 run"
+        to_sweep = samples[0][3]
+        assert to_sweep == len(samples)
+        assert [s[2] for s in samples] == list(range(len(samples)))
+        assert all(s[0] == "sweeping" and s[1] == "running" for s in samples)
+        sw = status["streams"]["sweep"]
+        assert (sw["state"], sw["swept"], sw["to_sweep"]) == ("done", to_sweep, to_sweep)
+
+    def _fail_second_reverse_write(self, monkeypatch):
+        import mcp_server
+        real = mcp_server._reverse_apply
+        calls = {"n": 0}
+
+        def failing(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("injected write failure")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", failing)
+        return real
+
+    def test_a_lost_commit_is_no_longer_reported_as_complete(self, tmp_path, monkeypatch):
+        """C1. Master reported `complete` at 20/20 while the graph held 19
+        commits and Stage B never ran."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 20)
+        self._fail_second_reverse_write(monkeypatch)
+        status, graph_commits = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        assert graph_commits == 19
+        assert status["status"] == "complete"  # the run itself finished
+        assert status["this_run"]["failed"] == 1
+        assert status["visibility"] == {"verified": 19, "total": 20, "complete": False}
+        sw = status["streams"]["sweep"]
+        assert (sw["state"], sw["blocked_reason"]) == ("blocked", "gap-open")
+        assert status["lineage"]["complete"] is False
+
+    def test_a_rewalk_never_reports_more_than_it_had_to_do(self, tmp_path, monkeypatch):
+        """C2. The re-walk below C1's reverse floor. Master's seeded counter
+        read 28/20 here; this also recomputes that old formula on the same
+        samples, so the scenario provably reaches the defect."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 20)
+        graph = tmp_path / "g.graph"
+        real_reverse = self._fail_second_reverse_write(monkeypatch)
+        _phase4_run(repo, graph, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_reverse)
+
+        samples = []
+
+        def sampling(*args, **kwargs):
+            p = mcp_server._ingest_progress
+            run = p["_run"].snapshot()["this_run"]
+            samples.append((run["retired"], run["to_retire"], p["prior_ingested"]))
+            return real_reverse(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", sampling)
+        status, graph_commits = _phase4_run(repo, graph, monkeypatch)
+        assert graph_commits == 20
+        assert all(retired <= to_retire for retired, to_retire, _ in samples)
+        run = status["this_run"]
+        assert run["retired"] == run["to_retire"]
+        old_processed = status["prior_ingested"] + run["retired"]
+        assert old_processed > status["total"], (
+            f"scenario no longer reaches the #222-phase-4 defect: old formula "
+            f"{old_processed} <= total {status['total']}"
+        )
+        assert status["visibility"]["complete"] is True
+        assert status["lineage"]["complete"] is True
+
+    def test_new_counter_equals_old_processed_census_parity(self, tmp_path, monkeypatch):
+        """#317's commit_census reads walk_claimed; after Task 6 it is
+        prior_ingested + this_run.retired. It must be the SAME number
+        `processed` held, or the census gates change meaning."""
+        repo = _phase4_linear_repo(tmp_path, 8)
+        graph = tmp_path / "g.graph"
+        _phase4_run(repo, graph, monkeypatch)
+        _phase4_add_commit(repo, 8)
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        # Pinned before `processed` was deleted: on this scenario the old
+        # counter read prior_ingested (8) + retired (1) = 9.
+        assert status["prior_ingested"] + status["this_run"]["retired"] == 9
+
+    def _head(self, repo):
+        return _subprocess.run(["git", "rev-parse", "master"], cwd=repo,
+                               capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_last_commit_is_the_branch_tip_fresh_incremental_and_noop(self, tmp_path, monkeypatch):
+        """Master: the meeting point on a fresh run, the forward watermark on a
+        no-op rerun -- never HEAD."""
+        repo = _phase4_linear_repo(tmp_path, 10)
+        graph = tmp_path / "g.graph"
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        assert status["last_commit"] == self._head(repo)
+        _phase4_add_commit(repo, 10)
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        assert status["last_commit"] == self._head(repo)
+        status, _ = _phase4_run(repo, graph, monkeypatch)
+        assert status["last_commit"] == self._head(repo)
+
+    def test_total_ingested_is_the_true_commit_count_after_a_rewalk(self, tmp_path, monkeypatch):
+        """Master persisted the seeded walk counter: 28 on a 20-commit graph."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 20)
+        graph = tmp_path / "g.graph"
+        real_reverse = self._fail_second_reverse_write(monkeypatch)
+        _phase4_run(repo, graph, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_reverse)
+        _, graph_commits = _phase4_run(repo, graph, monkeypatch)
+        with mcp_server.db_lease() as db:
+            persisted = mcp_server._total_ingested_query(db)
+        mcp_server._reset_db_state()
+        assert persisted == graph_commits == 20
+
+    def test_the_processed_family_is_gone(self, tmp_path, monkeypatch):
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 4)
+        status, _ = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        removed = {"processed", "processed_this_run", "positions_skipped", "positions_skipped_this_run"}
+        assert removed.isdisjoint(status), removed & set(status)
+        assert removed.isdisjoint(mcp_server._ingest_progress)
+
+    def test_a_declined_start_does_not_echo_the_previous_runs_numbers(
+        self, tmp_path, monkeypatch
+    ):
+        """A refused minigraf_ingest_git (another live process already owns
+        the graph, #108) must not report a stale `this_run`/`streams`/
+        `visibility`/`lineage` from whatever run last populated `_run` in
+        this process. Before the one-line fix
+        (`_ingest_progress["_run"] = None` in the "already owned" branch)
+        this failed: the previous run's RunProgress was still sitting in
+        `_ingest_progress["_run"]` and handle_minigraf_ingest_status happily
+        merged its snapshot() into the declined-start response.
+
+        Not `@pytest.mark.asyncio`, deliberately: `_phase4_run` drives
+        `_run_ingestion` through its own `asyncio.run`, which raises if
+        called from inside an already-running event loop -- so the
+        precondition run and the declined-start call below both go through
+        `asyncio.run`, matching `_phase4_run`'s own convention."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 2)
+        graph = tmp_path / "g.graph"
+        _phase4_run(repo, graph, monkeypatch)
+        assert mcp_server._ingest_progress.get("_run") is not None, (
+            "precondition: a completed run must leave a RunProgress behind, "
+            "or this test proves nothing about echoing it"
+        )
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: {"pid": 12345})
+        result = asyncio.run(mcp_server.handle_minigraf_ingest_git(repo_path=str(repo)))
+        assert result["ok"] is False
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert "this_run" not in status

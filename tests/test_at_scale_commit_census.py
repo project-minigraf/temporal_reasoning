@@ -214,3 +214,23 @@ class TestWhichDiagnosisWinsWhenSeveralApply:
         assert result["ident_collisions"] == 1
         assert result["walk_vs_graph"] == 2
         assert result["repo_vs_graph"] == 2
+
+
+class TestWalkClaimedFromProgress:
+    """#222 phase 4: `processed` is gone; walk_claimed is prior_ingested +
+    this run's retired count -- the SAME value `processed` held, so every
+    commit_census gate keeps its meaning."""
+
+    def test_prior_plus_retired(self):
+        from evals.at_scale.commit_census import walk_claimed_from_progress
+        from ingest_progress import RunProgress
+        run = RunProgress([f"{i:040x}" for i in range(20)], 9, -1, None, None)
+        run.stage_a_started()
+        for pos in range(9):
+            run.retired("rev", "written", pos)
+        assert walk_claimed_from_progress({"prior_ingested": 19, "_run": run}) == 28
+
+    def test_a_run_that_failed_before_construction_claims_prior_only(self):
+        from evals.at_scale.commit_census import walk_claimed_from_progress
+        assert walk_claimed_from_progress({"prior_ingested": 0, "_run": None}) == 0
+        assert walk_claimed_from_progress({"status": "error"}) == 0

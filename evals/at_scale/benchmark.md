@@ -2175,8 +2175,8 @@ nightly, per CLAUDE.md's rule against gating on a prediction:**
 | `repo_vs_walk` | 0 |
 | `walk_vs_graph` | 0 |
 | `prior_ingested` | 262 |
-| `processed_this_run` | 38 |
-| `positions_skipped_this_run` | 0 |
+| `processed_this_run` (pre-phase-4 name; now `retired_this_run`) | 38 |
+| `positions_skipped_this_run` (pre-phase-4 name; now `skipped_this_run`) | 0 |
 | `retention_engaged` | **true** |
 | `proved_nothing` | false (nonzero denominator — the positive control) |
 | `ok` | true |
@@ -2188,8 +2188,8 @@ pre-#325 discard-on-tip-growth behaviour would re-walk all 300 positions on
 the "resume" and still report `repo_vs_graph == 0` (minigraf collapses a
 re-transacted commit triple at an identical `commit_ts_iso` rather than
 duplicating it), so `ok` would stay green while silently no longer exercising
-the mechanism this probe exists to guard. `retention_engaged` is `prior_ingested
-> 0 and processed_this_run < repo_commits` (`evals/at_scale/probe_resume_census.py`'s
+the mechanism this probe exists to guard. `retention_engaged` is `census["prior_ingested"] > 0 and census["retired_this_run"]
+< census["repo_commits"]` (`evals/at_scale/probe_resume_census.py`'s
 `retention_engaged`) — RENDERED, never gated, so every run re-proves its own
 positive control rather than it being a fact about the day this baseline was
 measured. `262 > 0` and `38 < 300` both hold, so this run's `true` is direct
@@ -2229,12 +2229,13 @@ run that DOES re-touch already-ingested territory — the #326 same-run skip
 fast path, #313's torn-position repair re-walk, and this branch's own
 below-`rev_claim_floor` re-walk are all examples, and all three are CORRECT
 behaviour, not degraded resumes — double-counts that position:
-`_ingest_progress["processed"]` counts positions RETIRED this run (skip,
-extraction failure, or reaching write dispatch regardless of outcome),
-never commits actually WRITTEN, and is seeded with `prior_ingested` at run
-start, so a re-touched position already inside that seed drives
-`walk_claimed` — and `walk_vs_graph = walk_claimed - graph_commit_entities`
-— POSITIVE on a perfectly healthy run. Because `collect_commit_census` gates
+`commit_census.walk_claimed_from_progress` computes `walk_claimed` as
+`prior_ingested` (the graph's commit count at run start) plus the run's
+own `RunProgress.retired_count` — positions retired this run via written,
+skipped or failed outcomes, never commits actually WRITTEN alone — so a
+re-touched position already counted inside `prior_ingested` still adds to
+`retired_count` and drives `walk_claimed` up — and `walk_vs_graph =
+walk_claimed - graph_commit_entities` — POSITIVE on a perfectly healthy run. Because `collect_commit_census` gates
 `walk_vs_graph` BEFORE `repo_vs_walk` (an `elif` chain), `walk_vs_graph` is
 the clause that would actually fail such a run — that is what makes it a
 false positive — the exact shape

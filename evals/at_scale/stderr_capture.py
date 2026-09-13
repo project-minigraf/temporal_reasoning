@@ -1,10 +1,10 @@
 """Stderr capture and scanning for the at-scale ingestion benchmark (#256).
 
 _run_ingestion isolates per-commit failures rather than propagating them (its
-documented "fail only the one commit" contract), and _ingest_progress
-["processed"] increments on the skip paths too. So neither `processed` nor
-`final_status` can tell you a commit was dropped -- the stderr line is the
-only signal. Same for the correction sweep's residue total.
+documented "fail only the one commit" contract), and a failed position is
+still retired, so neither this run's retired count nor `final_status` can
+tell you a commit was dropped -- the stderr line is the only signal. Same
+for the correction sweep's residue total.
 """
 
 from __future__ import annotations
