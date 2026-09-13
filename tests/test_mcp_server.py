@@ -29161,3 +29161,130 @@ class TestIngestStatusPhase4E2E:
         assert result["ok"] is False
         status = mcp_server.handle_minigraf_ingest_status()
         assert "this_run" not in status
+
+
+# ---------------------------------------------------------------------------
+# #342: a failed FORWARD write must not be swallowed by frontier-low's range
+# ---------------------------------------------------------------------------
+
+def _phase4_commit_order(repo, branch="master"):
+    """hash -> linearization position. Built with the same git ordering
+    _run_ingestion's linearization uses; these repos are linear, so
+    --topo-order has only one valid answer and the two cannot diverge."""
+    out = _subprocess.run(
+        ["git", "log", "--topo-order", "--reverse", "--format=%H", branch],
+        cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.split()
+    return {h: i for i, h in enumerate(out)}
+
+
+def _phase4_ingestion_hash(graph_path, ident):
+    """The :hash a :type/ingestion watermark entity currently names, or None."""
+    import mcp_server
+    with mcp_server.db_lease() as db:
+        raw = mcp_server._db_execute(
+            db, f"(query [:find ?v :where [{ident} :hash ?v]])"
+        )
+    mcp_server._reset_db_state()
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+class TestForwardClaimCeiling342:
+    """#342: the forward analogue of #326's `rev_claim_floor`.
+
+    :ingestion/frontier-low is a closed RANGE bound, so a forward position
+    whose write RAISES is swept inside it by the next HIGHER position that
+    succeeds -- its own claim never persisted, but a neighbour's did. The
+    commit is then never re-walked and its entities are simply absent, on a
+    run that reports `status: complete`.
+    """
+
+    def _fail_nth_forward_write(self, monkeypatch, n=5):
+        """Raise inside the nth STAGE A _forward_apply call.
+
+        Stage B's lifecycle pass calls the same function with
+        linearization=None/pos=None/lifecycle_only=True; counting those would
+        move the injection onto a commit the forward stream never claimed, so
+        they are passed straight through.
+        """
+        import mcp_server
+        real = mcp_server._forward_apply
+        seen = {"n": 0}
+        failed = {}
+
+        def failing(*args, **kwargs):
+            lin = args[6] if len(args) > 6 else kwargs.get("linearization")
+            if lin is not None:
+                seen["n"] += 1
+                if seen["n"] == n:
+                    failed["hash"] = args[3][0]
+                    failed["pos"] = args[7] if len(args) > 7 else kwargs["pos"]
+                    raise RuntimeError("injected forward write failure")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", failing)
+        return real, failed
+
+    def test_the_next_run_rewalks_a_failed_forward_position(self, tmp_path, monkeypatch):
+        """The defect itself. Master persists a claim past the failed position,
+        so the next run reads the gap as starting above it and the commit is
+        lost permanently."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 20)
+        graph = tmp_path / "g.graph"
+        real, failed = self._fail_nth_forward_write(monkeypatch)
+        _, commits1 = _phase4_run(repo, graph, monkeypatch)
+        assert failed, "precondition: the injection never fired"
+        # 19, not 5: the positions ABOVE the failure still did their work --
+        # the ceiling withholds bookkeeping, never writes.
+        assert commits1 == 19, (
+            f"precondition: exactly one commit must be missing, got {commits1}"
+        )
+        monkeypatch.setattr(mcp_server, "_forward_apply", real)
+        status, commits2 = _phase4_run(repo, graph, monkeypatch)
+        assert commits2 == 20
+        assert status["visibility"]["complete"] is True
+        assert status["lineage"]["complete"] is True
+
+    def test_frontier_low_never_claims_past_a_failed_forward_position(
+        self, tmp_path, monkeypatch
+    ):
+        """The mechanism, asserted directly rather than through its effect."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 20)
+        graph = tmp_path / "g.graph"
+        _, failed = self._fail_nth_forward_write(monkeypatch)
+        _phase4_run(repo, graph, monkeypatch)
+        assert failed, "precondition: the injection never fired"
+        pos_of = _phase4_commit_order(repo)
+        with mcp_server.db_lease() as db:
+            low = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT)
+        mcp_server._reset_db_state()
+        assert low is not None, "precondition: the forward stream claimed nothing"
+        assert pos_of[low[1]] < failed["pos"], (
+            f"frontier-low's :hi-hash sits at position {pos_of[low[1]]}, at or "
+            f"above the failed position {failed['pos']}: the closed range now "
+            f"declares that commit complete and no run will re-walk it (#342)"
+        )
+
+    def test_all_three_forward_watermarks_stop_below_the_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """:ingestion/watermark and :ingestion/lineage-confirmed-through both
+        mean "contiguous from C0", exactly as frontier-low's range does, so a
+        ceiling that held back only one of the three would leave the other two
+        asserting past the failure."""
+        repo = _phase4_linear_repo(tmp_path, 20)
+        graph = tmp_path / "g.graph"
+        _, failed = self._fail_nth_forward_write(monkeypatch)
+        _phase4_run(repo, graph, monkeypatch)
+        assert failed, "precondition: the injection never fired"
+        pos_of = _phase4_commit_order(repo)
+        for ident in (":ingestion/watermark", ":ingestion/lineage-confirmed-through"):
+            h = _phase4_ingestion_hash(graph, ident)
+            assert h is not None, f"precondition: {ident} was never written"
+            assert pos_of[h] < failed["pos"], (
+                f"{ident} names position {pos_of[h]}, at or above the failed "
+                f"position {failed['pos']} (#342)"
+            )

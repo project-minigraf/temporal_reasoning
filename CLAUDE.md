@@ -1204,10 +1204,59 @@ commit. `ingest_progress.RunProgress` now reports `this_run` (work, `retired
 <= to_retire`), per-stream state and rate, `visibility` (what the frontier
 can prove, which can dip between runs) and `lineage`. **Done is
 `visibility.complete and lineage.complete`, never `status: complete`
-alone.** Residual: a failed FORWARD write is swallowed by frontier-low's
-range on the next forward claim (#326 left forward failure semantics out of
-scope), so the next run's `visibility` counts it. The failing run itself
-reports `complete: false`, and `skipped_commits` stays loud.
+alone.**
+
+**A failed FORWARD write is no longer swallowed by frontier-low's range, and
+#342 is #326's floor stated over the other stream.** `:ingestion/frontier-low`
+is a closed RANGE bound, so a forward position whose write RAISED was swept
+inside it by the next HIGHER position that succeeded — membership implied by a
+NEIGHBOUR's claim, never by its own, which is #326 Finding A exactly. The
+commit was then never re-walked: measured on a 20-commit linear repo with the
+5th forward write injected to raise, the graph held 19 commits after the
+failing run and **still 19 after a clean second run**, with frontier-low's
+`:hi-hash` and `:ingestion/watermark` both sitting at position 9 while the
+failure was at position 4.
+
+`_forward_apply` takes `persist_claim` (mirroring `_reverse_apply`'s), and
+`_run_ingestion` keeps `fwd_claim_ceiling`. A CEILING, not a floor: reverse
+descends so a failure blocks every LOWER position from claiming, forward
+ascends so it blocks every HIGHER one. As on the reverse side this withholds
+BOOKKEEPING, never WORK — the positions above are still parsed and written in
+full (19 commits, not 5), they simply do not assert completion — so do not
+"optimize" it into skipping the work.
+
+**All three forward watermarks move together or not at all.** `persist_claim`
+gates the frontier-low claim, `:ingestion/watermark` AND
+`:ingestion/lineage-confirmed-through` in one branch, because all three mean
+"contiguous from C0"; a gate holding back only the frontier would leave the
+other two asserting past the failure. Those three are also the only writes in
+`_forward_apply` that assert anything about positions other than the one being
+applied, and each has exactly ONE call site — all inside that branch.
+
+**A run-scoped SCALAR, where the reverse floor needs a dict keyed by target
+ident.** #325 made the reverse floor per-interval because one run's allocator
+can serve a tip gap and a disjoint bulk gap together. The forward stream has no
+such split: it claims exactly one interval (frontier-low, the authoritative
+one) and `claim_low()` is CONTIGUITY-bound since #325 — one ident, one ascent,
+one number. Widening `claim_low()` to serve a non-adjacent hole would require
+making this per-ident with it. The check is evaluated at DISPATCH time, not
+claim time, for the same reason the reverse one is: claims run ahead of writes
+by `pipeline_depth`.
+
+**Accepted cost, identical to #326's.** With frontier-low held below the
+failure the persisted gap never reads closed, so Stage B declines `gap-open`
+and `_should_fold_lineage_watermark` returns False — no lineage confirmation
+for that whole span, self-healing on the next clean run. And a deterministic
+forward failure at a fixed position blocks forward progress above it on every
+run until it stops failing. There is no `GRAPH_FORMAT_VERSION` bump and no
+migration: this only withholds writes.
+
+The failing run itself still reports `complete: false`, and `skipped_commits`
+stays loud. What has changed is that the failure now survives into the NEXT
+run's view instead of that run counting the missing commit as verified.
+Ablation-proven, with the dispatch argument forced to `True` (exactly what the
+old code did, having no `persist_claim` at all): all three regression tests
+redden, each on its own defect-naming assertion.
 
 ## Claude Code Plugin Publishing
 
