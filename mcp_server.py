@@ -11562,6 +11562,7 @@ def _forward_apply(
     linearization: Optional[List[str]] = None,
     pos: Optional[int] = None,
     lifecycle_only: bool = False,
+    persist_claim: bool = True,
 ) -> None:
     """Apply one commit's forward-walk writes.
 
@@ -11577,6 +11578,16 @@ def _forward_apply(
     frontier-low claim and advances the lineage-confirmed-through watermark;
     both default to None so the existing tests that call this function with a
     bare commit tuple stay valid.
+
+    persist_claim (#342) is the forward mirror of _reverse_apply's own
+    parameter: False withholds this position's BOOKKEEPING -- the
+    frontier-low claim, :ingestion/watermark and
+    :ingestion/lineage-confirmed-through -- while every triple above is
+    still written. All three move together because all three mean
+    "contiguous from C0", so a gate holding back only one would leave the
+    other two asserting past a position this run failed to complete. See
+    _run_ingestion's `fwd_claim_ceiling` for why that matters and do NOT
+    "optimize" this into skipping the writes as well.
 
     lifecycle_only (#222 phase 2d, Stage B) restricts this to the facts the
     REVERSE stream never wrote for a commit in frontier-high's territory --
@@ -12100,7 +12111,15 @@ def _forward_apply(
     # and none of these three watermarks may advance into the reverse region --
     # :ingestion/watermark and :ingestion/lineage-confirmed-through both mean
     # "contiguous from C0", and frontier-low belongs to the forward stream.
-    if not lifecycle_only:
+    #
+    # #342: `persist_claim=False` withholds all three of these together. They
+    # are the ONLY three writes in this function that assert something about
+    # positions OTHER than this one -- :lo-hash/:hi-hash is a closed RANGE and
+    # both watermarks mean "contiguous from C0" -- so each of them, written
+    # for a position above one whose write FAILED, silently declares that
+    # failed position complete. The work above has already happened; only the
+    # claim to have completed it is refused.
+    if not lifecycle_only and persist_claim:
         _watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
         if linearization is not None and pos is not None:
             _frontier_persist_claim(
@@ -13391,6 +13410,43 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # persisted interval permanently.
                 rev_claim_floor: Dict[str, int] = {}
 
+                # #342: the forward mirror. A CEILING, not a floor -- the
+                # reverse stream descends, so a failure there blocks every
+                # LOWER position from claiming; the forward stream ascends, so
+                # a failure here blocks every HIGHER one. Same defect either
+                # way: :ingestion/frontier-low is a closed RANGE bound, so a
+                # position whose write raised is swept inside it by the next
+                # position that succeeds -- membership implied by a
+                # NEIGHBOUR's claim, never by its own (#326 Finding A, stated
+                # over the other stream).
+                #
+                # A run-scoped SCALAR, deliberately, where the reverse side
+                # needs a dict keyed by target ident. #325 made the reverse
+                # floor per-interval because one run's allocator can serve a
+                # tip gap and a disjoint bulk gap in the same run, so a
+                # failure in one must not withhold bookkeeping for the other.
+                # The forward stream has no such split: it claims exactly one
+                # interval (:ingestion/frontier-low, the authoritative one),
+                # and claim_low() is CONTIGUITY-bound since #325 -- it serves
+                # only the hole adjacent to that interval's own edge and
+                # returns None for every other hole. One ident, one ascent,
+                # one number. Should claim_low() ever be widened to serve a
+                # non-adjacent hole, this must become per-ident with it.
+                fwd_claim_ceiling: Optional[int] = None
+
+                def _note_incomplete_fwd(claim_tag: str, claim_pos: int) -> None:
+                    # min(), not first-wins: the two are identical while the
+                    # FIFO pipeline delivers forward positions strictly
+                    # ascending (see submit_next's ordering note), and this
+                    # way the guarantee does not silently depend on that.
+                    nonlocal fwd_claim_ceiling
+                    if claim_tag != "fwd":
+                        return
+                    fwd_claim_ceiling = (
+                        claim_pos if fwd_claim_ceiling is None
+                        else min(fwd_claim_ceiling, claim_pos)
+                    )
+
                 def _note_incomplete_rev(claim_tag: str, claim_pos: int, ident: str) -> None:
                     # #325 review Finding 3 (Minor): `ident` is typed `str`,
                     # never `Optional[str]` -- this is only ever called with
@@ -13545,6 +13601,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             file=sys.stderr,
                         )
                         _note_incomplete_rev(tag, pos, claim_ident)
+                        _note_incomplete_fwd(tag, pos)
                         submit_next()
                         _ingest_progress["current_commit"] = commit_hash
                         run_progress.retired(tag, "failed", pos)
@@ -13588,6 +13645,20 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     commit_metadata[pos],
                                     (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
                                     index_con, linearization, pos,
+                                    # lifecycle_only=False, then #342's
+                                    # persist_claim. Positional because
+                                    # run_in_executor takes no kwargs.
+                                    #
+                                    # Evaluated at DISPATCH time, not claim
+                                    # time, for the same reason the reverse
+                                    # check is: claims run ahead of writes by
+                                    # pipeline_depth, so the position that
+                                    # fails may not have set the ceiling yet
+                                    # when a higher position was ALLOCATED in
+                                    # submit_next -- only by the time its own
+                                    # write is dispatched here.
+                                    False,
+                                    fwd_claim_ceiling is None or pos < fwd_claim_ceiling,
                                 )
                             else:
                                 await loop.run_in_executor(
@@ -13658,6 +13729,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             )
                             _trace_write_ok = False
                             _note_incomplete_rev(tag, pos, claim_ident)
+                            _note_incomplete_fwd(tag, pos)
 
                     # #260: no record for a commit whose write failed -- same
                     # contamination class the brief excluded extraction
