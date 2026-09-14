@@ -3227,6 +3227,28 @@ class TestIngestionBranchFact:
         }
         assert branch_desc not in other_descs
 
+    @pytest.mark.asyncio
+    async def test_status_reports_orphans_after_a_rewrite(self, tmp_path):
+        """Computed ONCE during the run, never queried at poll time: phase 4
+        settled that status is not derived from graph queries at poll time
+        (lock contention, added latency, staler than the in-memory state)."""
+        import mcp_server
+        divergent = TestDivergentRefEndToEnd()
+        repo = divergent._repo(tmp_path, 8)
+        mcp_server.open_db(str(tmp_path / "g.graph"))
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        head = _subprocess.run(["git", "rev-parse", "HEAD~3"], cwd=repo,
+                               check=True, capture_output=True, text=True).stdout.strip()
+        divergent._rewrite_from(repo, head)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["orphaned_commits"] > 0, (
+            "a rewrite left commit entities the ref no longer contains, and "
+            "status reported none"
+        )
+
 
 class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, real_db):

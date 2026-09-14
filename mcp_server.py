@@ -8444,6 +8444,28 @@ def _ingestion_branch_write(
         _transact(db, "[" + " ".join(to_transact) + "]", run_ts_iso, index_con=index_con)
 
 
+def _orphaned_commit_count(
+    db: Any, linearization: List[str], recorded_branch: Optional[str], ref: str
+) -> Optional[int]:
+    """How many live :type/commit entities hold a hash this ref's history no
+    longer contains, or None when that question cannot be answered.
+
+    None when the graph recorded no branch, or recorded a different one: those
+    commits may belong to another ingested branch, and reporting a count would
+    invite a reader to treat real history as garbage. Detection only -- nothing
+    here retracts anything.
+    """
+    if recorded_branch is None or recorded_branch != ref:
+        return None
+    raw = _db_execute(
+        db, "(query [:find ?h :where [?e :entity-type :type/commit] [?e :hash ?h]])"
+    )
+    graph_hashes = {r[0] for r in json.loads(raw).get("results", []) if r}
+    if not graph_hashes:
+        return None
+    return len(graph_hashes - set(linearization))
+
+
 # System attributes written by _transact_extracted_facts alongside domain attributes.
 # They are invisible to schema validation and filtered from attr_facts in minigraf_audit.
 _SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})
@@ -13328,8 +13350,31 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # suppressing its own stamp, then being refused by
             # _graph_format_version_verify as a state-present/stamp-absent
             # pre-#263 graph. That condemns a graph holding no ingested data.
+            #
+            # Read BEFORE the write below overwrites it. _orphaned_commit_count
+            # compares the PREVIOUSLY-recorded branch against this run's ref --
+            # reading after the write would compare this run's ref against
+            # itself, which always matches and silently defeats the guard.
+            prior_branch = await loop.run_in_executor(
+                write_executor, _ingestion_branch_read, db,
+            )
             await loop.run_in_executor(
                 write_executor, _ingestion_branch_write, db, branch, run_ts_iso, index_con,
+            )
+            # #222 phase 5 item B. Computed ONCE here, where the linearization
+            # and a lease are both already in hand, and stored as a plain
+            # _ingest_progress key -- NOT queried at poll time (phase 4: status
+            # is never derived from graph queries at poll time, which contends
+            # on _db_native_lock and is staler than memory anyway), and NOT put
+            # on RunProgress, which is deliberately pure (no DB, no git,
+            # injected clocks).
+            #
+            # None, never 0, when the previously-recorded branch does not
+            # match this run's ref: the graph carries no per-commit branch, so
+            # commits from another ingested branch are indistinguishable from
+            # a rewrite's leftovers. A 0 there would read as "verified clean".
+            _ingest_progress["orphaned_commits"] = await loop.run_in_executor(
+                write_executor, _orphaned_commit_count, db, linearization, prior_branch, branch,
             )
             allocator = await loop.run_in_executor(
                 write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
@@ -14429,7 +14474,7 @@ async def handle_minigraf_ingest_git(
     _ingest_progress = {
         "status": "starting", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-        "phase": None,
+        "phase": None, "orphaned_commits": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch or _default_git_branch(repo)))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
