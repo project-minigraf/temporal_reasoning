@@ -8641,6 +8641,39 @@ class TestFrontierLowRetentionCheck:
         )
 
 
+class TestFrontierLowRetractsUnresolvableBounds:
+    """#222 phase 5 item A, fix round 1. Mirrors
+    TestFrontierLoadRetractsUnresolvableBounds (the provisional/frontier-high
+    side): an unresolvable bound used to leave frontier-low's facts live
+    while loading no interval, so the next _frontier_persist_claim read a
+    non-None `existing` and extended bounds the allocator no longer believed
+    in. Unlike the provisional side, this discard does NOT archive a
+    :type/completed-region -- _skip_claim only ever honours a *provisional*
+    region, so archiving an authoritative one here would just leave an inert
+    row behind."""
+
+    def test_unresolvable_bounds_are_retracted(self, real_db):
+        import mcp_server, frontier_registry
+        ident = mcp_server._FRONTIER_LOW_IDENT
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag :authoritative]",
+            f'[{ident} :lo-hash "h0"]',
+            f'[{ident} :hi-hash "gone"]',
+            f"[{ident} :pos-count 2]",
+        ]) + "]", "2026-09-14T00:00:00Z")
+        lin = [f"h{i}" for i in range(20)]
+
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-14T00:00:01Z")
+
+        assert mcp_server._frontier_read_bounds(real_db, ident) is None, (
+            "left behind, these bounds are extended by the next claim"
+        )
+        assert not any(
+            iv.tag == frontier_registry.TAG_AUTHORITATIVE for iv in alloc.intervals()
+        ), "no authoritative interval should be loaded when a bound doesn't resolve"
+
+
 class TestFrontierPromoteBaseIfMissing:
     """#325 review round 3, Finding 1: a run can end with a provisional side
     that has NO BASE at all, and the state is self-perpetuating.
