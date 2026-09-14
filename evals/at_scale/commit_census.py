@@ -86,6 +86,9 @@ from typing import Any, Mapping, Optional
 # length.
 COMMIT_IDENT_PREFIX_LEN = 12
 
+# orphaned_commits' sample cap -- see its docstring.
+_ORPHAN_SAMPLE_CAP = 20
+
 
 def walk_claimed_from_progress(progress: Mapping[str, Any]) -> int:
     """`walk_claimed` from `mcp_server._ingest_progress` (#222 phase 4).
@@ -220,6 +223,63 @@ def commit_census(
     }
 
 
+def orphaned_commits(
+    graph_hashes: set[str],
+    repo_hashes: set[str],
+    recorded_branch: Optional[str],
+    audited_ref: str,
+    sample_cap: int = _ORPHAN_SAMPLE_CAP,
+) -> dict[str, Any]:
+    """`:type/commit` entities holding a hash the ref's history no longer
+    contains (#222 phase 5).
+
+    DETECTION ONLY -- there is deliberately no repair. The standing decision
+    throughout this arc is that an affected graph is REBUILT into a fresh
+    graph path, never migrated and never repaired in place; #329 established
+    separately that shipping a detector does not violate a scope decision
+    that excluded repair.
+
+    BESIDE fact_audit's scan rather than riding it, for the reason
+    collect_commit_census already states about itself: this holds a reference
+    the graph did not produce -- the repo -- and fact_audit deliberately takes
+    no repo handle.
+
+    `proved_nothing` IS THE POSITIVE CONTROL, and here it guards a false
+    positive with teeth. The graph records no per-commit branch, so a commit
+    entity absent from THIS ref's history is either a force-push orphan or a
+    commit from ANOTHER branch ingested into the same graph -- indistinguishable
+    without `:ingestion/branch`. When the recorded branch is absent or does not
+    match the audited ref, the count is not reported as a finding: it would
+    condemn a legitimately ingested branch's entire history. That is the
+    `:type/external-dependency` trap of #316 exactly, and the fix is the same
+    one -- ship the denominator, and refuse to read a number whose denominator
+    was never established.
+
+    A graph holding no commit entities reports `proved_nothing` too: a check
+    that matched nothing also reports 0.
+    """
+    scanned = len(graph_hashes)
+    interpretable = recorded_branch is not None and recorded_branch == audited_ref
+    if not interpretable or scanned == 0:
+        return {
+            "entities": 0,
+            "commit_entities_scanned": scanned,
+            "sample": [],
+            "recorded_branch": recorded_branch,
+            "audited_ref": audited_ref,
+            "proved_nothing": True,
+        }
+    orphans = sorted(graph_hashes - repo_hashes)
+    return {
+        "entities": len(orphans),
+        "commit_entities_scanned": scanned,
+        "sample": orphans[:sample_cap],
+        "recorded_branch": recorded_branch,
+        "audited_ref": audited_ref,
+        "proved_nothing": False,
+    }
+
+
 def repo_commit_counts(repo_path: str, ref: str) -> tuple[int, int]:
     """`(rev-list --count <ref>, distinct 12-char hash prefixes)`.
 
@@ -246,6 +306,38 @@ def repo_commit_counts(repo_path: str, ref: str) -> tuple[int, int]:
         if line
     }
     return int(count.stdout.strip()), len(prefixes)
+
+
+def repo_commit_hashes(repo_path: str, ref: str) -> set[str]:
+    """Every full commit hash reachable from `ref`.
+
+    A THIRD subprocess rather than a reuse of repo_commit_counts' second one:
+    that function returns 12-char PREFIXES for the ident-collision check, and
+    the orphan check compares FULL hashes (the graph stores the full hash in
+    :hash). Deriving one from the other would silently make an orphan check
+    prefix-sensitive.
+    """
+    out = subprocess.run(
+        ["git", "rev-list", ref],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    return {line for line in out.stdout.split() if line}
+
+
+def graph_commit_hashes(db: Any) -> set[str]:
+    """Every :hash value on a live :type/commit entity."""
+    import json as _json
+    import mcp_server
+    raw = mcp_server._db_execute(
+        db,
+        "(query [:find ?h :where [?e :entity-type :type/commit] [?e :hash ?h]])",
+    )
+    return {r[0] for r in _json.loads(raw).get("results", []) if r}
+
+
+def _recorded_branch(db: Any) -> Optional[str]:
+    import mcp_server
+    return mcp_server._ingestion_branch_read(db)
 
 
 def graph_commit_entities(db: Any) -> int:
@@ -286,10 +378,16 @@ def collect_commit_census(
     repo_commits = 0
     distinct = 0
     graph_count = 0
+    repo_hashes: set[str] = set()
+    graph_hashes: set[str] = set()
+    recorded_branch: Optional[str] = None
     error: Optional[str] = None
     try:
         repo_commits, distinct = repo_commit_counts(repo_path, ref)
         graph_count = graph_commit_entities(db)
+        repo_hashes = repo_commit_hashes(repo_path, ref)
+        graph_hashes = graph_commit_hashes(db)
+        recorded_branch = _recorded_branch(db)
     except Exception as e:  # noqa: BLE001 -- recorded, see docstring
         error = f"{type(e).__name__}: {e}"
 
@@ -302,4 +400,11 @@ def collect_commit_census(
         census_error=error,
     )
     result["ref"] = ref
+    # Reported under its own key and NOT folded into `ok`'s deltas: an orphan
+    # is a graph holding MORE than the repo, which drives repo_vs_graph
+    # NEGATIVE and matches none of the three delta diagnoses. It is gated
+    # separately in run_ingestion_benchmark._exit_code (clause 9).
+    result["orphaned_commits"] = orphaned_commits(
+        graph_hashes, repo_hashes, recorded_branch, ref,
+    )
     return result

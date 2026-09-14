@@ -10,7 +10,7 @@ a pure function cannot prove the numbers it is handed mean what it assumes.
 
 import pytest
 
-from evals.at_scale.commit_census import commit_census
+from evals.at_scale.commit_census import commit_census, orphaned_commits
 
 
 def _clean(**overrides):
@@ -214,6 +214,50 @@ class TestWhichDiagnosisWinsWhenSeveralApply:
         assert result["ident_collisions"] == 1
         assert result["walk_vs_graph"] == 2
         assert result["repo_vs_graph"] == 2
+
+
+class TestOrphanedCommits:
+    """#222 phase 5 item B. A force-push leaves :type/commit entities for
+    commits no longer in history, with every :introduced-by / :modified-in /
+    :parent / :tagged-commit reference to them still live."""
+
+    def test_clean_graph_reports_zero_with_a_denominator(self):
+        r = orphaned_commits({"a", "b"}, {"a", "b"}, "master", "master")
+        assert r["entities"] == 0
+        assert r["commit_entities_scanned"] == 2
+        assert r["proved_nothing"] is False
+
+    def test_rewritten_commit_is_reported(self):
+        r = orphaned_commits({"a", "dead"}, {"a", "new"}, "master", "master")
+        assert r["entities"] == 1
+        assert r["sample"] == ["dead"]
+
+    def test_branch_mismatch_proves_nothing_and_reports_no_count(self):
+        """The decisive false-positive guard. A graph ingested against
+        `develop` and audited against `master` legitimately holds commits
+        absent from master's linearization -- condemning it would delete a
+        real branch's history. #316's denominator idiom: report, never gate."""
+        r = orphaned_commits({"a", "b"}, {"a"}, "develop", "master")
+        assert r["proved_nothing"] is True
+        assert r["entities"] == 0
+
+    def test_absent_branch_proves_nothing(self):
+        """A graph predating :ingestion/branch cannot be retro-audited."""
+        r = orphaned_commits({"a", "b"}, {"a"}, None, "master")
+        assert r["proved_nothing"] is True
+        assert r["entities"] == 0
+
+    def test_empty_graph_proves_nothing(self):
+        """A check that scanned no commit entities also reports 0."""
+        r = orphaned_commits(set(), {"a"}, "master", "master")
+        assert r["proved_nothing"] is True
+        assert r["commit_entities_scanned"] == 0
+
+    def test_sample_is_capped_and_sorted(self):
+        dead = {f"d{i:03d}" for i in range(50)}
+        r = orphaned_commits(dead, set(), "master", "master", sample_cap=3)
+        assert r["entities"] == 50
+        assert r["sample"] == sorted(dead)[:3]
 
 
 class TestWalkClaimedFromProgress:
