@@ -246,11 +246,23 @@ the fact the detector depends on. The `:version` entry in that same dict
 carries a comment saying precisely this; it is the second instance of the same
 trap.
 
-**3. Detect on the existing scan.** `evals/at_scale/fact_audit.py` already
-runs a whole-graph `[:find ?e ?a ?v]` (`SCAN_QUERY`), and
-`introduced_by_audit.py` already rides it rather than paying for a second
-pass. Orphan detection rides the same scan and reports under its own key,
-`orphaned_commits`, carrying:
+**3. Detect BESIDE the audit, never inside it.** An earlier draft of this
+spec said the orphan check rides `fact_audit`'s whole-graph scan the way
+`introduced_by_audit` does. **That is wrong**, and the harness already states
+why at `commit_census`'s call site: this is a check that "holds a reference
+the graph did not produce -- the repo itself -- which is also why it cannot
+ride fact_audit's scan the way the two `:introduced-by` checks do. fact_audit
+deliberately takes no repo handle, and giving it one for this would cost that
+signature its honesty."
+
+Orphan detection needs `set(linearization)`, which is repo-derived, so it
+belongs exactly where `commit_census` belongs — in
+`evals/at_scale/commit_census.py`, which already takes `repo_path`, `ref` and
+a leased `db`, already runs `git rev-list` against the ref, and already counts
+commit entities. It is a second question over references that module already
+holds, so it costs one extra graph query and no extra git subprocess.
+
+It reports under its own key, `orphaned_commits`, carrying:
 
 - `entities` — the count of `:type/commit` entities absent from the ref's
   linearization,
@@ -274,8 +286,16 @@ positive control (that the check matches commit entities at all) is what
 An absent `orphaned_commits` key stays clean, matching every other clause: a
 metrics file from a harness that predates this check cannot be retro-failed.
 
-**5. Surface it in status.** `handle_minigraf_ingest_status` reports the same
-count, so a user sees it without running the at-scale harness.
+**5. Surface it in status, computed ONCE per run.** Not a poll-time graph
+query: phase 4 settled that status is never derived from graph queries at poll
+time, because that contends with ingestion on `_db_native_lock`, adds latency
+the benchmark measures, and is staler than the in-memory state anyway. The
+count is computed once in `_run_ingestion`, where the linearization and a
+lease are both already in hand, and stored as a plain `_ingest_progress` key.
+
+It does NOT go on `RunProgress`. That class is deliberately PURE — no DB, no
+git, injected clocks — and an orphan count is a graph-and-repo fact. Putting
+it there would cost the class the property phase 4 built it for.
 
 ### Graph format
 
