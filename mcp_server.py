@@ -6436,12 +6436,45 @@ def _frontier_load(
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     intervals: List[frontier_registry.Interval] = []
     low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
-    if low_bounds is not None and low_bounds[0] in hash_to_pos and low_bounds[1] in hash_to_pos:
-        intervals.append(frontier_registry.Interval(
-            hash_to_pos[low_bounds[0]], hash_to_pos[low_bounds[1]],
-            frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
-            ident=_FRONTIER_LOW_IDENT,
-        ))
+    if low_bounds is not None:
+        low_lo = hash_to_pos.get(low_bounds[0])
+        low_hi = hash_to_pos.get(low_bounds[1])
+        low_count = _frontier_read_pos_count(db, _FRONTIER_LOW_IDENT)
+        # #222 phase 5 item A. The same three conditions _load_one_interval
+        # demands of every PROVISIONAL interval, applied to the authoritative
+        # one, which had only the bounds-resolve test. A commit grafted below
+        # the forward frontier (#222's "merge grafts old history" edge case)
+        # leaves both hash bounds resolving while the SPAN between them grows
+        # -- and FrontierAllocator._unclaimed() is the complement of the
+        # interval set, so every position inside it is handed to no stream and
+        # silently never walked.
+        #
+        # An interval carrying NO :pos-count is not retained either: "no
+        # denominator" and "a denominator that still checks out" must not be
+        # the same branch when the failure mode is silent permanent loss.
+        # _frontier_pos_count_delta maintains it on the from_low path, so any
+        # graph that has taken a forward claim since #326 carries one.
+        #
+        # Discarded rather than routed through _load_one_interval, which also
+        # ARCHIVES a :type/completed-region -- regions are consumed by
+        # _skip_claim, which honours PROVISIONAL regions only. The cost of a
+        # discard is a forward re-walk from C0: expensive, never lossy.
+        if (
+            low_lo is not None
+            and low_hi is not None
+            and low_lo <= low_hi
+            and low_count == low_hi - low_lo + 1
+        ):
+            intervals.append(frontier_registry.Interval(
+                low_lo, low_hi,
+                frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
+                ident=_FRONTIER_LOW_IDENT,
+            ))
+        else:
+            _frontier_discard_interval(
+                db, _FRONTIER_LOW_IDENT, low_bounds,
+                index_con=index_con, pos_count=low_count,
+            )
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
     if high_bounds is not None:
         high_count = _frontier_read_pos_count(db, _FRONTIER_HIGH_IDENT)
