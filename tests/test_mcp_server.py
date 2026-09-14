@@ -3138,6 +3138,96 @@ class TestLastRunWriteGraphLevelIdempotency:
         assert json.loads(raw)["results"] == [["last ingestion run timestamp"]]
 
 
+class TestIngestionBranchFact:
+    """#222 phase 5 item B. The graph records no ref, so "a :type/commit
+    entity absent from the linearization" cannot distinguish a force-push
+    orphan from a second branch ingested into the same graph. This fact is
+    the discriminator that makes the orphan count interpretable."""
+
+    def test_write_then_read_roundtrips(self, real_db):
+        import mcp_server
+        mcp_server._ingestion_branch_write(real_db, "master", "2026-09-14T00:00:00.000Z")
+        assert mcp_server._ingestion_branch_read(real_db) == "master"
+
+    def test_absent_reads_none(self, real_db):
+        import mcp_server
+        assert mcp_server._ingestion_branch_read(real_db) is None
+
+    def test_rewriting_the_same_branch_creates_no_duplicate(self, real_db):
+        """#156: re-transacting the same (entity, attribute, value) at a fresh
+        valid-from creates a second LIVE fact, not a no-op. The diff is what
+        stops an unbounded pile-up across runs."""
+        import mcp_server
+        for ts in ("2026-09-14T00:00:00.000Z", "2026-09-14T00:00:01.000Z"):
+            mcp_server._ingestion_branch_write(real_db, "master", ts)
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?b :where [:ingestion/branch :branch ?b]])")
+        assert len(json.loads(raw).get("results", [])) == 1
+
+    def test_switching_branch_replaces_the_value(self, real_db):
+        import mcp_server
+        mcp_server._ingestion_branch_write(real_db, "master", "2026-09-14T00:00:00.000Z")
+        mcp_server._ingestion_branch_write(real_db, "develop", "2026-09-14T00:00:01.000Z")
+        assert mcp_server._ingestion_branch_read(real_db) == "develop"
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?b :where [:ingestion/branch :branch ?b]])")
+        assert len(json.loads(raw).get("results", [])) == 1
+
+    def test_audit_does_not_retract_the_branch_fact(self, real_db):
+        """handle_minigraf_audit iterates every REGISTERED type and retracts
+        any attribute outside its allowed set, querying the live graph
+        directly. `ingestion` is registered, so :branch must be listed in
+        MINIGRAF_SCHEMA or an audit run silently deletes the discriminator.
+        The :version entry carries a comment saying exactly this; this is the
+        second instance of the same trap."""
+        import mcp_server
+        mcp_server._ingestion_branch_write(real_db, "master", "2026-09-14T00:00:00.000Z")
+        mcp_server.handle_minigraf_audit()
+        assert mcp_server._ingestion_branch_read(real_db) == "master"
+
+    def test_entity_carries_expected_constants_and_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._ingestion_branch_write(db, "master", "2026-09-14T00:00:00.000Z")
+
+        ident = mcp_server._INGESTION_BRANCH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find ?a ?v :where [{ident} ?a ?v]])")
+        attrs = dict(json.loads(raw)["results"])
+        assert attrs[":entity-type"] == ":type/ingestion"
+        assert attrs[":ident"] == ident
+        assert isinstance(attrs[":description"], str) and attrs[":description"]
+
+        result = mcp_server.handle_minigraf_audit()
+        assert result["retracted"] == 0
+        assert mcp_server._ingestion_branch_read(db) == "master"
+
+    def test_description_is_distinct_from_other_ingestion_singletons(self, real_db):
+        """Two :type/ingestion watermarks with byte-identical :description
+        strings would both pass audit but be indistinguishable from each
+        other in the fact index and in minigraf_audit output."""
+        import mcp_server
+        db = real_db
+        mcp_server._ingestion_branch_write(db, "master", "2026-09-14T00:00:00.000Z")
+        mcp_server._last_run_write(db, "hash1", "2026-09-14T00:00:00.000Z", 1)
+        mcp_server._lineage_confirmed_through_update(db, "hash1", "2026-09-14T00:00:00.000Z")
+        mcp_server._correction_sweep_through_update(db, "hash1", "2026-09-14T00:00:00.000Z")
+
+        branch_desc = dict(json.loads(mcp_server._db_execute(
+            db, f"(query [:find ?a ?v :where [{mcp_server._INGESTION_BRANCH_IDENT} ?a ?v]])"
+        ))["results"])[":description"]
+        other_descs = {
+            dict(json.loads(mcp_server._db_execute(
+                db, f"(query [:find ?a ?v :where [{ident} ?a ?v]])"
+            ))["results"])[":description"]
+            for ident in (
+                ":ingestion/last-run-at",
+                mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT,
+                mcp_server._CORRECTION_SWEEP_THROUGH_IDENT,
+            )
+        }
+        assert branch_desc not in other_descs
+
+
 class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, real_db):
         import mcp_server

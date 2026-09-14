@@ -8379,6 +8379,71 @@ def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int,
         _transact(db, "[" + " ".join(to_transact) + "]", run_at, index_con=index_con)
 
 
+_INGESTION_BRANCH_IDENT = ":ingestion/branch"
+
+
+def _ingestion_branch_read(db: Any) -> Optional[str]:
+    """The ref this graph was last ingested against, or None if it predates
+    #222 phase 5 (or no run has completed its first write yet).
+
+    None is NOT "master" and must never be defaulted to one: the orphan check
+    reads an absent branch as "proved nothing", which is the honest answer for
+    a graph that never recorded one.
+    """
+    raw = _db_execute(
+        db, f"(query [:find ?b :where [{_INGESTION_BRANCH_IDENT} :branch ?b]])"
+    )
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+def _ingestion_branch_write(
+    db: Any, branch: str, run_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """Record the ref this run is walking. Written on EVERY run -- the branch
+    can change between runs -- which is why it is not a stamp-if-new like
+    _graph_format_version_stamp_if_new.
+
+    Value-diffed before writing, exactly as _last_run_write and _ingest_tags
+    do: minigraf is NOT idempotent at the graph level for re-transacting the
+    same (entity, attribute, value) at a fresh valid-from (#156), so an
+    unconditional re-transact accumulates a duplicate live fact per run.
+
+    Not folded into :ingestion/last-run-at, which is written only under
+    `if completed_all:` -- an interrupted run would record no branch, and the
+    orphan check needs the discriminator MORE on an interrupted graph, not
+    less.
+    """
+    current = _ingestion_branch_read(db)
+    if current == branch:
+        return
+    desired = {
+        ":entity-type": ":type/ingestion",
+        ":ident": _INGESTION_BRANCH_IDENT,
+        ":description": "ref this graph was last ingested against",
+        ":branch": branch,
+    }
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    raw = _db_execute(
+        db, f"(query [:find ?a ?v :where [{_INGESTION_BRANCH_IDENT} ?a ?v]])"
+    )
+    live: Dict[str, Any] = dict(json.loads(raw).get("results", []))
+    for attr, value in desired.items():
+        if live.get(attr) == value:
+            continue
+        rendered = value if attr == ":entity-type" else f'"{_edn_escape(value)}"'
+        if attr in live:
+            old = live[attr]
+            old_rendered = old if attr == ":entity-type" else f'"{_edn_escape(old)}"'
+            to_retract.append(f"[{_INGESTION_BRANCH_IDENT} {attr} {old_rendered}]")
+        to_transact.append(f"[{_INGESTION_BRANCH_IDENT} {attr} {rendered}]")
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    if to_transact:
+        _transact(db, "[" + " ".join(to_transact) + "]", run_ts_iso, index_con=index_con)
+
+
 # System attributes written by _transact_extracted_facts alongside domain attributes.
 # They are invisible to schema validation and filtered from attr_facts in minigraf_audit.
 _SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})
@@ -8456,9 +8521,12 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
         # attribute outside its allowed set, querying the live graph directly,
         # so dropping this line makes an audit run silently delete the very
         # stamp that protects the graph from being read under the wrong ident
-        # rule.
+        # rule. :branch (#222 phase 5) is load-bearing for the same reason --
+        # it is the discriminator that tells a force-push orphan apart from a
+        # second branch ingested into the same graph, and an audit that
+        # retracted it would make every orphan count uninterpretable.
         "optional": {":hash": str, ":alias": str, ":last-run-at": str, ":last-commit": str,
-                     ":total-ingested": int, ":version": int},
+                     ":total-ingested": int, ":version": int, ":branch": str},
     },
     "commit": {
         "required": {":description": str},
@@ -13246,6 +13314,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # exactly like a pre-#263 graph on the next run and be refused (#263).
             await loop.run_in_executor(
                 write_executor, _graph_format_version_stamp_if_new, db, run_ts_iso, index_con,
+            )
+            # #222 phase 5 item B. AFTER the format stamp, never before --
+            # defensive, not load-bearing: _graph_has_ingestion_state's
+            # disjunction is exactly three reads (_watermark_query and
+            # _frontier_read_bounds on each fixed frontier), so this fact is
+            # invisible to it and the stamp fires correctly either way.
+            # Keeping the stamp unambiguously first costs nothing.
+            #
+            # NEVER add :ingestion/branch to _graph_has_ingestion_state. This
+            # is written before any walk, so a run that recorded a branch and
+            # then died would afterwards read as "already ingested" --
+            # suppressing its own stamp, then being refused by
+            # _graph_format_version_verify as a state-present/stamp-absent
+            # pre-#263 graph. That condemns a graph holding no ingested data.
+            await loop.run_in_executor(
+                write_executor, _ingestion_branch_write, db, branch, run_ts_iso, index_con,
             )
             allocator = await loop.run_in_executor(
                 write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
