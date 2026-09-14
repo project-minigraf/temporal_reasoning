@@ -182,17 +182,39 @@ class TestFrontierLowRetentionCheck:
         return repo
 
     def _graft(self, repo):
-        """Branch from the ROOT, commit, merge back. `git log --topo-order`
-        places the side commit immediately after its branch point, so it
-        lands INSIDE the already-ingested span rather than above it."""
+        """Branch from the ROOT, commit, merge the MAINLINE INTO the side
+        branch, then fast-forward master onto the side branch's tip.
+
+        MEASURED IN TASK 1 -- do not "simplify" this back to the obvious
+        recipe. Branching off an old commit and then
+        `git checkout master && git merge --no-ff side` does NOT place the
+        side commit "right after its branch point": measured, it lands
+        SECOND-TO-LAST (position 8 of 10). The merge's FIRST parent is
+        master's own tip, so `git log --topo-order` exhausts the entire
+        original mainline before the second parent's exclusive ancestors
+        become due, and the side commit surfaces just before the merge
+        regardless of how old its branch point was. Backdating the grafted
+        commit's author and committer dates does not change this (tested).
+
+        Reversing which side is the first parent is what works: merge
+        master's tip INTO `side`, so GRAFTED's descendant chain is the
+        merge's first parent, then fast-forward master onto it. GRAFTED
+        then surfaces at position 1 -- strictly inside frontier-low's
+        [0, 4] -- which is CLAUDE.md's own description of the hazard read
+        literally ("branch off an old commit, merge the mainline in,
+        fast-forward the mainline")."""
         base = self._git(repo, "rev-list", "--max-parents=0", "HEAD")
+        mainline_tip = self._git(repo, "rev-parse", "master")
         self._git(repo, "checkout", "-b", "side", base)
         (repo / "grafted.py").write_text("def grafted():\n    return 1\n")
         self._git(repo, "add", ".")
         self._git(repo, "commit", "-m", "GRAFTED")
         grafted = self._git(repo, "rev-parse", "HEAD")
+        # Mainline INTO side, so side stays the first parent.
+        self._git(repo, "merge", "--no-ff", "-m", "merge mainline into side",
+                  mainline_tip)
         self._git(repo, "checkout", "master")
-        self._git(repo, "merge", "--no-ff", "-m", "merge side", "side")
+        self._git(repo, "merge", "--ff-only", "side")
         return grafted
 
     def _commit_hashes(self, db):
@@ -208,6 +230,10 @@ class TestFrontierLowRetentionCheck:
         mcp_server.open_db(str(tmp_path / "g.graph"))
         await mcp_server._run_ingestion(str(repo), "master")
 
+        with mcp_server.db_lease() as db:
+            bounds = mcp_server._frontier_read_bounds(
+                db, mcp_server._FRONTIER_LOW_IDENT)
+
         grafted = self._graft(repo)
         lin = frontier_registry.build_linearization(str(repo), "master")
         await mcp_server._run_ingestion(str(repo), "master")
@@ -215,11 +241,26 @@ class TestFrontierLowRetentionCheck:
         with mcp_server.db_lease() as db:
             hashes = self._commit_hashes(db)
 
+        # POSITIVE CONTROL, and it is load-bearing -- assert it BEFORE the
+        # real assertion. This test is vacuous unless the grafted commit
+        # actually lands strictly inside frontier-low's retained span: a
+        # graft that lands at the TIP is walked normally by any code, fixed
+        # or not, so `grafted in hashes` would pass without the fix and the
+        # test would guard nothing. Task 1 measured exactly that failure --
+        # the obvious graft recipe put the commit at position 8 of 10.
+        lo_pos, hi_pos = lin.index(bounds[0]), lin.index(bounds[1])
+        grafted_pos = lin.index(grafted)
+        assert lo_pos < grafted_pos < hi_pos, (
+            f"the graft landed at position {grafted_pos}, not strictly inside "
+            f"frontier-low's retained [{lo_pos}, {hi_pos}] -- this test proves "
+            f"nothing in that state, whatever the assertion below does"
+        )
+
         assert grafted in hashes, (
-            f"the grafted commit at position {lin.index(grafted)} of "
-            f"{len(lin)} never reached the graph -- frontier-low was retained "
-            f"over a span it was never claimed under, so the position was "
-            f"excluded from the gap and handed to no stream"
+            f"the grafted commit at position {grafted_pos} of {len(lin)} never "
+            f"reached the graph -- frontier-low was retained over a span it "
+            f"was never claimed under, so the position was excluded from "
+            f"_unclaimed()'s complement and handed to no stream"
         )
 ```
 
