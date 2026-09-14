@@ -3249,6 +3249,40 @@ class TestIngestionBranchFact:
             "status reported none"
         )
 
+    @pytest.mark.asyncio
+    async def test_status_is_none_after_a_branch_switch_with_no_rewrite(self, tmp_path):
+        """Fix round 1, finding 2. The rewrite test above cannot discriminate
+        read-before-write from read-after-write: both its runs pass "master",
+        so under EITHER ordering recorded_branch == ref holds trivially and
+        the count still computes -- the ordering hazard is invisible to it.
+
+        This test isolates the hazard directly, by construction: same
+        commits, ingested twice under two DIFFERENT branch names, with NO
+        rewrite at all (a second branch pointing at the identical tip). No
+        orphan genuinely exists here. Correct order (read
+        _ingestion_branch_read BEFORE _ingestion_branch_write) compares run
+        2's ref against run 1's recorded branch, sees a mismatch, and reports
+        None -- the honest "unanswerable", not the "verified clean" 0. Under
+        the ordering bug (read moved to AFTER the write), prior_branch
+        becomes run 2's OWN just-written branch, the comparison always
+        matches itself, and the count silently computes as 0 -- a plausible
+        but false "verified clean". `is None` (not a falsy check) matters
+        because 0 is exactly the wrong value the bug produces.
+        """
+        import mcp_server
+        divergent = TestDivergentRefEndToEnd()
+        repo = divergent._repo(tmp_path, 5)
+        _subprocess.run(["git", "branch", "develop"], cwd=repo, check=True, capture_output=True)
+        mcp_server.open_db(str(tmp_path / "g.graph"))
+        await mcp_server._run_ingestion(str(repo), "master")
+        await mcp_server._run_ingestion(str(repo), "develop")
+
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["orphaned_commits"] is None, (
+            "the branch changed between runs with no rewrite -- the question "
+            "is unanswerable and must read None, never a false 0"
+        )
+
 
 class TestMinigrafReportIssue:
     def test_delegates_to_report_issue(self, real_db):
@@ -29415,6 +29449,47 @@ class TestIngestStatusPhase4E2E:
         assert result["ok"] is False
         status = mcp_server.handle_minigraf_ingest_status()
         assert "this_run" not in status
+
+    def test_a_declined_start_does_not_echo_the_previous_runs_orphaned_commits(
+        self, tmp_path, monkeypatch
+    ):
+        """#222 phase 5 item B, fix round 1: mirrors
+        test_a_declined_start_does_not_echo_the_previous_runs_numbers exactly,
+        for orphaned_commits instead of _run. Before the fix (seeding the key
+        at module load and in main()'s init, plus resetting it alongside
+        index_cross_check/_run at the top of _run_ingestion and in the
+        declined-start branch), a completed run's orphaned_commits value sat
+        in _ingest_progress and was echoed by a later declined start that
+        never computed one of its own -- a wrong number misattributed to a
+        run that never happened.
+
+        Not @pytest.mark.asyncio, deliberately, matching the sibling test:
+        _phase4_run drives _run_ingestion through its own asyncio.run, which
+        raises if called from inside an already-running event loop."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 2)
+        graph = tmp_path / "g.graph"
+        # First run: no PREVIOUSLY-recorded branch exists yet, so
+        # orphaned_commits is unavoidably None (nothing to compare against).
+        # A second, same-branch rerun has a recorded branch to compare
+        # against and computes a real (0, on this untouched repo) count --
+        # that is the non-None value this test needs to prove is not echoed.
+        _phase4_run(repo, graph, monkeypatch)
+        _phase4_run(repo, graph, monkeypatch)
+        assert mcp_server._ingest_progress.get("orphaned_commits") is not None, (
+            "precondition: a completed run must leave a non-None "
+            "orphaned_commits behind, or this test proves nothing about "
+            "echoing it"
+        )
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: {"pid": 12345})
+        result = asyncio.run(mcp_server.handle_minigraf_ingest_git(repo_path=str(repo)))
+        assert result["ok"] is False
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["orphaned_commits"] is None, (
+            "a declined start must not echo the previous in-process run's "
+            "orphaned_commits -- there is no run this time, so nothing was "
+            "computed for it"
+        )
 
 
 # ---------------------------------------------------------------------------

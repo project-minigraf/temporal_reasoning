@@ -171,7 +171,7 @@ _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
     "status": "idle", "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-    "phase": None,
+    "phase": None, "orphaned_commits": None,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -13165,6 +13165,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # run's numbers. It lives in the dict, not a module global, so every
     # site that resets _ingest_progress by assignment clears it too.
     _ingest_progress["_run"] = None
+    # #222 phase 5 item B, fix round 1: same reasoning as index_cross_check
+    # above -- None until this run's own _orphaned_commit_count call below
+    # runs, so a run refused or failing before that point never echoes a
+    # previous run's orphan count under a run that never computed one.
+    _ingest_progress["orphaned_commits"] = None
     # Bound BEFORE the try so the outermost finally can shut it down no matter
     # where a failure lands, including the two awaited calls
     # (_open_index_writer_safe, _frontier_load) that sit above the inner try
@@ -14452,6 +14457,9 @@ async def handle_minigraf_ingest_git(
         # this_run/streams/visibility/lineage numbers -- there is no run this
         # time, so there is nothing to report them for.
         _ingest_progress["_run"] = None
+        # Fix round 1: same reasoning -- there is no run this time, so no
+        # orphan count was computed for it either.
+        _ingest_progress["orphaned_commits"] = None
         return {
             "ok": False,
             "error": f"ingestion already owned by live process (pid {holder_pid})",
@@ -14953,7 +14961,7 @@ async def main() -> None:
     _ingest_progress = {
         "status": "idle", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-        "phase": None,
+        "phase": None, "orphaned_commits": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         # Proactive check-before-attempt: if another live process already
