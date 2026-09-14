@@ -581,6 +581,23 @@ def _exit_code(metrics: dict[str, Any]) -> int:
     # asked cannot be retro-failed.
     if (metrics.get("commit_census") or {}).get("ok") is False:
         return 1
+    # Clause 9 (#222 phase 5). Orphaned commit entities: the graph holds
+    # history the ref no longer contains, after a force-push or rebase. Not
+    # foldable into clause 8 -- an orphan drives repo_vs_graph NEGATIVE, which
+    # matches none of the census's three delta diagnoses, and `ok` stays True.
+    #
+    # Gated ONLY when the check could interpret its own number.
+    # `proved_nothing` is true when the graph records no :ingestion/branch, or
+    # records one that is not the ref being audited: a second branch ingested
+    # into the same graph legitimately holds commits absent from this ref's
+    # history, and failing on that would condemn real data. The count still
+    # SHIPS in both cases -- not gated is not unmeasured.
+    #
+    # `.get()` throughout, so a metrics file from a harness predating this
+    # check stays clean, matching every clause above.
+    orphans = (metrics.get("commit_census") or {}).get("orphaned_commits") or {}
+    if not orphans.get("proved_nothing") and orphans.get("entities"):
+        return 1
     return 0
 
 

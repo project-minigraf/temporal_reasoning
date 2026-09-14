@@ -2292,3 +2292,31 @@ run. **A red resume-census step is not a harness failure in the sense the
 ident-collision census's own note describes** — it means #325's retention
 predicate is wrong on real history and needs reopening, with the full
 repo/walk/graph counts already in the run's log.
+
+## Ingestion Run — 20260914T134632Z
+
+- Repo: `.` @ `master`
+- minigraf: `2.0.0`
+- Metrics JSON: `results/ingestion-20260914T134632Z.json`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 957 |
+| Final status | complete |
+| Wall-clock | 2595.28s |
+| Throughput | 22.1 commits/min |
+| Peak RSS | 1021232 KB |
+| Graph size | 305741824 bytes |
+| Fact-index size | 131018752 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.4ms / 5.8ms / 32.7ms |
+| Graph-query latency (min/p50/p99/max) | 1.1ms / 25.4ms / 1604.3ms / 1905.1ms |
+| Poll duty cycle (#242) | 6.70% over 1556 polls |
+| Checkpoint duty cycle (#241) | 4.59% over 112 checkpoints (118.89s total, 1324 suppressed) |
+| Stderr tee (#256) | active (wall-clock and latencies measured with an fd-level tee in place) |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+| Fact-index divergence (#302) | 0 (36504 facts cross-checked) |
+| Duplicate :introduced-by (#287) | 0 |
+| Code entities with no :introduced-by (#316) | 0 of 3899 code entities |
+| Commits: repo / walk / graph (#317) | 957 / 957 / 957 (ref `master`) |
