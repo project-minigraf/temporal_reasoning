@@ -26430,7 +26430,16 @@ def test_run_ingestion_does_not_call_the_legacy_walk_wrappers():
     """#326's second unfiled follow-up: these always persist claims and have
     NO floor or ceiling concept, so wiring either into a real run
     reintroduces Critical 3 (a failed write swallowed by an interval's range
-    semantics) wholesale. They are reachable only from tests; this pins that."""
+    semantics) wholesale. They are reachable only from tests and the
+    evals/at_scale/profile_* scripts; this pins that _run_ingestion itself
+    stays clear of them.
+
+    This is a raw substring scan over inspect.getsource(_run_ingestion) --
+    it matches ANY textual occurrence of a name, including inside a comment
+    or docstring, not just a call. A future comment inside _run_ingestion
+    that explains why these four must not be called will trip this test the
+    same way a real call would; that is by design (see the assertion
+    message below), not a false positive to work around."""
     import inspect, mcp_server
     src = inspect.getsource(mcp_server._run_ingestion)
     for name in (
@@ -26440,9 +26449,13 @@ def test_run_ingestion_does_not_call_the_legacy_walk_wrappers():
         "_correction_sweep_claim_and_process",
     ):
         assert name not in src, (
-            f"{name} is called from _run_ingestion. It persists claims "
-            f"unconditionally and has no floor/ceiling, so a failed write is "
-            f"swallowed by the interval range -- #326 Critical 3."
+            f"{name} appears in _run_ingestion's source (as a call, comment, "
+            f"or docstring -- this is a substring scan, not a call-detector). "
+            f"If this is a real call: these persist claims unconditionally "
+            f"and have no floor/ceiling, so a failed write is swallowed by "
+            f"the interval range -- #326 Critical 3. If this is a mention "
+            f"(e.g. a comment explaining why {name} must not be used here), "
+            f"reword it to describe the hazard without naming the symbol."
         )
 
 
