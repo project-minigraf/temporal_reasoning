@@ -480,6 +480,56 @@ def _another_process_can_open(path):
     return proc.returncode == 0
 
 
+def _spawn_blocking_opener(path):
+    """Start a SEPARATE process that BLOCKS in MiniGrafDb.open() on `path` and
+    reports when it won the lock. Returns the Popen; read it with
+    _collect_blocking_opener.
+
+    Different question from _another_process_can_open, and the difference is
+    the point. That helper asks "is the graph free at this instant?", which a
+    caller can only ask from a moment it is itself occupying -- so it can
+    demonstrate that a boundary EXISTS without demonstrating that anyone else
+    could ever use it. This models the thing the window is actually for: a hook
+    that is ALREADY waiting when the lock comes free.
+
+    minigraf 2.0.0's open() does not fail fast. It blocks for ~375 ms,
+    adaptively polling 5->50 ms, and returns as soon as the lock frees. So a
+    waiter started while a window still holds the lease wins within ~5-50 ms of
+    the next boundary -- but only if that boundary leaves the lock free for an
+    interval rather than the microsecond instant a bare release-and-reacquire
+    produces.
+
+    Prints one JSON line: {"ok": bool, "acquired_at": <time.time()>}.
+    """
+    script = (
+        "import json, sys, time\n"
+        "from minigraf import MiniGrafDb\n"
+        "try:\n"
+        f"    db = MiniGrafDb.open({path!r})\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'ok': False, 'acquired_at': time.time(), 'err': str(e)}))\n"
+        "    sys.stdout.flush()\n"
+        "    sys.exit(1)\n"
+        "print(json.dumps({'ok': True, 'acquired_at': time.time()}))\n"
+        "sys.stdout.flush()\n"
+    )
+    return _subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True,
+    )
+
+
+def _collect_blocking_opener(proc, timeout=60):
+    out, err = proc.communicate(timeout=timeout)
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+    raise AssertionError(
+        f"the blocking opener printed no JSON line. stdout={out!r} stderr={err!r}"
+    )
+
+
 def _forbid_blocking_sleep_on_event_loop(monkeypatch):
     """Fail any ``time.sleep`` made while an asyncio event loop is running on
     the calling thread; let every other call through to the real sleep.
@@ -29881,4 +29931,85 @@ class TestStageBYieldsTheLock:
             f"_intervals_read_extra ran {len(calls)} times inside the sweep; "
             f"exactly 1 is expected -- computed once on the first window and "
             f"carried across the rest"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_process_wins_the_lock_during_the_sweep(
+        self, tmp_path, monkeypatch
+    ):
+        """The PROPERTY, where the three tests above check the MECHANISM.
+
+        Those three prove a boundary exists and that the graph is unlocked at
+        it. They cannot prove anyone else could ever USE it, and that gap is
+        not academic: _another_process_can_open only ever observes the gap it
+        is itself occupying, so it reports True even when the real gap is the
+        microseconds between a release and the next acquire -- which no hook
+        could win. The first version of this work shipped exactly that, and it
+        is why _SWEEP_YIELD_PAUSE_SECONDS exists.
+
+        So this test spawns a realistic waiter instead: a separate process that
+        starts blocking in MiniGrafDb.open() while a window still HOLDS the
+        lease, and must acquire the lock before the sweep ends. minigraf
+        2.0.0's open() blocks ~375 ms polling 5->50 ms, which is precisely the
+        hook behaviour the window exists to serve.
+
+        The `acquired_at < sweep_end_at` bound is what confines the win to
+        Stage B. Without it the test would pass on a graph whose lock simply
+        came free once the sweep was over -- the fold, _ingest_tags and the
+        final checkpoint all release between their own leases, so an opener
+        that waited out the whole sweep would still eventually succeed and
+        prove nothing about the window.
+        """
+        import mcp_server
+        repo, graph = self._prepare(tmp_path, monkeypatch, n=24)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        state = {"proc": None, "spawned_at": None, "sweep_end_at": None, "swept": 0}
+        real_apply = mcp_server._correction_sweep_apply
+        real_summary = mcp_server._correction_sweep_log_summary
+
+        def apply_spy(*a, **kw):
+            state["swept"] += 1
+            if state["proc"] is None:
+                # Spawned from INSIDE the lease (this runs on write_executor
+                # with the leased handle), so the opener begins blocking while
+                # a window still owns the graph -- never during a gap.
+                state["spawned_at"] = time.time()
+                state["proc"] = _spawn_blocking_opener(str(graph))
+            return real_apply(*a, **kw)
+
+        def summary_spy(*a, **kw):
+            if state["sweep_end_at"] is None:
+                state["sweep_end_at"] = time.time()
+            return real_summary(*a, **kw)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+        except BaseException:
+            if state["proc"] is not None and state["proc"].poll() is None:
+                state["proc"].kill()
+            raise
+
+        assert state["proc"] is not None, "the sweep never ran, so this proved nothing"
+        assert state["sweep_end_at"] is not None, "the sweep never ended"
+        result = _collect_blocking_opener(state["proc"])
+        assert state["swept"] >= 4, (
+            f"only {state['swept']} commit(s) were swept after the waiter was "
+            f"spawned on the first one -- too short a sweep for a boundary to "
+            f"be reachable, so this test cannot discriminate"
+        )
+        assert result["ok"], (
+            f"a process already blocked in MiniGrafDb.open() never won the "
+            f"lock: it waited out minigraf's whole ~375 ms open budget and "
+            f"failed ({result.get('err')!r}). The window boundary is not "
+            f"leaving the graph unlocked for long enough to be won -- see "
+            f"_SWEEP_YIELD_PAUSE_SECONDS"
+        )
+        assert result["acquired_at"] < state["sweep_end_at"], (
+            f"the waiter did win the lock, but only "
+            f"{result['acquired_at'] - state['sweep_end_at']:.3f}s AFTER the "
+            f"sweep ended -- i.e. it was let in by Stage B finishing, not by a "
+            f"window boundary"
         )

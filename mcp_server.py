@@ -207,6 +207,29 @@ except ValueError:
 _SWEEP_YIELD_COMMITS = int(os.environ.get("MINIGRAF_SWEEP_YIELD_COMMITS", "25"))
 _SWEEP_YIELD_SECONDS = float(os.environ.get("MINIGRAF_SWEEP_YIELD_SECONDS", "2.0"))
 
+# How long the boundary leaves the graph ACTUALLY unlocked.
+#
+# Without this the window is worthless in practice, and the reason is worth
+# stating exactly. Releasing the lease and re-acquiring it costs no awaits --
+# `window_started = ...`, `window_count = 0`, `try_acquire` -- so the graph is
+# free for MICROSECONDS. That is a free instant, not a free interval, and a
+# hook polling 5 times over its 0.75 s budget will essentially never land in
+# it. The boundary creates the right PLACE to yield; this constant is what
+# makes the yield real.
+#
+# Why 0.1 s. Under minigraf 2.0.0 `open()` does not fail fast: it blocks for
+# ~375 ms, adaptively polling 5->50 ms, and returns as soon as the lock frees.
+# So a hook ALREADY blocked in open() acquires within ~5-50 ms of the lock
+# becoming free, and 100 ms clears that comfortably while costing ~5% of a 2 s
+# window. A hook that has not started yet gains nothing from any PARTICULAR
+# boundary -- it simply blocks and wins at the next one.
+#
+# Paid only between windows, never after the last one (the sweep sets
+# sweep_done first), so a sweep that fits in one window pays nothing at all.
+_SWEEP_YIELD_PAUSE_SECONDS = float(
+    os.environ.get("MINIGRAF_SWEEP_YIELD_PAUSE_SECONDS", "0.1")
+)
+
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
@@ -14342,6 +14365,25 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         # condition so the first window is still entered above.
                         if _shutdown_requested.is_set():
                             break
+                        # Hold the graph genuinely unlocked for a moment. This
+                        # sleep is OUTSIDE the lease by construction -- the
+                        # `async with` above has exited and the next window's
+                        # has not been entered -- which is the whole point: a
+                        # sleep inside the lease would accomplish nothing but
+                        # slow the sweep down. See _SWEEP_YIELD_PAUSE_SECONDS
+                        # for why the gap has to be an interval rather than the
+                        # instant a bare release leaves behind.
+                        #
+                        # asyncio.sleep, never time.sleep: this runs on the
+                        # event loop, so a blocking sleep would freeze every
+                        # concurrent call_tool for the duration (#99) -- and
+                        # tests/_forbid_blocking_sleep_on_event_loop fires on
+                        # exactly that.
+                        #
+                        # Skipped when the sweep is already finished, so the
+                        # last window never pays it.
+                        if not sweep_done:
+                            await asyncio.sleep(_SWEEP_YIELD_PAUSE_SECONDS)
                     if _shutdown_requested.is_set():
                         completed_all = False
                         run_progress.sweep_ended("stopped")
