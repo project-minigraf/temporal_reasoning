@@ -29959,6 +29959,12 @@ class TestStageBYieldsTheLock:
         final checkpoint all release between their own leases, so an opener
         that waited out the whole sweep would still eventually succeed and
         prove nothing about the window.
+
+        That is not a hypothetical: `assert result["ok"]` PASSES the ablation
+        on its own. With _SWEEP_YIELD_PAUSE_SECONDS at 0 the waiter still won
+        every time, 26-35 ms after the sweep ended (3 of 3 runs), so the
+        sweep-end bound is this test's entire discriminating power. Do not
+        loosen or remove it.
         """
         import mcp_server
         repo, graph = self._prepare(tmp_path, monkeypatch, n=24)
@@ -30012,4 +30018,79 @@ class TestStageBYieldsTheLock:
             f"{result['acquired_at'] - state['sweep_end_at']:.3f}s AFTER the "
             f"sweep ended -- i.e. it was let in by Stage B finishing, not by a "
             f"window boundary"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_clock_alone_closes_a_window(self, tmp_path, monkeypatch):
+        """The window boundary is a DISJUNCTION, and until this test only one
+        half of it had ever fired.
+
+        `window_count >= _SWEEP_YIELD_COMMITS or time.monotonic() -
+        window_started >= _SWEEP_YIELD_SECONDS` short-circuits. Every other
+        test in this class sets _SWEEP_YIELD_COMMITS = 1, so `1 >= 1` is True
+        at the first check and the clock operand is never EVALUATED -- not
+        merely never true. Every pre-existing sweep test runs at the default
+        25 over sweeps far shorter than 2 s, where the clock term is False
+        forever. So no test had ever taken a boundary via the clock.
+
+        That gap sits exactly where it hurts: _SWEEP_YIELD_SECONDS is the
+        trigger that bounds hook lockout when a window's commits are
+        individually slow, which on a large graph they are. The tested
+        disjunct is the one that only ever fires on small synthetic repos;
+        the untested one is the one that delivers the feature in production.
+
+        So: make the count disjunct impossible (10**9) and let only the clock
+        end a window. Bracketed on the sweep's real end for the same reason
+        the two tests above are -- `phase` stays "sweeping" through the fold,
+        _ingest_tags and the final checkpoint, three leases that are not
+        window boundaries and would satisfy `>= 2` by themselves.
+
+        This is also the first test that reaches the boundary's
+        `await asyncio.sleep(_SWEEP_YIELD_PAUSE_SECONDS)` repeatedly, so it
+        carries _forbid_blocking_sleep_on_event_loop -- whose only other
+        _run_ingestion call site sweeps in a single window and never reaches
+        the pause at all. Without this the code comment claiming that guard
+        watches the pause was asserting a guard that was not watching.
+        """
+        import mcp_server
+        _forbid_blocking_sleep_on_event_loop(monkeypatch)
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 10**9)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 0.0)
+
+        windows = []
+        sweep_over = []
+        swept = []
+        real_lease = mcp_server.db_lease_async
+        real_summary = mcp_server._correction_sweep_log_summary
+        real_apply = mcp_server._correction_sweep_apply
+
+        def summary_spy(*a, **kw):
+            sweep_over.append(True)
+            return real_summary(*a, **kw)
+
+        def apply_spy(*a, **kw):
+            swept.append(1)
+            return real_apply(*a, **kw)
+
+        def lease_spy():
+            if mcp_server._ingest_progress.get("phase") == "sweeping" and not sweep_over:
+                windows.append(1)
+            return real_lease()
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        assert len(swept) >= 2, (
+            f"the sweep swept {len(swept)} commit(s); at least 2 are needed "
+            f"for a second window to be reachable at all, so this test cannot "
+            f"discriminate"
+        )
+        assert len(windows) >= 2, (
+            f"only {len(windows)} lease(s) taken inside the sweep with "
+            f"_SWEEP_YIELD_COMMITS at 10**9 -- the count disjunct cannot have "
+            f"fired, so the clock disjunct never ended a window either. The "
+            f"boundary's `or` has one half that is never evaluated"
         )
