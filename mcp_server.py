@@ -166,6 +166,47 @@ try:
 except ValueError:
     _OWNER_HINT_TTL = 30.0
 
+# #222 phase 5 item C. Stage B releases its lease every _SWEEP_YIELD_COMMITS
+# swept commits or _SWEEP_YIELD_SECONDS, whichever comes first, so the
+# out-of-process auto-memory hooks can win the graph file lock.
+#
+# Stage B used to hold ONE lease across its whole sweep. A lease is cheap
+# in-process (at count > 0 try_acquire joins and returns the same handle, so a
+# concurrent call_tool never blocks) but EXCLUSIVE out-of-process, and BOTH
+# auto-memory hooks (hooks/claude-code.json) are `command` hooks in separate
+# processes -- finalize_hook.py takes a lease to write each turn's facts. Their
+# retry budget is _LOCK_RETRY_MAX x _LOCK_RETRY_BASE doubling = 0.75 s total and
+# both swallow failures with `except Exception: pass`. So the whole-sweep hold
+# did not block queries; it SILENTLY DISCARDED every auto-memory write for the
+# sweep's duration, which on a large repo is a large fraction of the ingest.
+#
+# NOT a per-commit release: _DbLeaseManager.release() at refcount 1 -> 0 drops
+# the handle, and minigraf's `Drop for Inner` then runs a full O(graph size)
+# checkpoint -- #280, measured at 47.3% of Stage A's write time and growing
+# 3.47x within a 220-commit run, outside _CheckpointPolicy's duty gate and
+# invisible to the trace's ckpt_d_seconds. A window amortises that over N
+# commits.
+#
+# _SWEEP_YIELD_SECONDS is sized against the hooks' own retry budget (0.75 s
+# total): the lock must come free often enough that a hook already retrying can
+# win it. It is the SECOND trigger, not the first -- on a large graph one
+# window's worth of commits can take far longer than the clock bound, and
+# without it the hooks' window would be set by graph size rather than by
+# anything anyone chose.
+#
+# _DbLeaseManager exposes no waiter or contention signal, so "release only when
+# something is actually waiting" is not available without building one. The
+# trigger has to be a counter or a clock; it is both.
+#
+# When #280 lands (blocked on upstream minigraf#322), the drop checkpoint is
+# suppressed and N can safely go to 1 -- which is why this is a constant to
+# lower rather than a structure to rewrite.
+#
+# Read at import, so the conftest MINIGRAF_* scrub cannot reach it: a test that
+# depends on a value must patch the CONSTANT, not the variable.
+_SWEEP_YIELD_COMMITS = int(os.environ.get("MINIGRAF_SWEEP_YIELD_COMMITS", "25"))
+_SWEEP_YIELD_SECONDS = float(os.environ.get("MINIGRAF_SWEEP_YIELD_SECONDS", "2.0"))
+
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
@@ -14134,122 +14175,182 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         for i, (h, _t, _a, _s) in enumerate(commit_metadata)
                     }
                     skipped = 0
-                    async with db_lease_async() as db:
-                        # #325 review Finding 3: computed ONCE, not inside
-                        # the loop below. Stage B only starts once
-                        # completed_all is True -- the whole gap is
-                        # claimed and the walk that mints/merges interval
-                        # entities has already finished for this run -- and
-                        # nothing in this loop's body (select/extract/apply/
-                        # lifecycle-apply/watermark-update/checkpoint)
-                        # writes an interval fact, so fragmentation cannot
-                        # change between iterations. Passing it in turns
-                        # 2 extra datalog queries per swept commit into 2
-                        # for the whole sweep, mirroring the hash_to_pos
-                        # idiom just above.
-                        sweep_fragmented = bool(await loop.run_in_executor(
-                            write_executor, _intervals_read_extra, db,
-                        ))
-                        # #222 phase 4: the first call both PLANS the sweep
-                        # (to_sweep, or why it declines) and is the loop's
-                        # first iteration, so planning costs no query.
-                        nxt = await loop.run_in_executor(
-                            write_executor, _correction_sweep_next,
-                            db, linearization, commit_metadata, hash_to_pos,
-                            sweep_fragmented,
-                        )
-                        run_progress.sweep_planned(
-                            nxt.reason, nxt.region_lo, nxt.start_pos, nxt.ceiling_pos,
-                        )
-                        while not _shutdown_requested.is_set():
-                            if nxt.selected is None:
-                                run_progress.sweep_ended(nxt.reason)
-                                break
-                            sweep_hash, sweep_ts = nxt.selected
-                            try:
-                                sweep_extracted = await loop.run_in_executor(
-                                    executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
+                    # #222 phase 5 item C. Stage B no longer holds ONE lease
+                    # across the whole sweep -- see _SWEEP_YIELD_COMMITS for why
+                    # that silently discarded every auto-memory write for the
+                    # sweep's duration. The loop below is now an outer WINDOW
+                    # loop that re-enters the lease each time round, so these
+                    # three are hoisted above it to survive across windows.
+                    sweep_fragmented = None
+                    nxt = None
+                    sweep_done = False
+                    # NOT `while not sweep_done and not _shutdown_requested`: the
+                    # first window must always be entered, because that is where
+                    # the sweep is PLANNED (run_progress.sweep_planned). A run
+                    # whose shutdown flag is already set on arrival here would
+                    # otherwise report a sweep it never even planned, where the
+                    # single-lease version planned first and only then found the
+                    # flag. The inner loop's own condition reproduces that
+                    # exactly, and the trailing break ends every later window.
+                    while not sweep_done:
+                        window_started = time.monotonic()
+                        window_count = 0
+                        async with db_lease_async() as db:
+                            if sweep_fragmented is None:
+                                # #325 review Finding 3: computed ONCE, not inside
+                                # the loop below. Stage B only starts once
+                                # completed_all is True -- the whole gap is
+                                # claimed and the walk that mints/merges interval
+                                # entities has already finished for this run -- and
+                                # nothing in this loop's body (select/extract/apply/
+                                # lifecycle-apply/watermark-update/checkpoint)
+                                # writes an interval fact, so fragmentation cannot
+                                # change between iterations. Passing it in turns
+                                # 2 extra datalog queries per swept commit into 2
+                                # for the whole sweep, mirroring the hash_to_pos
+                                # idiom just above.
+                                sweep_fragmented = bool(await loop.run_in_executor(
+                                    write_executor, _intervals_read_extra, db,
+                                ))
+                            if nxt is None:
+                                # #222 phase 4: the first call both PLANS the sweep
+                                # (to_sweep, or why it declines) and is the loop's
+                                # first iteration, so planning costs no query.
+                                nxt = await loop.run_in_executor(
+                                    write_executor, _correction_sweep_next,
+                                    db, linearization, commit_metadata, hash_to_pos,
+                                    sweep_fragmented,
                                 )
-                                sweep_files = sweep_extracted[0]
-                                # update_watermark=False: this commit is only
-                                # half-processed until the lifecycle pass below
-                                # also lands, so the sweep watermark (and its
-                                # checkpoint) is deferred to after it -- see
-                                # _correction_sweep_apply's own docstring.
-                                skipped += await loop.run_in_executor(
-                                    write_executor, _correction_sweep_apply,
-                                    db, sweep_hash, sweep_ts, sweep_files, index_con, skipped,
-                                    False, sweep_pos_by_commit_ident,
+                                run_progress.sweep_planned(
+                                    nxt.reason, nxt.region_lo, nxt.start_pos, nxt.ceiling_pos,
                                 )
-                                # Apply the lifecycle facts the reverse stream
-                                # skipped entirely (D/R closes, renames,
-                                # dependency-edge churn, gitlink changes).
-                                # Fresh writes, not re-application -- nothing
-                                # wrote them for these commits. Runs AFTER the
-                                # A/M reconciliation above so an entity's
-                                # lineage is already authoritative before a
-                                # close in the same commit reads its window.
-                                await loop.run_in_executor(
-                                    write_executor, _forward_apply, db, repo_path, state,
-                                    commit_metadata[hash_to_pos[sweep_hash]],
-                                    sweep_extracted, index_con, None, None, True,
+                            while not _shutdown_requested.is_set():
+                                if nxt.selected is None:
+                                    run_progress.sweep_ended(nxt.reason)
+                                    sweep_done = True
+                                    break
+                                sweep_hash, sweep_ts = nxt.selected
+                                try:
+                                    sweep_extracted = await loop.run_in_executor(
+                                        executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
+                                    )
+                                    sweep_files = sweep_extracted[0]
+                                    # update_watermark=False: this commit is only
+                                    # half-processed until the lifecycle pass below
+                                    # also lands, so the sweep watermark (and its
+                                    # checkpoint) is deferred to after it -- see
+                                    # _correction_sweep_apply's own docstring.
+                                    skipped += await loop.run_in_executor(
+                                        write_executor, _correction_sweep_apply,
+                                        db, sweep_hash, sweep_ts, sweep_files, index_con, skipped,
+                                        False, sweep_pos_by_commit_ident,
+                                    )
+                                    # Apply the lifecycle facts the reverse stream
+                                    # skipped entirely (D/R closes, renames,
+                                    # dependency-edge churn, gitlink changes).
+                                    # Fresh writes, not re-application -- nothing
+                                    # wrote them for these commits. Runs AFTER the
+                                    # A/M reconciliation above so an entity's
+                                    # lineage is already authoritative before a
+                                    # close in the same commit reads its window.
+                                    await loop.run_in_executor(
+                                        write_executor, _forward_apply, db, repo_path, state,
+                                        commit_metadata[hash_to_pos[sweep_hash]],
+                                        sweep_extracted, index_con, None, None, True,
+                                    )
+                                    # Both halves landed -- only now is this commit
+                                    # genuinely swept, so only now may the watermark
+                                    # name it. Same one-checkpoint-per-commit cadence
+                                    # _correction_sweep_apply had when it owned this.
+                                    await loop.run_in_executor(
+                                        write_executor, _correction_sweep_through_update,
+                                        db, sweep_hash, sweep_ts, index_con,
+                                    )
+                                    run_progress.swept(hash_to_pos[sweep_hash])
+                                    await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
+                                except concurrent.futures.process.BrokenProcessPool:
+                                    raise
+                                except Exception as e:
+                                    # A sweep-step failure aborts Stage B only.
+                                    # Stage A's work is already persisted, and this
+                                    # commit's watermark was never advanced (see
+                                    # update_watermark=False above), so the next
+                                    # run's _correction_sweep_select_position
+                                    # re-selects THIS commit and reprocesses it from
+                                    # the start -- nothing is silently skipped.
+                                    print(
+                                        f"[_run_ingestion] correction sweep aborted at {sweep_hash}: {e}",
+                                        file=sys.stderr,
+                                    )
+                                    # Drop the traceback before leaving the loop.
+                                    # It chains back through _WorkItem.run to
+                                    # wherever `db` (a _LeasedDb, post-proxy) was
+                                    # passed into the failing call -- but severing
+                                    # THAT reference doesn't help: inside the
+                                    # native call, `db.__getattr__` already
+                                    # unwrapped it to the real MiniGrafDb, and the
+                                    # native `execute` frame in the traceback
+                                    # holds THAT as its own `self`, not the proxy.
+                                    # So the raw handle stays alive no matter how
+                                    # carefully the finallys below clear their
+                                    # locals or how faithfully _LeasedDb severs.
+                                    # The outer finally's final checkpoint then
+                                    # cannot open the graph ("Database is already
+                                    # open in this process") and an interrupted
+                                    # run silently skips its WAL compaction. Only
+                                    # the message is used above, so nothing is
+                                    # lost by dropping the traceback.
+                                    e.__traceback__ = None
+                                    completed_all = False
+                                    run_progress.sweep_ended("aborted")
+                                    sweep_done = True
+                                    break
+                                await asyncio.sleep(0)  # yield to event loop
+                                nxt = await loop.run_in_executor(
+                                    write_executor, _correction_sweep_next,
+                                    db, linearization, commit_metadata, hash_to_pos,
+                                    sweep_fragmented,
                                 )
-                                # Both halves landed -- only now is this commit
-                                # genuinely swept, so only now may the watermark
-                                # name it. Same one-checkpoint-per-commit cadence
-                                # _correction_sweep_apply had when it owned this.
-                                await loop.run_in_executor(
-                                    write_executor, _correction_sweep_through_update,
-                                    db, sweep_hash, sweep_ts, index_con,
-                                )
-                                run_progress.swept(hash_to_pos[sweep_hash])
-                                await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
-                            except concurrent.futures.process.BrokenProcessPool:
-                                raise
-                            except Exception as e:
-                                # A sweep-step failure aborts Stage B only.
-                                # Stage A's work is already persisted, and this
-                                # commit's watermark was never advanced (see
-                                # update_watermark=False above), so the next
-                                # run's _correction_sweep_select_position
-                                # re-selects THIS commit and reprocesses it from
-                                # the start -- nothing is silently skipped.
-                                print(
-                                    f"[_run_ingestion] correction sweep aborted at {sweep_hash}: {e}",
-                                    file=sys.stderr,
-                                )
-                                # Drop the traceback before leaving the loop.
-                                # It chains back through _WorkItem.run to
-                                # wherever `db` (a _LeasedDb, post-proxy) was
-                                # passed into the failing call -- but severing
-                                # THAT reference doesn't help: inside the
-                                # native call, `db.__getattr__` already
-                                # unwrapped it to the real MiniGrafDb, and the
-                                # native `execute` frame in the traceback
-                                # holds THAT as its own `self`, not the proxy.
-                                # So the raw handle stays alive no matter how
-                                # carefully the finallys below clear their
-                                # locals or how faithfully _LeasedDb severs.
-                                # The outer finally's final checkpoint then
-                                # cannot open the graph ("Database is already
-                                # open in this process") and an interrupted
-                                # run silently skips its WAL compaction. Only
-                                # the message is used above, so nothing is
-                                # lost by dropping the traceback.
-                                e.__traceback__ = None
-                                completed_all = False
-                                run_progress.sweep_ended("aborted")
-                                break
-                            await asyncio.sleep(0)  # yield to event loop
-                            nxt = await loop.run_in_executor(
-                                write_executor, _correction_sweep_next,
-                                db, linearization, commit_metadata, hash_to_pos,
-                                sweep_fragmented,
-                            )
+
+                                # #222 phase 5 item C: the ONLY safe place to end a
+                                # window. _correction_sweep_apply,
+                                # _forward_apply(lifecycle_only=True) and
+                                # _correction_sweep_through_update are ONE unit -- the
+                                # watermark is deliberately deferred until both halves
+                                # land (update_watermark=False above), so a boundary
+                                # anywhere inside that sequence creates exactly the
+                                # half-processed state the deferral exists to prevent.
+                                # Here the previous commit is fully swept AND its
+                                # watermark has landed, and `nxt` already names the next
+                                # one, so dropping the lease loses nothing: the next
+                                # window re-enters with `nxt` carried across and does not
+                                # re-plan.
+                                #
+                                # Two triggers, neither redundant. The COUNT bounds how
+                                # many O(graph size) drop-checkpoints the release costs
+                                # (#280); the CLOCK bounds how long the hooks are locked
+                                # out when one window's commits are individually slow,
+                                # which on a large graph they are.
+                                window_count += 1
+                                if (
+                                    window_count >= _SWEEP_YIELD_COMMITS
+                                    or time.monotonic() - window_started >= _SWEEP_YIELD_SECONDS
+                                ):
+                                    break
+                        # A window that ended on the shutdown flag must not open
+                        # another one. Checked out here rather than in the outer
+                        # condition so the first window is still entered above.
                         if _shutdown_requested.is_set():
-                            completed_all = False
-                            run_progress.sweep_ended("stopped")
-                        _correction_sweep_log_summary(skipped)
+                            break
+                    if _shutdown_requested.is_set():
+                        completed_all = False
+                        run_progress.sweep_ended("stopped")
+                    _correction_sweep_log_summary(skipped)
+                    # The fold takes its own lease: the sweep's last window has
+                    # already released, and re-entering here is what keeps every
+                    # window's acquire/release balanced (#255's single-handle
+                    # invariant) instead of leaving one straggler scope open.
+                    async with db_lease_async() as db:
                         # DB-bound like everything else here, so it runs on
                         # write_executor rather than inline on the event loop.
                         should_fold = completed_all and await loop.run_in_executor(

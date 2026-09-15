@@ -29617,3 +29617,268 @@ class TestForwardClaimCeiling342:
                 f"{ident} names position {pos_of[h]}, at or above the failed "
                 f"position {failed['pos']} (#342)"
             )
+
+
+class TestStageBYieldsTheLock:
+    """#222 phase 5 item C. Stage B held ONE lease across the whole sweep.
+
+    A lease is cheap in-process but EXCLUSIVE out-of-process, and both
+    auto-memory hooks (hooks/claude-code.json) are `command` hooks in separate
+    processes with a 0.75 s retry budget (_LOCK_RETRY_MAX x _LOCK_RETRY_BASE
+    doubling) and `except Exception: pass` -- so the whole-sweep hold did not
+    block queries, it SILENTLY DISCARDED every auto-memory write for the
+    sweep's duration.
+
+    WHERE THE PROBE GOES, and why it is not where the obvious seam is. The
+    brief proposed spying on _correction_sweep_apply and calling
+    _another_process_can_open from inside that spy. That test can never pass,
+    on any implementation: _correction_sweep_apply is dispatched via
+    run_in_executor with the LEASED handle, i.e. strictly inside the `async
+    with db_lease_async()` block, so the graph is by definition locked at that
+    instant and the probe returns False every time. It would have read as
+    "the window never opened" no matter how correct the restructure was.
+
+    The probe therefore goes at the lease ACQUIRE -- the only moment within
+    Stage B at which no lease is held -- by patching db_lease_async itself.
+    A True there is a real, cross-process demonstration that the PREVIOUS
+    window released the graph file.
+
+    That seam needs attribution, because db_lease_async is also entered at
+    several points that are not window boundaries at all (the end-of-walk
+    flush, _ingest_tags, the final checkpoint), and `phase` is still
+    "sweeping" for the ones that follow Stage B -- so a bare "was it ever
+    free?" would pass vacuously against a single whole-sweep lease. Each
+    observation is therefore tagged with how many commits have been swept so
+    far, and only a STRICTLY MID-SWEEP observation (0 < swept < total) counts.
+    Under one lease for the whole sweep the only observations possible are at
+    swept == 0 (Stage B's single acquire) and swept == total (everything
+    after it), so the mid-sweep set is empty -- which is exactly what the
+    ablation confirms.
+
+    Never assert on a .lock FILE: that is a tautology under minigraf 2.0.0,
+    which moved locking into the kernel and deleted the PID sidecar.
+    _another_process_can_open actually spawns a process and tries.
+    """
+
+    def _repo(self, tmp_path, n):
+        return TestDivergentRefEndToEnd()._repo(tmp_path, n)
+
+    def _prepare(self, tmp_path, monkeypatch, n=12):
+        import mcp_server
+        repo = self._repo(tmp_path, n)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(graph))
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph))
+        mcp_server._ingest_progress = {
+            "status": "idle", "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+        return repo, graph
+
+    @pytest.mark.asyncio
+    async def test_another_process_can_open_the_graph_mid_sweep(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        repo, graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        swept = []
+        observed = []
+        real_apply = mcp_server._correction_sweep_apply
+        real_lease = mcp_server.db_lease_async
+
+        def apply_spy(*a, **kw):
+            swept.append(1)
+            return real_apply(*a, **kw)
+
+        def lease_spy():
+            if mcp_server._ingest_progress.get("phase") == "sweeping":
+                observed.append((len(swept), _another_process_can_open(str(graph))))
+            return real_lease()
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        total = len(swept)
+        assert total >= 2, (
+            f"the sweep swept {total} commit(s), so this test cannot "
+            f"discriminate: with fewer than 2 there is no strictly-mid-sweep "
+            f"moment for a window boundary to fall at"
+        )
+        assert observed, "no lease was taken while the phase was 'sweeping'"
+        mid = [(k, free) for k, free in observed if 0 < k < total]
+        assert mid, (
+            f"no lease was acquired strictly mid-sweep (swept counts seen: "
+            f"{sorted({k for k, _ in observed})}, total swept {total}) -- Stage "
+            f"B is still holding ONE lease across the whole of its sweep"
+        )
+        assert all(free for _, free in mid), (
+            f"a window boundary was reached but another process still could "
+            f"not open the graph there: {mid}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_window_boundary_never_splits_a_swept_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """_correction_sweep_apply, _forward_apply(lifecycle_only=True) and
+        _correction_sweep_through_update are ONE unit: the watermark is
+        deliberately deferred until both halves land (update_watermark=False),
+        so a boundary inside that sequence creates exactly the half-processed
+        state the deferral exists to prevent -- and, because the watermark
+        would then name a commit whose lifecycle facts were never written, the
+        next run would skip it permanently and silently.
+
+        Cheap enough to run at _SWEEP_YIELD_COMMITS=1 (no subprocess spawns),
+        so every single commit boundary is checked rather than one in 25.
+
+        The `sweep_over` bracket is load-bearing, not tidiness. `phase` stays
+        "sweeping" until the very end of the run, so the leases taken AFTER
+        Stage B (the lineage fold, _ingest_tags, the final checkpoint) are
+        also seen by a phase-only filter -- and they carry the sweep's FINAL
+        counts, which satisfy `any(b["apply"] > 0)` all by themselves. Without
+        this bracket the positive control below passes under the ablation
+        (_SWEEP_YIELD_COMMITS larger than the sweep), i.e. against the very
+        single-lease Stage B this class exists to detect. Measured, not
+        supposed: it did.
+        """
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        counts = {"apply": 0, "lifecycle": 0, "through": 0}
+        boundaries = []
+        sweep_over = []
+        real_apply = mcp_server._correction_sweep_apply
+        real_forward = mcp_server._forward_apply
+        real_through = mcp_server._correction_sweep_through_update
+        real_lease = mcp_server.db_lease_async
+        real_summary = mcp_server._correction_sweep_log_summary
+
+        def summary_spy(*a, **kw):
+            sweep_over.append(True)
+            return real_summary(*a, **kw)
+
+        def apply_spy(*a, **kw):
+            out = real_apply(*a, **kw)
+            counts["apply"] += 1
+            return out
+
+        def forward_spy(*a, **kw):
+            # run_in_executor passes everything positionally; lifecycle_only
+            # is the 9th argument.
+            lifecycle_only = a[8] if len(a) > 8 else kw.get("lifecycle_only", False)
+            out = real_forward(*a, **kw)
+            if lifecycle_only:
+                counts["lifecycle"] += 1
+            return out
+
+        def through_spy(*a, **kw):
+            out = real_through(*a, **kw)
+            counts["through"] += 1
+            return out
+
+        def lease_spy():
+            if mcp_server._ingest_progress.get("phase") == "sweeping" and not sweep_over:
+                boundaries.append(dict(counts))
+            return real_lease()
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        monkeypatch.setattr(mcp_server, "_forward_apply", forward_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_through_update", through_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        assert counts["apply"] >= 2, f"the sweep did too little to check: {counts}"
+        assert any(b["apply"] > 0 for b in boundaries), (
+            f"every lease taken during the sweep happened before the first "
+            f"swept commit, so no real window boundary was ever checked -- "
+            f"Stage B is still holding ONE lease across its whole sweep: "
+            f"{boundaries}"
+        )
+        for b in boundaries:
+            assert b["apply"] == b["lifecycle"] == b["through"], (
+                f"a lease was released and re-acquired in the middle of one "
+                f"commit's sweep unit: {b} (all three must be equal at every "
+                f"boundary -- see _correction_sweep_apply's update_watermark "
+                f"docstring)"
+            )
+
+    @pytest.mark.asyncio
+    async def test_fragmentation_is_computed_once_not_once_per_window(
+        self, tmp_path, monkeypatch
+    ):
+        """#325 review Finding 3 moved _intervals_read_extra out of the sweep
+        loop deliberately: Stage B only starts once the whole gap is claimed
+        and nothing in the loop body writes an interval fact, so fragmentation
+        cannot change mid-sweep. The window loop must not quietly restore that
+        cost by recomputing it per window.
+
+        Both counters are bracketed on the sweep's real end (the
+        _correction_sweep_log_summary call that closes Stage B), for the same
+        reason test_a_window_boundary_never_splits_a_swept_commit is: `phase`
+        stays "sweeping" through the lineage fold, _ingest_tags and the final
+        checkpoint, so a phase-only filter counts 3 leases that are not window
+        boundaries -- enough, on its own, to satisfy `len(windows) >= 3` under
+        a single whole-sweep lease. This test PASSED the ablation before the
+        bracket was added. It also means _should_fold_lineage_watermark's own
+        _intervals_read_extra call is excluded, so the expected count inside
+        the sweep is exactly 1.
+        """
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        calls = []
+        windows = []
+        sweep_over = []
+        real_extra = mcp_server._intervals_read_extra
+        real_lease = mcp_server.db_lease_async
+        real_summary = mcp_server._correction_sweep_log_summary
+
+        def summary_spy(*a, **kw):
+            sweep_over.append(True)
+            return real_summary(*a, **kw)
+
+        def in_sweep():
+            return (
+                mcp_server._ingest_progress.get("phase") == "sweeping"
+                and not sweep_over
+            )
+
+        def extra_spy(*a, **kw):
+            if in_sweep():
+                calls.append(1)
+            return real_extra(*a, **kw)
+
+        def lease_spy():
+            if in_sweep():
+                windows.append(1)
+            return real_lease()
+
+        monkeypatch.setattr(mcp_server, "_intervals_read_extra", extra_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        assert len(windows) >= 3, (
+            f"only {len(windows)} lease(s) taken inside the sweep -- too few "
+            f"for a per-window recomputation to be distinguishable from a "
+            f"single one. Stage B is still holding ONE lease across its whole "
+            f"sweep"
+        )
+        assert len(calls) < len(windows), (
+            f"_intervals_read_extra ran {len(calls)} time(s) across "
+            f"{len(windows)} window(s): fragmentation is being recomputed per "
+            f"window, undoing #325 review Finding 3"
+        )
+        assert len(calls) == 1, (
+            f"_intervals_read_extra ran {len(calls)} times inside the sweep; "
+            f"exactly 1 is expected -- computed once on the first window and "
+            f"carried across the rest"
+        )
