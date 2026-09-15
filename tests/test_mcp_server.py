@@ -26426,6 +26426,26 @@ class TestStagingAndShutdown:
         assert mcp_server._ingest_progress["status"] == "complete"
 
 
+def test_run_ingestion_does_not_call_the_legacy_walk_wrappers():
+    """#326's second unfiled follow-up: these always persist claims and have
+    NO floor or ceiling concept, so wiring either into a real run
+    reintroduces Critical 3 (a failed write swallowed by an interval's range
+    semantics) wholesale. They are reachable only from tests; this pins that."""
+    import inspect, mcp_server
+    src = inspect.getsource(mcp_server._run_ingestion)
+    for name in (
+        "_reverse_bulk_fill_walk",
+        "_reverse_fill_claim_and_process",
+        "_correction_sweep_walk",
+        "_correction_sweep_claim_and_process",
+    ):
+        assert name not in src, (
+            f"{name} is called from _run_ingestion. It persists claims "
+            f"unconditionally and has no floor/ceiling, so a failed write is "
+            f"swallowed by the interval range -- #326 Critical 3."
+        )
+
+
 class TestEntityIntroducedByState:
     """#231/#238: the forward walk tracks each entity's introducing commit ident
     so close sites have the value they must retract, and #238's preload can seed

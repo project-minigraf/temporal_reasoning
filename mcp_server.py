@@ -11662,7 +11662,14 @@ def _reverse_fill_claim_and_process(
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
 ) -> Optional[str]:
-    """Synchronous convenience wrapper: claim one position from the gap's
+    """NOT REACHABLE FROM _run_ingestion, AND MUST NOT BECOME SO. This persists
+    its claim unconditionally and has no floor/ceiling concept, so a write
+    that raises is swallowed by the interval's closed-range semantics --
+    #326 Critical 3, which is permanent silent commit loss that every
+    at-scale detector reads clean. Pinned by
+    test_run_ingestion_does_not_call_the_legacy_walk_wrappers.
+
+    Synchronous convenience wrapper: claim one position from the gap's
     high end and process it. Kept for tests and _reverse_bulk_fill_walk.
 
     **2d must not call this from async code** -- it fuses the CPU-bound
@@ -11701,7 +11708,14 @@ def _reverse_bulk_fill_walk(
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
 ) -> int:
-    """#222 phase 2b: repeatedly call _reverse_fill_claim_and_process until
+    """NOT REACHABLE FROM _run_ingestion, AND MUST NOT BECOME SO. This persists
+    its claim unconditionally and has no floor/ceiling concept, so a write
+    that raises is swallowed by the interval's closed-range semantics --
+    #326 Critical 3, which is permanent silent commit loss that every
+    at-scale detector reads clean. Pinned by
+    test_run_ingestion_does_not_call_the_legacy_walk_wrappers.
+
+    #222 phase 2b: repeatedly call _reverse_fill_claim_and_process until
     the gap closes. Returns the count of commits processed. No caller in
     this sub-phase -- 2d wires this into the real concurrent ingestion
     loop alongside the forward stream.
@@ -12802,7 +12816,14 @@ def _correction_sweep_claim_and_process(
     skipped_so_far: int = 0,
     pos_by_commit_ident: Optional[Dict[str, int]] = None,
 ) -> Optional[Tuple[str, int]]:
-    """Synchronous convenience wrapper composing
+    """NOT REACHABLE FROM _run_ingestion, AND MUST NOT BECOME SO. This persists
+    its claim unconditionally and has no floor/ceiling concept, so a write
+    that raises is swallowed by the interval's closed-range semantics --
+    #326 Critical 3, which is permanent silent commit loss that every
+    at-scale detector reads clean. Pinned by
+    test_run_ingestion_does_not_call_the_legacy_walk_wrappers.
+
+    Synchronous convenience wrapper composing
     _correction_sweep_select_position, _extract_commit, and
     _correction_sweep_apply in order -- for tests and any caller that
     doesn't need them on separate executors. **2d must not call this
@@ -12849,7 +12870,14 @@ def _correction_sweep_walk(
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
 ) -> Tuple[int, int]:
-    """Build hash_to_pos and pos_by_commit_ident once and repeatedly call
+    """NOT REACHABLE FROM _run_ingestion, AND MUST NOT BECOME SO. This persists
+    its claim unconditionally and has no floor/ceiling concept, so a write
+    that raises is swallowed by the interval's closed-range semantics --
+    #326 Critical 3, which is permanent silent commit loss that every
+    at-scale detector reads clean. Pinned by
+    test_run_ingestion_does_not_call_the_legacy_walk_wrappers.
+
+    Build hash_to_pos and pos_by_commit_ident once and repeatedly call
     _correction_sweep_claim_and_process (passing them down, along with the
     running skipped-events total as skipped_so_far) until that returns
     None, then call _correction_sweep_log_summary with the final total.
@@ -14183,9 +14211,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # the gap is already closed.
                 #
                 # Drives 2c's three pieces directly on their correct
-                # executors. _correction_sweep_claim_and_process and
-                # _correction_sweep_walk must NOT be used here: both fuse the
-                # CPU-bound parse and the DB-bound writes into one body.
+                # executors. The legacy synchronous convenience wrappers for
+                # this sweep (see their docstrings) must NOT be used here:
+                # they fuse the CPU-bound parse and the DB-bound writes into
+                # one body.
                 if completed_all:
                     _ingest_progress["phase"] = "sweeping"
                     hash_to_pos = {h: i for i, h in enumerate(linearization)}
