@@ -24318,6 +24318,74 @@ class TestReDateStructuralFactsKeepsEverySiblingEdge:
         )
 
 
+class TestForwardStructuralTriplesByIdent:
+    """`_forward_structural_triples_by_ident` had no direct unit test -- it
+    was only ever exercised through _forward_apply and the correction sweep,
+    both of which would keep passing if it silently returned fewer idents."""
+
+    def test_every_candidate_ident_gets_an_entry(self):
+        """The two functions read the SAME five sources and must agree about
+        which idents exist. _forward_apply asserts on exactly this
+        correspondence (mcp_server.py:11989), so a silent disagreement shows
+        up there as a hard failure mid-ingestion rather than here."""
+        import mcp_server
+        # The third element of each *_entries tuple is that entity's own
+        # TRIPLE LIST -- not a type string. _forward_candidate_idents unpacks
+        # it as `for ident, _name, _t in ...` and discards it; this function
+        # is the consumer that actually uses it.
+        precomputed = {
+            "module_ident": ":module/auth-py",
+            "module_candidate_triples": [
+                "[:module/auth-py :entity-type :type/module]",
+                '[:module/auth-py :path "auth.py"]',
+            ],
+            "function_entries": [(
+                ":function/auth-py-login", "login",
+                ["[:function/auth-py-login :entity-type :type/function]",
+                 "[:module/auth-py :contains :function/auth-py-login]"],
+            )],
+            "class_entries": [(
+                ":class/auth-py-user", "User",
+                ["[:class/auth-py-user :entity-type :type/class]"],
+            )],
+            "global_entries": [(
+                ":variable/auth-py-limit", "LIMIT",
+                ["[:variable/auth-py-limit :entity-type :type/variable]"],
+            )],
+            "field_entries": [(
+                ":field/auth-py-user-name", "name",
+                ["[:field/auth-py-user-name :entity-type :type/field]"],
+            )],
+        }
+        result = mcp_server._forward_structural_triples_by_ident(precomputed)
+        for ident in mcp_server._forward_candidate_idents(precomputed):
+            assert ident in result, (
+                f"{ident} is a candidate ident but has no structural triples; "
+                f"_forward_apply asserts on exactly this correspondence"
+            )
+            assert result[ident], f"{ident} mapped to an empty triple list"
+
+    def test_a_child_carries_its_own_containment_edge(self):
+        """#222 phase 2b1: a child's list carries its [parent :contains child]
+        edge, so re-dating the child re-dates the containment with it. Pinned
+        because nothing else asserts it directly."""
+        import mcp_server
+        precomputed = {
+            "module_ident": ":module/auth-py",
+            "module_candidate_triples": ["[:module/auth-py :entity-type :type/module]"],
+            "function_entries": [(
+                ":function/auth-py-login", "login",
+                ["[:function/auth-py-login :entity-type :type/function]",
+                 "[:module/auth-py :contains :function/auth-py-login]"],
+            )],
+            "class_entries": [], "global_entries": [], "field_entries": [],
+        }
+        result = mcp_server._forward_structural_triples_by_ident(precomputed)
+        assert any(
+            ":contains" in t for t in result[":function/auth-py-login"]
+        ), "the child's own triple list lost its containment edge"
+
+
 class TestForwardReconcileProvisional:
     # The commit the forward walk is currently applying, i.e. the entity's
     # TRUE introduction. Distinct from _seed_provisional's guess commit in
@@ -25207,12 +25275,36 @@ class TestStageBRepairsLifecycleFacts:
         "static": ("?i ?v", "[?e :ident ?i] [?e :static ?v]"),
         "path": ("?i ?v", "[?e :ident ?i] [?e :path ?v]"),
         "file": ("?i ?v", "[?e :ident ?i] [?e :file ?v]"),
+        # An entity whose :ident is closed contributes NO rows to any query
+        # above -- every one of them binds [?e :ident ?i]. That makes both
+        # oracles blind to exactly the states _build_close_triples produces
+        # ("live :entity-type, no :ident"), which is where a resurrection or
+        # a purge would show up. This arm binds the type alone.
+        "entity-type-unidented": ("?e ?v", "[?e :entity-type ?v]"),
     }
     # Bookkeeping entities that legitimately differ between the two runs:
     # frontier-high and :ingestion/correction-sweep-through only exist when a
     # reverse stream ran at all, and the lineage/candidate companion entities
     # are transient scratch state.
     _BOOKKEEPING_PREFIXES = (":ingestion/", ":lineage/", ":candidate/")
+    # entity-type-unidented binds the raw entity (no :ident join, by
+    # construction -- that is the whole point of the arm), so
+    # _BOOKKEEPING_PREFIXES cannot filter it: row[0] there is minigraf's
+    # internal subject, never an ident string. Bookkeeping entities
+    # (frontier-high, correction-sweep-through, lineage markers,
+    # completed-region archives...) DO carry :entity-type, and differ
+    # legitimately between a mixed and a forward-only run the same way
+    # their idents do -- measured: dropping this filter reddens
+    # test_introduced_by_matches_a_forward_only_ingest et al. on
+    # (:type/ingest-interval, :type/ingestion) rows that have nothing to do
+    # with a closed code entity. Filtered by VALUE instead, since these are
+    # the only types this internal machinery ever writes; every real code
+    # entity type (:type/module/function/class/variable/field, plus
+    # :type/commit and :type/external-dependency) is untouched by this list.
+    _BOOKKEEPING_ENTITY_TYPES = (
+        ":type/ingestion", ":type/ingest-interval", ":type/completed-region",
+        ":type/lineage-marker",
+    )
 
     # ---- repo construction -------------------------------------------------
 
@@ -25311,8 +25403,11 @@ class TestStageBRepairsLifecycleFacts:
             out = {}
             for label, (find, where) in self._SNAPSHOT_QUERIES.items():
                 raw = mcp_server._db_execute(db, f"(query [:find {find}{clause} :where {where}])")
+                rows = json.loads(raw).get("results", [])
+                if label == "entity-type-unidented":
+                    rows = [r for r in rows if r[1] not in self._BOOKKEEPING_ENTITY_TYPES]
                 out[label] = sorted(
-                    tuple(row) for row in json.loads(raw).get("results", [])
+                    tuple(row) for row in rows
                     if not str(row[0]).startswith(self._BOOKKEEPING_PREFIXES)
                 )
             return out
@@ -25764,6 +25859,14 @@ class TestMultiStreamParityWithForwardOnly:
     # reverse stream ran at all; :lineage/ and :candidate/ are transient
     # scratch state. All of them legitimately differ between the two runs.
     _BOOKKEEPING_PREFIXES = (":ingestion/", ":lineage/", ":candidate/")
+    # entity-type-unidented (below) binds the entity directly with no :ident
+    # join, so _BOOKKEEPING_PREFIXES -- which matches an ident string --
+    # cannot filter it out; see the identical comment and measurement in
+    # TestStageBRepairsLifecycleFacts._BOOKKEEPING_ENTITY_TYPES.
+    _BOOKKEEPING_ENTITY_TYPES = (
+        ":type/ingestion", ":type/ingest-interval", ":type/completed-region",
+        ":type/lineage-marker",
+    )
 
     def _commit(self, repo, msg, day, paths=None):
         ts = f"2021-03-{day:02d}T00:00:00Z"
@@ -25949,13 +26052,24 @@ class TestMultiStreamParityWithForwardOnly:
         "depends-on": "[?e :ident ?i] [?e :depends-on ?v]",
         "renamed-to": "[?e :ident ?i] [?e :renamed-to ?v]",
         "renamed-from": "[?e :ident ?i] [?e :renamed-from ?v]",
+        # An entity whose :ident is closed contributes NO rows to any query
+        # above -- every one of them binds [?e :ident ?i]. That makes both
+        # oracles blind to exactly the states _build_close_triples produces
+        # ("live :entity-type, no :ident"), which is where a resurrection or
+        # a purge would show up. This arm binds the type alone; it reuses
+        # the fixed ?i find-var name for the entity itself, since this
+        # class's _snapshot always queries `:find ?i ?v`.
+        "entity-type-unidented": "[?i :entity-type ?v]",
     }
 
     def _snapshot(self, graph_path):
-        return {
-            label: self._query(graph_path, f"(query [:find ?i ?v :where {where}])")
-            for label, where in self._SNAPSHOT_QUERIES.items()
-        }
+        out = {}
+        for label, where in self._SNAPSHOT_QUERIES.items():
+            rows = self._query(graph_path, f"(query [:find ?i ?v :where {where}])")
+            if label == "entity-type-unidented":
+                rows = [r for r in rows if r[1] not in self._BOOKKEEPING_ENTITY_TYPES]
+            out[label] = rows
+        return out
 
     def _lineage(self, graph_path):
         """Every live entity's :introduced-by, keyed by :ident.
