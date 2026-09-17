@@ -1493,7 +1493,26 @@ def test_code_idents_carry_exactly_one_slash():
 
 - [ ] **Step 4: Run**
 
-Run: `.venv/bin/python -m pytest tests/test_mcp_server.py -k lineage_marker -v`
+**Name both tests explicitly. Do NOT use a `-k` substring filter here.**
+`-k lineage_marker` would select the first test but silently MISS
+`test_code_idents_carry_exactly_one_slash`, which contains neither "lineage"
+nor "marker" — and that is the test answering this task's actual open
+question. A `-k` filter that quietly selects fewer tests than the change
+touches already cost Task 9 a fix round, when a prescribed filter failed to
+select a class the task modified and the gap was papered over rather than
+noticed.
+
+Run:
+```bash
+.venv/bin/python -m pytest \
+  "tests/test_mcp_server.py::test_lineage_marker_ident_is_not_injective_on_raw_input" \
+  "tests/test_mcp_server.py::test_code_idents_carry_exactly_one_slash" -v
+```
+
+Expected: both PASS. If `test_code_idents_carry_exactly_one_slash` FAILS, you
+have found a reachable collision — **stop and report it** (see Step 3); that is
+a correctness bug needing its own fix and probably its own issue, not a
+hygiene commit.
 
 - [ ] **Step 5: Commit**
 
