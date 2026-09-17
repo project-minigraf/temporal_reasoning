@@ -25295,6 +25295,7 @@ class TestStageBRepairsLifecycleFacts:
     # completed-region archives...) DO carry :entity-type, and differ
     # legitimately between a mixed and a forward-only run the same way
     # their idents do -- measured: dropping this filter reddens
+    # TestMultiStreamParityWithForwardOnly's
     # test_introduced_by_matches_a_forward_only_ingest et al. on
     # (:type/ingest-interval, :type/ingestion) rows that have nothing to do
     # with a closed code entity. Filtered by VALUE instead, since these are
@@ -26039,9 +26040,19 @@ class TestMultiStreamParityWithForwardOnly:
         ]
 
     # The rest of the fact shape, beyond the :introduced-by and live-:ident
-    # oracles asserted first. Bound through :ident on purpose: `?e` alone is
-    # minigraf's internal subject, which is not stable across two
-    # separately-built graphs.
+    # oracles asserted first. Bound through :ident on purpose, for
+    # legibility: `?e` alone is minigraf's internal subject -- an opaque
+    # UUID in a failure diff, rather than a readable ident string.
+    #
+    # It is NOT unstable, despite what an earlier version of this comment
+    # claimed: minigraf derives an entity's internal id deterministically
+    # from its ident keyword (uuid5(NAMESPACE_OID, ...)), so the same ident
+    # text always maps to the same raw entity across two separately-built
+    # graphs of the same repo. That determinism is exactly what makes
+    # entity-type-unidented below sound -- it binds ?i directly to the raw
+    # entity, with no :ident join, and still compares equal between the
+    # mixed and forward-only graphs once bookkeeping types are filtered
+    # (measured: see _BOOKKEEPING_ENTITY_TYPES below).
     _SNAPSHOT_QUERIES = {
         "modified-in": "[?e :ident ?i] [?e :modified-in ?v]",
         "entity-type": "[?e :ident ?i] [?e :entity-type ?v]",
