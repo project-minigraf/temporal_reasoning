@@ -7779,6 +7779,19 @@ def _lineage_marker_ident(entity_ident: str) -> str:
     """Deterministic companion-entity ident for entity_ident's provisional
     marker. Not a public schema type -- see the #222 phase 2a design spec's
     "Schema/audit status of new entity types" section.
+
+    Collapses every '/' in entity_ident to '-', so this is injective only
+    because every real caller passes a `_code_ident`-produced ident, which
+    always carries exactly one '/' (`_canonical_ident` slugs the value before
+    joining it to the type prefix, so no '/' from the source path can survive
+    into the ident body). Both properties -- the raw function is NOT
+    injective in general, and `_code_ident` output IS single-slash -- are
+    pinned by test rather than asserted by reasoning: #222 phase 5 task 10,
+    `test_lineage_marker_ident_is_not_injective_on_raw_input` and
+    `test_code_idents_carry_exactly_one_slash` (tests/test_mcp_server.py).
+    If a future caller ever mints `_lineage_marker_ident` from something
+    other than a `_code_ident` output, re-check this property before trusting
+    it.
     """
     return f":lineage/{entity_ident.lstrip(':').replace('/', '-')}"
 

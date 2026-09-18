@@ -7680,6 +7680,36 @@ class TestCodeIdent:
         assert mcp_server._code_ident("function", "Foo.py", "MyFunc") == ":function/foo-py--myfunc"
 
 
+# #222 phase 5 task 10: `_lineage_marker_ident` collapses every '/' in its
+# input to '-' (`entity_ident.lstrip(':').replace('/', '-')`), so it is
+# injective only if its real inputs -- idents produced by `_code_ident` --
+# always carry exactly one '/'. The two tests below answer two different
+# questions and neither covers the other: the first shows the raw function is
+# not injective in general, the second shows whether ingestion can ever hand
+# it a colliding pair. Kept as module-level functions, not class methods, so
+# they can be named directly on the pytest command line.
+
+
+def test_lineage_marker_ident_is_not_injective_on_raw_input():
+    """`entity_ident.lstrip(':').replace('/', '-')` maps both of these to
+    `:lineage/module-a-b`. This is about the FUNCTION, not about whether
+    ingestion can produce the colliding input -- see the next test."""
+    import mcp_server
+    assert (mcp_server._lineage_marker_ident(":module/a-b")
+            == mcp_server._lineage_marker_ident(":module/a/b"))
+
+
+def test_code_idents_carry_exactly_one_slash():
+    """`_lineage_marker_ident` collapses every '/' to '-', so it is
+    injective over its real inputs only if code idents carry exactly one.
+    This is the pre-slug-input question that "it is a function of the ident
+    so it cannot differ" skips over."""
+    import mcp_server
+    for path in ("a/b.py", "a-b.py", "a/b/c.py", "a-b/c.py", "a/b-c.py"):
+        ident = mcp_server._code_ident("module", path)
+        assert ident.count("/") == 1, f"{path} -> {ident}"
+
+
 # Every (entity_type, file_path, name) input pair that the #263 census found
 # reachable to ONE ident over 674 commits of this repo — 9 of 2780 idents
 # (0.32%), lifted verbatim from
