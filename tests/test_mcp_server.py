@@ -16912,8 +16912,9 @@ class TestRunIngestionBatchedIndexWrites:
         below) confirmed this fixture would need 4 separate open+commit+close
         cycles if ingestion still wrote to the index one triple-batch at a
         time (the pre-Task-8 behavior) -- each with its own fsync -- versus
-        exactly 1 connection open and 3 commits (one per source commit, plus
-        one final flush-on-close) once batched. The gap between those two
+        exactly 1 connection open and 4 commits (one per source commit, one
+        for Stage B's sweep window, plus one final flush-on-close) once
+        batched. The gap between those two
         numbers is what would grow unboundedly on a 1M-fact repo if this
         regressed back to per-triple commits.
 
@@ -16959,14 +16960,18 @@ class TestRunIngestionBatchedIndexWrites:
         # >= 4 for this fixture (see docstring).
         assert len(open_calls) == 1
         # git_repo has 2 commits -> 2 per-commit commits (one right after
-        # each commit's _db_checkpoint) + 1 final flush inside
-        # fact_index.close_writer at run end = 3. This is a tight equality,
+        # each commit's _db_checkpoint) + 1 from Stage B's single sweep
+        # window (_db_lease_async_committing_index commits before every
+        # window's lease release -- final review C1; the first window is
+        # always entered, because that is where the sweep is planned, even
+        # when it then declines) + 1 final flush inside
+        # fact_index.close_writer at run end = 4. This is a tight equality,
         # not just an upper bound: 0 (nothing wired up) and any count that
         # scaled with the ~36 individual facts these 2 commits produce would
         # both fail it, so a regression to either "no batching wired up" or
         # "still committing per triple" is caught, not just silently allowed
         # through by a loose bound.
-        assert len(commit_calls) == 3
+        assert len(commit_calls) == 4
 
 
 class TestOpenIndexWriterSafeRetry:
@@ -25324,11 +25329,13 @@ class TestStageBRepairsLifecycleFacts:
     # (frontier-high, correction-sweep-through, lineage markers,
     # completed-region archives...) DO carry :entity-type, and differ
     # legitimately between a mixed and a forward-only run the same way
-    # their idents do -- measured: dropping this filter reddens
-    # TestMultiStreamParityWithForwardOnly's
-    # test_introduced_by_matches_a_forward_only_ingest et al. on
+    # their idents do. Measured on THIS class's own copy: emptying this
+    # tuple reddens all 5 of this class's own tests, on
     # (:type/ingest-interval, :type/ingestion) rows that have nothing to do
-    # with a closed code entity. Filtered by VALUE instead, since these are
+    # with a closed code entity. It does NOT redden
+    # TestMultiStreamParityWithForwardOnly, which keeps its own copy of the
+    # tuple (emptying THAT one reddens that class's 3 tests on the same
+    # two types). Filtered by VALUE instead, since these are
     # the only types this internal machinery ever writes; every real code
     # entity type (:type/module/function/class/variable/field, plus
     # :type/commit and :type/external-dependency) is untouched by this list.
@@ -25892,8 +25899,11 @@ class TestMultiStreamParityWithForwardOnly:
     _BOOKKEEPING_PREFIXES = (":ingestion/", ":lineage/", ":candidate/")
     # entity-type-unidented (below) binds the entity directly with no :ident
     # join, so _BOOKKEEPING_PREFIXES -- which matches an ident string --
-    # cannot filter it out; see the identical comment and measurement in
-    # TestStageBRepairsLifecycleFacts._BOOKKEEPING_ENTITY_TYPES.
+    # cannot filter it out; see the rationale at
+    # TestStageBRepairsLifecycleFacts._BOOKKEEPING_ENTITY_TYPES. The two
+    # tuples are independent copies, each load-bearing only for its own
+    # class. Measured on THIS copy: emptying it reddens all 3 of this class's
+    # tests on (:type/ingest-interval, :type/ingestion) rows.
     _BOOKKEEPING_ENTITY_TYPES = (
         ":type/ingestion", ":type/ingest-interval", ":type/completed-region",
         ":type/lineage-marker",
@@ -26082,7 +26092,7 @@ class TestMultiStreamParityWithForwardOnly:
     # entity-type-unidented below sound -- it binds ?i directly to the raw
     # entity, with no :ident join, and still compares equal between the
     # mixed and forward-only graphs once bookkeeping types are filtered
-    # (measured: see _BOOKKEEPING_ENTITY_TYPES below).
+    # (measured: see _BOOKKEEPING_ENTITY_TYPES above).
     _SNAPSHOT_QUERIES = {
         "modified-in": "[?e :ident ?i] [?e :modified-in ?v]",
         "entity-type": "[?e :ident ?i] [?e :entity-type ?v]",
@@ -26585,8 +26595,10 @@ def test_run_ingestion_does_not_call_the_legacy_walk_wrappers():
     """#326's second unfiled follow-up: these always persist claims and have
     NO floor or ceiling concept, so wiring either into a real run
     reintroduces Critical 3 (a failed write swallowed by an interval's range
-    semantics) wholesale. They are reachable only from tests and the
-    evals/at_scale/profile_* scripts; this pins that _run_ingestion itself
+    semantics) wholesale. They are reachable only from tests and
+    `evals/at_scale/profile_reverse_walk_writes.py` (the single script that
+    calls one; profile_forward_reconcile_attribution.py only mentions them in
+    a comment and drives the real _run_ingestion path); this pins that _run_ingestion itself
     stays clear of them.
 
     This is a raw substring scan over inspect.getsource(_run_ingestion) --
@@ -30281,4 +30293,217 @@ class TestStageBYieldsTheLock:
             f"_SWEEP_YIELD_COMMITS at 10**9 -- the count disjunct cannot have "
             f"fired, so the clock disjunct never ended a window either. The "
             f"boundary's `or` has one half that is never evaluated"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_hook_writing_graph_and_index_mid_sweep_lands_in_both(
+        self, tmp_path, monkeypatch
+    ):
+        """The window must release the graph with NO fact-index write
+        transaction open -- final whole-branch review C1.
+
+        The test above uses a bare MiniGrafDb.open() waiter, which touches
+        only the graph, so it cannot see this. A real auto-memory hook
+        (finalize_hook.py) writes the graph AND the fact index:
+        handle_minigraf_transact -> _transact with no index_con -> _index_write
+        opens its OWN SQLite connection. _correction_sweep_through_update
+        writes index rows on ingestion's batched index_con AFTER
+        _forward_apply's only commit, and _index_write never commits a
+        caller-supplied connection -- so a window that ended there released
+        the graph lock while still holding SQLite's writer lock. The hook then
+        took the graph, blocked on SQLite (5 s busy timeout) while HOLDING the
+        graph, ingestion's next window gave up acquiring after ~2.6 s and the
+        run ended `status: error`, and the hook's index insert failed
+        "database is locked" and was swallowed: a fact in the graph and not in
+        the index (#302 divergence).
+
+        So the waiter here is a separate PROCESS doing a real
+        handle_minigraf_transact, pre-spawned (importing mcp_server is slow)
+        and released from inside the first swept commit, so it is already
+        retrying when the first boundary arrives. `written_at < sweep_end_at`
+        is the positive control that the write really landed through a window
+        boundary, not after Stage B finished. It and the sweep-length guard
+        are asserted LAST so the ablation reddens on a defect-naming
+        assertion (under the defect the run dies after one swept commit).
+        """
+        import mcp_server
+        import fact_index
+        repo, graph = self._prepare(tmp_path, monkeypatch, n=24)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        ready = tmp_path / "hook_ready"
+        go = tmp_path / "hook_go"
+        script = (
+            "import json, os, sys, time\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n"
+            "import mcp_server\n"
+            f"open({str(ready)!r}, 'w').close()\n"
+            f"while not os.path.exists({str(go)!r}):\n"
+            "    time.sleep(0.002)\n"
+            "try:\n"
+            "    r = mcp_server.handle_minigraf_transact(\n"
+            "        '[[:decision/hook-fact :description \"written by hook\"]]', 'hook')\n"
+            "    print(json.dumps({'ok': bool(r.get('ok')), 'err': r.get('error'),\n"
+            "                      'written_at': time.time()}))\n"
+            "except Exception as e:\n"
+            "    print(json.dumps({'ok': False, 'err': repr(e), 'written_at': time.time()}))\n"
+            "sys.stdout.flush()\n"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MINIGRAF_")}
+        env["MINIGRAF_GRAPH_PATH"] = str(graph)
+        proc = _subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True, env=env,
+        )
+        state = {"sweep_end_at": None, "swept": 0}
+        try:
+            deadline = time.monotonic() + 60
+            while not ready.exists():
+                assert proc.poll() is None, proc.communicate()
+                assert time.monotonic() < deadline, "the hook process never got ready"
+                await asyncio.sleep(0.01)
+
+            real_apply = mcp_server._correction_sweep_apply
+            real_summary = mcp_server._correction_sweep_log_summary
+
+            def apply_spy(*a, **kw):
+                state["swept"] += 1
+                if state["swept"] == 1:
+                    # Inside the lease, so the hook starts retrying while a
+                    # window still owns the graph.
+                    go.touch()
+                return real_apply(*a, **kw)
+
+            def summary_spy(*a, **kw):
+                if state["sweep_end_at"] is None:
+                    state["sweep_end_at"] = time.time()
+                return real_summary(*a, **kw)
+
+            monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+            monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+            await mcp_server._run_ingestion(str(repo), "master")
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+        assert lines, f"the hook printed no result. stdout={out!r} stderr={err!r}"
+        hook = json.loads(lines[-1])
+        assert mcp_server._ingest_progress.get("status") == "complete", (
+            f"ingestion did not complete while a hook wrote mid-sweep: "
+            f"{mcp_server._ingest_progress.get('status')!r}, error="
+            f"{mcp_server._ingest_progress.get('error')!r}. A window released "
+            f"the graph lease with the fact-index write transaction still open, "
+            f"so the hook held the graph while blocked on SQLite and the next "
+            f"window could not re-acquire it"
+        )
+        assert hook["ok"], f"the hook's transact failed: {hook!r}; stderr={err[-2000:]!r}"
+
+        mcp_server._reset_db_state()
+        with mcp_server.db_lease() as db:
+            graph_rows = json.loads(mcp_server._db_execute(
+                db, '(query [:find ?d :where [:decision/hook-fact :description ?d]])'
+            )).get("results", [])
+        con = fact_index.open_reader(fact_index.index_path_for(str(graph)))
+        try:
+            index_rows = con.execute(
+                "select value from facts_fts where entity = ':decision/hook-fact'"
+            ).fetchall()
+        finally:
+            con.close()
+        assert graph_rows, f"the hook's fact is not in the graph: {hook!r}"
+        assert index_rows, (
+            f"the hook's fact reached the graph ({graph_rows!r}) but NOT the "
+            f"fact index -- its index insert hit 'database is locked' behind "
+            f"ingestion's uncommitted index transaction and was swallowed "
+            f"(#302 divergence). hook stderr tail: {err[-2000:]!r}"
+        )
+        # Positive controls, asserted after the defect assertions: under the
+        # defect the run dies after ONE swept commit, so the length guard
+        # would otherwise redden first and hide what actually broke.
+        assert state["swept"] >= 4, (
+            f"only {state['swept']} commit(s) swept -- too short a sweep for a "
+            f"boundary to be reachable, so this test cannot discriminate"
+        )
+        assert hook["written_at"] < state["sweep_end_at"], (
+            f"the hook's write landed {hook['written_at'] - state['sweep_end_at']:.3f}s "
+            f"AFTER the sweep ended, so it went through no window boundary and "
+            f"this test proved nothing about the window"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_exactly_one_window_long_takes_one_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """A sweep whose length is an exact multiple of _SWEEP_YIELD_COMMITS
+        must not break after its last commit: `nxt` already reads "nothing
+        selected" there, and a break would pay a pause, a fresh lease and its
+        drop-checkpoint (#280) only to discover the sweep is over.
+
+        Measured in two passes over identical repos: the first learns the
+        sweep length T with the window effectively unbounded, the second runs
+        with _SWEEP_YIELD_COMMITS = T and counts in-sweep leases and pauses.
+        Bracketed on _correction_sweep_log_summary for the same reason the
+        tests above are.
+        """
+        import mcp_server
+
+        async def run(sub, n_commits, window):
+            sub.mkdir()
+            repo, _g = self._prepare(sub, monkeypatch, n=n_commits)
+            monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", window)
+            monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
+            leases, pauses, swept, over = [], [], [], []
+            real_lease = mcp_server.db_lease_async
+            real_summary = mcp_server._correction_sweep_log_summary
+            real_apply = mcp_server._correction_sweep_apply
+            real_sleep = asyncio.sleep
+
+            def in_sweep():
+                return mcp_server._ingest_progress.get("phase") == "sweeping" and not over
+
+            def lease_spy():
+                if in_sweep():
+                    leases.append(1)
+                return real_lease()
+
+            async def sleep_spy(delay, *a, **kw):
+                if in_sweep() and delay == mcp_server._SWEEP_YIELD_PAUSE_SECONDS and delay > 0:
+                    pauses.append(delay)
+                return await real_sleep(delay, *a, **kw)
+
+            def summary_spy(*a, **kw):
+                over.append(True)
+                return real_summary(*a, **kw)
+
+            def apply_spy(*a, **kw):
+                swept.append(1)
+                return real_apply(*a, **kw)
+
+            monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+            monkeypatch.setattr(mcp_server.asyncio, "sleep", sleep_spy)
+            monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+            monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+            try:
+                await mcp_server._run_ingestion(str(repo), "master")
+            finally:
+                monkeypatch.setattr(mcp_server, "db_lease_async", real_lease)
+                monkeypatch.setattr(mcp_server.asyncio, "sleep", real_sleep)
+                monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", real_summary)
+                monkeypatch.setattr(mcp_server, "_correction_sweep_apply", real_apply)
+                mcp_server._reset_db_state()
+            return len(swept), len(leases), len(pauses)
+
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_PAUSE_SECONDS", 0.001)
+        total, _l, _p = await run(tmp_path / "learn", 12, 10**9)
+        assert total >= 2, f"the sweep swept {total} commit(s); nothing to check"
+        swept, leases, pauses = await run(tmp_path / "exact", 12, total)
+        assert swept == total, f"the two passes swept differently: {total} then {swept}"
+        assert (leases, pauses) == (1, 0), (
+            f"a sweep of exactly _SWEEP_YIELD_COMMITS={total} commits took "
+            f"{leases} in-sweep lease(s) and {pauses} pause(s); expected 1 and 0 "
+            f"-- the window broke after its last commit although `nxt` already "
+            f"selected nothing"
         )

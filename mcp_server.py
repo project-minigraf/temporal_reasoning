@@ -180,6 +180,16 @@ except ValueError:
 # did not block queries; it SILENTLY DISCARDED every auto-memory write for the
 # sweep's duration, which on a large repo is a large fraction of the ingest.
 #
+# Yielding only makes the hook's write SUCCEED if the fact index is committed
+# before every release -- which is why each window goes through
+# _db_lease_async_committing_index. A window released with the batched
+# index_con's SQLite write transaction still open is a lock-order inversion:
+# the hook takes the graph lock then blocks on SQLite (5 s busy timeout)
+# holding it, ingestion holds SQLite and cannot get the graph back (~2.6 s),
+# the run ends `status: error`, and the hook's index insert is swallowed --
+# fact in graph, missing from index (#302). Measured, not supposed: see
+# CLAUDE.md, "The fact index must be COMMITTED".
+#
 # NOT a per-commit release: _DbLeaseManager.release() at refcount 1 -> 0 drops
 # the handle, and minigraf's `Drop for Inner` then runs a full O(graph size)
 # checkpoint -- #280, measured at 47.3% of Stage A's write time and growing
@@ -3770,6 +3780,40 @@ async def db_lease_async():
         leased._sever()
         leased = None
         _lease_manager.release()
+
+
+@contextlib.asynccontextmanager
+async def _db_lease_async_committing_index(loop, write_executor, index_con):
+    """db_lease_async(), plus a commit of the batched fact-index connection
+    BEFORE the lease is released -- on every exit path, exceptions included.
+
+    Used by Stage B's sweep WINDOW (#222 phase 5 item C), whose whole purpose
+    is to let an out-of-process auto-memory hook take the graph lock between
+    windows. Releasing the graph lease while `index_con` still holds an open
+    SQLite write transaction is a lock-order inversion: the hook
+    (finalize_hook.py -> handle_minigraf_transact -> _transact with no
+    index_con) takes the graph lock and THEN blocks on SQLite for up to
+    fact_index.open_writer's 5 s busy timeout, still holding the graph lock;
+    ingestion holds SQLite and needs the graph lock back, gives up after
+    _LOCK_RETRY_MAX attempts (~2.6 s), and the run ends `status: error`. The
+    hook's index insert then fails "database is locked" and is swallowed by
+    _index_write, so the fact is in the graph and missing from the index --
+    a #302 divergence. Reproduced 2 of 2 at shipped defaults (100 commits)
+    before this existed; see CLAUDE.md, "Stage B now yields its lease".
+
+    The commit sits INSIDE the lease and after the window's last
+    _correction_sweep_through_update, so a window still ends only between
+    fully-swept commits. _commit_index_writer_safe never raises, so it cannot
+    mask an exception that is already propagating.
+
+    Looks up db_lease_async by module global at call time, so tests that
+    patch it still see every window's acquire.
+    """
+    async with db_lease_async() as db:
+        try:
+            yield db
+        finally:
+            await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
 
 
 def _graph_path_current() -> str:
@@ -7784,7 +7828,15 @@ def _lineage_marker_ident(entity_ident: str) -> str:
     because every real caller passes a `_code_ident`-produced ident, which
     always carries exactly one '/' (`_canonical_ident` slugs the value before
     joining it to the type prefix, so no '/' from the source path can survive
-    into the ident body). Both properties -- the raw function is NOT
+    into the ident body). Single-slash alone is NOT sufficient, though: the
+    collapse also needs the TYPE PREFIX to be hyphen-free, so the one '/' sits
+    at a fixed boundary the '-' it becomes cannot be confused with. With a
+    hyphenated prefix, `:a-b/c` and `:a/b-c` both collapse to
+    `:lineage/a-b-c`. That holds today because `_code_ident` is only ever
+    called with the literals module/function/class/variable/field (the
+    category loops iterate exactly those four, and renamed_pairs' categories
+    come from the same pools) -- a hyphenated code entity type would break it.
+    Both properties -- the raw function is NOT
     injective in general, and `_code_ident` output IS single-slash -- are
     pinned by test rather than asserted by reasoning: #222 phase 5 task 10,
     `test_lineage_marker_ident_is_not_injective_on_raw_input` and
@@ -14277,7 +14329,19 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     while not sweep_done:
                         window_started = time.monotonic()
                         window_count = 0
-                        async with db_lease_async() as db:
+                        # The fact index is committed before this lease is
+                        # released, on EVERY exit from the window (count or
+                        # clock boundary, sweep done, sweep aborted, shutdown,
+                        # exception). _correction_sweep_through_update writes
+                        # index rows AFTER _forward_apply's own commit, and
+                        # _index_write never commits a caller-supplied
+                        # index_con -- so without this the window released the
+                        # graph with SQLite's writer lock still held, and a
+                        # hook that took the graph lock then deadlocked against
+                        # it. See _db_lease_async_committing_index.
+                        async with _db_lease_async_committing_index(
+                            loop, write_executor, index_con,
+                        ) as db:
                             if sweep_fragmented is None:
                                 # #325 review Finding 3: computed ONCE, not inside
                                 # the loop below. Stage B only starts once
@@ -14413,8 +14477,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 # (#280); the CLOCK bounds how long the hooks are locked
                                 # out when one window's commits are individually slow,
                                 # which on a large graph they are.
+                                #
+                                # Never when `nxt` selected nothing: the sweep is
+                                # already over, and breaking here would pay a
+                                # pause, a fresh lease and its O(graph size)
+                                # drop-checkpoint (#280) only to discover that at
+                                # the top of the next window. Falling through lets
+                                # the loop head end the sweep inside THIS lease --
+                                # which is what makes "a sweep fitting in one
+                                # window pays nothing" true when its length is an
+                                # exact multiple of _SWEEP_YIELD_COMMITS.
                                 window_count += 1
-                                if (
+                                if nxt.selected is not None and (
                                     window_count >= _SWEEP_YIELD_COMMITS
                                     or time.monotonic() - window_started >= _SWEEP_YIELD_SECONDS
                                 ):
