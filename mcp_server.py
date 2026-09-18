@@ -12720,9 +12720,17 @@ def _correction_sweep_apply(
         to_confirm: List[str] = []
         # Deduplicated: the collection mirrors _forward_candidate_idents'
         # construction, which can repeat an ident when a file declares the
-        # same name in two categories. The per-ident work below is idempotent,
-        # so a repeat was harmless -- but it paid for a full
-        # _entity_introduced_by_values_query per duplicate.
+        # same name twice within one category -- a module-level constant
+        # reassigned, a function redefined, or a `self.` attribute reassigned
+        # a second time in __init__ (cross-category collision is impossible:
+        # _canonical_ident bakes entity_type into the ident prefix). The
+        # per-ident work below is idempotent, so a repeat was harmless -- but
+        # it paid for a full _entity_introduced_by_values_query per
+        # duplicate. dict.fromkeys, not set(): both dedupe, but set()'s
+        # hash-randomised iteration over strings would make the per-ident
+        # stderr skip-log order -- and so which idents hit
+        # _CORRECTION_SWEEP_LOG_CAP first -- vary between process runs;
+        # dict.fromkeys preserves first-seen order deterministically.
         for ident in dict.fromkeys(candidate_idents):
             introduced_by_values = set(_entity_introduced_by_values_query(db, ident))
 
