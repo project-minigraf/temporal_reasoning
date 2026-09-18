@@ -317,6 +317,68 @@ def _commit_census_row(metrics: dict[str, Any]) -> str:
     )
 
 
+def _orphaned_commits_row(metrics: dict[str, Any]) -> str:
+    """The "Orphaned commit entities" row (#222 phase 5, gate clause 9).
+
+    Its own row rather than part of the census row above: an orphan is a graph
+    holding MORE than the repo, which matches none of the census's three delta
+    diagnoses, so that row reads clean over a graph that kept rewritten history.
+
+    Same idioms as the #316 row. The clean rendering carries the DENOMINATOR
+    (`0 of 957`), never a bare 0. And `entities` is never rendered without
+    `proved_nothing`: when the recorded branch is absent or is not the audited
+    ref, the count is still computed and shipped, but it may be another
+    ingested branch's legitimate history, so it is shown as uninterpretable
+    rather than as findings or as clean. The gate does not fail it.
+
+    "not measured" is for a metrics file from a harness predating this check,
+    and "UNVERIFIED" for a census that could not gather its inputs -- in which
+    case the sets it did hold are partial, so no number is quoted.
+    """
+    label = "| Orphaned commit entities (#222 phase 5) |"
+    census = metrics.get("commit_census")
+    if census is None or "orphaned_commits" not in census:
+        return (
+            f"{label} not measured (pre-2026-09-14 harness; this graph was "
+            f"never asked) |"
+        )
+    if census.get("census_error"):
+        return (
+            f"{label} **UNVERIFIED** -- the census could not gather its "
+            f"inputs: `{census['census_error']}` |"
+        )
+    orphans = census["orphaned_commits"] or {}
+    entities = orphans.get("entities", 0)
+    scanned = orphans.get("commit_entities_scanned", 0)
+    recorded = orphans.get("recorded_branch")
+    audited = orphans.get("audited_ref")
+    if orphans.get("proved_nothing"):
+        if not scanned:
+            why = "0 commit entities were scanned -- this graph holds none"
+        elif recorded is None:
+            why = "the graph records no `:ingestion/branch`"
+        else:
+            why = (
+                f"the graph was ingested against `{recorded}`, not the audited "
+                f"`{audited}`, so commits outside `{audited}` may be another "
+                f"branch's real history"
+            )
+        return (
+            f"{label} {entities} of {scanned} absent from `{audited}`, but "
+            f"**{why}**, so the check proved nothing about it (not gated) |"
+        )
+    if not entities:
+        return f"{label} 0 of {scanned} (ref `{audited}`) |"
+    sample = ", ".join(f"`{h}`" for h in orphans.get("sample", []))
+    return (
+        f"{label} **{entities}** of {scanned} hold a hash `{audited}` no longer "
+        f"contains -- this graph must be **rebuilt into a fresh graph path**, "
+        f"not repaired or re-ingested in place"
+        + (f". e.g. {sample}" if sample else "")
+        + " |"
+    )
+
+
 def _introduced_by_duplicates_row(metrics: dict[str, Any]) -> str:
     """The "Duplicate :introduced-by" row (#287).
 
@@ -569,6 +631,7 @@ def append_ingestion_report(
         _introduced_by_duplicates_row(metrics),
         _orphan_introduced_by_row(metrics),
         _commit_census_row(metrics),
+        _orphaned_commits_row(metrics),
     ]
     if "ignore_comparison" in metrics:
         comp = metrics["ignore_comparison"]
@@ -770,9 +833,10 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
 
     _stderr_capture_row / _skipped_commits_row / _error_signals_row /
     _fact_audit_row / _introduced_by_duplicates_row / _orphan_introduced_by_row
-    / _commit_census_row are reused verbatim rather than re-rendered from the
-    same keys. That is the point: an Ingestion Run section and a Query Correctness
-    Run section must not be able to disagree about how a dirty run reads.
+    / _commit_census_row / _orphaned_commits_row are reused verbatim rather than
+    re-rendered from the same keys. That is the point: an Ingestion Run section
+    and a Query Correctness Run section must not be able to disagree about how
+    a dirty run reads.
     """
     metrics = report.get("ingestion")
     if metrics is None:
@@ -797,6 +861,7 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
         _introduced_by_duplicates_row(metrics),
         _orphan_introduced_by_row(metrics),
         _commit_census_row(metrics),
+        _orphaned_commits_row(metrics),
     ]
 
 

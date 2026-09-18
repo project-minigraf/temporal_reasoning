@@ -2348,3 +2348,4 @@ repo/walk/graph counts already in the run's log.
 | Duplicate :introduced-by (#287) | 0 |
 | Code entities with no :introduced-by (#316) | 0 of 3899 code entities |
 | Commits: repo / walk / graph (#317) | 957 / 957 / 957 (ref `master`) |
+| Orphaned commit entities (#222 phase 5) | 0 of 957 (ref `master`) |

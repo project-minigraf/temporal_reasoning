@@ -257,18 +257,17 @@ def orphaned_commits(
 
     A graph holding no commit entities reports `proved_nothing` too: a check
     that matched nothing also reports 0.
+
+    THE COUNT IS COMPUTED AND SHIPPED IN BOTH CASES; only `proved_nothing`
+    differs. An uninterpretable run used to return a hard-coded
+    `"entities": 0` and never compute the difference -- and a placeholder 0
+    beside a denominator reads as "verified clean", the exact misreading this
+    arc refuses everywhere else. Both sets are already in hand, so the real
+    number costs nothing. It is gated only when interpretable (clause 9 reads
+    `proved_nothing` first), and no reader may take `entities` without it.
     """
     scanned = len(graph_hashes)
     interpretable = recorded_branch is not None and recorded_branch == audited_ref
-    if not interpretable or scanned == 0:
-        return {
-            "entities": 0,
-            "commit_entities_scanned": scanned,
-            "sample": [],
-            "recorded_branch": recorded_branch,
-            "audited_ref": audited_ref,
-            "proved_nothing": True,
-        }
     orphans = sorted(graph_hashes - repo_hashes)
     return {
         "entities": len(orphans),
@@ -276,7 +275,7 @@ def orphaned_commits(
         "sample": orphans[:sample_cap],
         "recorded_branch": recorded_branch,
         "audited_ref": audited_ref,
-        "proved_nothing": False,
+        "proved_nothing": not interpretable or scanned == 0,
     }
 
 

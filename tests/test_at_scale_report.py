@@ -606,6 +606,94 @@ class TestCommitCensusRow:
         assert "proved nothing about the" in text
 
 
+class TestOrphanedCommitsRow:
+    """#222 phase 5, gate clause 9. `entities` is never rendered without
+    `proved_nothing`, and a clean row carries its denominator."""
+
+    def _render(self, tmp_path, census):
+        metrics = {**TestCommitCensusRow()._clean()}
+        if census is not None:
+            metrics["commit_census"] = census
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        return report_path.read_text()
+
+    @staticmethod
+    def _census(orphans, census_error=None):
+        return {
+            "ref": "master", "repo_commits": 957, "walk_claimed": 957,
+            "graph_commit_entities": 957, "ok": True, "proved_nothing": False,
+            "census_error": census_error, "orphaned_commits": orphans,
+        }
+
+    def test_a_clean_run_renders_zero_with_its_denominator(self, tmp_path):
+        text = self._render(tmp_path, self._census({
+            "entities": 0, "commit_entities_scanned": 957, "sample": [],
+            "recorded_branch": "master", "audited_ref": "master",
+            "proved_nothing": False,
+        }))
+        assert "| Orphaned commit entities (#222 phase 5) | 0 of 957 (ref `master`) |" in text
+
+    def test_an_orphaned_graph_is_told_to_rebuild_not_repair(self, tmp_path):
+        text = self._render(tmp_path, self._census({
+            "entities": 2, "commit_entities_scanned": 959, "sample": ["dead1", "dead2"],
+            "recorded_branch": "master", "audited_ref": "master",
+            "proved_nothing": False,
+        }))
+        assert "**2** of 959" in text
+        assert "rebuilt into a fresh graph path" in text
+        assert "`dead1`" in text
+
+    def test_a_branch_mismatch_shows_its_count_as_uninterpretable_not_findings(
+        self, tmp_path
+    ):
+        """The count ships, but it may be another branch's real history: the
+        row must neither call it clean nor tell anyone to rebuild."""
+        text = self._render(tmp_path, self._census({
+            "entities": 5, "commit_entities_scanned": 962, "sample": ["x"],
+            "recorded_branch": "develop", "audited_ref": "master",
+            "proved_nothing": True,
+        }))
+        row = next(l for l in text.splitlines() if "Orphaned commit entities" in l)
+        assert "5 of 962" in row
+        assert "proved nothing" in row
+        assert "`develop`" in row
+        assert "rebuilt" not in row
+        assert "**5**" not in row
+
+    def test_an_absent_branch_is_named_as_the_reason(self, tmp_path):
+        text = self._render(tmp_path, self._census({
+            "entities": 3, "commit_entities_scanned": 10, "sample": [],
+            "recorded_branch": None, "audited_ref": "master",
+            "proved_nothing": True,
+        }))
+        assert "records no `:ingestion/branch`" in text
+
+    def test_a_zero_denominator_is_not_rendered_as_clean(self, tmp_path):
+        text = self._render(tmp_path, self._census({
+            "entities": 0, "commit_entities_scanned": 0, "sample": [],
+            "recorded_branch": "master", "audited_ref": "master",
+            "proved_nothing": True,
+        }))
+        assert "0 commit entities were scanned" in text
+        assert "0 of 0 (ref" not in text
+
+    def test_a_failed_census_reads_as_unverified(self, tmp_path):
+        text = self._render(tmp_path, self._census({
+            "entities": 0, "commit_entities_scanned": 0, "sample": [],
+            "recorded_branch": None, "audited_ref": "master",
+            "proved_nothing": True,
+        }, census_error="FileNotFoundError: git"))
+        row = next(l for l in text.splitlines() if "Orphaned commit entities" in l)
+        assert "**UNVERIFIED**" in row
+
+    def test_a_pre_phase5_census_renders_not_measured(self, tmp_path):
+        census = self._census(None)
+        del census["orphaned_commits"]
+        text = self._render(tmp_path, census)
+        assert "| Orphaned commit entities (#222 phase 5) | not measured" in text
+
+
 class TestMetricsJsonBullet:
     """#276: a reader of an Ingestion Run section had no way to find the
     results JSON it was rendered from, and therefore no way to find the

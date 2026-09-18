@@ -590,8 +590,11 @@ def _exit_code(metrics: dict[str, Any]) -> int:
     # `proved_nothing` is true when the graph records no :ingestion/branch, or
     # records one that is not the ref being audited: a second branch ingested
     # into the same graph legitimately holds commits absent from this ref's
-    # history, and failing on that would condemn real data. The count still
-    # SHIPS in both cases -- not gated is not unmeasured.
+    # history, and failing on that would condemn real data. The count and its
+    # denominator are still COMPUTED and shipped in both cases (orphaned_commits
+    # never substitutes a placeholder 0) -- not gated is not unmeasured -- so
+    # `entities` must never be read without `proved_nothing`, which is why it
+    # is tested first here.
     #
     # `.get()` throughout, so a metrics file from a harness predating this
     # check stays clean, matching every clause above.

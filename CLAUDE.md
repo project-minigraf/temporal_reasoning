@@ -1379,8 +1379,24 @@ condemn a legitimately ingested branch's entire history: the
 `:type/external-dependency` trap of #316 exactly, and the same fix — ship the
 denominator (`commit_entities_scanned`) and refuse to read a number whose
 denominator was never established. A graph holding no commit entities reports
-`proved_nothing` too, since a check that matched nothing also reports 0. **The
-count SHIPS in both cases — not gated is not unmeasured.** Measured clean
+`proved_nothing` too, since a check that matched nothing also reports 0.
+**The count and its denominator are COMPUTED and shipped in both cases, and
+only `proved_nothing` differs — not gated is not unmeasured.**
+`orphaned_commits` always returns the real `graph_hashes - repo_hashes`
+difference in `entities`/`sample`; clause 9 gates it only when
+`proved_nothing` is false, and no reader may take `entities` without
+`proved_nothing` (the report row renders an uninterpretable count as "proved
+nothing", never as findings or as clean). The first version of this check did
+the opposite on the uninterpretable path — a hard-coded `"entities": 0` that
+never computed the difference, a placeholder 0 beside a real denominator that
+read as "verified clean" — while this very paragraph claimed the count
+shipped; the review caught the prose, and the code was changed to match it.
+Ablation-proven: restoring the placeholder reddens both
+`TestOrphanedCommits` uninterpretable-path tests on their `entities == 1`
+assertion. This is the harness channel only: the status channel,
+`mcp_server._orphaned_commit_count`, returns `None` rather than a number on
+the same uninterpretable path, which is honest there because status carries no
+`proved_nothing` beside it. Measured clean
 before the gate was wired, per the standing rule for a zero-tolerance gate:
 `entities: 0`, `commit_entities_scanned: 957`, `proved_nothing: false` on the
 957-commit at-scale run over this repo.
@@ -1395,8 +1411,9 @@ are already in hand — never queried at poll time (phase 4's rule: status is
 never derived from graph queries at poll time, which contends on
 `_db_native_lock` and is staler than memory anyway) and never placed on
 `RunProgress`, which is deliberately pure. It is reset at the top of
-`_run_ingestion` and in the declined-start branch, like `index_cross_check`:
-without that, a run that failed or was declined before reaching the assignment
+`_run_ingestion` (as `index_cross_check` is) and ALSO in
+`handle_minigraf_ingest_git`'s declined-start branch, which `index_cross_check`
+is not: without that, a run that failed or was declined before reaching the assignment
 left the PREVIOUS run's value in the status response, misattributed to a run
 that never happened.
 
@@ -1448,7 +1465,9 @@ not fail fast: it blocks ~375 ms polling 5 → 50 ms and returns as soon as the
 lock frees, so a hook ALREADY blocked wins within ~5-50 ms of a boundary.
 Measured +0.43 s over 4 boundaries against an arithmetic prediction of 0.4;
 the cost is a flat 0.1 s per boundary from 1 to 100 boundaries and does not
-grow with sweep length (~19 boundaries, ~1.9 s on this repo's own history).
+grow with sweep length. On this repo's own history that PROJECTS to ~19
+boundaries and ~1.9 s — arithmetic from the measured flat per-boundary cost,
+not itself a measurement.
 `asyncio.sleep`, never `time.sleep` — this runs on the event loop (#99), and
 `_forbid_blocking_sleep_on_event_loop` fires on exactly that.
 

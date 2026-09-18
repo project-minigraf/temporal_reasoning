@@ -232,20 +232,31 @@ class TestOrphanedCommits:
         assert r["entities"] == 1
         assert r["sample"] == ["dead"]
 
-    def test_branch_mismatch_proves_nothing_and_reports_no_count(self):
-        """The decisive false-positive guard. A graph ingested against
-        `develop` and audited against `master` legitimately holds commits
-        absent from master's linearization -- condemning it would delete a
-        real branch's history. #316's denominator idiom: report, never gate."""
+    def test_branch_mismatch_proves_nothing_but_still_ships_the_real_count(self):
+        """The decisive false-positive guard, and the contract that it does
+        NOT hide the number. A graph ingested against `develop` and audited
+        against `master` legitimately holds commits absent from master's
+        linearization -- condemning it would delete a real branch's history,
+        so `proved_nothing` is True and clause 9 does not gate it. But the
+        count is still COMPUTED and shipped: a placeholder 0 here beside a
+        denominator of 2 would read as "verified clean", which is exactly the
+        misreading this arc refuses (#316's idiom: report, never gate)."""
         r = orphaned_commits({"a", "b"}, {"a"}, "develop", "master")
         assert r["proved_nothing"] is True
-        assert r["entities"] == 0
+        assert r["entities"] == 1, (
+            "an uninterpretable run must still ship the real difference, not "
+            "a placeholder 0 that reads as clean"
+        )
+        assert r["sample"] == ["b"]
+        assert r["commit_entities_scanned"] == 2
 
-    def test_absent_branch_proves_nothing(self):
-        """A graph predating :ingestion/branch cannot be retro-audited."""
+    def test_absent_branch_proves_nothing_but_still_ships_the_real_count(self):
+        """A graph predating :ingestion/branch cannot be retro-audited -- but
+        what it holds outside the ref is still reported, just not gated."""
         r = orphaned_commits({"a", "b"}, {"a"}, None, "master")
         assert r["proved_nothing"] is True
-        assert r["entities"] == 0
+        assert r["entities"] == 1
+        assert r["sample"] == ["b"]
 
     def test_empty_graph_proves_nothing(self):
         """A check that scanned no commit entities also reports 0."""
