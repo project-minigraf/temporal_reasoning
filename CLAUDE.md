@@ -1270,9 +1270,16 @@ denominator that still checks out must not be the same branch" rule.
 
 **It is a separate code path rather than a call to `_load_one_interval`, and
 that is not duplication.** `_load_one_interval` also ARCHIVES a
-`:type/completed-region` on its discard paths, and regions are consumed by
-`_skip_claim`, which honours PROVISIONAL regions only — so routing
-frontier-low through it would write a row nothing can ever read. The cost of
+`:type/completed-region` — on its UNRESOLVABLE-bounds discard path only (a
+count mismatch discards without archiving; see its docstring) — and it stamps
+that archive with the provisional tag, which it hardcodes. Routing
+frontier-low through it would therefore record an AUTHORITATIVE forward span
+as a PROVISIONAL completed region: a row `_completed_regions_load` never
+loads, since its bounds are by construction unresolvable in that run's
+linearization and regain resolvability only if those exact hashes reappear
+(which no ordinary history rewrite produces) — and one `_skip_claim`, which
+honours provisional regions only, would then misread under the wrong tag if
+they ever did. The cost of
 the discard is a full forward re-walk from C0: expensive, never lossy, which
 is the same price every other "no denominator, no trust" branch in this arc
 pays.
@@ -1426,7 +1433,10 @@ auto-memory hooks are `command` hooks in separate processes whose retry budget
 is 0.75 s total and which swallow failures with `except Exception: pass`. So
 the hold did not block queries; it silently discarded every auto-memory write
 for the sweep's duration, which on a large repo is a large fraction of the
-ingest.
+ingest. Yielding only lets a hook's write SUCCEED because
+every window commits the fact index before releasing the lease; without that
+the yield deadlocks the hook against ingestion instead (see "The fact index
+must be COMMITTED" below).
 
 **A WINDOW rather than a per-commit release, because the release is not
 free.** `_DbLeaseManager.release()` at refcount 1 → 0 drops the handle, and
@@ -1443,6 +1453,45 @@ complete, so the window costs time, not outcome. When #280 lands (blocked on
 upstream minigraf#322) the drop checkpoint is suppressed and N can safely go
 to 1 — which is why this is a constant to lower rather than a structure to
 rewrite.
+
+**The fact index must be COMMITTED before every window's lease release, and
+for a while it was not — so the window, as first shipped, broke ingestion
+instead of saving the hook's write (final whole-branch review C1).**
+`_correction_sweep_through_update` writes index rows on ingestion's batched
+`index_con` AFTER `_forward_apply`'s only `_commit_index_writer_safe`, and
+`_index_write` never commits a caller-supplied connection. So a window ended
+with SQLite's writer lock still held and the graph lock free — a LOCK-ORDER
+INVERSION. The hook (`finalize_hook.py` → `handle_minigraf_transact` →
+`_transact` with no `index_con`) takes the GRAPH lock first, then blocks on
+SQLite for up to `fact_index.open_writer`'s 5 s busy timeout while still
+holding the graph; ingestion holds SQLite and needs the graph back, gives up
+after `_LOCK_RETRY_MAX` attempts (~2.6 s) outside the per-commit `try`, and
+the run ends `status: error`. The hook's index insert then fails "database is
+locked", swallowed by `_index_write`: the fact is in the graph and missing from
+the index, a #302 divergence. Measured at shipped defaults, 100 commits,
+real processes: 2 of 2 by the reviewer and 1 of 1 again on the pre-fix code
+(`status: error`, `[fact_index] insert failed: database is locked`, the
+hook's `:description` in the graph and not the index); after the fix 3 of 3
+complete with the hook's fact in both. Every window now goes through
+`_db_lease_async_committing_index`, which commits in a `finally` INSIDE the
+lease — every exit (count or clock boundary, sweep done, abort, shutdown,
+exception) — and after the window's last `_correction_sweep_through_update`,
+so a window still ends only between fully-swept commits.
+`TestStageBYieldsTheLock::test_a_hook_writing_graph_and_index_mid_sweep_lands_in_both`
+drives a real `handle_minigraf_transact` from a separate process; with the
+commit deleted it reddens on `status == "complete"` 5 of 5.
+
+**Stage A has the same uncommitted-index shape, PRE-EXISTING and NOT fixed
+here (follow-up issue).** `_reverse_apply` writes index rows on `index_con`
+and never commits (it ends at `_db_checkpoint_gated(db)` / `return
+commit_hash`), and `_run_ingestion`'s per-commit `async with db_lease_async()`
+around its dispatch releases the graph right after — so on a reverse-heavy
+stretch the SQLite writer transaction stays open across many lease releases,
+until a forward apply or `_close_index_writer_safe` commits it. Stage A takes
+no pause between leases, so a hook wins far less often than at a window
+boundary, but the inversion is the same. So are the single leases after the
+sweep that write index rows and release without committing (the lineage fold,
+the end-of-walk skipped-span flush, `_ingest_tags`/`_last_run_write`).
 
 **Boundaries fall only between fully-swept commits.**
 `_correction_sweep_apply`, `_forward_apply(lifecycle_only=True)` and
@@ -1529,7 +1578,15 @@ which always carries exactly ONE `/`: `_canonical_ident`'s
 `re.sub(r"[^a-z0-9_-]", "-", ...)` replaces every character outside
 `[a-z0-9_-]`, `/` included, so no `/` from a source path can survive into the
 ident body, and the single `/` is the type-prefix separator appended
-afterwards. Both halves — that the raw function is not injective, and that
+afterwards. **Single-slash is necessary but not sufficient: the type prefix
+must also be HYPHEN-FREE**, so that the one `/` sits at a fixed boundary the
+`-` it collapses into cannot be confused with — with a hyphenated prefix,
+`:a-b/c` and `:a/b-c` both become `:lineage/a-b-c`. That holds today because
+`_code_ident` is only ever called with the literals
+`module`/`function`/`class`/`variable`/`field` (verified by grep: every call
+site passes one of those literals, a loop over exactly the four child
+categories, or a `renamed_pairs` category drawn from the same pools); minting
+a hyphenated code entity type would break it. Both halves — that the raw function is not injective, and that
 `_code_ident` output is single-slash — are pinned by test rather than asserted
 by reasoning: `test_lineage_marker_ident_is_not_injective_on_raw_input` and
 `test_code_idents_carry_exactly_one_slash` (tests/test_mcp_server.py), driven
