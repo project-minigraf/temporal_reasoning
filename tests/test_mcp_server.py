@@ -30325,6 +30325,16 @@ class TestStageBYieldsTheLock:
         boundary, not after Stage B finished. It and the sweep-length guard
         are asserted LAST so the ablation reddens on a defect-naming
         assertion (under the defect the run dies after one swept commit).
+
+        In THIS fixture the defect is caught by the `status == "complete"`
+        assertion, NOT by the index-row one -- do not "simplify" the status
+        assertion away. Ingestion's lease budget (~2.6 s) always expires before
+        the hook's SQLite busy timeout (5 s), so the run dies first and the
+        hook's index insert then succeeds; ablated with the status assertion
+        disabled, the index row is present and the test reddens only on the
+        sweep-length guard. The missing-index-row divergence itself reproduced
+        only at the shipped defaults over 100 commits (final-review e2e). The
+        index-row assertion stays as a correct postcondition.
         """
         import mcp_server
         import fact_index

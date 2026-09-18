@@ -1482,7 +1482,7 @@ drives a real `handle_minigraf_transact` from a separate process; with the
 commit deleted it reddens on `status == "complete"` 5 of 5.
 
 **Stage A has the same uncommitted-index shape, PRE-EXISTING and NOT fixed
-here (follow-up issue).** `_reverse_apply` writes index rows on `index_con`
+here (#347).** `_reverse_apply` writes index rows on `index_con`
 and never commits (it ends at `_db_checkpoint_gated(db)` / `return
 commit_hash`), and `_run_ingestion`'s per-commit `async with db_lease_async()`
 around its dispatch releases the graph right after — so on a reverse-heavy
