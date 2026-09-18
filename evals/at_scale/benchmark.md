@@ -2320,3 +2320,31 @@ repo/walk/graph counts already in the run's log.
 | Duplicate :introduced-by (#287) | 0 |
 | Code entities with no :introduced-by (#316) | 0 of 3899 code entities |
 | Commits: repo / walk / graph (#317) | 957 / 957 / 957 (ref `master`) |
+
+## Ingestion Run — 20260918T140704Z
+
+- Repo: `.` @ `master`
+- minigraf: `2.0.0`
+- Metrics JSON: `results/ingestion-20260918T140704Z.json`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 957 |
+| Final status | complete |
+| Wall-clock | 2778.68s |
+| Throughput | 20.7 commits/min |
+| Peak RSS | 1095220 KB |
+| Graph size | 305799168 bytes |
+| Fact-index size | 131280896 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 14.8ms / 36.6ms |
+| Graph-query latency (min/p50/p99/max) | 1.4ms / 27.5ms / 1672.5ms / 2427.0ms |
+| Poll duty cycle (#242) | 6.73% over 1686 polls |
+| Checkpoint duty cycle (#241) | 4.58% over 115 checkpoints (127.13s total, 1321 suppressed) |
+| Stderr tee (#256) | active (wall-clock and latencies measured with an fd-level tee in place) |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+| Fact-index divergence (#302) | 0 (36504 facts cross-checked) |
+| Duplicate :introduced-by (#287) | 0 |
+| Code entities with no :introduced-by (#316) | 0 of 3899 code entities |
+| Commits: repo / walk / graph (#317) | 957 / 957 / 957 (ref `master`) |
