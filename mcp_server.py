@@ -8182,6 +8182,10 @@ def _entity_introduced_by_set_provisional_batch(
     ~1ms, so the retract batching is the load-bearing half.
 
     Returns the set of idents whose guess was actually asserted or moved.
+    NO PRODUCTION CONSUMER -- both call sites in _reverse_apply discard it.
+    It is kept because the test suite asserts on it to distinguish "moved" from
+    "left alone", which is otherwise only observable by re-querying every
+    ident. Do not "clean it up" into None without re-pointing those tests.
 
     Every gate is per-ident and is applied in the same order the per-ident
     function used, because batching must not turn one ident's refusal into
@@ -12714,7 +12718,12 @@ def _correction_sweep_apply(
         # file and flushed once at the bottom of this same iteration, so a
         # file's confirms are one call.
         to_confirm: List[str] = []
-        for ident in candidate_idents:
+        # Deduplicated: the collection mirrors _forward_candidate_idents'
+        # construction, which can repeat an ident when a file declares the
+        # same name in two categories. The per-ident work below is idempotent,
+        # so a repeat was harmless -- but it paid for a full
+        # _entity_introduced_by_values_query per duplicate.
+        for ident in dict.fromkeys(candidate_idents):
             introduced_by_values = set(_entity_introduced_by_values_query(db, ident))
 
             # #235 repair: collapse a corrupted multi-valued entity BEFORE the
@@ -12992,7 +13001,7 @@ def _parse_stream_ratio(raw: Optional[str]) -> Tuple[int, int]:
         return forward, reverse
     except Exception as e:
         print(
-            f"[_run_ingestion] ignoring malformed MINIGRAF_INGEST_STREAM_RATIO "
+            f"[_parse_stream_ratio] ignoring malformed MINIGRAF_INGEST_STREAM_RATIO "
             f"{raw!r} ({e}); using {_DEFAULT_STREAM_RATIO[0]}:{_DEFAULT_STREAM_RATIO[1]}",
             file=sys.stderr,
         )
