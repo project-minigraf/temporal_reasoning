@@ -20,7 +20,7 @@
 - **No `GRAPH_FORMAT_VERSION` bump and no migration** anywhere in this plan.
 - **minigraf#287 workaround is permanent.** `:contains`, `:depends-on` and `:parent` are transacted ONE PER CALL. Never batch them.
 - **#156 non-idempotency.** Re-transacting the same `(entity, attribute, value)` at a fresh valid-from creates a second live fact, not a no-op. Every repeated write diffs against the current live value first.
-- **Existing full-suite baseline:** 2087 passed / 1 xfailed on master `49acbb1`. Any new failure is yours.
+- **Full-suite baseline — CURRENT figure is 2116 passed / 1 xfailed**, measured 2026-09-17 after Task 9 (`9a09b8f`). Any new failure is yours. This number MOVES as the plan adds tests: it was 2087 on master `49acbb1` before Task 2, 2113 after Task 7, 2116 after Task 9. **Always quote the latest measured figure, never a remembered one** — a stale baseline used as a floor lets a suite that has silently LOST tests read as passing.
 
 ## File Structure
 
@@ -1634,7 +1634,14 @@ Claude-Session: https://claude.ai/code/session_01UZDij8wb7jHW7CAj55ZUbw"
 - [ ] **Step 1: Full suite**
 
 Run: `.venv/bin/python -m pytest tests/ -q`
-Expected: ≥ 2087 passed / 1 xfailed, no new failures.
+Expected: **2116 passed / 1 xfailed** (the figure measured after Task 9 at
+`9a09b8f`), plus whatever Tasks 10-12 add, and ZERO failures.
+
+**Do not treat this as a `>=` floor.** An open-ended "≥ 2087" would pass a
+suite that had silently lost twenty-nine tests. Compare against the latest
+measured count recorded in the SDD ledger, and if the total is LOWER than
+expected, that is a finding — collected tests disappearing is exactly as
+serious as tests failing, and far quieter.
 
 - [ ] **Step 2: At-scale gate**
 
