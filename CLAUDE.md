@@ -1561,18 +1561,24 @@ them. All three constants are read at IMPORT, so the conftest `MINIGRAF_*`
 scrub cannot reach them: a test that depends on a value must patch the
 CONSTANT, not the variable.
 
-**`_forward_apply`'s positional-argument hazard is the most valuable thing
-phase 5 learned about code it did not change (#346).** `lifecycle_only` and
-`persist_claim` are arguments 9 and 10 of `_forward_apply`, and BOTH reach it
-POSITIONALLY through `run_in_executor` — `mcp_server.py:13932` (Stage A's
-forward dispatch) and `:14338` (Stage B's lifecycle apply) — because
-`run_in_executor` takes no kwargs. Neither is named at either site, both carry
-defaults, and the `:14338` site already passes fewer than the full count. So
-**inserting a parameter ahead of them raises no `TypeError`; it silently
-rebinds the existing booleans**, and a wrong `lifecycle_only` flips the whole
-function's behaviour. **Convert those two call sites to keyword form — a
-`functools.partial` or a named dispatch shim — BEFORE any signature change.**
-That is a prerequisite, not cleanup.
+**`_forward_apply`'s positional-argument hazard was the most valuable thing
+phase 5 learned about code it did not change, and #346's prerequisite closed
+it.** `lifecycle_only` and `persist_claim` were arguments 9 and 10, both
+defaulted, and both reached the function POSITIONALLY through
+`run_in_executor` (which takes no kwargs) — Stage B's call already passed fewer
+than the full count. So inserting a parameter ahead of them raised no
+`TypeError`; it silently rebound the existing booleans, and a wrong
+`lifecycle_only` flips the whole function's behaviour. `_reverse_apply` had the
+same shape (`persist_claim`, `claim_ident`, `absorbed_idents`). **Every
+defaulted parameter of both functions is now KEYWORD-ONLY** (a bare `*` after
+the required positionals), and all three dispatch sites submit a
+`functools.partial` naming each flag, so a positional flag is a `TypeError` at
+the first call rather than a silent rebind. Keep it that way: a new parameter
+on either function goes after the `*`. `TestApplyDispatchIsKeywordSafe` pins
+the signatures and spies on a real 1:1 run, requiring that it saw a Stage A
+forward, a Stage A reverse AND a Stage B lifecycle call — a spy that never saw
+a site proves nothing about it. Test spies read these flags from `kwargs`, never
+by argument index.
 
 The decomposition itself was DECLINED and filed as #346 rather than attempted.
 Every seam that would meaningfully decompose the function moves mutable
