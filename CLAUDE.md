@@ -1650,13 +1650,31 @@ module and a function in each group.
 history (`49acbb1`) was built three ways: forward-only, 1:1 pre-fix, and 1:1
 post-fix. All three agree exactly on 3988 live code entities and 3899
 `:introduced-by` facts, and pre and post are identical in every compared set.
-The forward-only graph does carry 23 `:modified-in` edges the multi-stream
-graphs lack. They are NOT this defect: every one sits at the entity's own
+The forward-only graph did carry 23 `:modified-in` edges the multi-stream
+graphs lack. They were NOT this defect: every one sat at the entity's own
 introduction commit, from a name defined twice in one file (`_ingest` in
-several test classes). `_build_code_triples` introduces the first definition
-and reads the second as a modification, while the multi-stream paths dedupe
-candidates. No graph format bump and no migration: this only changes what
-Stage B writes going forward.
+several test classes) — #351, below. No graph format bump and no migration:
+this only changes what Stage B writes going forward.
+
+**One file defining one name twice yields ONE entry, the FIRST (#351).**
+`_code_ident` maps a method name shared by several classes, a redefined
+function, or a class-level attribute that `__init__` also assigns through
+`self` to a single ident, and `_precompute_file_triples` used to emit an entry
+per occurrence. `_build_code_triples` then introduced the ident from the first
+and took the "already known" branch on the second, asserting `:modified-in` at
+the entity's own `:introduced-by` commit — in the forward walk of BOTH modes,
+not only forward-only. The close path had a second defect of the same shape:
+`field_static_map` kept the LAST declaration's `:static` while the
+introduction wrote the FIRST's (`x = 1` at class level is `true`, `self.x` in
+`__init__` is `false`), so a close retracted a value never asserted and left
+the real `:static` live on a closed field; and
+`_forward_structural_triples_by_ident` kept the last entry's triples. Now
+`_first_entry_per_ident` dedupes all four entry lists at source and
+`field_static_map` uses `setdefault`, so every consumer sees the same entity.
+Each half was ablated separately and reddens its own tests
+(`TestDuplicateNameInOneFile`). No format bump, no migration: existing graphs
+keep their self-edges and stale `:static` facts and get rebuilt, per the
+standing decision.
 
 ## Claude Code Plugin Publishing
 

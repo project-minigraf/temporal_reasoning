@@ -26726,6 +26726,173 @@ class TestRebirthInsideReverseRegion:
         assert saw_live and saw_dead
 
 
+class TestDuplicateNameInOneFile:
+    """#351: one file defining one name twice -- a method name shared by
+    several classes, a redefined function, a class-level attribute that
+    __init__ also assigns through self -- yields two entries with ONE ident.
+
+    Before the fix _precompute_file_triples emitted both, so
+    _build_code_triples introduced the ident from the first and then took
+    the "already known" branch on the second, asserting :modified-in at the
+    entity's own introduction commit (23 such edges on this repo's own
+    history, forward-only; the multi-stream graph lacked them because
+    _correction_sweep_apply dedupes). And for a field, field_static_map kept
+    the LAST entry's :static while the introduction wrote the FIRST's, so a
+    later close retracted a value that was never asserted and left the real
+    one live.
+
+    Reuses TestMultiStreamParityWithForwardOnly's oracle through an instance,
+    as TestRebirthInsideReverseRegion does.
+    """
+
+    # 1:1 over eight commits: forward claims p0-p3, reverse p4-p7.
+    _REVERSE_POSITIONS = [4, 5, 6, 7]
+
+    _TWO_METHODS = (
+        "class A:\n    def run(self):\n        return {n}\n\n"
+        "class B:\n    def run(self):\n        return {n}\n"
+    )
+    _REDEFINED = "def f():\n    return 0\n\ndef f():\n    return {n}\n"
+    _FIELD = (
+        "class C:\n    x = {n}\n\n"
+        "    def __init__(self):\n        self.x = {n}\n"
+    )
+
+    def test_precompute_emits_one_entry_per_ident(self):
+        import mcp_server
+        extracted = {
+            "functions": ["run", "run", "g"],
+            "classes": ["A", "A"],
+            "globals": ["K", "K"],
+            "fields": [("x", "C", True), ("x", "C", False)],
+            "imports": [],
+        }
+        pre = mcp_server._precompute_file_triples("m.py", extracted, ":commit/c1", {})
+        for key in ("function_entries", "class_entries", "global_entries", "field_entries"):
+            idents = [i for i, _n, _t in pre[key]]
+            assert len(idents) == len(set(idents)), f"{key} repeats an ident: {idents}"
+        assert [n for _i, n, _t in pre["function_entries"]] == ["run", "g"]
+
+        # The field's :static is the FIRST declaration's, in BOTH places it is
+        # recorded -- the introduction triple and the map a close retracts from.
+        (field_ident, _n, triples), = pre["field_entries"]
+        assert f"[{field_ident} :static true]" in triples
+        assert pre["field_static_map"][field_ident] is True
+
+    def test_build_code_triples_does_not_self_modify_on_introduction(self):
+        import mcp_server
+        extracted = {"functions": ["run", "run"], "classes": [], "globals": [],
+                     "fields": [], "imports": []}
+        pre = mcp_server._precompute_file_triples("m.py", extracted, ":commit/c1", {})
+        triples = mcp_server._build_code_triples(
+            "m.py", extracted, "2021-03-01T00:00:00Z", {}, {}, {}, ":commit/c1", pre,
+        )
+        fn = mcp_server._code_ident("function", "m.py", "run")
+        assert f"[{fn} :introduced-by :commit/c1]" in triples
+        assert not [t for t in triples if ":modified-in" in t], triples
+
+    def _repo(self, tmp_path, h):
+        """Eight commits, p0..p7.
+
+          fwd.py    two classes sharing `run`, born p1 (forward region),
+                    edited p5 (reverse) -- the already-known path
+          rev.py    `f` defined twice, born p5 (reverse region), edited p6
+          field.py  C.x declared static AND via self, born p1, deleted p2
+                    (forward-region close)
+          field2.py the same, born p4, deleted p6 (Stage B's close)
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for args in (["init", "-b", "master"], ["config", "user.email", "t@t.com"],
+                     ["config", "user.name", "T"]):
+            _subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+        # n per position; None = absent.
+        plan = {
+            "fwd.py": (self._TWO_METHODS, [None, 1, 1, 1, 1, 2, 2, 2]),
+            "rev.py": (self._REDEFINED, [None] * 5 + [1, 2, 2]),
+            "field.py": (self._FIELD, [None, 1] + [None] * 6),
+            "field2.py": (self._FIELD, [None] * 4 + [1, 1, None, None]),
+        }
+        for p in range(8):
+            (repo / "base.py").write_text(f"def base():\n    return {p}\n")
+            for path, (text, ns) in plan.items():
+                if ns[p] is None:
+                    if (repo / path).exists():
+                        (repo / path).unlink()
+                else:
+                    (repo / path).write_text(text.format(n=ns[p]))
+            h._commit(repo, f"p{p}", p + 1)
+        return repo
+
+    async def _ingest_both(self, tmp_path, monkeypatch):
+        h = TestMultiStreamParityWithForwardOnly()
+        repo = self._repo(tmp_path, h)
+        multi = tmp_path / "multi.graph"
+        forward_only = tmp_path / "fwd.graph"
+        await h._ingest(repo, multi, monkeypatch, "1:1")
+        await h._ingest(repo, forward_only, monkeypatch, f"{10**6}:1")
+        h._assert_reverse_claimed(multi, repo, self._REVERSE_POSITIONS)
+        return h, multi, forward_only
+
+    @pytest.mark.asyncio
+    async def test_forward_only_matches_multi_stream_with_no_self_modification(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        h, multi, forward_only = await self._ingest_both(tmp_path, monkeypatch)
+        # Positive control: the duplicated idents exist and were introduced,
+        # so an empty offender list is about them and not about their absence.
+        dup = {
+            mcp_server._code_ident("function", "fwd.py", "run"),
+            mcp_server._code_ident("function", "rev.py", "f"),
+        }
+        for graph in (multi, forward_only):
+            live = {i for (i,) in h._live_idents(graph)}
+            assert dup <= live, f"{graph.name} lost a duplicated entity: {dup - live}"
+        # ...and the edit commits (p5 for fwd.py, p6 for rev.py) did record a
+        # modification, so the fix narrowed only the self-modification.
+        modified = {i for i, _c in h._query(
+            forward_only, "(query [:find ?i ?c :where [?e :ident ?i] [?e :modified-in ?c]])"
+        )}
+        assert dup <= modified, f"a real edit went unrecorded: {dup - modified}"
+
+        # Includes _assert_no_self_modification on the forward-only graph.
+        h._assert_parity(multi, forward_only)
+
+    @pytest.mark.asyncio
+    async def test_closed_duplicate_field_leaves_no_live_static(self, tmp_path, monkeypatch):
+        import mcp_server
+        h, multi, forward_only = await self._ingest_both(tmp_path, monkeypatch)
+        # Every :static the graph holds, keyed by the raw field entity:
+        # a closed field has no live :ident to join through.
+        q = "(query [:find ?e ?v :where [?e :static ?v]])"
+        for graph in (multi, forward_only):
+            assert h._raw_query(graph, q) == [], (
+                f"{graph.name}: a closed field kept a live :static -- the close "
+                f"retracted a value the introduction never wrote: {h._raw_query(graph, q)}"
+            )
+            live = {i for (i,) in h._live_idents(graph)}
+            for path in ("field.py", "field2.py"):
+                assert mcp_server._code_ident("field", path, "C.x") not in live
+
+    @pytest.mark.asyncio
+    async def test_static_positive_control(self, tmp_path, monkeypatch):
+        """The test above is vacuous if :static is never written at all."""
+        h = TestMultiStreamParityWithForwardOnly()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for args in (["init", "-b", "master"], ["config", "user.email", "t@t.com"],
+                     ["config", "user.name", "T"]):
+            _subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+        (repo / "field.py").write_text(self._FIELD.format(n=1))
+        h._commit(repo, "p0", 1)
+        graph = tmp_path / "g.graph"
+        await h._ingest(repo, graph, monkeypatch, f"{10**6}:1")
+        vals = [v for _e, v in h._raw_query(graph, "(query [:find ?e ?v :where [?e :static ?v]])")]
+        assert vals == [True], vals
+
+
 class TestStagingAndShutdown:
     def _repo(self, tmp_path, n_commits=6):
         """A linear auth.py history where the newest third also carries a
