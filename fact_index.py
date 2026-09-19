@@ -435,6 +435,50 @@ def delete_facts(
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 
 
+def has_commit_entities(path: str) -> bool:
+    """True iff the index holds a LIVE `:entity-type :type/commit` row, i.e.
+    this graph has ingested git history (#353).
+
+    Answers the navigation nudge's gate without a graph lease. The graph
+    query it replaces (mcp_server._count_commit_entities) cost a full handle
+    open plus an aggregate scan -- ~70 ms on a 179 MB graph -- and, when
+    another process held the graph (ingestion, the finalize hook), blocked
+    ~3.1 s through the lease retry budget and then dropped the nudge anyway.
+    This is one range seek on facts_dedup's covering index (':commit/' up to
+    ':commit0', the character after '/'), ~0.3 ms.
+
+    valid_to = '' is insert_facts' sentinel for a current row, matching the
+    old query's live-only semantics. A missing or unreadable file reads
+    False: the nudge is advisory, and "no evidence of ingestion" is the
+    honest answer when there is no index to ask. The index can diverge from
+    the graph (#302); for a one-line hint that is an accepted cost, never a
+    reason to open the graph on every prompt.
+
+    Relies on commit rows being NAMED `:commit/...`. Ingestion guarantees it
+    by writing a string `:ident` beside every `:type/commit` (both apply
+    paths), which is what a backfill (mcp_server._rebuild_index_from_graph)
+    maps entities back through. A commit hand-written through the public
+    handler WITHOUT an :ident is renamed into UUID space by a backfill and is
+    invisible here -- a missed hint on a graph that holds no ingested history.
+    """
+    try:
+        con = open_reader(path)
+    except sqlite3.Error:
+        return False
+    try:
+        row = con.execute(
+            "SELECT 1 FROM facts_dedup "
+            "WHERE entity >= ':commit/' AND entity < ':commit0' "
+            "AND attribute = ':entity-type' AND value = ':type/commit' "
+            "AND valid_to = '' LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+    return row is not None
+
+
 def _tokenize(text: str) -> List[str]:
     """Split text on non-alphanumeric chars, lowercase, filter empties."""
     return _TOKEN_PATTERN.findall(text.lower())

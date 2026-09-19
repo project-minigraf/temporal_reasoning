@@ -5983,18 +5983,17 @@ def _count_commit_entities(db: Any) -> int:
     commit_ts_iso, so a resumed run re-walking a position whose
     _frontier_persist_claim never landed (#313) re-writes the identical triple
     at the identical valid-from and it COLLAPSES rather than duplicating. The
-    reachable path is the public handler -- `commit` is a registered
-    MINIGRAF_SCHEMA type, so handle_minigraf_transact accepts
-    `[:commit/xyz :description "..."]` and writes its :entity-type at
-    wall-clock valid-from; twice, seconds apart, on a graph mixing memory
-    writes with ingested history, and the old query was wrong.
+    reachable path is the public handler -- it accepts a caller-written
+    `[:commit/xyz :entity-type :type/commit]` and transacts it at wall-clock
+    valid-from (it does NOT add an :entity-type of its own: measured, a bare
+    `[:commit/xyz :description "..."]` leaves no :entity-type row, #353);
+    twice, seconds apart, on a graph mixing memory writes with ingested
+    history, and the old query was wrong.
 
-    The over-count is invisible to this function's other caller
-    (prepare_turn's navigation nudge only asks `> 0`), but #317's commit census
-    compares this number against the repo's own `git rev-list --count`, where
-    one duplicated entity would CANCEL one genuinely lost commit and read
-    clean on a graph that lost history -- the precise failure that census
-    exists to catch.
+    #317's commit census compares this number against the repo's own
+    `git rev-list --count`, where one duplicated entity would CANCEL one
+    genuinely lost commit and read clean on a graph that lost history -- the
+    precise failure that census exists to catch.
     """
     raw = _db_execute(db, "(query [:find (count-distinct ?e) :where [?e :entity-type :type/commit]])")
     results = json.loads(raw).get("results", [])
@@ -9050,7 +9049,9 @@ def handle_memory_prepare_turn(user_message: str) -> str:
     including labeled historical (retracted/superseded) facts -- the index
     is the entry point into history, the bi-temporal graph is the archive.
     Also appends a lightweight code-graph navigation nudge (#220) on
-    build/fix/navigate-shaped messages, gated on ingestion being present.
+    build/fix/navigate-shaped messages, gated on ingestion being present --
+    read from the fact index, so the steady-state path takes no graph lease
+    at all (#353).
 
     Only memory facts (:decision/ :preference/ :constraint/ :dependency/) are
     injected (#354). Ingested code-graph rows matched on common words and
@@ -9091,10 +9092,12 @@ def handle_memory_prepare_turn(user_message: str) -> str:
 
     nav_nudge = ""
     if _looks_like_navigation_task(user_message):
+        # Answered from the fact index, never a graph lease (#353): the lease
+        # cost a handle open plus an aggregate scan on every nav-shaped
+        # prompt, and under contention blocked ~3.1 s and then lost the nudge.
         try:
-            with db_lease() as db:
-                if _count_commit_entities(db) > 0:
-                    nav_nudge = _NAV_NUDGE
+            if fact_index.has_commit_entities(path):
+                nav_nudge = _NAV_NUDGE
         except Exception as e:
             print(f"[prepare_turn] navigation nudge check failed: {e}", file=sys.stderr)
 
