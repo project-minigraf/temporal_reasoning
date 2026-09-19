@@ -166,12 +166,86 @@ try:
 except ValueError:
     _OWNER_HINT_TTL = 30.0
 
+# #222 phase 5 item C. Stage B releases its lease every _SWEEP_YIELD_COMMITS
+# swept commits or _SWEEP_YIELD_SECONDS, whichever comes first, so the
+# out-of-process auto-memory hooks can win the graph file lock.
+#
+# Stage B used to hold ONE lease across its whole sweep. A lease is cheap
+# in-process (at count > 0 try_acquire joins and returns the same handle, so a
+# concurrent call_tool never blocks) but EXCLUSIVE out-of-process, and BOTH
+# auto-memory hooks (hooks/claude-code.json) are `command` hooks in separate
+# processes -- finalize_hook.py takes a lease to write each turn's facts. Their
+# retry budget is _LOCK_RETRY_MAX x _LOCK_RETRY_BASE doubling = 0.75 s total and
+# both swallow failures with `except Exception: pass`. So the whole-sweep hold
+# did not block queries; it SILENTLY DISCARDED every auto-memory write for the
+# sweep's duration, which on a large repo is a large fraction of the ingest.
+#
+# Yielding only makes the hook's write SUCCEED if the fact index is committed
+# before every release -- which is why each window goes through
+# _db_lease_async_committing_index. A window released with the batched
+# index_con's SQLite write transaction still open is a lock-order inversion:
+# the hook takes the graph lock then blocks on SQLite (5 s busy timeout)
+# holding it, ingestion holds SQLite and cannot get the graph back (~2.6 s),
+# the run ends `status: error`, and the hook's index insert is swallowed --
+# fact in graph, missing from index (#302). Measured, not supposed: see
+# CLAUDE.md, "The fact index must be COMMITTED".
+#
+# NOT a per-commit release: _DbLeaseManager.release() at refcount 1 -> 0 drops
+# the handle, and minigraf's `Drop for Inner` then runs a full O(graph size)
+# checkpoint -- #280, measured at 47.3% of Stage A's write time and growing
+# 3.47x within a 220-commit run, outside _CheckpointPolicy's duty gate and
+# invisible to the trace's ckpt_d_seconds. A window amortises that over N
+# commits.
+#
+# _SWEEP_YIELD_SECONDS is sized against the hooks' own retry budget (0.75 s
+# total): the lock must come free often enough that a hook already retrying can
+# win it. It is the SECOND trigger, not the first -- on a large graph one
+# window's worth of commits can take far longer than the clock bound, and
+# without it the hooks' window would be set by graph size rather than by
+# anything anyone chose.
+#
+# _DbLeaseManager exposes no waiter or contention signal, so "release only when
+# something is actually waiting" is not available without building one. The
+# trigger has to be a counter or a clock; it is both.
+#
+# When #280 lands (blocked on upstream minigraf#322), the drop checkpoint is
+# suppressed and N can safely go to 1 -- which is why this is a constant to
+# lower rather than a structure to rewrite.
+#
+# Read at import, so the conftest MINIGRAF_* scrub cannot reach it: a test that
+# depends on a value must patch the CONSTANT, not the variable.
+_SWEEP_YIELD_COMMITS = int(os.environ.get("MINIGRAF_SWEEP_YIELD_COMMITS", "25"))
+_SWEEP_YIELD_SECONDS = float(os.environ.get("MINIGRAF_SWEEP_YIELD_SECONDS", "2.0"))
+
+# How long the boundary leaves the graph ACTUALLY unlocked.
+#
+# Without this the window is worthless in practice, and the reason is worth
+# stating exactly. Releasing the lease and re-acquiring it costs no awaits --
+# `window_started = ...`, `window_count = 0`, `try_acquire` -- so the graph is
+# free for MICROSECONDS. That is a free instant, not a free interval, and a
+# hook polling 5 times over its 0.75 s budget will essentially never land in
+# it. The boundary creates the right PLACE to yield; this constant is what
+# makes the yield real.
+#
+# Why 0.1 s. Under minigraf 2.0.0 `open()` does not fail fast: it blocks for
+# ~375 ms, adaptively polling 5->50 ms, and returns as soon as the lock frees.
+# So a hook ALREADY blocked in open() acquires within ~5-50 ms of the lock
+# becoming free, and 100 ms clears that comfortably while costing ~5% of a 2 s
+# window. A hook that has not started yet gains nothing from any PARTICULAR
+# boundary -- it simply blocks and wins at the next one.
+#
+# Paid only between windows, never after the last one (the sweep sets
+# sweep_done first), so a sweep that fits in one window pays nothing at all.
+_SWEEP_YIELD_PAUSE_SECONDS = float(
+    os.environ.get("MINIGRAF_SWEEP_YIELD_PAUSE_SECONDS", "0.1")
+)
+
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
     "status": "idle", "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-    "phase": None,
+    "phase": None, "orphaned_commits": None,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -3708,6 +3782,40 @@ async def db_lease_async():
         _lease_manager.release()
 
 
+@contextlib.asynccontextmanager
+async def _db_lease_async_committing_index(loop, write_executor, index_con):
+    """db_lease_async(), plus a commit of the batched fact-index connection
+    BEFORE the lease is released -- on every exit path, exceptions included.
+
+    Used by Stage B's sweep WINDOW (#222 phase 5 item C), whose whole purpose
+    is to let an out-of-process auto-memory hook take the graph lock between
+    windows. Releasing the graph lease while `index_con` still holds an open
+    SQLite write transaction is a lock-order inversion: the hook
+    (finalize_hook.py -> handle_minigraf_transact -> _transact with no
+    index_con) takes the graph lock and THEN blocks on SQLite for up to
+    fact_index.open_writer's 5 s busy timeout, still holding the graph lock;
+    ingestion holds SQLite and needs the graph lock back, gives up after
+    _LOCK_RETRY_MAX attempts (~2.6 s), and the run ends `status: error`. The
+    hook's index insert then fails "database is locked" and is swallowed by
+    _index_write, so the fact is in the graph and missing from the index --
+    a #302 divergence. Reproduced 2 of 2 at shipped defaults (100 commits)
+    before this existed; see CLAUDE.md, "Stage B now yields its lease".
+
+    The commit sits INSIDE the lease and after the window's last
+    _correction_sweep_through_update, so a window still ends only between
+    fully-swept commits. _commit_index_writer_safe never raises, so it cannot
+    mask an exception that is already propagating.
+
+    Looks up db_lease_async by module global at call time, so tests that
+    patch it still see every window's acquire.
+    """
+    async with db_lease_async() as db:
+        try:
+            yield db
+        finally:
+            await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
+
+
 def _graph_path_current() -> str:
     """The bound graph path, falling back to the environment."""
     return _lease_manager.path or _get_graph_path()
@@ -6436,12 +6544,45 @@ def _frontier_load(
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     intervals: List[frontier_registry.Interval] = []
     low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
-    if low_bounds is not None and low_bounds[0] in hash_to_pos and low_bounds[1] in hash_to_pos:
-        intervals.append(frontier_registry.Interval(
-            hash_to_pos[low_bounds[0]], hash_to_pos[low_bounds[1]],
-            frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
-            ident=_FRONTIER_LOW_IDENT,
-        ))
+    if low_bounds is not None:
+        low_lo = hash_to_pos.get(low_bounds[0])
+        low_hi = hash_to_pos.get(low_bounds[1])
+        low_count = _frontier_read_pos_count(db, _FRONTIER_LOW_IDENT)
+        # #222 phase 5 item A. The same three conditions _load_one_interval
+        # demands of every PROVISIONAL interval, applied to the authoritative
+        # one, which had only the bounds-resolve test. A commit grafted below
+        # the forward frontier (#222's "merge grafts old history" edge case)
+        # leaves both hash bounds resolving while the SPAN between them grows
+        # -- and FrontierAllocator._unclaimed() is the complement of the
+        # interval set, so every position inside it is handed to no stream and
+        # silently never walked.
+        #
+        # An interval carrying NO :pos-count is not retained either: "no
+        # denominator" and "a denominator that still checks out" must not be
+        # the same branch when the failure mode is silent permanent loss.
+        # _frontier_pos_count_delta maintains it on the from_low path, so any
+        # graph that has taken a forward claim since #326 carries one.
+        #
+        # Discarded rather than routed through _load_one_interval, which also
+        # ARCHIVES a :type/completed-region -- regions are consumed by
+        # _skip_claim, which honours PROVISIONAL regions only. The cost of a
+        # discard is a forward re-walk from C0: expensive, never lossy.
+        if (
+            low_lo is not None
+            and low_hi is not None
+            and low_lo <= low_hi
+            and low_count == low_hi - low_lo + 1
+        ):
+            intervals.append(frontier_registry.Interval(
+                low_lo, low_hi,
+                frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
+                ident=_FRONTIER_LOW_IDENT,
+            ))
+        else:
+            _frontier_discard_interval(
+                db, _FRONTIER_LOW_IDENT, low_bounds,
+                index_con=index_con, pos_count=low_count,
+            )
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
     if high_bounds is not None:
         high_count = _frontier_read_pos_count(db, _FRONTIER_HIGH_IDENT)
@@ -7682,6 +7823,27 @@ def _lineage_marker_ident(entity_ident: str) -> str:
     """Deterministic companion-entity ident for entity_ident's provisional
     marker. Not a public schema type -- see the #222 phase 2a design spec's
     "Schema/audit status of new entity types" section.
+
+    Collapses every '/' in entity_ident to '-', so this is injective only
+    because every real caller passes a `_code_ident`-produced ident, which
+    always carries exactly one '/' (`_canonical_ident` slugs the value before
+    joining it to the type prefix, so no '/' from the source path can survive
+    into the ident body). Single-slash alone is NOT sufficient, though: the
+    collapse also needs the TYPE PREFIX to be hyphen-free, so the one '/' sits
+    at a fixed boundary the '-' it becomes cannot be confused with. With a
+    hyphenated prefix, `:a-b/c` and `:a/b-c` both collapse to
+    `:lineage/a-b-c`. That holds today because `_code_ident` is only ever
+    called with the literals module/function/class/variable/field (the
+    category loops iterate exactly those four, and renamed_pairs' categories
+    come from the same pools) -- a hyphenated code entity type would break it.
+    Both properties -- the raw function is NOT
+    injective in general, and `_code_ident` output IS single-slash -- are
+    pinned by test rather than asserted by reasoning: #222 phase 5 task 10,
+    `test_lineage_marker_ident_is_not_injective_on_raw_input` and
+    `test_code_idents_carry_exactly_one_slash` (tests/test_mcp_server.py).
+    If a future caller ever mints `_lineage_marker_ident` from something
+    other than a `_code_ident` output, re-check this property before trusting
+    it.
     """
     return f":lineage/{entity_ident.lstrip(':').replace('/', '-')}"
 
@@ -8072,6 +8234,10 @@ def _entity_introduced_by_set_provisional_batch(
     ~1ms, so the retract batching is the load-bearing half.
 
     Returns the set of idents whose guess was actually asserted or moved.
+    NO PRODUCTION CONSUMER -- both call sites in _reverse_apply discard it.
+    It is kept because the test suite asserts on it to distinguish "moved" from
+    "left alone", which is otherwise only observable by re-querying every
+    ident. Do not "clean it up" into None without re-pointing those tests.
 
     Every gate is per-ident and is applied in the same order the per-ident
     function used, because batching must not turn one ident's refusal into
@@ -8346,6 +8512,93 @@ def _last_run_write(db: Any, commit_hash: str, run_at: str, total_ingested: int,
         _transact(db, "[" + " ".join(to_transact) + "]", run_at, index_con=index_con)
 
 
+_INGESTION_BRANCH_IDENT = ":ingestion/branch"
+
+
+def _ingestion_branch_read(db: Any) -> Optional[str]:
+    """The ref this graph was last ingested against, or None if it predates
+    #222 phase 5 (or no run has completed its first write yet).
+
+    None is NOT "master" and must never be defaulted to one: the orphan check
+    reads an absent branch as "proved nothing", which is the honest answer for
+    a graph that never recorded one.
+    """
+    raw = _db_execute(
+        db, f"(query [:find ?b :where [{_INGESTION_BRANCH_IDENT} :branch ?b]])"
+    )
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+def _ingestion_branch_write(
+    db: Any, branch: str, run_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """Record the ref this run is walking. Written on EVERY run -- the branch
+    can change between runs -- which is why it is not a stamp-if-new like
+    _graph_format_version_stamp_if_new.
+
+    Value-diffed before writing, exactly as _last_run_write and _ingest_tags
+    do: minigraf is NOT idempotent at the graph level for re-transacting the
+    same (entity, attribute, value) at a fresh valid-from (#156), so an
+    unconditional re-transact accumulates a duplicate live fact per run.
+
+    Not folded into :ingestion/last-run-at, which is written only under
+    `if completed_all:` -- an interrupted run would record no branch, and the
+    orphan check needs the discriminator MORE on an interrupted graph, not
+    less.
+    """
+    current = _ingestion_branch_read(db)
+    if current == branch:
+        return
+    desired = {
+        ":entity-type": ":type/ingestion",
+        ":ident": _INGESTION_BRANCH_IDENT,
+        ":description": "ref this graph was last ingested against",
+        ":branch": branch,
+    }
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    raw = _db_execute(
+        db, f"(query [:find ?a ?v :where [{_INGESTION_BRANCH_IDENT} ?a ?v]])"
+    )
+    live: Dict[str, Any] = dict(json.loads(raw).get("results", []))
+    for attr, value in desired.items():
+        if live.get(attr) == value:
+            continue
+        rendered = value if attr == ":entity-type" else f'"{_edn_escape(value)}"'
+        if attr in live:
+            old = live[attr]
+            old_rendered = old if attr == ":entity-type" else f'"{_edn_escape(old)}"'
+            to_retract.append(f"[{_INGESTION_BRANCH_IDENT} {attr} {old_rendered}]")
+        to_transact.append(f"[{_INGESTION_BRANCH_IDENT} {attr} {rendered}]")
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    if to_transact:
+        _transact(db, "[" + " ".join(to_transact) + "]", run_ts_iso, index_con=index_con)
+
+
+def _orphaned_commit_count(
+    db: Any, linearization: List[str], recorded_branch: Optional[str], ref: str
+) -> Optional[int]:
+    """How many live :type/commit entities hold a hash this ref's history no
+    longer contains, or None when that question cannot be answered.
+
+    None when the graph recorded no branch, or recorded a different one: those
+    commits may belong to another ingested branch, and reporting a count would
+    invite a reader to treat real history as garbage. Detection only -- nothing
+    here retracts anything.
+    """
+    if recorded_branch is None or recorded_branch != ref:
+        return None
+    raw = _db_execute(
+        db, "(query [:find ?h :where [?e :entity-type :type/commit] [?e :hash ?h]])"
+    )
+    graph_hashes = {r[0] for r in json.loads(raw).get("results", []) if r}
+    if not graph_hashes:
+        return None
+    return len(graph_hashes - set(linearization))
+
+
 # System attributes written by _transact_extracted_facts alongside domain attributes.
 # They are invisible to schema validation and filtered from attr_facts in minigraf_audit.
 _SYSTEM_ATTRS: frozenset = frozenset({":entity-type", ":ident"})
@@ -8423,9 +8676,12 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
         # attribute outside its allowed set, querying the live graph directly,
         # so dropping this line makes an audit run silently delete the very
         # stamp that protects the graph from being read under the wrong ident
-        # rule.
+        # rule. :branch (#222 phase 5) is load-bearing for the same reason --
+        # it is the discriminator that tells a force-push orphan apart from a
+        # second branch ingested into the same graph, and an audit that
+        # retracted it would make every orphan count uninterpretable.
         "optional": {":hash": str, ":alias": str, ":last-run-at": str, ":last-commit": str,
-                     ":total-ingested": int, ":version": int},
+                     ":total-ingested": int, ":version": int, ":branch": str},
     },
     "commit": {
         "required": {":description": str},
@@ -11475,7 +11731,14 @@ def _reverse_fill_claim_and_process(
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
 ) -> Optional[str]:
-    """Synchronous convenience wrapper: claim one position from the gap's
+    """NOT REACHABLE FROM _run_ingestion, AND MUST NOT BECOME SO. This persists
+    its claim unconditionally and has no floor/ceiling concept, so a write
+    that raises is swallowed by the interval's closed-range semantics --
+    #326 Critical 3, which is permanent silent commit loss that every
+    at-scale detector reads clean. Pinned by
+    test_run_ingestion_does_not_call_the_legacy_walk_wrappers.
+
+    Synchronous convenience wrapper: claim one position from the gap's
     high end and process it. Kept for tests and _reverse_bulk_fill_walk.
 
     **2d must not call this from async code** -- it fuses the CPU-bound
@@ -11514,7 +11777,14 @@ def _reverse_bulk_fill_walk(
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
 ) -> int:
-    """#222 phase 2b: repeatedly call _reverse_fill_claim_and_process until
+    """NOT REACHABLE FROM _run_ingestion, AND MUST NOT BECOME SO. This persists
+    its claim unconditionally and has no floor/ceiling concept, so a write
+    that raises is swallowed by the interval's closed-range semantics --
+    #326 Critical 3, which is permanent silent commit loss that every
+    at-scale detector reads clean. Pinned by
+    test_run_ingestion_does_not_call_the_legacy_walk_wrappers.
+
+    #222 phase 2b: repeatedly call _reverse_fill_claim_and_process until
     the gap closes. Returns the count of commits processed. No caller in
     this sub-phase -- 2d wires this into the real concurrent ingestion
     loop alongside the forward stream.
@@ -12500,7 +12770,20 @@ def _correction_sweep_apply(
         # file and flushed once at the bottom of this same iteration, so a
         # file's confirms are one call.
         to_confirm: List[str] = []
-        for ident in candidate_idents:
+        # Deduplicated: the collection mirrors _forward_candidate_idents'
+        # construction, which can repeat an ident when a file declares the
+        # same name twice within one category -- a module-level constant
+        # reassigned, a function redefined, or a `self.` attribute reassigned
+        # a second time in __init__ (cross-category collision is impossible:
+        # _canonical_ident bakes entity_type into the ident prefix). The
+        # per-ident work below is idempotent, so a repeat was harmless -- but
+        # it paid for a full _entity_introduced_by_values_query per
+        # duplicate. dict.fromkeys, not set(): both dedupe, but set()'s
+        # hash-randomised iteration over strings would make the per-ident
+        # stderr skip-log order -- and so which idents hit
+        # _CORRECTION_SWEEP_LOG_CAP first -- vary between process runs;
+        # dict.fromkeys preserves first-seen order deterministically.
+        for ident in dict.fromkeys(candidate_idents):
             introduced_by_values = set(_entity_introduced_by_values_query(db, ident))
 
             # #235 repair: collapse a corrupted multi-valued entity BEFORE the
@@ -12615,7 +12898,14 @@ def _correction_sweep_claim_and_process(
     skipped_so_far: int = 0,
     pos_by_commit_ident: Optional[Dict[str, int]] = None,
 ) -> Optional[Tuple[str, int]]:
-    """Synchronous convenience wrapper composing
+    """NOT REACHABLE FROM _run_ingestion, AND MUST NOT BECOME SO. This persists
+    its claim unconditionally and has no floor/ceiling concept, so a write
+    that raises is swallowed by the interval's closed-range semantics --
+    #326 Critical 3, which is permanent silent commit loss that every
+    at-scale detector reads clean. Pinned by
+    test_run_ingestion_does_not_call_the_legacy_walk_wrappers.
+
+    Synchronous convenience wrapper composing
     _correction_sweep_select_position, _extract_commit, and
     _correction_sweep_apply in order -- for tests and any caller that
     doesn't need them on separate executors. **2d must not call this
@@ -12662,7 +12952,14 @@ def _correction_sweep_walk(
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
 ) -> Tuple[int, int]:
-    """Build hash_to_pos and pos_by_commit_ident once and repeatedly call
+    """NOT REACHABLE FROM _run_ingestion, AND MUST NOT BECOME SO. This persists
+    its claim unconditionally and has no floor/ceiling concept, so a write
+    that raises is swallowed by the interval's closed-range semantics --
+    #326 Critical 3, which is permanent silent commit loss that every
+    at-scale detector reads clean. Pinned by
+    test_run_ingestion_does_not_call_the_legacy_walk_wrappers.
+
+    Build hash_to_pos and pos_by_commit_ident once and repeatedly call
     _correction_sweep_claim_and_process (passing them down, along with the
     running skipped-events total as skipped_so_far) until that returns
     None, then call _correction_sweep_log_summary with the final total.
@@ -12764,7 +13061,7 @@ def _parse_stream_ratio(raw: Optional[str]) -> Tuple[int, int]:
         return forward, reverse
     except Exception as e:
         print(
-            f"[_run_ingestion] ignoring malformed MINIGRAF_INGEST_STREAM_RATIO "
+            f"[_parse_stream_ratio] ignoring malformed MINIGRAF_INGEST_STREAM_RATIO "
             f"{raw!r} ({e}); using {_DEFAULT_STREAM_RATIO[0]}:{_DEFAULT_STREAM_RATIO[1]}",
             file=sys.stderr,
         )
@@ -13042,6 +13339,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # run's numbers. It lives in the dict, not a module global, so every
     # site that resets _ingest_progress by assignment clears it too.
     _ingest_progress["_run"] = None
+    # #222 phase 5 item B, fix round 1: same reasoning as index_cross_check
+    # above -- None until this run's own _orphaned_commit_count call below
+    # runs, so a run refused or failing before that point never echoes a
+    # previous run's orphan count under a run that never computed one.
+    _ingest_progress["orphaned_commits"] = None
     # Bound BEFORE the try so the outermost finally can shut it down no matter
     # where a failure lands, including the two awaited calls
     # (_open_index_writer_safe, _frontier_load) that sit above the inner try
@@ -13213,6 +13515,45 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # exactly like a pre-#263 graph on the next run and be refused (#263).
             await loop.run_in_executor(
                 write_executor, _graph_format_version_stamp_if_new, db, run_ts_iso, index_con,
+            )
+            # #222 phase 5 item B. AFTER the format stamp, never before --
+            # defensive, not load-bearing: _graph_has_ingestion_state's
+            # disjunction is exactly three reads (_watermark_query and
+            # _frontier_read_bounds on each fixed frontier), so this fact is
+            # invisible to it and the stamp fires correctly either way.
+            # Keeping the stamp unambiguously first costs nothing.
+            #
+            # NEVER add :ingestion/branch to _graph_has_ingestion_state. This
+            # is written before any walk, so a run that recorded a branch and
+            # then died would afterwards read as "already ingested" --
+            # suppressing its own stamp, then being refused by
+            # _graph_format_version_verify as a state-present/stamp-absent
+            # pre-#263 graph. That condemns a graph holding no ingested data.
+            #
+            # Read BEFORE the write below overwrites it. _orphaned_commit_count
+            # compares the PREVIOUSLY-recorded branch against this run's ref --
+            # reading after the write would compare this run's ref against
+            # itself, which always matches and silently defeats the guard.
+            prior_branch = await loop.run_in_executor(
+                write_executor, _ingestion_branch_read, db,
+            )
+            await loop.run_in_executor(
+                write_executor, _ingestion_branch_write, db, branch, run_ts_iso, index_con,
+            )
+            # #222 phase 5 item B. Computed ONCE here, where the linearization
+            # and a lease are both already in hand, and stored as a plain
+            # _ingest_progress key -- NOT queried at poll time (phase 4: status
+            # is never derived from graph queries at poll time, which contends
+            # on _db_native_lock and is staler than memory anyway), and NOT put
+            # on RunProgress, which is deliberately pure (no DB, no git,
+            # injected clocks).
+            #
+            # None, never 0, when the previously-recorded branch does not
+            # match this run's ref: the graph carries no per-commit branch, so
+            # commits from another ingested branch are indistinguishable from
+            # a rewrite's leftovers. A 0 there would read as "verified clean".
+            _ingest_progress["orphaned_commits"] = await loop.run_in_executor(
+                write_executor, _orphaned_commit_count, db, linearization, prior_branch, branch,
             )
             allocator = await loop.run_in_executor(
                 write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
@@ -13952,9 +14293,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # the gap is already closed.
                 #
                 # Drives 2c's three pieces directly on their correct
-                # executors. _correction_sweep_claim_and_process and
-                # _correction_sweep_walk must NOT be used here: both fuse the
-                # CPU-bound parse and the DB-bound writes into one body.
+                # executors. The legacy synchronous convenience wrappers for
+                # this sweep (see their docstrings) must NOT be used here:
+                # they fuse the CPU-bound parse and the DB-bound writes into
+                # one body.
                 if completed_all:
                     _ingest_progress["phase"] = "sweeping"
                     hash_to_pos = {h: i for i, h in enumerate(linearization)}
@@ -13967,122 +14309,223 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         for i, (h, _t, _a, _s) in enumerate(commit_metadata)
                     }
                     skipped = 0
-                    async with db_lease_async() as db:
-                        # #325 review Finding 3: computed ONCE, not inside
-                        # the loop below. Stage B only starts once
-                        # completed_all is True -- the whole gap is
-                        # claimed and the walk that mints/merges interval
-                        # entities has already finished for this run -- and
-                        # nothing in this loop's body (select/extract/apply/
-                        # lifecycle-apply/watermark-update/checkpoint)
-                        # writes an interval fact, so fragmentation cannot
-                        # change between iterations. Passing it in turns
-                        # 2 extra datalog queries per swept commit into 2
-                        # for the whole sweep, mirroring the hash_to_pos
-                        # idiom just above.
-                        sweep_fragmented = bool(await loop.run_in_executor(
-                            write_executor, _intervals_read_extra, db,
-                        ))
-                        # #222 phase 4: the first call both PLANS the sweep
-                        # (to_sweep, or why it declines) and is the loop's
-                        # first iteration, so planning costs no query.
-                        nxt = await loop.run_in_executor(
-                            write_executor, _correction_sweep_next,
-                            db, linearization, commit_metadata, hash_to_pos,
-                            sweep_fragmented,
-                        )
-                        run_progress.sweep_planned(
-                            nxt.reason, nxt.region_lo, nxt.start_pos, nxt.ceiling_pos,
-                        )
-                        while not _shutdown_requested.is_set():
-                            if nxt.selected is None:
-                                run_progress.sweep_ended(nxt.reason)
-                                break
-                            sweep_hash, sweep_ts = nxt.selected
-                            try:
-                                sweep_extracted = await loop.run_in_executor(
-                                    executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
+                    # #222 phase 5 item C. Stage B no longer holds ONE lease
+                    # across the whole sweep -- see _SWEEP_YIELD_COMMITS for why
+                    # that silently discarded every auto-memory write for the
+                    # sweep's duration. The loop below is now an outer WINDOW
+                    # loop that re-enters the lease each time round, so these
+                    # three are hoisted above it to survive across windows.
+                    sweep_fragmented = None
+                    nxt = None
+                    sweep_done = False
+                    # NOT `while not sweep_done and not _shutdown_requested`: the
+                    # first window must always be entered, because that is where
+                    # the sweep is PLANNED (run_progress.sweep_planned). A run
+                    # whose shutdown flag is already set on arrival here would
+                    # otherwise report a sweep it never even planned, where the
+                    # single-lease version planned first and only then found the
+                    # flag. The inner loop's own condition reproduces that
+                    # exactly, and the trailing break ends every later window.
+                    while not sweep_done:
+                        window_started = time.monotonic()
+                        window_count = 0
+                        # The fact index is committed before this lease is
+                        # released, on EVERY exit from the window (count or
+                        # clock boundary, sweep done, sweep aborted, shutdown,
+                        # exception). _correction_sweep_through_update writes
+                        # index rows AFTER _forward_apply's own commit, and
+                        # _index_write never commits a caller-supplied
+                        # index_con -- so without this the window released the
+                        # graph with SQLite's writer lock still held, and a
+                        # hook that took the graph lock then deadlocked against
+                        # it. See _db_lease_async_committing_index.
+                        async with _db_lease_async_committing_index(
+                            loop, write_executor, index_con,
+                        ) as db:
+                            if sweep_fragmented is None:
+                                # #325 review Finding 3: computed ONCE, not inside
+                                # the loop below. Stage B only starts once
+                                # completed_all is True -- the whole gap is
+                                # claimed and the walk that mints/merges interval
+                                # entities has already finished for this run -- and
+                                # nothing in this loop's body (select/extract/apply/
+                                # lifecycle-apply/watermark-update/checkpoint)
+                                # writes an interval fact, so fragmentation cannot
+                                # change between iterations. Passing it in turns
+                                # 2 extra datalog queries per swept commit into 2
+                                # for the whole sweep, mirroring the hash_to_pos
+                                # idiom just above.
+                                sweep_fragmented = bool(await loop.run_in_executor(
+                                    write_executor, _intervals_read_extra, db,
+                                ))
+                            if nxt is None:
+                                # #222 phase 4: the first call both PLANS the sweep
+                                # (to_sweep, or why it declines) and is the loop's
+                                # first iteration, so planning costs no query.
+                                nxt = await loop.run_in_executor(
+                                    write_executor, _correction_sweep_next,
+                                    db, linearization, commit_metadata, hash_to_pos,
+                                    sweep_fragmented,
                                 )
-                                sweep_files = sweep_extracted[0]
-                                # update_watermark=False: this commit is only
-                                # half-processed until the lifecycle pass below
-                                # also lands, so the sweep watermark (and its
-                                # checkpoint) is deferred to after it -- see
-                                # _correction_sweep_apply's own docstring.
-                                skipped += await loop.run_in_executor(
-                                    write_executor, _correction_sweep_apply,
-                                    db, sweep_hash, sweep_ts, sweep_files, index_con, skipped,
-                                    False, sweep_pos_by_commit_ident,
+                                run_progress.sweep_planned(
+                                    nxt.reason, nxt.region_lo, nxt.start_pos, nxt.ceiling_pos,
                                 )
-                                # Apply the lifecycle facts the reverse stream
-                                # skipped entirely (D/R closes, renames,
-                                # dependency-edge churn, gitlink changes).
-                                # Fresh writes, not re-application -- nothing
-                                # wrote them for these commits. Runs AFTER the
-                                # A/M reconciliation above so an entity's
-                                # lineage is already authoritative before a
-                                # close in the same commit reads its window.
-                                await loop.run_in_executor(
-                                    write_executor, _forward_apply, db, repo_path, state,
-                                    commit_metadata[hash_to_pos[sweep_hash]],
-                                    sweep_extracted, index_con, None, None, True,
+                            while not _shutdown_requested.is_set():
+                                if nxt.selected is None:
+                                    run_progress.sweep_ended(nxt.reason)
+                                    sweep_done = True
+                                    break
+                                sweep_hash, sweep_ts = nxt.selected
+                                try:
+                                    sweep_extracted = await loop.run_in_executor(
+                                        executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
+                                    )
+                                    sweep_files = sweep_extracted[0]
+                                    # update_watermark=False: this commit is only
+                                    # half-processed until the lifecycle pass below
+                                    # also lands, so the sweep watermark (and its
+                                    # checkpoint) is deferred to after it -- see
+                                    # _correction_sweep_apply's own docstring.
+                                    skipped += await loop.run_in_executor(
+                                        write_executor, _correction_sweep_apply,
+                                        db, sweep_hash, sweep_ts, sweep_files, index_con, skipped,
+                                        False, sweep_pos_by_commit_ident,
+                                    )
+                                    # Apply the lifecycle facts the reverse stream
+                                    # skipped entirely (D/R closes, renames,
+                                    # dependency-edge churn, gitlink changes).
+                                    # Fresh writes, not re-application -- nothing
+                                    # wrote them for these commits. Runs AFTER the
+                                    # A/M reconciliation above so an entity's
+                                    # lineage is already authoritative before a
+                                    # close in the same commit reads its window.
+                                    await loop.run_in_executor(
+                                        write_executor, _forward_apply, db, repo_path, state,
+                                        commit_metadata[hash_to_pos[sweep_hash]],
+                                        sweep_extracted, index_con, None, None, True,
+                                    )
+                                    # Both halves landed -- only now is this commit
+                                    # genuinely swept, so only now may the watermark
+                                    # name it. Same one-checkpoint-per-commit cadence
+                                    # _correction_sweep_apply had when it owned this.
+                                    await loop.run_in_executor(
+                                        write_executor, _correction_sweep_through_update,
+                                        db, sweep_hash, sweep_ts, index_con,
+                                    )
+                                    run_progress.swept(hash_to_pos[sweep_hash])
+                                    await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
+                                except concurrent.futures.process.BrokenProcessPool:
+                                    raise
+                                except Exception as e:
+                                    # A sweep-step failure aborts Stage B only.
+                                    # Stage A's work is already persisted, and this
+                                    # commit's watermark was never advanced (see
+                                    # update_watermark=False above), so the next
+                                    # run's _correction_sweep_select_position
+                                    # re-selects THIS commit and reprocesses it from
+                                    # the start -- nothing is silently skipped.
+                                    print(
+                                        f"[_run_ingestion] correction sweep aborted at {sweep_hash}: {e}",
+                                        file=sys.stderr,
+                                    )
+                                    # Drop the traceback before leaving the loop.
+                                    # It chains back through _WorkItem.run to
+                                    # wherever `db` (a _LeasedDb, post-proxy) was
+                                    # passed into the failing call -- but severing
+                                    # THAT reference doesn't help: inside the
+                                    # native call, `db.__getattr__` already
+                                    # unwrapped it to the real MiniGrafDb, and the
+                                    # native `execute` frame in the traceback
+                                    # holds THAT as its own `self`, not the proxy.
+                                    # So the raw handle stays alive no matter how
+                                    # carefully the finallys below clear their
+                                    # locals or how faithfully _LeasedDb severs.
+                                    # The outer finally's final checkpoint then
+                                    # cannot open the graph ("Database is already
+                                    # open in this process") and an interrupted
+                                    # run silently skips its WAL compaction. Only
+                                    # the message is used above, so nothing is
+                                    # lost by dropping the traceback.
+                                    e.__traceback__ = None
+                                    completed_all = False
+                                    run_progress.sweep_ended("aborted")
+                                    sweep_done = True
+                                    break
+                                await asyncio.sleep(0)  # yield to event loop
+                                nxt = await loop.run_in_executor(
+                                    write_executor, _correction_sweep_next,
+                                    db, linearization, commit_metadata, hash_to_pos,
+                                    sweep_fragmented,
                                 )
-                                # Both halves landed -- only now is this commit
-                                # genuinely swept, so only now may the watermark
-                                # name it. Same one-checkpoint-per-commit cadence
-                                # _correction_sweep_apply had when it owned this.
-                                await loop.run_in_executor(
-                                    write_executor, _correction_sweep_through_update,
-                                    db, sweep_hash, sweep_ts, index_con,
-                                )
-                                run_progress.swept(hash_to_pos[sweep_hash])
-                                await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
-                            except concurrent.futures.process.BrokenProcessPool:
-                                raise
-                            except Exception as e:
-                                # A sweep-step failure aborts Stage B only.
-                                # Stage A's work is already persisted, and this
-                                # commit's watermark was never advanced (see
-                                # update_watermark=False above), so the next
-                                # run's _correction_sweep_select_position
-                                # re-selects THIS commit and reprocesses it from
-                                # the start -- nothing is silently skipped.
-                                print(
-                                    f"[_run_ingestion] correction sweep aborted at {sweep_hash}: {e}",
-                                    file=sys.stderr,
-                                )
-                                # Drop the traceback before leaving the loop.
-                                # It chains back through _WorkItem.run to
-                                # wherever `db` (a _LeasedDb, post-proxy) was
-                                # passed into the failing call -- but severing
-                                # THAT reference doesn't help: inside the
-                                # native call, `db.__getattr__` already
-                                # unwrapped it to the real MiniGrafDb, and the
-                                # native `execute` frame in the traceback
-                                # holds THAT as its own `self`, not the proxy.
-                                # So the raw handle stays alive no matter how
-                                # carefully the finallys below clear their
-                                # locals or how faithfully _LeasedDb severs.
-                                # The outer finally's final checkpoint then
-                                # cannot open the graph ("Database is already
-                                # open in this process") and an interrupted
-                                # run silently skips its WAL compaction. Only
-                                # the message is used above, so nothing is
-                                # lost by dropping the traceback.
-                                e.__traceback__ = None
-                                completed_all = False
-                                run_progress.sweep_ended("aborted")
-                                break
-                            await asyncio.sleep(0)  # yield to event loop
-                            nxt = await loop.run_in_executor(
-                                write_executor, _correction_sweep_next,
-                                db, linearization, commit_metadata, hash_to_pos,
-                                sweep_fragmented,
-                            )
+
+                                # #222 phase 5 item C: the ONLY safe place to end a
+                                # window. _correction_sweep_apply,
+                                # _forward_apply(lifecycle_only=True) and
+                                # _correction_sweep_through_update are ONE unit -- the
+                                # watermark is deliberately deferred until both halves
+                                # land (update_watermark=False above), so a boundary
+                                # anywhere inside that sequence creates exactly the
+                                # half-processed state the deferral exists to prevent.
+                                # Here the previous commit is fully swept AND its
+                                # watermark has landed, and `nxt` already names the next
+                                # one, so dropping the lease loses nothing: the next
+                                # window re-enters with `nxt` carried across and does not
+                                # re-plan.
+                                #
+                                # Two triggers, neither redundant. The COUNT bounds how
+                                # many O(graph size) drop-checkpoints the release costs
+                                # (#280); the CLOCK bounds how long the hooks are locked
+                                # out when one window's commits are individually slow,
+                                # which on a large graph they are.
+                                #
+                                # Never when `nxt` selected nothing: the sweep is
+                                # already over, and breaking here would pay a
+                                # pause, a fresh lease and its O(graph size)
+                                # drop-checkpoint (#280) only to discover that at
+                                # the top of the next window. Falling through lets
+                                # the loop head end the sweep inside THIS lease --
+                                # which is what makes "a sweep fitting in one
+                                # window pays nothing" true when its length is an
+                                # exact multiple of _SWEEP_YIELD_COMMITS.
+                                window_count += 1
+                                if nxt.selected is not None and (
+                                    window_count >= _SWEEP_YIELD_COMMITS
+                                    or time.monotonic() - window_started >= _SWEEP_YIELD_SECONDS
+                                ):
+                                    break
+                        # A window that ended on the shutdown flag must not open
+                        # another one. Checked out here rather than in the outer
+                        # condition so the first window is still entered above.
                         if _shutdown_requested.is_set():
-                            completed_all = False
-                            run_progress.sweep_ended("stopped")
-                        _correction_sweep_log_summary(skipped)
+                            break
+                        # Hold the graph genuinely unlocked for a moment. This
+                        # sleep is OUTSIDE the lease by construction -- the
+                        # `async with` above has exited and the next window's
+                        # has not been entered -- which is the whole point: a
+                        # sleep inside the lease would accomplish nothing but
+                        # slow the sweep down. See _SWEEP_YIELD_PAUSE_SECONDS
+                        # for why the gap has to be an interval rather than the
+                        # instant a bare release leaves behind.
+                        #
+                        # asyncio.sleep, never time.sleep: this runs on the
+                        # event loop, so a blocking sleep would freeze every
+                        # concurrent call_tool for the duration (#99) -- and
+                        # tests/_forbid_blocking_sleep_on_event_loop fires on
+                        # exactly that.
+                        #
+                        # Skipped when the sweep is already finished, so the
+                        # last window never pays it.
+                        if not sweep_done:
+                            await asyncio.sleep(_SWEEP_YIELD_PAUSE_SECONDS)
+                    if _shutdown_requested.is_set():
+                        completed_all = False
+                        run_progress.sweep_ended("stopped")
+                    _correction_sweep_log_summary(skipped)
+                    # The fold takes its own lease: the sweep's last window has
+                    # already released, and re-entering here is what keeps every
+                    # window's acquire/release balanced (#255's single-handle
+                    # invariant) instead of leaving one straggler scope open.
+                    async with db_lease_async() as db:
                         # DB-bound like everything else here, so it runs on
                         # write_executor rather than inline on the event loop.
                         should_fold = completed_all and await loop.run_in_executor(
@@ -14290,6 +14733,9 @@ async def handle_minigraf_ingest_git(
         # this_run/streams/visibility/lineage numbers -- there is no run this
         # time, so there is nothing to report them for.
         _ingest_progress["_run"] = None
+        # Fix round 1: same reasoning -- there is no run this time, so no
+        # orphan count was computed for it either.
+        _ingest_progress["orphaned_commits"] = None
         return {
             "ok": False,
             "error": f"ingestion already owned by live process (pid {holder_pid})",
@@ -14312,7 +14758,7 @@ async def handle_minigraf_ingest_git(
     _ingest_progress = {
         "status": "starting", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-        "phase": None,
+        "phase": None, "orphaned_commits": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch or _default_git_branch(repo)))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
@@ -14791,7 +15237,7 @@ async def main() -> None:
     _ingest_progress = {
         "status": "idle", "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-        "phase": None,
+        "phase": None, "orphaned_commits": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         # Proactive check-before-attempt: if another live process already

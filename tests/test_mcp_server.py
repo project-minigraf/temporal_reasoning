@@ -480,6 +480,56 @@ def _another_process_can_open(path):
     return proc.returncode == 0
 
 
+def _spawn_blocking_opener(path):
+    """Start a SEPARATE process that BLOCKS in MiniGrafDb.open() on `path` and
+    reports when it won the lock. Returns the Popen; read it with
+    _collect_blocking_opener.
+
+    Different question from _another_process_can_open, and the difference is
+    the point. That helper asks "is the graph free at this instant?", which a
+    caller can only ask from a moment it is itself occupying -- so it can
+    demonstrate that a boundary EXISTS without demonstrating that anyone else
+    could ever use it. This models the thing the window is actually for: a hook
+    that is ALREADY waiting when the lock comes free.
+
+    minigraf 2.0.0's open() does not fail fast. It blocks for ~375 ms,
+    adaptively polling 5->50 ms, and returns as soon as the lock frees. So a
+    waiter started while a window still holds the lease wins within ~5-50 ms of
+    the next boundary -- but only if that boundary leaves the lock free for an
+    interval rather than the microsecond instant a bare release-and-reacquire
+    produces.
+
+    Prints one JSON line: {"ok": bool, "acquired_at": <time.time()>}.
+    """
+    script = (
+        "import json, sys, time\n"
+        "from minigraf import MiniGrafDb\n"
+        "try:\n"
+        f"    db = MiniGrafDb.open({path!r})\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'ok': False, 'acquired_at': time.time(), 'err': str(e)}))\n"
+        "    sys.stdout.flush()\n"
+        "    sys.exit(1)\n"
+        "print(json.dumps({'ok': True, 'acquired_at': time.time()}))\n"
+        "sys.stdout.flush()\n"
+    )
+    return _subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True,
+    )
+
+
+def _collect_blocking_opener(proc, timeout=60):
+    out, err = proc.communicate(timeout=timeout)
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+    raise AssertionError(
+        f"the blocking opener printed no JSON line. stdout={out!r} stderr={err!r}"
+    )
+
+
 def _forbid_blocking_sleep_on_event_loop(monkeypatch):
     """Fail any ``time.sleep`` made while an asyncio event loop is running on
     the calling thread; let every other call through to the real sleep.
@@ -3136,6 +3186,152 @@ class TestLastRunWriteGraphLevelIdempotency:
             real_db, "(query [:find ?v :where [:ingestion/last-run-at :description ?v]])"
         )
         assert json.loads(raw)["results"] == [["last ingestion run timestamp"]]
+
+
+class TestIngestionBranchFact:
+    """#222 phase 5 item B. The graph records no ref, so "a :type/commit
+    entity absent from the linearization" cannot distinguish a force-push
+    orphan from a second branch ingested into the same graph. This fact is
+    the discriminator that makes the orphan count interpretable."""
+
+    def test_write_then_read_roundtrips(self, real_db):
+        import mcp_server
+        mcp_server._ingestion_branch_write(real_db, "master", "2026-09-14T00:00:00.000Z")
+        assert mcp_server._ingestion_branch_read(real_db) == "master"
+
+    def test_absent_reads_none(self, real_db):
+        import mcp_server
+        assert mcp_server._ingestion_branch_read(real_db) is None
+
+    def test_rewriting_the_same_branch_creates_no_duplicate(self, real_db):
+        """#156: re-transacting the same (entity, attribute, value) at a fresh
+        valid-from creates a second LIVE fact, not a no-op. The diff is what
+        stops an unbounded pile-up across runs."""
+        import mcp_server
+        for ts in ("2026-09-14T00:00:00.000Z", "2026-09-14T00:00:01.000Z"):
+            mcp_server._ingestion_branch_write(real_db, "master", ts)
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?b :where [:ingestion/branch :branch ?b]])")
+        assert len(json.loads(raw).get("results", [])) == 1
+
+    def test_switching_branch_replaces_the_value(self, real_db):
+        import mcp_server
+        mcp_server._ingestion_branch_write(real_db, "master", "2026-09-14T00:00:00.000Z")
+        mcp_server._ingestion_branch_write(real_db, "develop", "2026-09-14T00:00:01.000Z")
+        assert mcp_server._ingestion_branch_read(real_db) == "develop"
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?b :where [:ingestion/branch :branch ?b]])")
+        assert len(json.loads(raw).get("results", [])) == 1
+
+    def test_audit_does_not_retract_the_branch_fact(self, real_db):
+        """handle_minigraf_audit iterates every REGISTERED type and retracts
+        any attribute outside its allowed set, querying the live graph
+        directly. `ingestion` is registered, so :branch must be listed in
+        MINIGRAF_SCHEMA or an audit run silently deletes the discriminator.
+        The :version entry carries a comment saying exactly this; this is the
+        second instance of the same trap."""
+        import mcp_server
+        mcp_server._ingestion_branch_write(real_db, "master", "2026-09-14T00:00:00.000Z")
+        mcp_server.handle_minigraf_audit()
+        assert mcp_server._ingestion_branch_read(real_db) == "master"
+
+    def test_entity_carries_expected_constants_and_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._ingestion_branch_write(db, "master", "2026-09-14T00:00:00.000Z")
+
+        ident = mcp_server._INGESTION_BRANCH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find ?a ?v :where [{ident} ?a ?v]])")
+        attrs = dict(json.loads(raw)["results"])
+        assert attrs[":entity-type"] == ":type/ingestion"
+        assert attrs[":ident"] == ident
+        assert isinstance(attrs[":description"], str) and attrs[":description"]
+
+        result = mcp_server.handle_minigraf_audit()
+        assert result["retracted"] == 0
+        assert mcp_server._ingestion_branch_read(db) == "master"
+
+    def test_description_is_distinct_from_other_ingestion_singletons(self, real_db):
+        """Two :type/ingestion watermarks with byte-identical :description
+        strings would both pass audit but be indistinguishable from each
+        other in the fact index and in minigraf_audit output."""
+        import mcp_server
+        db = real_db
+        mcp_server._ingestion_branch_write(db, "master", "2026-09-14T00:00:00.000Z")
+        mcp_server._last_run_write(db, "hash1", "2026-09-14T00:00:00.000Z", 1)
+        mcp_server._lineage_confirmed_through_update(db, "hash1", "2026-09-14T00:00:00.000Z")
+        mcp_server._correction_sweep_through_update(db, "hash1", "2026-09-14T00:00:00.000Z")
+
+        branch_desc = dict(json.loads(mcp_server._db_execute(
+            db, f"(query [:find ?a ?v :where [{mcp_server._INGESTION_BRANCH_IDENT} ?a ?v]])"
+        ))["results"])[":description"]
+        other_descs = {
+            dict(json.loads(mcp_server._db_execute(
+                db, f"(query [:find ?a ?v :where [{ident} ?a ?v]])"
+            ))["results"])[":description"]
+            for ident in (
+                ":ingestion/last-run-at",
+                mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT,
+                mcp_server._CORRECTION_SWEEP_THROUGH_IDENT,
+            )
+        }
+        assert branch_desc not in other_descs
+
+    @pytest.mark.asyncio
+    async def test_status_reports_orphans_after_a_rewrite(self, tmp_path):
+        """Computed ONCE during the run, never queried at poll time: phase 4
+        settled that status is not derived from graph queries at poll time
+        (lock contention, added latency, staler than the in-memory state)."""
+        import mcp_server
+        divergent = TestDivergentRefEndToEnd()
+        repo = divergent._repo(tmp_path, 8)
+        mcp_server.open_db(str(tmp_path / "g.graph"))
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        head = _subprocess.run(["git", "rev-parse", "HEAD~3"], cwd=repo,
+                               check=True, capture_output=True, text=True).stdout.strip()
+        divergent._rewrite_from(repo, head)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["orphaned_commits"] > 0, (
+            "a rewrite left commit entities the ref no longer contains, and "
+            "status reported none"
+        )
+
+    @pytest.mark.asyncio
+    async def test_status_is_none_after_a_branch_switch_with_no_rewrite(self, tmp_path):
+        """Fix round 1, finding 2. The rewrite test above cannot discriminate
+        read-before-write from read-after-write: both its runs pass "master",
+        so under EITHER ordering recorded_branch == ref holds trivially and
+        the count still computes -- the ordering hazard is invisible to it.
+
+        This test isolates the hazard directly, by construction: same
+        commits, ingested twice under two DIFFERENT branch names, with NO
+        rewrite at all (a second branch pointing at the identical tip). No
+        orphan genuinely exists here. Correct order (read
+        _ingestion_branch_read BEFORE _ingestion_branch_write) compares run
+        2's ref against run 1's recorded branch, sees a mismatch, and reports
+        None -- the honest "unanswerable", not the "verified clean" 0. Under
+        the ordering bug (read moved to AFTER the write), prior_branch
+        becomes run 2's OWN just-written branch, the comparison always
+        matches itself, and the count silently computes as 0 -- a plausible
+        but false "verified clean". `is None` (not a falsy check) matters
+        because 0 is exactly the wrong value the bug produces.
+        """
+        import mcp_server
+        divergent = TestDivergentRefEndToEnd()
+        repo = divergent._repo(tmp_path, 5)
+        _subprocess.run(["git", "branch", "develop"], cwd=repo, check=True, capture_output=True)
+        mcp_server.open_db(str(tmp_path / "g.graph"))
+        await mcp_server._run_ingestion(str(repo), "master")
+        await mcp_server._run_ingestion(str(repo), "develop")
+
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["orphaned_commits"] is None, (
+            "the branch changed between runs with no rewrite -- the question "
+            "is unanswerable and must read None, never a false 0"
+        )
 
 
 class TestMinigrafReportIssue:
@@ -7484,6 +7680,36 @@ class TestCodeIdent:
         assert mcp_server._code_ident("function", "Foo.py", "MyFunc") == ":function/foo-py--myfunc"
 
 
+# #222 phase 5 task 10: `_lineage_marker_ident` collapses every '/' in its
+# input to '-' (`entity_ident.lstrip(':').replace('/', '-')`), so it is
+# injective only if its real inputs -- idents produced by `_code_ident` --
+# always carry exactly one '/'. The two tests below answer two different
+# questions and neither covers the other: the first shows the raw function is
+# not injective in general, the second shows whether ingestion can ever hand
+# it a colliding pair. Kept as module-level functions, not class methods, so
+# they can be named directly on the pytest command line.
+
+
+def test_lineage_marker_ident_is_not_injective_on_raw_input():
+    """`entity_ident.lstrip(':').replace('/', '-')` maps both of these to
+    `:lineage/module-a-b`. This is about the FUNCTION, not about whether
+    ingestion can produce the colliding input -- see the next test."""
+    import mcp_server
+    assert (mcp_server._lineage_marker_ident(":module/a-b")
+            == mcp_server._lineage_marker_ident(":module/a/b"))
+
+
+def test_code_idents_carry_exactly_one_slash():
+    """`_lineage_marker_ident` collapses every '/' to '-', so it is
+    injective over its real inputs only if code idents carry exactly one.
+    This is the pre-slug-input question that "it is a function of the ident
+    so it cannot differ" skips over."""
+    import mcp_server
+    for path in ("a/b.py", "a-b.py", "a/b/c.py", "a-b/c.py", "a/b-c.py"):
+        ident = mcp_server._code_ident("module", path)
+        assert ident.count("/") == 1, f"{path} -> {ident}"
+
+
 # Every (entity_type, file_path, name) input pair that the #263 census found
 # reachable to ONE ident over 674 commits of this repo — 9 of 2780 idents
 # (0.32%), lifted verbatim from
@@ -8530,6 +8756,148 @@ class TestFrontierLoadRetractsUnresolvableBounds:
         mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
         assert mcp_server._completed_regions_read_full(real_db) == \
             [("gone-a", "gone-b", ":provisional", 2)]
+
+
+class TestFrontierLowRetentionCheck:
+    """#222 phase 5 item A. The authoritative interval was retained on bare
+    hash bounds -- no lo<=hi guard and no :pos-count check -- while every
+    provisional interval gets all three via _load_one_interval. A commit
+    grafted below the forward frontier lands INSIDE the retained span, is
+    excluded from _unclaimed()'s complement, and is never walked by anyone.
+    Every detector reads clean: fact_audit's two witnesses agree (neither
+    holds it), both :introduced-by checks only examine entities that EXIST,
+    and stderr carries nothing."""
+
+    def _git(self, repo, *args):
+        return _subprocess.run(["git", *args], cwd=repo, check=True,
+                               capture_output=True, text=True).stdout.strip()
+
+    def _repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-b", "master")
+        self._git(repo, "config", "user.email", "t@t.com")
+        self._git(repo, "config", "user.name", "T")
+        for i in range(8):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            self._git(repo, "add", ".")
+            self._git(repo, "commit", "-m", f"c{i}")
+        return repo
+
+    def _graft(self, repo):
+        """Branch from the ROOT, commit, merge the MAINLINE INTO the side
+        branch, then fast-forward master onto the side branch's tip.
+
+        MEASURED IN TASK 1 -- do not "simplify" this back to the obvious
+        recipe. Branching off an old commit and then
+        `git checkout master && git merge --no-ff side` does NOT place the
+        side commit "right after its branch point": measured, it lands
+        SECOND-TO-LAST (position 8 of 10). The merge's FIRST parent is
+        master's own tip, so `git log --topo-order` exhausts the entire
+        original mainline before the second parent's exclusive ancestors
+        become due, and the side commit surfaces just before the merge
+        regardless of how old its branch point was. Backdating the grafted
+        commit's author and committer dates does not change this (tested).
+
+        Reversing which side is the first parent is what works: merge
+        master's tip INTO `side`, so GRAFTED's descendant chain is the
+        merge's first parent, then fast-forward master onto it. GRAFTED
+        then surfaces at position 1 -- strictly inside frontier-low's
+        [0, 4] -- which is CLAUDE.md's own description of the hazard read
+        literally ("branch off an old commit, merge the mainline in,
+        fast-forward the mainline")."""
+        base = self._git(repo, "rev-list", "--max-parents=0", "HEAD")
+        mainline_tip = self._git(repo, "rev-parse", "master")
+        self._git(repo, "checkout", "-b", "side", base)
+        (repo / "grafted.py").write_text("def grafted():\n    return 1\n")
+        self._git(repo, "add", ".")
+        self._git(repo, "commit", "-m", "GRAFTED")
+        grafted = self._git(repo, "rev-parse", "HEAD")
+        # Mainline INTO side, so side stays the first parent.
+        self._git(repo, "merge", "--no-ff", "-m", "merge mainline into side",
+                  mainline_tip)
+        self._git(repo, "checkout", "master")
+        self._git(repo, "merge", "--ff-only", "side")
+        return grafted
+
+    def _commit_hashes(self, db):
+        import mcp_server
+        raw = mcp_server._db_execute(
+            db, '(query [:find ?h :where [?e :entity-type :type/commit] [?e :hash ?h]])')
+        return {r[0] for r in json.loads(raw).get("results", [])}
+
+    @pytest.mark.asyncio
+    async def test_commit_grafted_inside_frontier_low_is_still_walked(self, tmp_path):
+        import mcp_server
+        repo = self._repo(tmp_path)
+        mcp_server.open_db(str(tmp_path / "g.graph"))
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        with mcp_server.db_lease() as db:
+            bounds = mcp_server._frontier_read_bounds(
+                db, mcp_server._FRONTIER_LOW_IDENT)
+
+        grafted = self._graft(repo)
+        lin = frontier_registry.build_linearization(str(repo), "master")
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        with mcp_server.db_lease() as db:
+            hashes = self._commit_hashes(db)
+
+        # POSITIVE CONTROL, and it is load-bearing -- assert it BEFORE the
+        # real assertion. This test is vacuous unless the grafted commit
+        # actually lands strictly inside frontier-low's retained span: a
+        # graft that lands at the TIP is walked normally by any code, fixed
+        # or not, so `grafted in hashes` would pass without the fix and the
+        # test would guard nothing. Task 1 measured exactly that failure --
+        # the obvious graft recipe put the commit at position 8 of 10.
+        lo_pos, hi_pos = lin.index(bounds[0]), lin.index(bounds[1])
+        grafted_pos = lin.index(grafted)
+        assert lo_pos < grafted_pos < hi_pos, (
+            f"the graft landed at position {grafted_pos}, not strictly inside "
+            f"frontier-low's retained [{lo_pos}, {hi_pos}] -- this test proves "
+            f"nothing in that state, whatever the assertion below does"
+        )
+
+        assert grafted in hashes, (
+            f"the grafted commit at position {grafted_pos} of {len(lin)} never "
+            f"reached the graph -- frontier-low was retained over a span it "
+            f"was never claimed under, so the position was excluded from "
+            f"_unclaimed()'s complement and handed to no stream"
+        )
+
+
+class TestFrontierLowRetractsUnresolvableBounds:
+    """#222 phase 5 item A, fix round 1. Mirrors
+    TestFrontierLoadRetractsUnresolvableBounds (the provisional/frontier-high
+    side): an unresolvable bound used to leave frontier-low's facts live
+    while loading no interval, so the next _frontier_persist_claim read a
+    non-None `existing` and extended bounds the allocator no longer believed
+    in. Unlike the provisional side, this discard does NOT archive a
+    :type/completed-region -- _skip_claim only ever honours a *provisional*
+    region, so archiving an authoritative one here would just leave an inert
+    row behind."""
+
+    def test_unresolvable_bounds_are_retracted(self, real_db):
+        import mcp_server, frontier_registry
+        ident = mcp_server._FRONTIER_LOW_IDENT
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag :authoritative]",
+            f'[{ident} :lo-hash "h0"]',
+            f'[{ident} :hi-hash "gone"]',
+            f"[{ident} :pos-count 2]",
+        ]) + "]", "2026-09-14T00:00:00Z")
+        lin = [f"h{i}" for i in range(20)]
+
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-14T00:00:01Z")
+
+        assert mcp_server._frontier_read_bounds(real_db, ident) is None, (
+            "left behind, these bounds are extended by the next claim"
+        )
+        assert not any(
+            iv.tag == frontier_registry.TAG_AUTHORITATIVE for iv in alloc.intervals()
+        ), "no authoritative interval should be loaded when a bound doesn't resolve"
 
 
 class TestFrontierPromoteBaseIfMissing:
@@ -16544,8 +16912,9 @@ class TestRunIngestionBatchedIndexWrites:
         below) confirmed this fixture would need 4 separate open+commit+close
         cycles if ingestion still wrote to the index one triple-batch at a
         time (the pre-Task-8 behavior) -- each with its own fsync -- versus
-        exactly 1 connection open and 3 commits (one per source commit, plus
-        one final flush-on-close) once batched. The gap between those two
+        exactly 1 connection open and 4 commits (one per source commit, one
+        for Stage B's sweep window, plus one final flush-on-close) once
+        batched. The gap between those two
         numbers is what would grow unboundedly on a 1M-fact repo if this
         regressed back to per-triple commits.
 
@@ -16591,14 +16960,18 @@ class TestRunIngestionBatchedIndexWrites:
         # >= 4 for this fixture (see docstring).
         assert len(open_calls) == 1
         # git_repo has 2 commits -> 2 per-commit commits (one right after
-        # each commit's _db_checkpoint) + 1 final flush inside
-        # fact_index.close_writer at run end = 3. This is a tight equality,
+        # each commit's _db_checkpoint) + 1 from Stage B's single sweep
+        # window (_db_lease_async_committing_index commits before every
+        # window's lease release -- final review C1; the first window is
+        # always entered, because that is where the sweep is planned, even
+        # when it then declines) + 1 final flush inside
+        # fact_index.close_writer at run end = 4. This is a tight equality,
         # not just an upper bound: 0 (nothing wired up) and any count that
         # scaled with the ~36 individual facts these 2 commits produce would
         # both fail it, so a regression to either "no batching wired up" or
         # "still committing per triple" is caught, not just silently allowed
         # through by a loose bound.
-        assert len(commit_calls) == 3
+        assert len(commit_calls) == 4
 
 
 class TestOpenIndexWriterSafeRetry:
@@ -23980,6 +24353,74 @@ class TestReDateStructuralFactsKeepsEverySiblingEdge:
         )
 
 
+class TestForwardStructuralTriplesByIdent:
+    """`_forward_structural_triples_by_ident` had no direct unit test -- it
+    was only ever exercised through _forward_apply and the correction sweep,
+    both of which would keep passing if it silently returned fewer idents."""
+
+    def test_every_candidate_ident_gets_an_entry(self):
+        """The two functions read the SAME five sources and must agree about
+        which idents exist. _forward_apply asserts on exactly this
+        correspondence (mcp_server.py:11989), so a silent disagreement shows
+        up there as a hard failure mid-ingestion rather than here."""
+        import mcp_server
+        # The third element of each *_entries tuple is that entity's own
+        # TRIPLE LIST -- not a type string. _forward_candidate_idents unpacks
+        # it as `for ident, _name, _t in ...` and discards it; this function
+        # is the consumer that actually uses it.
+        precomputed = {
+            "module_ident": ":module/auth-py",
+            "module_candidate_triples": [
+                "[:module/auth-py :entity-type :type/module]",
+                '[:module/auth-py :path "auth.py"]',
+            ],
+            "function_entries": [(
+                ":function/auth-py-login", "login",
+                ["[:function/auth-py-login :entity-type :type/function]",
+                 "[:module/auth-py :contains :function/auth-py-login]"],
+            )],
+            "class_entries": [(
+                ":class/auth-py-user", "User",
+                ["[:class/auth-py-user :entity-type :type/class]"],
+            )],
+            "global_entries": [(
+                ":variable/auth-py-limit", "LIMIT",
+                ["[:variable/auth-py-limit :entity-type :type/variable]"],
+            )],
+            "field_entries": [(
+                ":field/auth-py-user-name", "name",
+                ["[:field/auth-py-user-name :entity-type :type/field]"],
+            )],
+        }
+        result = mcp_server._forward_structural_triples_by_ident(precomputed)
+        for ident in mcp_server._forward_candidate_idents(precomputed):
+            assert ident in result, (
+                f"{ident} is a candidate ident but has no structural triples; "
+                f"_forward_apply asserts on exactly this correspondence"
+            )
+            assert result[ident], f"{ident} mapped to an empty triple list"
+
+    def test_a_child_carries_its_own_containment_edge(self):
+        """#222 phase 2b1: a child's list carries its [parent :contains child]
+        edge, so re-dating the child re-dates the containment with it. Pinned
+        because nothing else asserts it directly."""
+        import mcp_server
+        precomputed = {
+            "module_ident": ":module/auth-py",
+            "module_candidate_triples": ["[:module/auth-py :entity-type :type/module]"],
+            "function_entries": [(
+                ":function/auth-py-login", "login",
+                ["[:function/auth-py-login :entity-type :type/function]",
+                 "[:module/auth-py :contains :function/auth-py-login]"],
+            )],
+            "class_entries": [], "global_entries": [], "field_entries": [],
+        }
+        result = mcp_server._forward_structural_triples_by_ident(precomputed)
+        assert any(
+            ":contains" in t for t in result[":function/auth-py-login"]
+        ), "the child's own triple list lost its containment edge"
+
+
 class TestForwardReconcileProvisional:
     # The commit the forward walk is currently applying, i.e. the entity's
     # TRUE introduction. Distinct from _seed_provisional's guess commit in
@@ -24869,12 +25310,39 @@ class TestStageBRepairsLifecycleFacts:
         "static": ("?i ?v", "[?e :ident ?i] [?e :static ?v]"),
         "path": ("?i ?v", "[?e :ident ?i] [?e :path ?v]"),
         "file": ("?i ?v", "[?e :ident ?i] [?e :file ?v]"),
+        # An entity whose :ident is closed contributes NO rows to any query
+        # above -- every one of them binds [?e :ident ?i]. That makes both
+        # oracles blind to exactly the states _build_close_triples produces
+        # ("live :entity-type, no :ident"), which is where a resurrection or
+        # a purge would show up. This arm binds the type alone.
+        "entity-type-unidented": ("?e ?v", "[?e :entity-type ?v]"),
     }
     # Bookkeeping entities that legitimately differ between the two runs:
     # frontier-high and :ingestion/correction-sweep-through only exist when a
     # reverse stream ran at all, and the lineage/candidate companion entities
     # are transient scratch state.
     _BOOKKEEPING_PREFIXES = (":ingestion/", ":lineage/", ":candidate/")
+    # entity-type-unidented binds the raw entity (no :ident join, by
+    # construction -- that is the whole point of the arm), so
+    # _BOOKKEEPING_PREFIXES cannot filter it: row[0] there is minigraf's
+    # internal subject, never an ident string. Bookkeeping entities
+    # (frontier-high, correction-sweep-through, lineage markers,
+    # completed-region archives...) DO carry :entity-type, and differ
+    # legitimately between a mixed and a forward-only run the same way
+    # their idents do. Measured on THIS class's own copy: emptying this
+    # tuple reddens all 5 of this class's own tests, on
+    # (:type/ingest-interval, :type/ingestion) rows that have nothing to do
+    # with a closed code entity. It does NOT redden
+    # TestMultiStreamParityWithForwardOnly, which keeps its own copy of the
+    # tuple (emptying THAT one reddens that class's 3 tests on the same
+    # two types). Filtered by VALUE instead, since these are
+    # the only types this internal machinery ever writes; every real code
+    # entity type (:type/module/function/class/variable/field, plus
+    # :type/commit and :type/external-dependency) is untouched by this list.
+    _BOOKKEEPING_ENTITY_TYPES = (
+        ":type/ingestion", ":type/ingest-interval", ":type/completed-region",
+        ":type/lineage-marker",
+    )
 
     # ---- repo construction -------------------------------------------------
 
@@ -24973,8 +25441,11 @@ class TestStageBRepairsLifecycleFacts:
             out = {}
             for label, (find, where) in self._SNAPSHOT_QUERIES.items():
                 raw = mcp_server._db_execute(db, f"(query [:find {find}{clause} :where {where}])")
+                rows = json.loads(raw).get("results", [])
+                if label == "entity-type-unidented":
+                    rows = [r for r in rows if r[1] not in self._BOOKKEEPING_ENTITY_TYPES]
                 out[label] = sorted(
-                    tuple(row) for row in json.loads(raw).get("results", [])
+                    tuple(row) for row in rows
                     if not str(row[0]).startswith(self._BOOKKEEPING_PREFIXES)
                 )
             return out
@@ -25426,6 +25897,17 @@ class TestMultiStreamParityWithForwardOnly:
     # reverse stream ran at all; :lineage/ and :candidate/ are transient
     # scratch state. All of them legitimately differ between the two runs.
     _BOOKKEEPING_PREFIXES = (":ingestion/", ":lineage/", ":candidate/")
+    # entity-type-unidented (below) binds the entity directly with no :ident
+    # join, so _BOOKKEEPING_PREFIXES -- which matches an ident string --
+    # cannot filter it out; see the rationale at
+    # TestStageBRepairsLifecycleFacts._BOOKKEEPING_ENTITY_TYPES. The two
+    # tuples are independent copies, each load-bearing only for its own
+    # class. Measured on THIS copy: emptying it reddens all 3 of this class's
+    # tests on (:type/ingest-interval, :type/ingestion) rows.
+    _BOOKKEEPING_ENTITY_TYPES = (
+        ":type/ingestion", ":type/ingest-interval", ":type/completed-region",
+        ":type/lineage-marker",
+    )
 
     def _commit(self, repo, msg, day, paths=None):
         ts = f"2021-03-{day:02d}T00:00:00Z"
@@ -25598,9 +26080,19 @@ class TestMultiStreamParityWithForwardOnly:
         ]
 
     # The rest of the fact shape, beyond the :introduced-by and live-:ident
-    # oracles asserted first. Bound through :ident on purpose: `?e` alone is
-    # minigraf's internal subject, which is not stable across two
-    # separately-built graphs.
+    # oracles asserted first. Bound through :ident on purpose, for
+    # legibility: `?e` alone is minigraf's internal subject -- an opaque
+    # UUID in a failure diff, rather than a readable ident string.
+    #
+    # It is NOT unstable, despite what an earlier version of this comment
+    # claimed: minigraf derives an entity's internal id deterministically
+    # from its ident keyword (uuid5(NAMESPACE_OID, ...)), so the same ident
+    # text always maps to the same raw entity across two separately-built
+    # graphs of the same repo. That determinism is exactly what makes
+    # entity-type-unidented below sound -- it binds ?i directly to the raw
+    # entity, with no :ident join, and still compares equal between the
+    # mixed and forward-only graphs once bookkeeping types are filtered
+    # (measured: see _BOOKKEEPING_ENTITY_TYPES above).
     _SNAPSHOT_QUERIES = {
         "modified-in": "[?e :ident ?i] [?e :modified-in ?v]",
         "entity-type": "[?e :ident ?i] [?e :entity-type ?v]",
@@ -25611,13 +26103,24 @@ class TestMultiStreamParityWithForwardOnly:
         "depends-on": "[?e :ident ?i] [?e :depends-on ?v]",
         "renamed-to": "[?e :ident ?i] [?e :renamed-to ?v]",
         "renamed-from": "[?e :ident ?i] [?e :renamed-from ?v]",
+        # An entity whose :ident is closed contributes NO rows to any query
+        # above -- every one of them binds [?e :ident ?i]. That makes both
+        # oracles blind to exactly the states _build_close_triples produces
+        # ("live :entity-type, no :ident"), which is where a resurrection or
+        # a purge would show up. This arm binds the type alone; it reuses
+        # the fixed ?i find-var name for the entity itself, since this
+        # class's _snapshot always queries `:find ?i ?v`.
+        "entity-type-unidented": "[?i :entity-type ?v]",
     }
 
     def _snapshot(self, graph_path):
-        return {
-            label: self._query(graph_path, f"(query [:find ?i ?v :where {where}])")
-            for label, where in self._SNAPSHOT_QUERIES.items()
-        }
+        out = {}
+        for label, where in self._SNAPSHOT_QUERIES.items():
+            rows = self._query(graph_path, f"(query [:find ?i ?v :where {where}])")
+            if label == "entity-type-unidented":
+                rows = [r for r in rows if r[1] not in self._BOOKKEEPING_ENTITY_TYPES]
+            out[label] = rows
+        return out
 
     def _lineage(self, graph_path):
         """Every live entity's :introduced-by, keyed by :ident.
@@ -26086,6 +26589,41 @@ class TestStagingAndShutdown:
 
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
+
+
+def test_run_ingestion_does_not_call_the_legacy_walk_wrappers():
+    """#326's second unfiled follow-up: these always persist claims and have
+    NO floor or ceiling concept, so wiring either into a real run
+    reintroduces Critical 3 (a failed write swallowed by an interval's range
+    semantics) wholesale. They are reachable only from tests and
+    `evals/at_scale/profile_reverse_walk_writes.py` (the single script that
+    calls one; profile_forward_reconcile_attribution.py only mentions them in
+    a comment and drives the real _run_ingestion path); this pins that _run_ingestion itself
+    stays clear of them.
+
+    This is a raw substring scan over inspect.getsource(_run_ingestion) --
+    it matches ANY textual occurrence of a name, including inside a comment
+    or docstring, not just a call. A future comment inside _run_ingestion
+    that explains why these four must not be called will trip this test the
+    same way a real call would; that is by design (see the assertion
+    message below), not a false positive to work around."""
+    import inspect, mcp_server
+    src = inspect.getsource(mcp_server._run_ingestion)
+    for name in (
+        "_reverse_bulk_fill_walk",
+        "_reverse_fill_claim_and_process",
+        "_correction_sweep_walk",
+        "_correction_sweep_claim_and_process",
+    ):
+        assert name not in src, (
+            f"{name} appears in _run_ingestion's source (as a call, comment, "
+            f"or docstring -- this is a substring scan, not a call-detector). "
+            f"If this is a real call: these persist claims unconditionally "
+            f"and have no floor/ceiling, so a failed write is swallowed by "
+            f"the interval range -- #326 Critical 3. If this is a mention "
+            f"(e.g. a comment explaining why {name} must not be used here), "
+            f"reword it to describe the hazard without naming the symbol."
+        )
 
 
 class TestEntityIntroducedByState:
@@ -28632,7 +29170,7 @@ class TestFrontierLoadCoalescesProvisionalIntervals:
         import mcp_server, frontier_registry
         lin = [f"h{i}" for i in range(30)]
         self._seed_interval(
-            real_db, mcp_server._FRONTIER_LOW_IDENT, lin, 0, 10, None,
+            real_db, mcp_server._FRONTIER_LOW_IDENT, lin, 0, 10, 11,
             tag=":authoritative",
         )
         self._seed_interval(real_db, mcp_server._FRONTIER_HIGH_IDENT, lin, 11, 20, 10)
@@ -29162,6 +29700,47 @@ class TestIngestStatusPhase4E2E:
         status = mcp_server.handle_minigraf_ingest_status()
         assert "this_run" not in status
 
+    def test_a_declined_start_does_not_echo_the_previous_runs_orphaned_commits(
+        self, tmp_path, monkeypatch
+    ):
+        """#222 phase 5 item B, fix round 1: mirrors
+        test_a_declined_start_does_not_echo_the_previous_runs_numbers exactly,
+        for orphaned_commits instead of _run. Before the fix (seeding the key
+        at module load and in main()'s init, plus resetting it alongside
+        index_cross_check/_run at the top of _run_ingestion and in the
+        declined-start branch), a completed run's orphaned_commits value sat
+        in _ingest_progress and was echoed by a later declined start that
+        never computed one of its own -- a wrong number misattributed to a
+        run that never happened.
+
+        Not @pytest.mark.asyncio, deliberately, matching the sibling test:
+        _phase4_run drives _run_ingestion through its own asyncio.run, which
+        raises if called from inside an already-running event loop."""
+        import mcp_server
+        repo = _phase4_linear_repo(tmp_path, 2)
+        graph = tmp_path / "g.graph"
+        # First run: no PREVIOUSLY-recorded branch exists yet, so
+        # orphaned_commits is unavoidably None (nothing to compare against).
+        # A second, same-branch rerun has a recorded branch to compare
+        # against and computes a real (0, on this untouched repo) count --
+        # that is the non-None value this test needs to prove is not echoed.
+        _phase4_run(repo, graph, monkeypatch)
+        _phase4_run(repo, graph, monkeypatch)
+        assert mcp_server._ingest_progress.get("orphaned_commits") is not None, (
+            "precondition: a completed run must leave a non-None "
+            "orphaned_commits behind, or this test proves nothing about "
+            "echoing it"
+        )
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: {"pid": 12345})
+        result = asyncio.run(mcp_server.handle_minigraf_ingest_git(repo_path=str(repo)))
+        assert result["ok"] is False
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["orphaned_commits"] is None, (
+            "a declined start must not echo the previous in-process run's "
+            "orphaned_commits -- there is no run this time, so nothing was "
+            "computed for it"
+        )
+
 
 # ---------------------------------------------------------------------------
 # #342: a failed FORWARD write must not be swallowed by frontier-low's range
@@ -29288,3 +29867,653 @@ class TestForwardClaimCeiling342:
                 f"{ident} names position {pos_of[h]}, at or above the failed "
                 f"position {failed['pos']} (#342)"
             )
+
+
+class TestStageBYieldsTheLock:
+    """#222 phase 5 item C. Stage B held ONE lease across the whole sweep.
+
+    A lease is cheap in-process but EXCLUSIVE out-of-process, and both
+    auto-memory hooks (hooks/claude-code.json) are `command` hooks in separate
+    processes with a 0.75 s retry budget (_LOCK_RETRY_MAX x _LOCK_RETRY_BASE
+    doubling) and `except Exception: pass` -- so the whole-sweep hold did not
+    block queries, it SILENTLY DISCARDED every auto-memory write for the
+    sweep's duration.
+
+    WHERE THE PROBE GOES, and why it is not where the obvious seam is. The
+    brief proposed spying on _correction_sweep_apply and calling
+    _another_process_can_open from inside that spy. That test can never pass,
+    on any implementation: _correction_sweep_apply is dispatched via
+    run_in_executor with the LEASED handle, i.e. strictly inside the `async
+    with db_lease_async()` block, so the graph is by definition locked at that
+    instant and the probe returns False every time. It would have read as
+    "the window never opened" no matter how correct the restructure was.
+
+    The probe therefore goes at the lease ACQUIRE -- the only moment within
+    Stage B at which no lease is held -- by patching db_lease_async itself.
+    A True there is a real, cross-process demonstration that the PREVIOUS
+    window released the graph file.
+
+    That seam needs attribution, because db_lease_async is also entered at
+    several points that are not window boundaries at all (the end-of-walk
+    flush, _ingest_tags, the final checkpoint), and `phase` is still
+    "sweeping" for the ones that follow Stage B -- so a bare "was it ever
+    free?" would pass vacuously against a single whole-sweep lease. Each
+    observation is therefore tagged with how many commits have been swept so
+    far, and only a STRICTLY MID-SWEEP observation (0 < swept < total) counts.
+    Under one lease for the whole sweep the only observations possible are at
+    swept == 0 (Stage B's single acquire) and swept == total (everything
+    after it), so the mid-sweep set is empty -- which is exactly what the
+    ablation confirms.
+
+    Never assert on a .lock FILE: that is a tautology under minigraf 2.0.0,
+    which moved locking into the kernel and deleted the PID sidecar.
+    _another_process_can_open actually spawns a process and tries.
+    """
+
+    def _repo(self, tmp_path, n):
+        return TestDivergentRefEndToEnd()._repo(tmp_path, n)
+
+    def _prepare(self, tmp_path, monkeypatch, n=12):
+        import mcp_server
+        repo = self._repo(tmp_path, n)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(graph))
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph))
+        mcp_server._ingest_progress = {
+            "status": "idle", "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+        return repo, graph
+
+    @pytest.mark.asyncio
+    async def test_another_process_can_open_the_graph_mid_sweep(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        repo, graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        swept = []
+        observed = []
+        real_apply = mcp_server._correction_sweep_apply
+        real_lease = mcp_server.db_lease_async
+
+        def apply_spy(*a, **kw):
+            swept.append(1)
+            return real_apply(*a, **kw)
+
+        def lease_spy():
+            if mcp_server._ingest_progress.get("phase") == "sweeping":
+                observed.append((len(swept), _another_process_can_open(str(graph))))
+            return real_lease()
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        total = len(swept)
+        assert total >= 2, (
+            f"the sweep swept {total} commit(s), so this test cannot "
+            f"discriminate: with fewer than 2 there is no strictly-mid-sweep "
+            f"moment for a window boundary to fall at"
+        )
+        assert observed, "no lease was taken while the phase was 'sweeping'"
+        mid = [(k, free) for k, free in observed if 0 < k < total]
+        assert mid, (
+            f"no lease was acquired strictly mid-sweep (swept counts seen: "
+            f"{sorted({k for k, _ in observed})}, total swept {total}) -- Stage "
+            f"B is still holding ONE lease across the whole of its sweep"
+        )
+        assert all(free for _, free in mid), (
+            f"a window boundary was reached but another process still could "
+            f"not open the graph there: {mid}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_window_boundary_never_splits_a_swept_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """_correction_sweep_apply, _forward_apply(lifecycle_only=True) and
+        _correction_sweep_through_update are ONE unit: the watermark is
+        deliberately deferred until both halves land (update_watermark=False),
+        so a boundary inside that sequence creates exactly the half-processed
+        state the deferral exists to prevent -- and, because the watermark
+        would then name a commit whose lifecycle facts were never written, the
+        next run would skip it permanently and silently.
+
+        Cheap enough to run at _SWEEP_YIELD_COMMITS=1 (no subprocess spawns),
+        so every single commit boundary is checked rather than one in 25.
+
+        The `sweep_over` bracket is load-bearing, not tidiness. `phase` stays
+        "sweeping" until the very end of the run, so the leases taken AFTER
+        Stage B (the lineage fold, _ingest_tags, the final checkpoint) are
+        also seen by a phase-only filter -- and they carry the sweep's FINAL
+        counts, which satisfy `any(b["apply"] > 0)` all by themselves. Without
+        this bracket the positive control below passes under the ablation
+        (_SWEEP_YIELD_COMMITS larger than the sweep), i.e. against the very
+        single-lease Stage B this class exists to detect. Measured, not
+        supposed: it did.
+        """
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        counts = {"apply": 0, "lifecycle": 0, "through": 0}
+        boundaries = []
+        sweep_over = []
+        real_apply = mcp_server._correction_sweep_apply
+        real_forward = mcp_server._forward_apply
+        real_through = mcp_server._correction_sweep_through_update
+        real_lease = mcp_server.db_lease_async
+        real_summary = mcp_server._correction_sweep_log_summary
+
+        def summary_spy(*a, **kw):
+            sweep_over.append(True)
+            return real_summary(*a, **kw)
+
+        def apply_spy(*a, **kw):
+            out = real_apply(*a, **kw)
+            counts["apply"] += 1
+            return out
+
+        def forward_spy(*a, **kw):
+            # run_in_executor passes everything positionally; lifecycle_only
+            # is the 9th argument.
+            lifecycle_only = a[8] if len(a) > 8 else kw.get("lifecycle_only", False)
+            out = real_forward(*a, **kw)
+            if lifecycle_only:
+                counts["lifecycle"] += 1
+            return out
+
+        def through_spy(*a, **kw):
+            out = real_through(*a, **kw)
+            counts["through"] += 1
+            return out
+
+        def lease_spy():
+            if mcp_server._ingest_progress.get("phase") == "sweeping" and not sweep_over:
+                boundaries.append(dict(counts))
+            return real_lease()
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        monkeypatch.setattr(mcp_server, "_forward_apply", forward_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_through_update", through_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        assert counts["apply"] >= 2, f"the sweep did too little to check: {counts}"
+        assert any(b["apply"] > 0 for b in boundaries), (
+            f"every lease taken during the sweep happened before the first "
+            f"swept commit, so no real window boundary was ever checked -- "
+            f"Stage B is still holding ONE lease across its whole sweep: "
+            f"{boundaries}"
+        )
+        for b in boundaries:
+            assert b["apply"] == b["lifecycle"] == b["through"], (
+                f"a lease was released and re-acquired in the middle of one "
+                f"commit's sweep unit: {b} (all three must be equal at every "
+                f"boundary -- see _correction_sweep_apply's update_watermark "
+                f"docstring)"
+            )
+
+    @pytest.mark.asyncio
+    async def test_fragmentation_is_computed_once_not_once_per_window(
+        self, tmp_path, monkeypatch
+    ):
+        """#325 review Finding 3 moved _intervals_read_extra out of the sweep
+        loop deliberately: Stage B only starts once the whole gap is claimed
+        and nothing in the loop body writes an interval fact, so fragmentation
+        cannot change mid-sweep. The window loop must not quietly restore that
+        cost by recomputing it per window.
+
+        Both counters are bracketed on the sweep's real end (the
+        _correction_sweep_log_summary call that closes Stage B), for the same
+        reason test_a_window_boundary_never_splits_a_swept_commit is: `phase`
+        stays "sweeping" through the lineage fold, _ingest_tags and the final
+        checkpoint, so a phase-only filter counts 3 leases that are not window
+        boundaries -- enough, on its own, to satisfy `len(windows) >= 3` under
+        a single whole-sweep lease. This test PASSED the ablation before the
+        bracket was added. It also means _should_fold_lineage_watermark's own
+        _intervals_read_extra call is excluded, so the expected count inside
+        the sweep is exactly 1.
+        """
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        calls = []
+        windows = []
+        sweep_over = []
+        real_extra = mcp_server._intervals_read_extra
+        real_lease = mcp_server.db_lease_async
+        real_summary = mcp_server._correction_sweep_log_summary
+
+        def summary_spy(*a, **kw):
+            sweep_over.append(True)
+            return real_summary(*a, **kw)
+
+        def in_sweep():
+            return (
+                mcp_server._ingest_progress.get("phase") == "sweeping"
+                and not sweep_over
+            )
+
+        def extra_spy(*a, **kw):
+            if in_sweep():
+                calls.append(1)
+            return real_extra(*a, **kw)
+
+        def lease_spy():
+            if in_sweep():
+                windows.append(1)
+            return real_lease()
+
+        monkeypatch.setattr(mcp_server, "_intervals_read_extra", extra_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        assert len(windows) >= 3, (
+            f"only {len(windows)} lease(s) taken inside the sweep -- too few "
+            f"for a per-window recomputation to be distinguishable from a "
+            f"single one. Stage B is still holding ONE lease across its whole "
+            f"sweep"
+        )
+        assert len(calls) < len(windows), (
+            f"_intervals_read_extra ran {len(calls)} time(s) across "
+            f"{len(windows)} window(s): fragmentation is being recomputed per "
+            f"window, undoing #325 review Finding 3"
+        )
+        assert len(calls) == 1, (
+            f"_intervals_read_extra ran {len(calls)} times inside the sweep; "
+            f"exactly 1 is expected -- computed once on the first window and "
+            f"carried across the rest"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_process_wins_the_lock_during_the_sweep(
+        self, tmp_path, monkeypatch
+    ):
+        """The PROPERTY, where the three tests above check the MECHANISM.
+
+        Those three prove a boundary exists and that the graph is unlocked at
+        it. They cannot prove anyone else could ever USE it, and that gap is
+        not academic: _another_process_can_open only ever observes the gap it
+        is itself occupying, so it reports True even when the real gap is the
+        microseconds between a release and the next acquire -- which no hook
+        could win. The first version of this work shipped exactly that, and it
+        is why _SWEEP_YIELD_PAUSE_SECONDS exists.
+
+        So this test spawns a realistic waiter instead: a separate process that
+        starts blocking in MiniGrafDb.open() while a window still HOLDS the
+        lease, and must acquire the lock before the sweep ends. minigraf
+        2.0.0's open() blocks ~375 ms polling 5->50 ms, which is precisely the
+        hook behaviour the window exists to serve.
+
+        The `acquired_at < sweep_end_at` bound is what confines the win to
+        Stage B. Without it the test would pass on a graph whose lock simply
+        came free once the sweep was over -- the fold, _ingest_tags and the
+        final checkpoint all release between their own leases, so an opener
+        that waited out the whole sweep would still eventually succeed and
+        prove nothing about the window.
+
+        That is not a hypothetical: `assert result["ok"]` PASSES the ablation
+        on its own. With _SWEEP_YIELD_PAUSE_SECONDS at 0 the waiter still won
+        every time, 26-35 ms after the sweep ended (3 of 3 runs), so the
+        sweep-end bound is this test's entire discriminating power. Do not
+        loosen or remove it.
+        """
+        import mcp_server
+        repo, graph = self._prepare(tmp_path, monkeypatch, n=24)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        state = {"proc": None, "spawned_at": None, "sweep_end_at": None, "swept": 0}
+        real_apply = mcp_server._correction_sweep_apply
+        real_summary = mcp_server._correction_sweep_log_summary
+
+        def apply_spy(*a, **kw):
+            state["swept"] += 1
+            if state["proc"] is None:
+                # Spawned from INSIDE the lease (this runs on write_executor
+                # with the leased handle), so the opener begins blocking while
+                # a window still owns the graph -- never during a gap.
+                state["spawned_at"] = time.time()
+                state["proc"] = _spawn_blocking_opener(str(graph))
+            return real_apply(*a, **kw)
+
+        def summary_spy(*a, **kw):
+            if state["sweep_end_at"] is None:
+                state["sweep_end_at"] = time.time()
+            return real_summary(*a, **kw)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+        except BaseException:
+            if state["proc"] is not None and state["proc"].poll() is None:
+                state["proc"].kill()
+            raise
+
+        assert state["proc"] is not None, "the sweep never ran, so this proved nothing"
+        assert state["sweep_end_at"] is not None, "the sweep never ended"
+        result = _collect_blocking_opener(state["proc"])
+        assert state["swept"] >= 4, (
+            f"only {state['swept']} commit(s) were swept after the waiter was "
+            f"spawned on the first one -- too short a sweep for a boundary to "
+            f"be reachable, so this test cannot discriminate"
+        )
+        assert result["ok"], (
+            f"a process already blocked in MiniGrafDb.open() never won the "
+            f"lock: it waited out minigraf's whole ~375 ms open budget and "
+            f"failed ({result.get('err')!r}). The window boundary is not "
+            f"leaving the graph unlocked for long enough to be won -- see "
+            f"_SWEEP_YIELD_PAUSE_SECONDS"
+        )
+        assert result["acquired_at"] < state["sweep_end_at"], (
+            f"the waiter did win the lock, but only "
+            f"{result['acquired_at'] - state['sweep_end_at']:.3f}s AFTER the "
+            f"sweep ended -- i.e. it was let in by Stage B finishing, not by a "
+            f"window boundary"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_clock_alone_closes_a_window(self, tmp_path, monkeypatch):
+        """The window boundary is a DISJUNCTION, and until this test only one
+        half of it had ever fired.
+
+        `window_count >= _SWEEP_YIELD_COMMITS or time.monotonic() -
+        window_started >= _SWEEP_YIELD_SECONDS` short-circuits. Every other
+        test in this class sets _SWEEP_YIELD_COMMITS = 1, so `1 >= 1` is True
+        at the first check and the clock operand is never EVALUATED -- not
+        merely never true. Every pre-existing sweep test runs at the default
+        25 over sweeps far shorter than 2 s, where the clock term is False
+        forever. So no test had ever taken a boundary via the clock.
+
+        That gap sits exactly where it hurts: _SWEEP_YIELD_SECONDS is the
+        trigger that bounds hook lockout when a window's commits are
+        individually slow, which on a large graph they are. The tested
+        disjunct is the one that only ever fires on small synthetic repos;
+        the untested one is the one that delivers the feature in production.
+
+        So: make the count disjunct impossible (10**9) and let only the clock
+        end a window. Bracketed on the sweep's real end for the same reason
+        the two tests above are -- `phase` stays "sweeping" through the fold,
+        _ingest_tags and the final checkpoint, three leases that are not
+        window boundaries and would satisfy `>= 2` by themselves.
+
+        This is also the first test that reaches the boundary's
+        `await asyncio.sleep(_SWEEP_YIELD_PAUSE_SECONDS)` repeatedly, so it
+        carries _forbid_blocking_sleep_on_event_loop -- whose only other
+        _run_ingestion call site sweeps in a single window and never reaches
+        the pause at all. Without this the code comment claiming that guard
+        watches the pause was asserting a guard that was not watching.
+        """
+        import mcp_server
+        _forbid_blocking_sleep_on_event_loop(monkeypatch)
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 10**9)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 0.0)
+
+        windows = []
+        sweep_over = []
+        swept = []
+        real_lease = mcp_server.db_lease_async
+        real_summary = mcp_server._correction_sweep_log_summary
+        real_apply = mcp_server._correction_sweep_apply
+
+        def summary_spy(*a, **kw):
+            sweep_over.append(True)
+            return real_summary(*a, **kw)
+
+        def apply_spy(*a, **kw):
+            swept.append(1)
+            return real_apply(*a, **kw)
+
+        def lease_spy():
+            if mcp_server._ingest_progress.get("phase") == "sweeping" and not sweep_over:
+                windows.append(1)
+            return real_lease()
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+
+        assert len(swept) >= 2, (
+            f"the sweep swept {len(swept)} commit(s); at least 2 are needed "
+            f"for a second window to be reachable at all, so this test cannot "
+            f"discriminate"
+        )
+        assert len(windows) >= 2, (
+            f"only {len(windows)} lease(s) taken inside the sweep with "
+            f"_SWEEP_YIELD_COMMITS at 10**9 -- the count disjunct cannot have "
+            f"fired, so the clock disjunct never ended a window either. The "
+            f"boundary's `or` has one half that is never evaluated"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_hook_writing_graph_and_index_mid_sweep_lands_in_both(
+        self, tmp_path, monkeypatch
+    ):
+        """The window must release the graph with NO fact-index write
+        transaction open -- final whole-branch review C1.
+
+        The test above uses a bare MiniGrafDb.open() waiter, which touches
+        only the graph, so it cannot see this. A real auto-memory hook
+        (finalize_hook.py) writes the graph AND the fact index:
+        handle_minigraf_transact -> _transact with no index_con -> _index_write
+        opens its OWN SQLite connection. _correction_sweep_through_update
+        writes index rows on ingestion's batched index_con AFTER
+        _forward_apply's only commit, and _index_write never commits a
+        caller-supplied connection -- so a window that ended there released
+        the graph lock while still holding SQLite's writer lock. The hook then
+        took the graph, blocked on SQLite (5 s busy timeout) while HOLDING the
+        graph, ingestion's next window gave up acquiring after ~2.6 s and the
+        run ended `status: error`, and the hook's index insert failed
+        "database is locked" and was swallowed: a fact in the graph and not in
+        the index (#302 divergence).
+
+        So the waiter here is a separate PROCESS doing a real
+        handle_minigraf_transact, pre-spawned (importing mcp_server is slow)
+        and released from inside the first swept commit, so it is already
+        retrying when the first boundary arrives. `written_at < sweep_end_at`
+        is the positive control that the write really landed through a window
+        boundary, not after Stage B finished. It and the sweep-length guard
+        are asserted LAST so the ablation reddens on a defect-naming
+        assertion (under the defect the run dies after one swept commit).
+
+        In THIS fixture the defect is caught by the `status == "complete"`
+        assertion, NOT by the index-row one -- do not "simplify" the status
+        assertion away. Ingestion's lease budget (~2.6 s) always expires before
+        the hook's SQLite busy timeout (5 s), so the run dies first and the
+        hook's index insert then succeeds; ablated with the status assertion
+        disabled, the index row is present and the test reddens only on the
+        sweep-length guard. The missing-index-row divergence itself reproduced
+        only at the shipped defaults over 100 commits (final-review e2e). The
+        index-row assertion stays as a correct postcondition.
+        """
+        import mcp_server
+        import fact_index
+        repo, graph = self._prepare(tmp_path, monkeypatch, n=24)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+
+        ready = tmp_path / "hook_ready"
+        go = tmp_path / "hook_go"
+        script = (
+            "import json, os, sys, time\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n"
+            "import mcp_server\n"
+            f"open({str(ready)!r}, 'w').close()\n"
+            f"while not os.path.exists({str(go)!r}):\n"
+            "    time.sleep(0.002)\n"
+            "try:\n"
+            "    r = mcp_server.handle_minigraf_transact(\n"
+            "        '[[:decision/hook-fact :description \"written by hook\"]]', 'hook')\n"
+            "    print(json.dumps({'ok': bool(r.get('ok')), 'err': r.get('error'),\n"
+            "                      'written_at': time.time()}))\n"
+            "except Exception as e:\n"
+            "    print(json.dumps({'ok': False, 'err': repr(e), 'written_at': time.time()}))\n"
+            "sys.stdout.flush()\n"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MINIGRAF_")}
+        env["MINIGRAF_GRAPH_PATH"] = str(graph)
+        proc = _subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True, env=env,
+        )
+        state = {"sweep_end_at": None, "swept": 0}
+        try:
+            deadline = time.monotonic() + 60
+            while not ready.exists():
+                assert proc.poll() is None, proc.communicate()
+                assert time.monotonic() < deadline, "the hook process never got ready"
+                await asyncio.sleep(0.01)
+
+            real_apply = mcp_server._correction_sweep_apply
+            real_summary = mcp_server._correction_sweep_log_summary
+
+            def apply_spy(*a, **kw):
+                state["swept"] += 1
+                if state["swept"] == 1:
+                    # Inside the lease, so the hook starts retrying while a
+                    # window still owns the graph.
+                    go.touch()
+                return real_apply(*a, **kw)
+
+            def summary_spy(*a, **kw):
+                if state["sweep_end_at"] is None:
+                    state["sweep_end_at"] = time.time()
+                return real_summary(*a, **kw)
+
+            monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+            monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+            await mcp_server._run_ingestion(str(repo), "master")
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+        assert lines, f"the hook printed no result. stdout={out!r} stderr={err!r}"
+        hook = json.loads(lines[-1])
+        assert mcp_server._ingest_progress.get("status") == "complete", (
+            f"ingestion did not complete while a hook wrote mid-sweep: "
+            f"{mcp_server._ingest_progress.get('status')!r}, error="
+            f"{mcp_server._ingest_progress.get('error')!r}. A window released "
+            f"the graph lease with the fact-index write transaction still open, "
+            f"so the hook held the graph while blocked on SQLite and the next "
+            f"window could not re-acquire it"
+        )
+        assert hook["ok"], f"the hook's transact failed: {hook!r}; stderr={err[-2000:]!r}"
+
+        mcp_server._reset_db_state()
+        with mcp_server.db_lease() as db:
+            graph_rows = json.loads(mcp_server._db_execute(
+                db, '(query [:find ?d :where [:decision/hook-fact :description ?d]])'
+            )).get("results", [])
+        con = fact_index.open_reader(fact_index.index_path_for(str(graph)))
+        try:
+            index_rows = con.execute(
+                "select value from facts_fts where entity = ':decision/hook-fact'"
+            ).fetchall()
+        finally:
+            con.close()
+        assert graph_rows, f"the hook's fact is not in the graph: {hook!r}"
+        assert index_rows, (
+            f"the hook's fact reached the graph ({graph_rows!r}) but NOT the "
+            f"fact index -- its index insert hit 'database is locked' behind "
+            f"ingestion's uncommitted index transaction and was swallowed "
+            f"(#302 divergence). hook stderr tail: {err[-2000:]!r}"
+        )
+        # Positive controls, asserted after the defect assertions: under the
+        # defect the run dies after ONE swept commit, so the length guard
+        # would otherwise redden first and hide what actually broke.
+        assert state["swept"] >= 4, (
+            f"only {state['swept']} commit(s) swept -- too short a sweep for a "
+            f"boundary to be reachable, so this test cannot discriminate"
+        )
+        assert hook["written_at"] < state["sweep_end_at"], (
+            f"the hook's write landed {hook['written_at'] - state['sweep_end_at']:.3f}s "
+            f"AFTER the sweep ended, so it went through no window boundary and "
+            f"this test proved nothing about the window"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_exactly_one_window_long_takes_one_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """A sweep whose length is an exact multiple of _SWEEP_YIELD_COMMITS
+        must not break after its last commit: `nxt` already reads "nothing
+        selected" there, and a break would pay a pause, a fresh lease and its
+        drop-checkpoint (#280) only to discover the sweep is over.
+
+        Measured in two passes over identical repos: the first learns the
+        sweep length T with the window effectively unbounded, the second runs
+        with _SWEEP_YIELD_COMMITS = T and counts in-sweep leases and pauses.
+        Bracketed on _correction_sweep_log_summary for the same reason the
+        tests above are.
+        """
+        import mcp_server
+
+        async def run(sub, n_commits, window):
+            sub.mkdir()
+            repo, _g = self._prepare(sub, monkeypatch, n=n_commits)
+            monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", window)
+            monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
+            leases, pauses, swept, over = [], [], [], []
+            real_lease = mcp_server.db_lease_async
+            real_summary = mcp_server._correction_sweep_log_summary
+            real_apply = mcp_server._correction_sweep_apply
+            real_sleep = asyncio.sleep
+
+            def in_sweep():
+                return mcp_server._ingest_progress.get("phase") == "sweeping" and not over
+
+            def lease_spy():
+                if in_sweep():
+                    leases.append(1)
+                return real_lease()
+
+            async def sleep_spy(delay, *a, **kw):
+                if in_sweep() and delay == mcp_server._SWEEP_YIELD_PAUSE_SECONDS and delay > 0:
+                    pauses.append(delay)
+                return await real_sleep(delay, *a, **kw)
+
+            def summary_spy(*a, **kw):
+                over.append(True)
+                return real_summary(*a, **kw)
+
+            def apply_spy(*a, **kw):
+                swept.append(1)
+                return real_apply(*a, **kw)
+
+            monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+            monkeypatch.setattr(mcp_server.asyncio, "sleep", sleep_spy)
+            monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
+            monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+            try:
+                await mcp_server._run_ingestion(str(repo), "master")
+            finally:
+                monkeypatch.setattr(mcp_server, "db_lease_async", real_lease)
+                monkeypatch.setattr(mcp_server.asyncio, "sleep", real_sleep)
+                monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", real_summary)
+                monkeypatch.setattr(mcp_server, "_correction_sweep_apply", real_apply)
+                mcp_server._reset_db_state()
+            return len(swept), len(leases), len(pauses)
+
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_PAUSE_SECONDS", 0.001)
+        total, _l, _p = await run(tmp_path / "learn", 12, 10**9)
+        assert total >= 2, f"the sweep swept {total} commit(s); nothing to check"
+        swept, leases, pauses = await run(tmp_path / "exact", 12, total)
+        assert swept == total, f"the two passes swept differently: {total} then {swept}"
+        assert (leases, pauses) == (1, 0), (
+            f"a sweep of exactly _SWEEP_YIELD_COMMITS={total} commits took "
+            f"{leases} in-sweep lease(s) and {pauses} pause(s); expected 1 and 0 "
+            f"-- the window broke after its last commit although `nxt` already "
+            f"selected nothing"
+        )

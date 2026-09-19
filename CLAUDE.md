@@ -1258,6 +1258,351 @@ Ablation-proven, with the dispatch argument forced to `True` (exactly what the
 old code did, having no `persist_claim` at all): all three regression tests
 redden, each on its own defect-naming assertion.
 
+**Frontier-low is now held to the same three retention conditions as every
+provisional interval (#222 phase 5, item A).** `_frontier_load` retains
+`:ingestion/frontier-low` iff both bounds resolve in the current
+linearization, `lo <= hi`, AND the stored `:pos-count` still equals
+`hi - lo + 1`. Master retained it on bare resolving hash bounds alone — no
+ordering guard and no denominator — while `_load_one_interval` had demanded
+all three of the provisional side since #325. An interval carrying NO
+`:pos-count` is not retained either, the same "no denominator and a
+denominator that still checks out must not be the same branch" rule.
+
+**It is a separate code path rather than a call to `_load_one_interval`, and
+that is not duplication.** `_load_one_interval` also ARCHIVES a
+`:type/completed-region` — on its UNRESOLVABLE-bounds discard path only (a
+count mismatch discards without archiving; see its docstring) — and it stamps
+that archive with the provisional tag, which it hardcodes. Routing
+frontier-low through it would therefore record an AUTHORITATIVE forward span
+as a PROVISIONAL completed region: a row `_completed_regions_load` never
+loads, since its bounds are by construction unresolvable in that run's
+linearization and regain resolvability only if those exact hashes reappear
+(which no ordinary history rewrite produces) — and one `_skip_claim`, which
+honours provisional regions only, would then misread under the wrong tag if
+they ever did. The cost of
+the discard is a full forward re-walk from C0: expensive, never lossy, which
+is the same price every other "no denominator, no trust" branch in this arc
+pays.
+
+**The defect was MEASURED before the fix, and the measurement task was allowed
+to stop the work.** Task 1 reproduced it: a commit grafted below the forward
+frontier landed at position 1 of a 10-position linearization, strictly inside
+frontier-low's retained `[0, 4]`, whose stored `:pos-count` read 4 against an
+actual span of 5. Both bounds still resolved, so master retained the interval;
+`FrontierAllocator._unclaimed()` is the COMPLEMENT of the interval set, so the
+grafted position was handed to no stream and never walked — not skipped
+loudly, never claimed. The graph held 9 of 10 commits and the missing set was
+exactly `{grafted_hash}`, on a second run reporting no error and leaving
+frontier-low's persisted bounds completely unchanged. Every detector read
+clean, for the reasons this file already gives elsewhere: the commit reached
+neither graph nor index, so `fact_audit`'s two witnesses agree about its
+absence.
+
+**The obvious graft recipe does NOT produce this, and an earlier draft of the
+plan shipped one that did not work.** Branching off an old commit and then
+`git checkout master && git merge --no-ff side` lands the grafted commit at
+position 8 of 10 — the merge's FIRST parent is master's own tip, so
+`git log --topo-order` exhausts the entire original mainline before the second
+parent's exclusive ancestors become due. Backdating the grafted commit's
+author and committer dates does not change it. The construction that works is
+this file's own wording read literally: merge the mainline INTO the side
+branch, so the grafted commit's descendant chain is the first parent, then
+fast-forward master onto it. **The more dangerous half was that the test
+asserted only `grafted in hashes`, which is VACUOUS under the broken recipe** —
+a commit landing at the tip is walked by fixed and unfixed code alike, so the
+test would have passed WITHOUT the fix. It now asserts containment
+(`lo_pos < grafted_pos < hi_pos`) as a positive control, ordered strictly
+before the defect-naming assertion, so a mis-placed graft fails as "this test
+proves nothing" rather than passing green.
+
+**The same change closes a fact leak the plan did not name.** When a watermark
+hash does not resolve in the linearization, `_frontier_seed_from_watermark`
+writes bounds with no `:pos-count`; master skipped appending the interval but
+left those facts LIVE, so the next `_frontier_persist_claim` read a non-None
+`existing` and extended bounds the allocator no longer believed in. The `else`
+branch now discards them. That claim shipped one commit ahead of its evidence
+and was ablation-proven separately afterwards
+(`TestFrontierLowRetractsUnresolvableBounds`): reverting to the two-condition
+branch leaves `_frontier_read_bounds` returning `('h0', 'gone')` instead of
+None. Unlike the provisional side, this discard archives no region, for the
+`_skip_claim` reason above.
+
+**`:ingestion/branch` is the discriminator the orphan check cannot work
+without.** It records the ref this graph was last ingested against, written on
+EVERY run — the branch can change between runs, so it is NOT a stamp-if-new
+like `_graph_format_version_stamp_if_new`. It is value-diffed against the live
+fact before writing, exactly as `_last_run_write` and `_ingest_tags` do:
+minigraf is not idempotent at the graph level for re-transacting the same
+`(entity, attribute, value)` at a fresh valid-from (#156), so an unconditional
+re-transact accumulates one duplicate live fact per run. It is deliberately
+NOT folded into `:ingestion/last-run-at`, which is written only under
+`if completed_all:` — an interrupted run would then record no branch, and the
+orphan check needs the discriminator MORE on an interrupted graph, not less.
+`:branch` is registered in `MINIGRAF_SCHEMA` under the `ingestion` type for
+the same reason `:version` is: `handle_minigraf_audit` iterates exactly the
+registered types and retracts any attribute outside the allowed set, so an
+unregistered `:branch` would be silently deleted by an audit run and every
+orphan count afterwards made uninterpretable.
+
+**NEVER add `:ingestion/branch` to `_graph_has_ingestion_state`'s
+disjunction.** That function's three reads — `_watermark_query` and
+`_frontier_read_bounds` on each of the two fixed frontiers — are exactly the
+three things that mean a walk HAPPENED, and that is what makes an absent
+format stamp mean "version 0" rather than "fresh". `:ingestion/branch` is
+written before any walk, so a run that recorded a branch and then died would
+afterwards read as "already ingested": it would suppress its own format stamp,
+and then be refused by `_graph_format_version_verify` as a
+state-present/stamp-absent pre-#263 graph. That condemns a graph holding no
+ingested data at all. The write is placed after the stamp for the same
+reason — defensively, not load-bearingly, since the fact is invisible to those
+three reads either way.
+
+**The branch must be READ before it is written, and 0 is the
+false-but-plausible value the wrong order produces.** `_orphaned_commit_count`
+compares the PREVIOUSLY-recorded branch against this run's ref; reading after
+the write compares the run's ref against itself, which always matches and
+silently defeats the guard. Ablation-proven: moving the read below the write
+makes the guard report `0` instead of `None` when the branch changed with no
+real orphans. The regression test isolates the hazard by construction — same
+commits, two DIFFERENT branch names, no rewrite — and asserts `is None`, never
+a falsy check, precisely because `0` is what the bug yields.
+
+**Orphan detection lives BESIDE the commit census, not riding `fact_audit`'s
+scan.** A commit rewritten out of history keeps its `:type/commit` entity and
+every reference to it. The check holds a reference the graph did not
+produce — the repo — and `fact_audit` deliberately takes no repo handle, while
+`commit_census` already holds `repo_path`, the ref and a lease. It is also not
+foldable into clause 8: an orphan drives `repo_vs_graph` NEGATIVE, which
+matches none of the census's three delta diagnoses, so `ok` stays True.
+`orphaned_commits` (`evals/at_scale/commit_census.py`) is gated as clause 9.
+
+**`proved_nothing` is the positive control, and here it guards a false
+positive with teeth.** The graph carries no per-commit branch, so a commit
+entity absent from THIS ref's history is either a force-push orphan or a
+commit from ANOTHER branch ingested into the same graph — indistinguishable
+without `:ingestion/branch`. When the recorded branch is absent or does not
+match the audited ref, the count is not gated, because failing on it would
+condemn a legitimately ingested branch's entire history: the
+`:type/external-dependency` trap of #316 exactly, and the same fix — ship the
+denominator (`commit_entities_scanned`) and refuse to read a number whose
+denominator was never established. A graph holding no commit entities reports
+`proved_nothing` too, since a check that matched nothing also reports 0.
+**The count and its denominator are COMPUTED and shipped in both cases, and
+only `proved_nothing` differs — not gated is not unmeasured.**
+`orphaned_commits` always returns the real `graph_hashes - repo_hashes`
+difference in `entities`/`sample`; clause 9 gates it only when
+`proved_nothing` is false, and no reader may take `entities` without
+`proved_nothing` (the report row renders an uninterpretable count as "proved
+nothing", never as findings or as clean). The first version of this check did
+the opposite on the uninterpretable path — a hard-coded `"entities": 0` that
+never computed the difference, a placeholder 0 beside a real denominator that
+read as "verified clean" — while this very paragraph claimed the count
+shipped; the review caught the prose, and the code was changed to match it.
+Ablation-proven: restoring the placeholder reddens both
+`TestOrphanedCommits` uninterpretable-path tests on their `entities == 1`
+assertion. This is the harness channel only: the status channel,
+`mcp_server._orphaned_commit_count`, returns `None` rather than a number on
+the same uninterpretable path, which is honest there because status carries no
+`proved_nothing` beside it. Measured clean
+before the gate was wired, per the standing rule for a zero-tolerance gate:
+`entities: 0`, `commit_entities_scanned: 957`, `proved_nothing: false` on the
+957-commit at-scale run over this repo.
+
+**Detection only — there is deliberately no repair.** The standing decision
+throughout this arc holds: an affected graph is REBUILT into a fresh graph
+path, never migrated and never repaired in place. #329 established separately
+that shipping a detector does not violate a scope decision that excluded
+repair. `handle_minigraf_ingest_status` reports the count as
+`orphaned_commits`, computed ONCE per run where the linearization and a lease
+are already in hand — never queried at poll time (phase 4's rule: status is
+never derived from graph queries at poll time, which contends on
+`_db_native_lock` and is staler than memory anyway) and never placed on
+`RunProgress`, which is deliberately pure. It is reset at the top of
+`_run_ingestion` (as `index_cross_check` is) and ALSO in
+`handle_minigraf_ingest_git`'s declined-start branch, which `index_cross_check`
+is not: without that, a run that failed or was declined before reaching the assignment
+left the PREVIOUS run's value in the status response, misattributed to a run
+that never happened.
+
+**Stage B now yields its lease on a bounded window, and the whole-sweep hold
+it replaced was silently discarding auto-memory writes (#222 phase 5, item
+C).** Stage B held ONE lease across its entire sweep. A lease is cheap
+in-process — at count > 0 `try_acquire` joins and returns the same handle, so
+a concurrent `call_tool` never blocks — but EXCLUSIVE out-of-process, and both
+auto-memory hooks are `command` hooks in separate processes whose retry budget
+is 0.75 s total and which swallow failures with `except Exception: pass`. So
+the hold did not block queries; it silently discarded every auto-memory write
+for the sweep's duration, which on a large repo is a large fraction of the
+ingest. Yielding only lets a hook's write SUCCEED because
+every window commits the fact index before releasing the lease; without that
+the yield deadlocks the hook against ingestion instead (see "The fact index
+must be COMMITTED" below).
+
+**A WINDOW rather than a per-commit release, because the release is not
+free.** `_DbLeaseManager.release()` at refcount 1 → 0 drops the handle, and
+minigraf's `Drop for Inner` then runs a full O(graph size) checkpoint — #280,
+measured at 47.3% of Stage A's write time, outside `_CheckpointPolicy`'s duty
+gate and invisible to the trace's `ckpt_d_seconds`. Measured against a
+baseline of one lease for the whole sweep, same binary and graph size: at the
+shipped `_SWEEP_YIELD_COMMITS` of 25, +5.3% (60 commits, 0.9 MB graph) and
++2.1% (200 commits, 2.9 MB); at 1, +40.8% and +100.8%, which is why the
+default is not 1. Marginal cost per extra handle drop was 4.4 ms at 0.9 MB and
+14.4 ms at 2.9 MB — the graph grew 3.2x and the cost 3.3x, confirming the drop
+checkpoint is O(graph size). Every config swept the same commits and reported
+complete, so the window costs time, not outcome. When #280 lands (blocked on
+upstream minigraf#322) the drop checkpoint is suppressed and N can safely go
+to 1 — which is why this is a constant to lower rather than a structure to
+rewrite.
+
+**The fact index must be COMMITTED before every window's lease release, and
+for a while it was not — so the window, as first shipped, broke ingestion
+instead of saving the hook's write (final whole-branch review C1).**
+`_correction_sweep_through_update` writes index rows on ingestion's batched
+`index_con` AFTER `_forward_apply`'s only `_commit_index_writer_safe`, and
+`_index_write` never commits a caller-supplied connection. So a window ended
+with SQLite's writer lock still held and the graph lock free — a LOCK-ORDER
+INVERSION. The hook (`finalize_hook.py` → `handle_minigraf_transact` →
+`_transact` with no `index_con`) takes the GRAPH lock first, then blocks on
+SQLite for up to `fact_index.open_writer`'s 5 s busy timeout while still
+holding the graph; ingestion holds SQLite and needs the graph back, gives up
+after `_LOCK_RETRY_MAX` attempts (~2.6 s) outside the per-commit `try`, and
+the run ends `status: error`. The hook's index insert then fails "database is
+locked", swallowed by `_index_write`: the fact is in the graph and missing from
+the index, a #302 divergence. Measured at shipped defaults, 100 commits,
+real processes: 2 of 2 by the reviewer and 1 of 1 again on the pre-fix code
+(`status: error`, `[fact_index] insert failed: database is locked`, the
+hook's `:description` in the graph and not the index); after the fix 3 of 3
+complete with the hook's fact in both. Every window now goes through
+`_db_lease_async_committing_index`, which commits in a `finally` INSIDE the
+lease — every exit (count or clock boundary, sweep done, abort, shutdown,
+exception) — and after the window's last `_correction_sweep_through_update`,
+so a window still ends only between fully-swept commits.
+`TestStageBYieldsTheLock::test_a_hook_writing_graph_and_index_mid_sweep_lands_in_both`
+drives a real `handle_minigraf_transact` from a separate process; with the
+commit deleted it reddens on `status == "complete"` 5 of 5.
+
+**Stage A has the same uncommitted-index shape, PRE-EXISTING and NOT fixed
+here (#347).** `_reverse_apply` writes index rows on `index_con`
+and never commits (it ends at `_db_checkpoint_gated(db)` / `return
+commit_hash`), and `_run_ingestion`'s per-commit `async with db_lease_async()`
+around its dispatch releases the graph right after — so on a reverse-heavy
+stretch the SQLite writer transaction stays open across many lease releases,
+until a forward apply or `_close_index_writer_safe` commits it. Stage A takes
+no pause between leases, so a hook wins far less often than at a window
+boundary, but the inversion is the same. So are the single leases after the
+sweep that write index rows and release without committing (the lineage fold,
+the end-of-walk skipped-span flush, `_ingest_tags`/`_last_run_write`).
+
+**Boundaries fall only between fully-swept commits.**
+`_correction_sweep_apply`, `_forward_apply(lifecycle_only=True)` and
+`_correction_sweep_through_update` are ONE unit — the watermark is deliberately
+deferred until both halves land — so a boundary anywhere inside that triple
+creates exactly the half-processed state the deferral exists to prevent. The
+window closes after the watermark has landed and `nxt` already names the next
+commit, so the next window re-enters carrying it across and does not re-plan.
+`sweep_fragmented`, `nxt` and `skipped` are hoisted above the window loop for
+the same reason.
+
+**The pause is what makes the yield real, and without it the window is
+worthless.** Releasing the lease and re-acquiring it crosses no await, so the
+graph is free for MICROSECONDS — a free instant, not a free interval, and a
+hook polling 5 times across its 0.75 s budget would essentially never land in
+it. `_SWEEP_YIELD_PAUSE_SECONDS` (0.1) is awaited at the boundary, OUTSIDE the
+lease by construction, and skipped once the sweep is done so the last window
+never pays it. 0.1 s is sized against minigraf 2.0.0's `open()`, which does
+not fail fast: it blocks ~375 ms polling 5 → 50 ms and returns as soon as the
+lock frees, so a hook ALREADY blocked wins within ~5-50 ms of a boundary.
+Measured +0.43 s over 4 boundaries against an arithmetic prediction of 0.4;
+the cost is a flat 0.1 s per boundary from 1 to 100 boundaries and does not
+grow with sweep length. On this repo's own history that PROJECTS to ~19
+boundaries and ~1.9 s — arithmetic from the measured flat per-boundary cost,
+not itself a measurement.
+`asyncio.sleep`, never `time.sleep` — this runs on the event loop (#99), and
+`_forbid_blocking_sleep_on_event_loop` fires on exactly that.
+
+**Two stated residuals, neither fixed.** `_SWEEP_YIELD_SECONDS` (2.0) is
+UNVALIDATED by measurement — it is sized by argument against the hooks' retry
+budget, not by an experiment. The boundary is a disjunction and for a while
+only one half had ever fired: every test set `_SWEEP_YIELD_COMMITS` to 1, so
+the count operand was True at the first check and Python short-circuited the
+`or` — the clock operand was never EVALUATED, not merely never true, while it
+is the disjunct that delivers the feature in production, where one window's
+commits can individually be slow. `test_the_clock_alone_closes_a_window` now
+makes the count disjunct impossible (10**9) so only the clock can end a
+window. And a hook that has not started blocking when a boundary arrives gains
+nothing from that PARTICULAR boundary — it simply blocks and wins at the next
+one — so the guarantee is "a waiter wins within one window", never "within one
+pause". `_DbLeaseManager` exposes no waiter or contention signal, so "release
+only when something is actually waiting" is not available without building one.
+
+`evals/at_scale/probe_sweep_window_cost.py` is the instrument behind those
+numbers, kept in the repo rather than a scratchpad (precedent:
+`probe_lease_drop_cost.py`, #281). Its own caveats are load-bearing: synthetic
+linear graphs of 0.9-3.2 MB against this repo's ~179 MB real one, no merges,
+and **absolute numbers are NOT comparable across invocation batches** — the
+baseline configuration, where neither window nor pause can apply by
+construction, drifted 2.4x between two rounds on the same machine with no code
+change. Run the arms you mean to compare back to back, interleaved, and repeat
+them. All three constants are read at IMPORT, so the conftest `MINIGRAF_*`
+scrub cannot reach them: a test that depends on a value must patch the
+CONSTANT, not the variable.
+
+**`_forward_apply`'s positional-argument hazard is the most valuable thing
+phase 5 learned about code it did not change (#346).** `lifecycle_only` and
+`persist_claim` are arguments 9 and 10 of `_forward_apply`, and BOTH reach it
+POSITIONALLY through `run_in_executor` — `mcp_server.py:13932` (Stage A's
+forward dispatch) and `:14338` (Stage B's lifecycle apply) — because
+`run_in_executor` takes no kwargs. Neither is named at either site, both carry
+defaults, and the `:14338` site already passes fewer than the full count. So
+**inserting a parameter ahead of them raises no `TypeError`; it silently
+rebinds the existing booleans**, and a wrong `lifecycle_only` flips the whole
+function's behaviour. **Convert those two call sites to keyword form — a
+`functools.partial` or a named dispatch shim — BEFORE any signature change.**
+That is a prerequisite, not cleanup.
+
+The decomposition itself was DECLINED and filed as #346 rather than attempted.
+Every seam that would meaningfully decompose the function moves mutable
+`_ForwardWalkState` across a new boundary: the per-file loop alone is 243
+lines carrying 16 in-place mutations that touch 8 of the state's 12 dicts,
+with further mutation happening indirectly through `_forget_closed_entity` and
+`_build_code_triples`. Splitting by `lifecycle_only` is also the wrong axis —
+the mutations partition by FILE STATUS (D / R / A-M), not by the flag, which
+is why the flag leaves 183 unguarded lines stranded in the middle belonging to
+neither side. A status-based split is the more promising direction.
+
+**`_lineage_marker_ident` is injective only over `_code_ident` output, and the
+precondition is structural rather than conventional.** It collapses every `/`
+in the entity ident to `-`, so the raw function is NOT injective in general.
+It is safe because every real caller passes a `_code_ident`-produced ident,
+which always carries exactly ONE `/`: `_canonical_ident`'s
+`re.sub(r"[^a-z0-9_-]", "-", ...)` replaces every character outside
+`[a-z0-9_-]`, `/` included, so no `/` from a source path can survive into the
+ident body, and the single `/` is the type-prefix separator appended
+afterwards. **Single-slash is necessary but not sufficient: the type prefix
+must also be HYPHEN-FREE**, so that the one `/` sits at a fixed boundary the
+`-` it collapses into cannot be confused with — with a hyphenated prefix,
+`:a-b/c` and `:a/b-c` both become `:lineage/a-b-c`. That holds today because
+`_code_ident` is only ever called with the literals
+`module`/`function`/`class`/`variable`/`field` (verified by grep: every call
+site passes one of those literals, a loop over exactly the four child
+categories, or a `renamed_pairs` category drawn from the same pools); minting
+a hyphenated code entity type would break it. Both halves — that the raw function is not injective, and that
+`_code_ident` output is single-slash — are pinned by test rather than asserted
+by reasoning: `test_lineage_marker_ident_is_not_injective_on_raw_input` and
+`test_code_idents_carry_exactly_one_slash` (tests/test_mcp_server.py), driven
+over adversarial paths (`a/b.py`, `a-b.py`, `a/b/c.py`, `a-b/c.py`,
+`a/b-c.py`). If a future caller ever mints a marker from something other than
+a `_code_ident` output, re-check this before trusting it.
+
+**No `GRAPH_FORMAT_VERSION` bump anywhere in phase 5, and no migration.**
+`:ingestion/branch` only adds a fact going forward; the frontier-low retention
+check only discards facts that already exist; the yield window writes nothing
+at all. A graph that predates phase 5 records no branch and therefore reads
+`proved_nothing` on the orphan check — the honest answer, and the reason
+`_ingestion_branch_read` returns None rather than defaulting to `"master"`.
+Existing graphs are not repaired; an affected one is rebuilt into a fresh
+graph path, as everywhere else in this arc.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.

@@ -396,6 +396,28 @@ class TestExitCodeCommitCensusClause:
         }) == 0
 
 
+def test_exit_code_fails_on_orphaned_commits():
+    assert _exit_code({
+        "commit_census": {"ok": True, "orphaned_commits": {
+            "entities": 3, "proved_nothing": False}},
+    }) == 1
+
+
+def test_exit_code_ignores_orphans_when_nothing_was_proved():
+    """A branch mismatch or an absent :ingestion/branch means the count is
+    uninterpretable, not clean-with-findings."""
+    assert _exit_code({
+        "commit_census": {"ok": True, "orphaned_commits": {
+            "entities": 7, "proved_nothing": True}},
+    }) == 0
+
+
+def test_exit_code_clean_when_key_absent():
+    """A metrics file from a harness predating this check cannot be
+    retro-failed -- same precedent as stderr_capture_complete and fact_audit."""
+    assert _exit_code({"commit_census": {"ok": True}}) == 0
+
+
 class TestCommitCensusReachesTheMetrics:
     """The pure comparison is tested in tests/test_at_scale_commit_census.py.
     What THIS needs to prove is that the harness hands it the right three
