@@ -9583,6 +9583,28 @@ async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]
         return {"ok": False, "error": f"Unknown strategy: {strategy}"}
 
 
+def _first_entry_per_ident(
+    entries: List[Tuple[str, str, List[str]]],
+) -> List[Tuple[str, str, List[str]]]:
+    """Keep only the first entry for each ident, in order (#351).
+
+    One file can define one name twice -- a method name shared by several
+    classes, a redefined function, a class-level attribute __init__ also
+    assigns through self -- and _code_ident maps both to one ident. Every
+    consumer treats an entry as one entity: _build_code_triples would
+    introduce the ident from the first and assert :modified-in at its own
+    introduction from the second, and _forward_structural_triples_by_ident
+    would keep the LAST entry's triples while the introduction wrote the
+    FIRST's (a field's :static can differ between the two)."""
+    seen: Set[str] = set()
+    out: List[Tuple[str, str, List[str]]] = []
+    for entry in entries:
+        if entry[0] not in seen:
+            seen.add(entry[0])
+            out.append(entry)
+    return out
+
+
 def _precompute_file_triples(
     file_path: str,
     extracted: Dict[str, List[str]],
@@ -9680,7 +9702,9 @@ def _precompute_file_triples(
     for field_name, owning_class, is_static in extracted.get("fields", []):
         qualified_name = f"{owning_class}.{field_name}"
         field_ident = _code_ident("field", file_path, qualified_name)
-        field_static_map[field_ident] = is_static
+        # setdefault: the FIRST declaration wins, matching the entry
+        # _first_entry_per_ident keeps (#351) -- a close retracts this value.
+        field_static_map.setdefault(field_ident, is_static)
         static_literal = "true" if is_static else "false"
         candidate_triples = [
             f"[{field_ident} :entity-type :type/field]",
@@ -9736,10 +9760,10 @@ def _precompute_file_triples(
     return {
         "module_ident": module_ident,
         "module_candidate_triples": module_candidate_triples,
-        "function_entries": function_entries,
-        "class_entries": class_entries,
-        "global_entries": global_entries,
-        "field_entries": field_entries,
+        "function_entries": _first_entry_per_ident(function_entries),
+        "class_entries": _first_entry_per_ident(class_entries),
+        "global_entries": _first_entry_per_ident(global_entries),
+        "field_entries": _first_entry_per_ident(field_entries),
         "field_class_map": field_class_map,
         "field_static_map": field_static_map,
         "resolved_imports": resolved_imports,
@@ -12807,15 +12831,14 @@ def _correction_sweep_apply(
         # file and flushed once at the bottom of this same iteration, so a
         # file's confirms are one call.
         to_confirm: List[str] = []
-        # Deduplicated: the collection mirrors _forward_candidate_idents'
-        # construction, which can repeat an ident when a file declares the
-        # same name twice within one category -- a module-level constant
-        # reassigned, a function redefined, or a `self.` attribute reassigned
-        # a second time in __init__ (cross-category collision is impossible:
-        # _canonical_ident bakes entity_type into the ident prefix). The
-        # per-ident work below is idempotent, so a repeat was harmless -- but
-        # it paid for a full _entity_introduced_by_values_query per
-        # duplicate. dict.fromkeys, not set(): both dedupe, but set()'s
+        # Deduplicated: a file declaring one name twice within one category
+        # -- a module-level constant reassigned, a function redefined, a
+        # `self.` attribute reassigned in __init__ -- used to repeat an ident
+        # here (cross-category collision is impossible: _canonical_ident
+        # bakes entity_type into the ident prefix). _precompute_file_triples
+        # now emits one entry per ident (#351), so this is belt-and-braces:
+        # the per-ident work below is idempotent, but a repeat would pay a
+        # full _entity_introduced_by_values_query. dict.fromkeys, not set(): both dedupe, but set()'s
         # hash-randomised iteration over strings would make the per-ident
         # stderr skip-log order -- and so which idents hit
         # _CORRECTION_SWEEP_LOG_CAP first -- vary between process runs;
