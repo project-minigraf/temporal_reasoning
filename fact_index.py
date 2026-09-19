@@ -18,6 +18,26 @@ from typing import List, Optional, Sequence, Tuple
 # mcp_server) to avoid a circular import -- mcp_server.py imports this module.
 _MEMORY_PREFIXES = (":decision/", ":preference/", ":constraint/", ":dependency/")
 
+# Words that carry no retrieval signal. Lives here rather than in mcp_server
+# (which imports it back for heuristic extraction) so the match expression can
+# drop them without a circular import. Before #354 the prepare query ORed every
+# token of the prompt, so a one-word reply of "A" matched every row containing
+# the word "a".
+_STOP_WORDS = frozenset(
+    "a an the is are was were be been being have has had do does did will would could should "
+    "may might shall can need dare ought used to am i we you he she it they what which who "
+    "this that these those my our your his her its their about above after all also and as at "
+    "before but by for from if in into just me more most no not of on only or other our out "
+    "same so than then there they through to too under up us very via was we what when where "
+    "which while who why with".split()
+)
+
+# SQL predicate for "entity is a memory fact", shared by the boost and the
+# memory-only filter so the two can never disagree about what counts.
+_MEMORY_ENTITY_SQL = "(" + " OR ".join(
+    f"entity LIKE '{prefix}%'" for prefix in _MEMORY_PREFIXES
+) + ")"
+
 _MMAP_SIZE = 1_073_741_824  # 1 GiB
 _BUSY_TIMEOUT_MS = 5000
 _SCHEMA_SQL = (
@@ -425,15 +445,18 @@ def _fts5_match_query(text: str) -> Optional[str]:
     semantics), matching the "any token overlap" relevance model the old
     rank_bm25-based FactIndex used. Returns None if there are no usable
     tokens. Each token is double-quoted to neutralize FTS5 special syntax
-    characters a raw user message could otherwise trigger."""
-    tokens = _tokenize(text)
+    characters a raw user message could otherwise trigger. Stop words and
+    single-character tokens are dropped (#354): they match nearly every row
+    and carry no signal, so a prompt made only of them matches nothing."""
+    tokens = [t for t in _tokenize(text) if len(t) > 1 and t not in _STOP_WORDS]
     if not tokens:
         return None
     return " OR ".join(f'"{t}"' for t in tokens)
 
 
 def query_facts(
-    path: str, text: str, top_n: int, boost: float, historical_discount: float
+    path: str, text: str, top_n: int, boost: float, historical_discount: float,
+    memory_only: bool = False,
 ) -> List[List[str]]:
     """Ranked, read-only query against the index.
 
@@ -455,6 +478,12 @@ def query_facts(
     this sign convention: boost should be > 1 to promote, historical_discount
     should be in (0, 1] to demote or leave unchanged.
 
+    memory_only restricts results to memory-fact entities (_MEMORY_PREFIXES)
+    with a WHERE clause, so top_n bounds memory rows rather than being filled
+    by better-matching code rows first (#354). It is a QUERY-time filter by
+    design: the index still holds every row, because it is also #302's
+    independent witness for evals/at_scale/fact_audit.py.
+
     Raises sqlite3.OperationalError if the index file doesn't exist -- the
     caller (mcp_server.handle_memory_prepare_turn) is responsible for
     checking fact_index.needs_backfill() before calling this, not for
@@ -468,13 +497,12 @@ def query_facts(
         rows = con.execute(
             "SELECT entity, attribute, value, valid_from, valid_to, "
             "  (bm25(facts_fts) "
-            "    * (CASE WHEN entity LIKE ':decision/%' OR entity LIKE ':preference/%' "
-            "            OR entity LIKE ':constraint/%' OR entity LIKE ':dependency/%' "
-            "       THEN ? ELSE 1.0 END) "
+            f"    * (CASE WHEN {_MEMORY_ENTITY_SQL} THEN ? ELSE 1.0 END) "
             "    * (CASE WHEN valid_to IS NULL THEN 1.0 ELSE ? END) "
             "  ) AS score "
             "FROM facts_fts WHERE facts_fts MATCH ? "
-            "ORDER BY score ASC LIMIT ?",
+            + (f"AND {_MEMORY_ENTITY_SQL} " if memory_only else "")
+            + "ORDER BY score ASC LIMIT ?",
             (boost, historical_discount, match_expr, top_n),
         ).fetchall()
     finally:
