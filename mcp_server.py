@@ -188,7 +188,8 @@ except ValueError:
 # holding it, ingestion holds SQLite and cannot get the graph back (~2.6 s),
 # the run ends `status: error`, and the hook's index insert is swallowed --
 # fact in graph, missing from index (#302). Measured, not supposed: see
-# CLAUDE.md, "The fact index must be COMMITTED".
+# CLAUDE.md, "The fact index must be COMMITTED". Every other index-writing
+# lease in _run_ingestion goes through the same wrapper since #347.
 #
 # NOT a per-commit release: _DbLeaseManager.release() at refcount 1 -> 0 drops
 # the handle, and minigraf's `Drop for Inner` then runs a full O(graph size)
@@ -3787,10 +3788,13 @@ async def _db_lease_async_committing_index(loop, write_executor, index_con):
     """db_lease_async(), plus a commit of the batched fact-index connection
     BEFORE the lease is released -- on every exit path, exceptions included.
 
-    Used by Stage B's sweep WINDOW (#222 phase 5 item C), whose whole purpose
-    is to let an out-of-process auto-memory hook take the graph lock between
-    windows. Releasing the graph lease while `index_con` still holds an open
-    SQLite write transaction is a lock-order inversion: the hook
+    Used by EVERY lease _run_ingestion takes that writes index rows (#347):
+    the preload lease, Stage A's per-commit dispatch, Stage B's sweep WINDOW
+    (#222 phase 5 item C, where it first shipped), the skipped-span flush,
+    the lineage fold and _ingest_tags/_last_run_write. Any of those releases
+    lets an out-of-process auto-memory hook take the graph lock. Releasing
+    the graph lease while `index_con` still holds an open SQLite write
+    transaction is a lock-order inversion: the hook
     (finalize_hook.py -> handle_minigraf_transact -> _transact with no
     index_con) takes the graph lock and THEN blocks on SQLite for up to
     fact_index.open_writer's 5 s busy timeout, still holding the graph lock;
@@ -13585,7 +13589,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         run_ts_iso = datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%S.%f"
         )[:-3] + "Z"
-        async with db_lease_async() as db:
+        async with _db_lease_async_committing_index(loop, write_executor, index_con) as db:
             # The run's FIRST write, ahead of _frontier_load's own migrations: a
             # fresh graph that got ingestion state without its stamp would look
             # exactly like a pre-#263 graph on the next run and be refused (#263).
@@ -14054,7 +14058,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # drop are both inside the measured span, not just open.
                     _trace_t_apply = time.perf_counter()
                     _trace_write_ok = True
-                    async with db_lease_async() as db:
+                    async with _db_lease_async_committing_index(loop, write_executor, index_con) as db:
                         try:
                             if tag == "fwd":
                                 await loop.run_in_executor(
@@ -14354,7 +14358,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             lo_pos = max(lo_pos, floor + 1)
                         if lo_pos > hi_pos:
                             continue
-                        async with db_lease_async() as db:
+                        async with _db_lease_async_committing_index(loop, write_executor, index_con) as db:
                             await loop.run_in_executor(
                                 write_executor, _frontier_persist_span, db, linearization,
                                 lo_pos, hi_pos, False,
@@ -14601,7 +14605,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # already released, and re-entering here is what keeps every
                     # window's acquire/release balanced (#255's single-handle
                     # invariant) instead of leaving one straggler scope open.
-                    async with db_lease_async() as db:
+                    async with _db_lease_async_committing_index(loop, write_executor, index_con) as db:
                         # DB-bound like everything else here, so it runs on
                         # write_executor rather than inline on the event loop.
                         should_fold = completed_all and await loop.run_in_executor(
@@ -14619,7 +14623,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # so they use the batched connection instead of opening new ones
                 if completed_all:
                     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                    async with db_lease_async() as db:
+                    async with _db_lease_async_committing_index(loop, write_executor, index_con) as db:
                         await loop.run_in_executor(write_executor, _ingest_tags, db, repo_path, now, index_con)
                         # #222 phase 4: the tip this run covered, never
                         # whichever commit Stage A applied last -- on a

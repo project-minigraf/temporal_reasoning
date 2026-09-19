@@ -1484,17 +1484,28 @@ so a window still ends only between fully-swept commits.
 drives a real `handle_minigraf_transact` from a separate process; with the
 commit deleted it reddens on `status == "complete"` 5 of 5.
 
-**Stage A has the same uncommitted-index shape, PRE-EXISTING and NOT fixed
-here (#347).** `_reverse_apply` writes index rows on `index_con`
-and never commits (it ends at `_db_checkpoint_gated(db)` / `return
-commit_hash`), and `_run_ingestion`'s per-commit `async with db_lease_async()`
-around its dispatch releases the graph right after — so on a reverse-heavy
-stretch the SQLite writer transaction stays open across many lease releases,
-until a forward apply or `_close_index_writer_safe` commits it. Stage A takes
-no pause between leases, so a hook wins far less often than at a window
-boundary, but the inversion is the same. So are the single leases after the
-sweep that write index rows and release without committing (the lineage fold,
-the end-of-walk skipped-span flush, `_ingest_tags`/`_last_run_write`).
+**Every lease `_run_ingestion` takes that writes index rows now commits
+before it releases, not only Stage B's windows (#347).** Five more sites had
+the same inversion: the preload lease (format stamp, `:ingestion/branch`,
+`_frontier_load`'s migrations), Stage A's per-commit dispatch
+(`_reverse_apply` writes index rows and never commits — only `_forward_apply`
+does — so a reverse-heavy stretch held one SQLite transaction open across many
+lease releases), the end-of-walk skipped-span flush, the lineage fold, and
+`_ingest_tags`/`_last_run_write`. All five now go through
+`_db_lease_async_committing_index`. Stage A takes no pause between leases, so
+a real hook lands there rarely, but when it does the run ends `status: error`
+exactly as in Stage B: reproduced by holding the graph free for 1 s after a
+reverse write, with a real hook process
+(`TestIngestionCommitsTheIndexBeforeReleasingTheGraph`). The class's
+deterministic test checks `index_con.in_transaction` at every release and
+names the offending line; each of the five sites was ablated on its own and
+reddened it. The skipped-span flush needed `_skip_claim` forced, because a
+fresh run never reaches it (see "#326's skip fast path is now VESTIGIAL").
+The final-checkpoint lease writes no index rows and is unchanged. **Cost,
+measured:** a 200-commit synthetic run went from 206 to 407 index commits,
++~10 ms total (~0.05 ms each), well inside run-to-run wall-clock noise. That
+is expected, since `_forward_apply` already paid one commit per forward
+position.
 
 **Boundaries fall only between fully-swept commits.**
 `_correction_sweep_apply`, `_forward_apply(lifecycle_only=True)` and
