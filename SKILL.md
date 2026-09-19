@@ -743,6 +743,11 @@ Default: `memory.graph` in the current working directory. Run all commands from 
 
 Memory retrieval uses a persisted SQLite FTS5 fact index alongside the graph, at `<graph_path>.fts.sqlite3` by default. Override with `MINIGRAF_INDEX_PATH=/custom/path`.
 
+`memory_prepare_turn` returns **memory facts only** — `:decision/`, `:preference/`,
+`:constraint/` and `:dependency/` entities, one line per entity. Ingested code structure
+is never injected there (#354); query it with `minigraf_query`. Stop words and
+single-character tokens are ignored, so a prompt made only of them returns nothing.
+
 Memory context returned by `memory_prepare_turn` can include historical facts (things
 that were true in the past but have since changed or been removed) alongside current
 ones — historical entries are labeled with their validity window, e.g. `[was valid
@@ -765,9 +770,11 @@ fact descriptions and `:alias` values that name both the concept and the specifi
 technology/term someone might search for later (e.g. a decision described only as "use
 Redis" won't be found by a query for "caching layer" unless an alias bridges them).
 
-Tuning env vars: `MINIGRAF_PREPARE_SCAN_LIMIT` (default 50, max facts returned),
+Tuning env vars: `MINIGRAF_PREPARE_SCAN_LIMIT` (default 50, max index rows scanned),
+`MINIGRAF_PREPARE_MAX_ENTITIES` (default 8, max entities injected, one line each),
 `MINIGRAF_MEMORY_BOOST` (default 2.0, ranking boost for decision/preference/constraint/
-dependency facts over git-ingested code structure), `MINIGRAF_HISTORICAL_DISCOUNT`
+dependency facts over git-ingested code structure; moot for `memory_prepare_turn`, which
+returns memory facts only), `MINIGRAF_HISTORICAL_DISCOUNT`
 (default 0.5, ranking discount for historical facts relative to current ones — values
 below 1.0 demote history, 1.0 is neutral).
 

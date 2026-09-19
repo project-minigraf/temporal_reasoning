@@ -1293,3 +1293,77 @@ def test_cross_process_reader_sees_writer_commits(tmp_path):
     )
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# #354: memory_prepare_turn relevance -- query-time memory-only filter and a
+# stop-word-free match expression. The index itself is unchanged (it is
+# #302's independent witness), so every exclusion here is at QUERY time.
+# ---------------------------------------------------------------------------
+
+
+def test_query_facts_memory_only_excludes_code_rows_but_the_index_keeps_them(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [
+        (":decision/use-redis", ":description", "use redis for caching", None, None),
+        (":function/redis_helper", ":description", "redis caching helper redis caching", None, None),
+        (":commit/abc123", ":subject", "switch caching to redis", None, None),
+        (":lineage/function-redis_helper", ":status", "redis caching provisional", None, None),
+    ])
+    fact_index.close_writer(con)
+
+    filtered = fact_index.query_facts(
+        path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0, memory_only=True,
+    )
+    assert [r[0] for r in filtered] == [":decision/use-redis"]
+
+    # Query-time only: without the flag every row is still there to match.
+    unfiltered = fact_index.query_facts(
+        path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0,
+    )
+    assert {r[0] for r in unfiltered} == {
+        ":decision/use-redis", ":function/redis_helper", ":commit/abc123",
+        ":lineage/function-redis_helper",
+    }
+
+
+def test_query_facts_memory_only_limit_applies_after_the_filter(tmp_path):
+    """The LIMIT must bound MEMORY rows, not rows in general -- otherwise a
+    corpus of better-matching code rows fills the window and the filter
+    returns nothing although a memory fact matches."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [
+        (f":function/f{i}", ":description", "redis redis redis caching caching", None, None)
+        for i in range(20)
+    ] + [(":constraint/no-redis", ":description", "redis is banned in production for caching", None, None)])
+    fact_index.close_writer(con)
+    results = fact_index.query_facts(
+        path, "redis caching", top_n=3, boost=1.0, historical_discount=1.0, memory_only=True,
+    )
+    assert [r[0] for r in results] == [":constraint/no-redis"]
+
+
+def test_match_query_drops_stop_words_and_single_characters():
+    assert fact_index._fts5_match_query("A") is None
+    assert fact_index._fts5_match_query("and a 2 and 3") is None
+    expr = fact_index._fts5_match_query("create a branch and open a pr")
+    assert expr is not None
+    for dropped in ('"a"', '"and"'):
+        assert dropped not in expr
+    for kept in ('"create"', '"branch"', '"open"', '"pr"'):
+        assert kept in expr
+
+
+def test_query_facts_stop_word_only_prompt_matches_nothing(tmp_path):
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, [
+        (":decision/a-thing", ":description", "a decision about the thing and a plan", None, None),
+    ])
+    fact_index.close_writer(con)
+    for prompt in ("A", "and the", "is it a"):
+        assert fact_index.query_facts(
+            path, prompt, top_n=10, boost=2.0, historical_discount=1.0, memory_only=True,
+        ) == [], prompt

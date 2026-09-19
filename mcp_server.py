@@ -4824,14 +4824,8 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
 # memory_prepare_turn
 # ---------------------------------------------------------------------------
 
-_STOP_WORDS = frozenset(
-    "a an the is are was were be been being have has had do does did will would could should "
-    "may might shall can need dare ought used to am i we you he she it they what which who "
-    "this that these those my our your his her its their about above after all also and as at "
-    "before but by for from if in into just me more most no not of on only or other our out "
-    "same so than then there they through to too under up us very via was we what when where "
-    "which while who why with".split()
-)
+# Moved to fact_index (#354) so the retrieval query can share it.
+_STOP_WORDS = fact_index._STOP_WORDS
 
 _MIN_ENTITY_LEN = 4
 
@@ -8844,26 +8838,38 @@ def _extract_entities(text: str) -> List[str]:
     return result
 
 
-def _format_facts(results: List[List[str]]) -> str:
-    """Format fact-index rows as a readable block. Each row is
-    [entity, attribute, value] (2-tuple attr/val rows from other callers) or
-    [entity, attribute, value, valid_from, valid_to] (5-element fact-index
-    rows). A historical row (valid_to present and non-None) is labeled with
-    its validity window so the agent has the entity ident + window it needs
-    to follow up with a precise :as-of/:valid-at Datalog query."""
-    if not results:
-        return ""
-    lines = []
-    for row in results:
-        if len(row) == 5:
-            entity, attribute, value, valid_from, valid_to = row
-            base = f"  {entity} | {attribute} | {value}"
-            if valid_to is not None:
-                base += f"  [was valid {valid_from} → {valid_to}]"
-            lines.append(base)
-        else:
-            lines.append("  " + " | ".join(str(v) for v in row))
-    return "\n".join(lines)
+# Rows that restate an entity's identity rather than saying anything about it.
+# The entity is already each line's head, so echoing these is pure noise.
+_PREPARE_OMITTED_ATTRIBUTES = frozenset({":ident", ":entity-type"})
+
+
+def _format_memory_entities(results: List[List[str]], max_entities: int) -> str:
+    """Collapse ranked fact-index rows into one line per entity (#354).
+
+    Entities keep the rank of their best-matching row; at most max_entities
+    lines are produced. Each line lists the entity's matched attribute/value
+    pairs once (exact repeats dropped), with a historical value labeled by its
+    validity window so the agent still has what it needs for a precise
+    :as-of/:valid-at follow-up query. :ident/:entity-type rows are omitted,
+    but an entity matched only through them still gets its (bare) line.
+    """
+    grouped: Dict[str, List[str]] = {}
+    for entity, attribute, value, valid_from, valid_to in results:
+        if entity not in grouped:
+            if len(grouped) >= max_entities:
+                continue
+            grouped[entity] = []
+        if attribute in _PREPARE_OMITTED_ATTRIBUTES:
+            continue
+        part = f"{attribute.lstrip(':')}: {value}"
+        if valid_to is not None:
+            part += f" [was valid {valid_from} → {valid_to}]"
+        if part not in grouped[entity]:
+            grouped[entity].append(part)
+    return "\n".join(
+        f"  {entity}" + (f" | {'; '.join(parts)}" if parts else "")
+        for entity, parts in grouped.items()
+    )
 
 
 def _now_utc_ms() -> str:
@@ -9046,6 +9052,14 @@ def handle_memory_prepare_turn(user_message: str) -> str:
     Also appends a lightweight code-graph navigation nudge (#220) on
     build/fix/navigate-shaped messages, gated on ingestion being present.
 
+    Only memory facts (:decision/ :preference/ :constraint/ :dependency/) are
+    injected (#354). Ingested code-graph rows matched on common words and
+    were nearly all noise -- ~50 rows every turn -- so code structure is left
+    to minigraf_query and the nudge. The filter is applied at QUERY time; the
+    index keeps every row as #302's audit witness. Up to
+    MINIGRAF_PREPARE_SCAN_LIMIT rows are scanned and collapsed into at most
+    MINIGRAF_PREPARE_MAX_ENTITIES lines, one per entity.
+
     Returns a formatted context block string for injection as
     additionalContext, or an empty string if no relevant facts are found.
     Proactively checks fact_index.needs_backfill() before querying (fresh
@@ -9055,6 +9069,7 @@ def handle_memory_prepare_turn(user_message: str) -> str:
     reliable signal).
     """
     scan_limit = int(os.environ.get("MINIGRAF_PREPARE_SCAN_LIMIT", "50"))
+    max_entities = int(os.environ.get("MINIGRAF_PREPARE_MAX_ENTITIES", "8"))
     boost = float(os.environ.get("MINIGRAF_MEMORY_BOOST", "2.0"))
     historical_discount = float(os.environ.get("MINIGRAF_HISTORICAL_DISCOUNT", "0.5"))
     path = fact_index.index_path_for(_graph_path_current())
@@ -9064,10 +9079,13 @@ def handle_memory_prepare_turn(user_message: str) -> str:
             _rebuild_index_from_graph()
         results = fact_index.query_facts(
             path, user_message, top_n=scan_limit, boost=boost,
-            historical_discount=historical_discount,
+            historical_discount=historical_discount, memory_only=True,
         )
         if results:
-            memory_block = f"Relevant memory context:\n{_format_facts(results)}"
+            memory_block = (
+                "Relevant memory context:\n"
+                f"{_format_memory_entities(results, max_entities)}"
+            )
     except Exception as e:
         print(f"[fact_index] prepare_turn failed: {e}", file=sys.stderr)
 

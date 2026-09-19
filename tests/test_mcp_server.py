@@ -18318,7 +18318,10 @@ class TestHandleMemoryPrepareTurnFts5:
         result = mcp_server.handle_memory_prepare_turn("anything at all")
         assert result == ""
 
-    def test_memory_facts_rank_above_non_memory_facts(self, real_db):
+    def test_non_memory_facts_are_never_injected(self, real_db):
+        """#354: code-graph rows are left to minigraf_query and the nav nudge.
+        Before, they were only ranked BELOW memory facts, so any prompt that
+        matched no memory fact was answered entirely with code rows."""
         import mcp_server
         mcp_server.handle_minigraf_transact(
             '[[:decision/use-redis :description "use redis for caching layer"] '
@@ -18328,14 +18331,108 @@ class TestHandleMemoryPrepareTurnFts5:
         )
         mcp_server._ingest_transact(
             mcp_server.get_db(),
-            ['[:function/unrelated :name "use redis for caching layer somewhere else use redis for caching layer somewhere else"]'],
+            [
+                '[:function/unrelated :name "use redis for caching layer somewhere else use redis for caching layer somewhere else"]',
+                # Without :ident the backfill rebuild names this entity by its
+                # UUID, and the absence assertion below would pass vacuously.
+                '[:function/unrelated :ident ":function/unrelated"]',
+            ],
             "2026-01-01T00:00:00.000Z", "test",
         )
+        # Positive control: the code row IS in the index under its ident.
+        import fact_index
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
+        if fact_index.needs_backfill(index_path):
+            mcp_server._rebuild_index_from_graph()
+        raw = fact_index.query_facts(index_path, "use redis for caching layer", top_n=50,
+                                     boost=2.0, historical_discount=0.5)
+        assert any(r[0] == ":function/unrelated" for r in raw)
+
         result = mcp_server.handle_memory_prepare_turn("use redis for caching layer")
-        redis_pos = result.find(":decision/use-redis")
-        other_pos = result.find(":function/unrelated")
-        assert redis_pos != -1
-        assert other_pos == -1 or redis_pos < other_pos
+        assert ":decision/use-redis" in result
+        assert ":function/unrelated" not in result
+
+    def test_a_graph_holding_only_code_rows_injects_nothing(self, real_db):
+        """The observed #354 case: an ingested repo, no memory facts, and a
+        prompt that shares ordinary words with test-function names and
+        commit subjects."""
+        import mcp_server
+        mcp_server._ingest_transact(
+            mcp_server.get_db(),
+            [
+                '[:function/tests-test_x-py--test_open_writer_wipes_a_file :description "test_open_writer_wipes_a_file"]',
+                '[:commit/abc123 :subject "create a branch and open new issues file"]',
+                '[:lineage/function-x :status :provisional]',
+                '[:function/tests-test_x-py--test_open_writer_wipes_a_file :ident ":function/tests-test_x-py--test_open_writer_wipes_a_file"]',
+                '[:commit/abc123 :ident ":commit/abc123"]',
+            ],
+            "2026-01-01T00:00:00.000Z", "test",
+        )
+        result = mcp_server.handle_memory_prepare_turn(
+            "Yes, create a branch and open a pr and also file 2 and 3 as new issues"
+        )
+        assert result == ""
+
+    def test_one_line_per_entity(self, real_db):
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/use-redis :description "use redis for caching layer"] '
+            '[:decision/use-redis :rationale "redis caching is fast"] '
+            '[:decision/use-redis :alias "redis caching backend"]]',
+            reason="test",
+        )
+        result = mcp_server.handle_memory_prepare_turn("redis caching")
+        lines = [l for l in result.splitlines() if ":decision/use-redis" in l]
+        assert len(lines) == 1, result
+        line = lines[0]
+        for value in ("use redis for caching layer", "redis caching is fast", "redis caching backend"):
+            assert value in line
+        # The entity is the line's head; its own :ident/:entity-type rows
+        # are bookkeeping and must not be echoed back as attributes.
+        assert ":type/decision" not in line
+        assert line.count(":decision/use-redis") == 1
+
+    def test_a_re_transacted_value_is_shown_once(self, real_db):
+        """Re-transacting an identical fact at a fresh valid-from leaves two
+        live index rows for one value (#156); the line must show it once."""
+        import mcp_server
+        import fact_index
+        for _ in range(2):
+            mcp_server.handle_minigraf_transact(
+                '[[:decision/use-redis :description "use redis for caching layer"]]', reason="test"
+            )
+        # Positive control: the index really does hold the value twice.
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
+        if fact_index.needs_backfill(index_path):
+            mcp_server._rebuild_index_from_graph()
+        raw = fact_index.query_facts(index_path, "redis caching", top_n=50, boost=2.0,
+                                     historical_discount=0.5, memory_only=True)
+        assert sum(r[2] == "use redis for caching layer" for r in raw) >= 2, raw
+
+        result = mcp_server.handle_memory_prepare_turn("redis caching")
+        assert result.count("use redis for caching layer") == 1, result
+
+    def test_respects_max_entities_env_var(self, real_db, monkeypatch):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_PREPARE_MAX_ENTITIES", "3")
+        for i in range(6):
+            mcp_server.handle_minigraf_transact(
+                f'[[:decision/x{i} :description "redis caching option {i}"] '
+                f'[:decision/x{i} :rationale "redis caching rationale {i}"]]',
+                reason="test",
+            )
+        result = mcp_server.handle_memory_prepare_turn("redis caching")
+        entity_lines = [l for l in result.splitlines() if ":decision/x" in l]
+        assert len(entity_lines) == 3, result
+
+    def test_max_entities_defaults_to_eight(self, real_db):
+        import mcp_server
+        for i in range(12):
+            mcp_server.handle_minigraf_transact(
+                f'[[:decision/x{i} :description "redis caching option {i}"]]', reason="test"
+            )
+        result = mcp_server.handle_memory_prepare_turn("redis caching")
+        assert len([l for l in result.splitlines() if ":decision/x" in l]) == 8, result
 
     def test_respects_scan_limit_env_var(self, real_db, monkeypatch):
         import mcp_server
@@ -18394,11 +18491,20 @@ class TestHandleMemoryPrepareTurnFts5:
         write happens (creating the index file with only its own content),
         THEN handle_memory_prepare_turn must still recover the pre-existing
         fact. Must fail against the reactive file-existence check (proves
-        this test catches the real bug), pass against needs_backfill()."""
+        this test catches the real bug), pass against needs_backfill().
+
+        The seed carries an explicit :ident (#354). Without one the backfill
+        can name the entity only by its raw UUID, and since #354 prepare_turn
+        injects memory-prefixed entities only, so such a fact is no longer
+        shown -- a stated residual, reachable only from raw writes or graphs
+        predating :ident auto-tagging, never from a current write path. What
+        this test guards is the backfill TRIGGER, which the :ident leaves
+        untouched: the fact is still absent from the index until a rebuild."""
         import mcp_server
         real_db.execute(
             '(transact {:valid-from "2024-01-01T00:00:00.000Z"} '
-            '[[:decision/pre-existing :description "a decision from before this feature shipped"]])'
+            '[[:decision/pre-existing :description "a decision from before this feature shipped"] '
+            '[:decision/pre-existing :ident ":decision/pre-existing"]])'
         )
         # One choke-point write -- creates the index file via open_writer,
         # with only ITS OWN content, before any read has ever happened.
@@ -18425,11 +18531,15 @@ class TestHandleMemoryPrepareTurnFts5:
         requires this explicit `:ident` fact (confirmed empirically: a bare
         keyword entity reference resolves to a stable but opaque UUID with
         no reverse-lookup pseudo-attribute exposed by minigraf 1.2.1).
+
+        The entity is a :decision/ since #354 -- prepare_turn injects memory
+        facts only -- and the index labels a historical row identically for
+        every entity type, so the same write helpers still exercise it.
         """
         import mcp_server
         triples = [
-            '[:module/old-cache :description "legacy caching layer using memcached"]',
-            '[:module/old-cache :ident ":module/old-cache"]',
+            '[:decision/old-cache :description "legacy caching layer using memcached"]',
+            '[:decision/old-cache :ident ":decision/old-cache"]',
         ]
         mcp_server._ingest_transact(
             mcp_server.get_db(), triples, "2024-01-01T00:00:00.000Z", "test",
@@ -18439,7 +18549,7 @@ class TestHandleMemoryPrepareTurnFts5:
             "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z", "test",
         )
         result = mcp_server.handle_memory_prepare_turn("legacy caching layer using memcached")
-        assert ":module/old-cache" in result
+        assert ":decision/old-cache" in result
         assert "2024-01-01" in result
         assert "2025-01-01" in result
 
@@ -18448,8 +18558,8 @@ class TestHandleMemoryPrepareTurnFts5:
         docstring for why an explicit `:ident` triple is required here."""
         import mcp_server
         old_triples = [
-            '[:module/old-cache :description "shared caching layer text for ranking test"]',
-            '[:module/old-cache :ident ":module/old-cache"]',
+            '[:decision/old-cache :description "shared caching layer text for ranking test"]',
+            '[:decision/old-cache :ident ":decision/old-cache"]',
         ]
         mcp_server._ingest_transact(
             mcp_server.get_db(), old_triples, "2024-01-01T00:00:00.000Z", "test",
@@ -18461,14 +18571,14 @@ class TestHandleMemoryPrepareTurnFts5:
         mcp_server._ingest_transact(
             mcp_server.get_db(),
             [
-                '[:module/new-cache :description "shared caching layer text for ranking test"]',
-                '[:module/new-cache :ident ":module/new-cache"]',
+                '[:decision/new-cache :description "shared caching layer text for ranking test"]',
+                '[:decision/new-cache :ident ":decision/new-cache"]',
             ],
             "2025-01-01T00:00:00.000Z", "test",
         )
         result = mcp_server.handle_memory_prepare_turn("shared caching layer text for ranking test")
-        old_pos = result.find(":module/old-cache")
-        new_pos = result.find(":module/new-cache")
+        old_pos = result.find(":decision/old-cache")
+        new_pos = result.find(":decision/new-cache")
         assert new_pos != -1 and old_pos != -1
         assert new_pos < old_pos
 
@@ -18478,8 +18588,8 @@ class TestHandleMemoryPrepareTurnFts5:
         import mcp_server
         monkeypatch.setenv("MINIGRAF_HISTORICAL_DISCOUNT", "1.0")
         triples = [
-            '[:module/old-cache :description "discount env var test text repeated repeated"]',
-            '[:module/old-cache :ident ":module/old-cache"]',
+            '[:decision/old-cache :description "discount env var test text repeated repeated"]',
+            '[:decision/old-cache :ident ":decision/old-cache"]',
         ]
         mcp_server._ingest_transact(
             mcp_server.get_db(), triples, "2024-01-01T00:00:00.000Z", "test",
@@ -18492,7 +18602,7 @@ class TestHandleMemoryPrepareTurnFts5:
         # scoring collapses to pure relevance -- just confirm it still finds
         # the historical fact at all when the discount is disabled.
         result = mcp_server.handle_memory_prepare_turn("discount env var test text repeated repeated")
-        assert ":module/old-cache" in result
+        assert ":decision/old-cache" in result
 
 
 class TestLooksLikeNavigationTask:

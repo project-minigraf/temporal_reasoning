@@ -206,12 +206,10 @@ When running under Claude Code with the hook configuration in `hooks/claude-code
 
 `prepare_hook.py` fires on the `UserPromptSubmit` event. It:
 
-1. Extracts candidate entity tokens from the user's message (stop-word filtered, minimum 4 characters).
-2. Queries the graph for facts whose values contain those tokens, using `:valid-at` set to the current UTC timestamp so only currently-valid facts are returned.
-3. Falls back to a broad scan (capped by `MINIGRAF_PREPARE_SCAN_LIMIT`, default 50 rows) when no entity-specific results are found.
+1. Tokenizes the user's message, dropping stop words and single-character tokens (a reply of just "A" or "yes, and 2" matches nothing).
+2. Runs a BM25 full-text query against the fact index (`<graph_path>.fts.sqlite3`), restricted to **memory facts** — `:decision/`, `:preference/`, `:constraint/`, `:dependency/` entities. Ingested code-graph rows (functions, commits, lineage bookkeeping) are never injected: they matched prompts on common words and were almost all noise (#354). Reach code structure through `minigraf_query`; a build/fix-shaped prompt in an ingested repo also gets a one-line nudge toward it. Historical facts are included, labeled with their validity window.
+3. Scans up to `MINIGRAF_PREPARE_SCAN_LIMIT` rows (default 50) and collapses them into one line per entity, at most `MINIGRAF_PREPARE_MAX_ENTITIES` (default 8), best match first.
 4. Returns the results as `hookSpecificOutput.additionalContext` (with `hookEventName: "UserPromptSubmit"`), which Claude Code adds to the agent's context for that turn. The nesting is required: a top-level `additionalContext` is silently ignored, which is how this hook's output went unused until #344.
-
-For messages containing temporal signals (e.g. "before", "last week", "as of") with an explicit ISO date, `:valid-at` is set to that date instead (midnight UTC), enabling point-in-time recall.
 
 ### Finalize phase (after the turn)
 
@@ -241,8 +239,9 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 | `MINIGRAF_LLM_TIMEOUT_SECONDS` | `30` | Per-call timeout for the `llm` strategy |
 | `ANTHROPIC_API_KEY` | — | Required for the `llm` strategy with a Claude model |
 | `OPENAI_API_KEY` | — | Required for the `llm` strategy when `MINIGRAF_LLM_MODEL` is an OpenAI model (e.g. `gpt-4o-mini`) |
-| `MINIGRAF_PREPARE_SCAN_LIMIT` | `50` | Max facts returned by the prepare phase |
-| `MINIGRAF_MEMORY_BOOST` | `2.0` | Ranking boost for decision/preference/constraint/dependency facts over ingested code structure |
+| `MINIGRAF_PREPARE_SCAN_LIMIT` | `50` | Max index rows the prepare phase scans before grouping by entity |
+| `MINIGRAF_PREPARE_MAX_ENTITIES` | `8` | Max entities (one line each) the prepare phase injects |
+| `MINIGRAF_MEMORY_BOOST` | `2.0` | Ranking boost for decision/preference/constraint/dependency facts over ingested code structure. The prepare phase injects memory facts only, so the boost has no effect there |
 | `MINIGRAF_HISTORICAL_DISCOUNT` | `0.5` | Ranking discount for historical facts; below 1.0 demotes them, 1.0 is neutral |
 | `MINIGRAF_MAX_FACT_VALUE_LENGTH` | `4096` | Cap on a string-valued fact; a longer value is a schema violation |
 
