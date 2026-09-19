@@ -185,7 +185,7 @@ For traversal, use recursive rules (see Quick Reference).
 
 When the MCP server is configured and hooks are enabled, memory is managed automatically without explicit tool calls:
 
-- **Before each turn** — `memory_prepare_turn` is called with the user's message and the result is injected as `additionalContext`.
+- **Before each turn** — `memory_prepare_turn` is called with the user's message and the result is injected as `hookSpecificOutput.additionalContext` (a top-level `additionalContext` is silently ignored by Claude Code).
 - **After each turn** — `memory_finalize_turn` is called with the user+agent exchange; facts are extracted and stored.
 
 Extraction strategy is controlled by `MINIGRAF_EXTRACTION_STRATEGY` (env var):

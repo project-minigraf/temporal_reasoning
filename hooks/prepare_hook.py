@@ -2,9 +2,12 @@
 """
 Claude Code UserPromptSubmit hook — inject memory context before each turn.
 
-Claude Code calls this script with the user's message on stdin (JSON) and expects
-a JSON response with optional additionalContext. The context is prepended to the
-agent's working context for this turn.
+Claude Code calls this script with the user's message on stdin (JSON). Any
+memory context goes out as ``hookSpecificOutput.additionalContext`` with
+``hookEventName: "UserPromptSubmit"``, which Claude Code adds to the model's
+context for this turn. It must be nested there: a top-level
+``additionalContext`` is silently dropped, and this hook emitted exactly that
+shape until #344, so its context never reached the model at all.
 
 Usage (hooks/claude-code.json):
   "command": "python PATH_TO_REPO/hooks/prepare_hook.py"
@@ -40,7 +43,13 @@ def main() -> None:
         except Exception:
             pass  # Never block the turn on memory errors
 
-    print(json.dumps({"continue": True, "additionalContext": context}))
+    out = {"continue": True}
+    if context:
+        out["hookSpecificOutput"] = {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    print(json.dumps(out))
 
 
 if __name__ == "__main__":

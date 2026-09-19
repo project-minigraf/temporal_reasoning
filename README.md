@@ -209,7 +209,7 @@ When running under Claude Code with the hook configuration in `hooks/claude-code
 1. Extracts candidate entity tokens from the user's message (stop-word filtered, minimum 4 characters).
 2. Queries the graph for facts whose values contain those tokens, using `:valid-at` set to the current UTC timestamp so only currently-valid facts are returned.
 3. Falls back to a broad scan (capped by `MINIGRAF_PREPARE_SCAN_LIMIT`, default 50 rows) when no entity-specific results are found.
-4. Returns the results as `additionalContext` prepended to the agent's working context for that turn.
+4. Returns the results as `hookSpecificOutput.additionalContext` (with `hookEventName: "UserPromptSubmit"`), which Claude Code adds to the agent's context for that turn. The nesting is required: a top-level `additionalContext` is silently ignored, which is how this hook's output went unused until #344.
 
 For messages containing temporal signals (e.g. "before", "last week", "as of") with an explicit ISO date, `:valid-at` is set to that date instead (midnight UTC), enabling point-in-time recall.
 
