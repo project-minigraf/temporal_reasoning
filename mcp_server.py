@@ -8981,9 +8981,10 @@ async def _run_startup_backfill() -> None:
 
     Without this, backfill only ever ran lazily inside
     handle_memory_prepare_turn, which is very often invoked from the
-    UserPromptSubmit hook's short-lived, 5-second-timeout-bound process: a
-    slow rescan there trips the timeout and retry-storms on every subsequent
-    turn instead of ever completing.
+    UserPromptSubmit hook's short-lived, timeout-bound process: a slow rescan
+    there trips the timeout and retry-storms on every subsequent turn instead
+    of ever completing. (The bound is 30 s since #344; the 5000 configured
+    before that was read by Claude Code as SECONDS, not the intended 5 s.)
 
     The lease taken by _rebuild_index_from_graph releases the graph's file lock
     when the rebuild returns, so the prepare_hook subprocess can still acquire

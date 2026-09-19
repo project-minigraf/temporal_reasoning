@@ -667,8 +667,8 @@ def setup_claude_settings(target_dir: str) -> bool:
         })
         return "added"
 
-    prepare_status = _upsert_hook("UserPromptSubmit", "prepare_hook.py", prepare_cmd, 5000)
-    finalize_status = _upsert_hook("Stop", "finalize_hook.py", finalize_cmd, 10000)
+    prepare_status = _upsert_hook("UserPromptSubmit", "prepare_hook.py", prepare_cmd, 30)
+    finalize_status = _upsert_hook("Stop", "finalize_hook.py", finalize_cmd, 60)
 
     os.makedirs(claude_dir, exist_ok=True)
     try:

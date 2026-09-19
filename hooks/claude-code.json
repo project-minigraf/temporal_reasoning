@@ -24,7 +24,7 @@
           {
             "type": "command",
             "command": "python PATH_TO_REPO/hooks/prepare_hook.py",
-            "timeout": 5000
+            "timeout": 30
           }
         ]
       }
@@ -36,7 +36,7 @@
           {
             "type": "command",
             "command": "python PATH_TO_REPO/hooks/finalize_hook.py",
-            "timeout": 10000
+            "timeout": 60
           }
         ]
       }

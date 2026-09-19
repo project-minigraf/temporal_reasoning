@@ -18058,8 +18058,8 @@ class TestMainStartupBackfill:
         a background task at startup, mirroring the auto-start-ingestion
         pattern, instead of leaving it to the first lazy
         handle_memory_prepare_turn call -- which can run inside a short-lived,
-        5-second-timeout-bound UserPromptSubmit hook process and retry-storm
-        on a large graph."""
+        timeout-bound UserPromptSubmit hook process and retry-storm on a
+        large graph."""
         import mcp_server
 
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))

@@ -356,3 +356,44 @@ class TestMainHarnessGating:
 
         out = capsys.readouterr().out
         assert "Setup complete!" in out
+
+
+class TestHookTimeoutsAreSeconds:
+    """Claude Code reads a command hook's `timeout` in SECONDS (#344). The
+    installer wrote 5000/10000 believing milliseconds, i.e. an 83-minute and
+    a 2.8-hour bound: one prepare_hook run was observed at 32 minutes before
+    the user cancelled it."""
+
+    @staticmethod
+    def _timeouts(settings):
+        return {
+            event: [h["timeout"] for e in settings["hooks"][event] for h in e["hooks"]]
+            for event in ("UserPromptSubmit", "Stop")
+        }
+
+    def test_fresh_install_writes_second_valued_timeouts(self, tmp_path):
+        assert install.setup_claude_settings(str(tmp_path))
+        settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
+        assert self._timeouts(settings) == {"UserPromptSubmit": [30], "Stop": [60]}
+
+    def test_reinstall_corrects_a_millisecond_valued_timeout(self, tmp_path):
+        # The path every existing user takes: the entry already references our
+        # scripts, so it is updated in place rather than appended.
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        old = {"hooks": {
+            event: [{"matcher": "", "hooks": [{"type": "command",
+                                               "command": f"python /x/hooks/{script}",
+                                               "timeout": ms}]}]
+            for event, (script, ms) in
+            {"UserPromptSubmit": ("prepare_hook.py", 5000), "Stop": ("finalize_hook.py", 10000)}.items()
+        }}
+        (claude_dir / "settings.local.json").write_text(json.dumps(old))
+        assert install.setup_claude_settings(str(tmp_path))
+        settings = json.loads((claude_dir / "settings.local.json").read_text())
+        assert self._timeouts(settings) == {"UserPromptSubmit": [30], "Stop": [60]}
+
+    def test_sample_config_matches_installer(self):
+        with open(os.path.join(install.REPO_DIR, "hooks", "claude-code.json")) as f:
+            sample = json.load(f)
+        assert self._timeouts(sample) == {"UserPromptSubmit": [30], "Stop": [60]}
