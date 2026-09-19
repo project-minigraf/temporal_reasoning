@@ -1603,6 +1603,47 @@ at all. A graph that predates phase 5 records no branch and therefore reads
 Existing graphs are not repaired; an affected one is rebuilt into a fresh
 graph path, as everywhere else in this arc.
 
+**Stage B writes one kind of entity rather than reconciling it: a REBIRTH
+inside the reverse region (#349).** The reverse stream cannot see
+incarnations: it skips "D" files, and a commit removing a function from a
+surviving file simply lacks it, so it writes ONE entity, walks its guess down
+to the first birth, and leaves a retroactive `:modified-in` at each rebirth.
+Stage B's lifecycle pass closes that entity at the first removal, and before
+the fix nothing re-opened it — `_forward_apply(lifecycle_only=True)` discards
+its A/M output, and `_correction_sweep_apply` met the reborn entity in case
+3's ambiguous-zero skip. The run reported `complete` with the entity not live
+at HEAD. No gate could see it: not live, so both `:introduced-by` checks skip
+it; graph and index agree, so `divergence` is 0. stderr was NOT silent, as the
+issue said — each rebirth printed an ordinary "left unreconciled ...
+introduced-by values: []" line — but that only feeds
+`correction_sweep_skipped`, which nothing gates. The same failure hit an
+entity born in the FORWARD region and then removed and reborn inside the
+reverse one.
+
+`_correction_sweep_apply` now treats **zero `:introduced-by` AND no live
+`:ident`** as a rebirth: it writes the entity's full candidate triples at this
+commit (`:contains` one per call) and retracts `[ident :modified-in <this
+commit>]`. Both halves are load-bearing, and ablation proves it: without the
+write the entities are not live; without the retract the self-modification
+check and the point-in-time comparison go red. Liveness is what separates a
+rebirth from #313's torn entity (live, zero values), which keeps the
+fail-safe skip. The check sits only on the zero-values path, so the common
+case pays no extra query. `TestRebirthInsideReverseRegion` runs the parity
+oracle plus point-in-time snapshots at every commit date, over two lives of a
+module and a function in each group.
+
+**Measured exposure on this repo: nil at FUNCTION level too.** The 957-commit
+history (`49acbb1`) was built three ways: forward-only, 1:1 pre-fix, and 1:1
+post-fix. All three agree exactly on 3988 live code entities and 3899
+`:introduced-by` facts, and pre and post are identical in every compared set.
+The forward-only graph does carry 23 `:modified-in` edges the multi-stream
+graphs lack. They are NOT this defect: every one sits at the entity's own
+introduction commit, from a name defined twice in one file (`_ingest` in
+several test classes). `_build_code_triples` introduces the first definition
+and reads the second as a modification, while the multi-stream paths dedupe
+candidates. No graph format bump and no migration: this only changes what
+Stage B writes going forward.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.

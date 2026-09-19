@@ -8099,7 +8099,8 @@ def _entity_ident_is_live(db: Any, entity_ident: str) -> bool:
     and emitted only :modified-in -- the entity was resurrected with lineage
     but no identity, invisible to nearly every query, and
     _correction_sweep_apply could not repair it either (it reconciles lineage
-    only and never emits structural facts).
+    only; the one place it emits structural facts, #349's rebirth branch,
+    requires ZERO :introduced-by values, and a ghost still carries one).
 
     Task 4 of this change does make close sites retract :introduced-by, which
     would make the old gate correct too. This gate stays on :ident anyway: the
@@ -11876,7 +11877,10 @@ def _forward_apply(
       keeps its _build_code_triples emission for the NEW path: the reverse
       stream skipped renames entirely, so nothing ever wrote those entities.
     * "A"/"M" files still CALL _build_code_triples, and its returned triples
-      are DISCARDED. This looks redundant and is not: state.entity_valid_from
+      are DISCARDED -- including for an entity reborn after a removal this
+      pass already closed, whose introduction _correction_sweep_apply has
+      written just before this call (#349). This looks redundant and is
+      not: state.entity_valid_from
       after Stage A covers only positions 0..meeting_point, so an entity
       introduced INSIDE the reverse region is absent from it and a later
       deletion of that entity within the same region would close with
@@ -12662,6 +12666,13 @@ def _correction_sweep_apply(
     never writes commit_hash's own :type/commit entity (2b already wrote
     it for every commit in this sweep's range). DB-bound, parse-free.
 
+    The one entity it WRITES rather than reconciles is a rebirth (#349): a
+    candidate with no :introduced-by and no live :ident was closed earlier in
+    this same sweep by the lifecycle pass and reappears here, so it gets the
+    full introduction a forward walk would write at this commit, and the
+    reverse stream's retroactive :modified-in at this commit is retracted.
+    See the branch's own comment for why nothing else in Stage B writes it.
+
     Re-dates each confirmed (case 1) entity's structural facts to the
     introduction commit (#233), which _reverse_apply used to do eagerly on
     every provisional move. Sound here and only here: the gap-closed
@@ -12811,6 +12822,49 @@ def _correction_sweep_apply(
                     file=sys.stderr,
                 )
                 introduced_by_values = {survivor}
+
+            # #349 REBIRTH: no :introduced-by AND no live :ident means this
+            # sweep's own lifecycle pass closed the entity at an EARLIER
+            # commit of the region (_forward_apply(lifecycle_only=True)
+            # retracts both, #231), and the entity reappears here. The
+            # reverse stream never saw the two incarnations as distinct: it
+            # skips "D" files and the removing commit's diff simply lacks
+            # the entity, so it wrote ONE entity, moved its guess down to
+            # the first birth, and left a retroactive [ident :modified-in
+            # <this commit>] behind at the rebirth. Nothing else writes a
+            # birth in Stage B -- the lifecycle pass discards its A/M
+            # output -- so without this branch the entity fell into case
+            # 3's ambiguous-zero skip and stayed closed at HEAD on a run
+            # reporting complete, betrayed only by an ordinary skip line
+            # that no at-scale gate fails on.
+            #
+            # Write exactly what a forward walk writes at an introduction:
+            # the entity's full candidate triples, :introduced-by included,
+            # at this commit's timestamp -- and retract the retroactive
+            # :modified-in, since forward never asserts :modified-in at an
+            # entity's own introduction. The lifecycle pass that follows
+            # records the same introduction in its walk state (the close
+            # purged the ident, so _build_code_triples reads it as new),
+            # which is what lets a LATER removal close this incarnation.
+            #
+            # Gated on BOTH halves, and evaluated only on the zero-values
+            # path, so the common case pays no extra query. Liveness is the
+            # discriminator from #313's torn entity: live with zero
+            # :introduced-by is an interrupted write, not a rebirth, and
+            # keeps the fail-safe skip below.
+            if not introduced_by_values and not _entity_ident_is_live(db, ident):
+                rebirth = candidate_triples_by_ident[ident]
+                contains = [t for t in rebirth if ":contains" in t]
+                other = [t for t in rebirth if ":contains" not in t]
+                _transact(db, "[" + " ".join(other) + "]", commit_ts_iso, index_con=index_con)
+                for triple in contains:  # one per call: minigraf#287
+                    _transact(db, "[" + triple + "]", commit_ts_iso, index_con=index_con)
+                raw_mod = _db_execute(
+                    db, f"(query [:find ?c :where [{ident} :modified-in ?c]])"
+                )
+                if [commit_ident] in json.loads(raw_mod).get("results", []):
+                    _retract(db, f"[[{ident} :modified-in {commit_ident}]]", index_con=index_con)
+                continue
 
             if _lineage_is_provisional(db, ident):
                 if introduced_by_values == {commit_ident}:

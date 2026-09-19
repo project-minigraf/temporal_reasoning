@@ -25891,6 +25891,12 @@ class TestMultiStreamParityWithForwardOnly:
     and its now-passing default-ratio companion. Mixing path reuse into the
     parity oracle here would only duplicate what that class already covers,
     not exercise anything new.
+
+    That reasoning held for reuse ACROSS the meeting point and was wrong for
+    reuse entirely INSIDE the reverse region: an entity born, removed and
+    reborn there came out of Stage B closed at HEAD (#349), a case #231's
+    test never reached. TestRebirthInsideReverseRegion runs this class's
+    oracle over exactly that fixture.
     """
 
     # frontier-high and :ingestion/correction-sweep-through only exist when a
@@ -26386,6 +26392,183 @@ class TestMultiStreamParityWithForwardOnly:
         assert mcp_server._code_ident("function", "auth.py", "audit") in live, \
             "the function born in the interrupted run's reverse region was " \
             "closed by the resumed forward walk"
+
+
+class TestRebirthInsideReverseRegion:
+    """#349: an entity removed and reborn inside the reverse-claimed region
+    must come out of a multi-stream ingest exactly as it comes out of a
+    forward-only one -- live at HEAD, introduced by its LAST rebirth, with
+    each earlier incarnation closed over its own window. The issue named the
+    case whose first birth is inside the region too; one born in the forward
+    region and then removed and reborn inside it failed identically (measured
+    by ablation), so the fixture carries both.
+
+    The reverse stream cannot see incarnations: it skips "D" files, and the
+    commit that removes a function from a surviving file simply lacks it. So
+    it writes ONE entity, walks its guess down to the first birth, and leaves
+    a retroactive :modified-in at every rebirth. Stage B's lifecycle pass then
+    closes that entity at the first removal, and before the fix nothing
+    re-opened it: the run reported complete with the entity not live, and no
+    at-scale gate can see that (not live -> both :introduced-by checks skip
+    it; graph and index agree -> divergence 0). stderr was NOT silent, as the
+    issue reported it -- each rebirth printed an ordinary "left unreconciled
+    ... ambiguous introduced-by values: []" sweep line -- but those only feed
+    stderr_capture's correction_sweep_skipped count, which nothing gates on.
+
+    Reuses TestMultiStreamParityWithForwardOnly's oracle through an instance
+    rather than by subclassing, so that class's own tests are not
+    re-collected against this fixture.
+    """
+
+    # 1:1 over twelve commits: forward claims p0-p5, reverse p6-p11. Group F's
+    # p2 birth is forward-claimed on purpose (see _repo), so it is not listed.
+    _LIFECYCLE_POSITIONS = [6, 7, 8, 9, 10, 11]
+
+    def _parity(self):
+        return TestMultiStreamParityWithForwardOnly()
+
+    def _repo(self, tmp_path):
+        """Twelve commits, dated 2021-03-01 (p0) .. 2021-03-12 (p11).
+
+        Each life is exercised by a module (file re-created) AND a function
+        (re-added inside a file that survives), since the lifecycle pass
+        closes the two through different branches -- the "D" branch and the
+        "M" removed-idents diff respectively. Two groups, differing only in
+        where their FIRST birth lands, because that decides what the reverse
+        stream finds when it reaches the first rebirth:
+
+          group R (gamma.py + auth.py's ghost): born at p6, inside the
+            reverse region, so the reverse stream writes one PROVISIONAL
+            entity and walks its guess down to p6;
+          group F (delta.py + util.py's spook): born at p2, inside the
+            forward region, so the reverse stream meets an AUTHORITATIVE
+            entity and only adds :modified-in edges.
+
+        From p7 on both groups follow the same lives:
+
+          p7  removed
+          p8  reborn                  <- first rebirth
+          p9  modified                <- the rebirth must carry later edits
+          p10 removed again           <- ...and be closable itself
+          p11 reborn again            <- live at HEAD
+        """
+        h = self._parity()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for args in (["init", "-b", "master"], ["config", "user.email", "t@t.com"],
+                     ["config", "user.name", "T"]):
+            _subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+        module = (
+            "import util\n\ndef {fn}():\n    return {n}\n\n"
+            "class {cls}:\n    def m(self):\n        return {n}\n"
+        )
+        # n per position; None = absent. p9 changes n (a modification).
+        tail = [None, 1, 2, None, 3]  # p7..p11
+        group_r = [None] * 6 + [1] + tail  # p0..p11
+        group_f = [None, None] + [1] * 5 + tail
+
+        def put(path, n, text):
+            if n is None:
+                if (repo / path).exists():
+                    (repo / path).unlink()
+            else:
+                (repo / path).write_text(text)
+
+        for p in range(12):
+            r, f = group_r[p], group_f[p]
+            # auth.py and util.py survive every commit; util.py also takes a
+            # plain edit on every forward-region commit.
+            (repo / "auth.py").write_text(
+                f"def login():\n    return {p}\n"
+                + ("" if r is None else f"\ndef ghost():\n    return {r}\n")
+            )
+            (repo / "util.py").write_text(
+                f"def normalize(s):\n    return s * {min(p, 5)}\n"
+                + ("" if f is None else f"\ndef spook():\n    return {f}\n")
+            )
+            put("gamma.py", r, module.format(fn="g", cls="K", n=r))
+            put("delta.py", f, module.format(fn="d", cls="D", n=f))
+            h._commit(repo, f"p{p}", p + 1)
+        return repo
+
+    def _reborn(self):
+        import mcp_server
+        return {
+            mcp_server._code_ident("module", "gamma.py"),
+            mcp_server._code_ident("function", "gamma.py", "g"),
+            mcp_server._code_ident("class", "gamma.py", "K"),
+            mcp_server._code_ident("function", "auth.py", "ghost"),
+            mcp_server._code_ident("module", "delta.py"),
+            mcp_server._code_ident("function", "delta.py", "d"),
+            mcp_server._code_ident("class", "delta.py", "D"),
+            mcp_server._code_ident("function", "util.py", "spook"),
+        }
+
+    async def _ingest_both(self, tmp_path, monkeypatch):
+        h = self._parity()
+        repo = self._repo(tmp_path)
+        multi = tmp_path / "multi.graph"
+        forward_only = tmp_path / "fwd.graph"
+        await h._ingest(repo, multi, monkeypatch, "1:1")
+        await h._ingest(repo, forward_only, monkeypatch, f"{10**6}:1")
+        # Non-vacuity: every birth, removal and rebirth was reverse-claimed.
+        h._assert_reverse_claimed(multi, repo, self._LIFECYCLE_POSITIONS)
+        return h, multi, forward_only
+
+    @pytest.mark.asyncio
+    async def test_reborn_entities_are_live_and_match_forward_only(self, tmp_path, monkeypatch):
+        h, multi, forward_only = await self._ingest_both(tmp_path, monkeypatch)
+        reborn = self._reborn()
+
+        # Positive control: the oracle graph really does hold them live, so
+        # the assertion below is about the multi-stream run and not about a
+        # fixture that never produced them.
+        fwd_live = {i for (i,) in h._live_idents(forward_only)}
+        assert reborn <= fwd_live, f"forward-only lost reborn entities: {reborn - fwd_live}"
+
+        multi_live = {i for (i,) in h._live_idents(multi)}
+        assert reborn <= multi_live, (
+            f"reborn entities not live at HEAD after the 1:1 run: {sorted(reborn - multi_live)}"
+        )
+        # Lineage, liveness, the full fact shape, and no provisional marker.
+        h._assert_parity(multi, forward_only)
+
+    @pytest.mark.asyncio
+    async def test_every_commit_date_matches_forward_only(self, tmp_path, monkeypatch):
+        """Current-time parity cannot see an incarnation's WINDOW -- a
+        rebirth written at the wrong valid-from, or a first life left open
+        across the gap, agrees at HEAD. So compare every reborn entity's
+        facts point-in-time at every commit date of the region, plus the
+        day after the tip."""
+        h, multi, forward_only = await self._ingest_both(tmp_path, monkeypatch)
+
+        def at(graph, day):
+            rows = []
+            for ident in sorted(self._reborn()):
+                rows += [(ident, *r) for r in h._raw_query(graph, (
+                    f'(query [:find ?a ?v :valid-at "2021-03-{day:02d}T12:00:00Z" '
+                    f':where [{ident} ?a ?v]])'
+                ))]
+                rows += [(ident, "<-", *r) for r in h._raw_query(graph, (
+                    f'(query [:find ?e ?a :valid-at "2021-03-{day:02d}T12:00:00Z" '
+                    f':where [?e ?a {ident}]])'
+                ))]
+            return sorted(rows)
+
+        saw_live = saw_dead = False
+        for day in range(2, 14):  # p1 (day 2) .. p11 (day 12), then after the tip
+            a, b = at(multi, day), at(forward_only, day)
+            saw_live |= any(r[1] == ":ident" for r in b)
+            saw_dead |= not any(r[1] == ":ident" for r in b)
+            assert a == b, (
+                f"1:1 and forward-only disagree on 2021-03-{day:02d}\n"
+                f"  only in 1:1:  {sorted(set(a) - set(b))}\n"
+                f"  only in fwd:  {sorted(set(b) - set(a))}"
+            )
+        # Positive control: the window really alternates, so a comparison
+        # that matched nothing on every day would not pass as agreement.
+        assert saw_live and saw_dead
 
 
 class TestStagingAndShutdown:
@@ -30517,3 +30700,4 @@ class TestStageBYieldsTheLock:
             f"-- the window broke after its last commit although `nxt` already "
             f"selected nothing"
         )
+
