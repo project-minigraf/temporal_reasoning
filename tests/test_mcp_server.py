@@ -16912,9 +16912,9 @@ class TestRunIngestionBatchedIndexWrites:
         below) confirmed this fixture would need 4 separate open+commit+close
         cycles if ingestion still wrote to the index one triple-batch at a
         time (the pre-Task-8 behavior) -- each with its own fsync -- versus
-        exactly 1 connection open and 4 commits (one per source commit, one
-        for Stage B's sweep window, plus one final flush-on-close) once
-        batched. The gap between those two
+        exactly 1 connection open and a per-lease/per-commit number of
+        commits once batched (9 for this fixture since #347 -- see the
+        breakdown at the assertion). The gap between those two
         numbers is what would grow unboundedly on a 1M-fact repo if this
         regressed back to per-triple commits.
 
@@ -16959,19 +16959,25 @@ class TestRunIngestionBatchedIndexWrites:
         # call). A regression back to per-call connections would make this
         # >= 4 for this fixture (see docstring).
         assert len(open_calls) == 1
-        # git_repo has 2 commits -> 2 per-commit commits (one right after
-        # each commit's _db_checkpoint) + 1 from Stage B's single sweep
-        # window (_db_lease_async_committing_index commits before every
-        # window's lease release -- final review C1; the first window is
-        # always entered, because that is where the sweep is planned, even
-        # when it then declines) + 1 final flush inside
-        # fact_index.close_writer at run end = 4. This is a tight equality,
-        # not just an upper bound: 0 (nothing wired up) and any count that
-        # scaled with the ~36 individual facts these 2 commits produce would
-        # both fail it, so a regression to either "no batching wired up" or
-        # "still committing per triple" is caught, not just silently allowed
-        # through by a loose bound.
-        assert len(commit_calls) == 4
+        # git_repo has 2 commits. Every index-writing lease _run_ingestion
+        # takes commits before it releases (_db_lease_async_committing_index;
+        # Stage B's windows since final review C1, the rest since #347):
+        #   1  preload lease (format stamp, :ingestion/branch, _frontier_load)
+        #   2  _forward_apply's own per-commit commit, x2 commits
+        #   2  the Stage A dispatch lease around each of those, x2
+        #      (a no-op at the SQLite level: _forward_apply already committed,
+        #      and sqlite3's commit() with no open transaction does nothing)
+        #   1  Stage B's single sweep window (the first window is always
+        #      entered, because that is where the sweep is planned, even when
+        #      it then declines)
+        #   1  the lineage fold's lease
+        #   1  the _ingest_tags/_last_run_write lease
+        #   1  the final flush inside fact_index.close_writer
+        # = 9. A tight equality, not an upper bound: 0 (nothing wired up) and
+        # any count that scaled with the ~36 individual facts these 2 commits
+        # produce would both fail it. Every term is per-lease or per-commit,
+        # never per-triple, which is the property this test guards.
+        assert len(commit_calls) == 9
 
 
 class TestOpenIndexWriterSafeRetry:
@@ -30850,3 +30856,260 @@ class TestStageBYieldsTheLock:
             f"selected nothing"
         )
 
+
+
+class TestIngestionCommitsTheIndexBeforeReleasingTheGraph:
+    """#347. Stage B's windows commit the batched fact-index connection
+    before releasing the graph lease (_db_lease_async_committing_index), but
+    every OTHER lease _run_ingestion takes released the graph with
+    `index_con`'s SQLite write transaction still open: the preload lease
+    (format stamp, :ingestion/branch, _frontier_load's migrations), Stage A's
+    per-commit dispatch (_reverse_apply writes index rows and never commits;
+    only _forward_apply does), the end-of-walk skipped-span flush, the
+    lineage fold, and _ingest_tags/_last_run_write.
+
+    That is the lock-order inversion TestStageBYieldsTheLock pins for Stage
+    B: an auto-memory hook takes the free graph lock, then blocks on SQLite
+    for its 5 s busy timeout while HOLDING the graph; ingestion holds SQLite
+    and cannot re-acquire the graph (~2.6 s budget), so the run ends
+    `status: error`.
+    """
+
+    def _prepare(self, tmp_path, monkeypatch, n=12):
+        return TestStageBYieldsTheLock()._prepare(tmp_path, monkeypatch, n=n)
+
+    @staticmethod
+    def _run_ingestion_line():
+        """The _run_ingestion source line whose `async with` took this lease,
+        found by walking out through contextlib -- so a site routed through
+        _db_lease_async_committing_index is still attributed to its caller."""
+        f = sys._getframe(2)
+        while f is not None and f.f_code.co_name != "_run_ingestion":
+            f = f.f_back
+        return f.f_lineno if f is not None else None
+
+    async def _released_with_open_txn(self, tmp_path, monkeypatch):
+        """Run a fresh ingestion and record, for every lease _run_ingestion
+        releases, whether the batched index connection was still inside a
+        transaction at that instant. Returns (released, cons, rev).
+
+        Checked inside the lease, after the body (and after the committing
+        wrapper's own `finally`), which is exactly the last instant before the
+        graph lock can pass to another process.
+        """
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+
+        cons = []
+        real_open = mcp_server._open_index_writer_safe
+
+        def open_spy(path):
+            con = real_open(path)
+            cons.append(con)
+            return con
+
+        released = []  # (line, in_transaction)
+        real_lease = mcp_server.db_lease_async
+
+        @contextlib.asynccontextmanager
+        async def lease_spy():
+            line = self._run_ingestion_line()
+            async with real_lease() as db:
+                try:
+                    yield db
+                finally:
+                    if cons and cons[0] is not None:
+                        released.append((line, cons[0].in_transaction))
+
+        rev = []
+        real_rev = mcp_server._reverse_apply
+
+        def rev_spy(*a, **kw):
+            rev.append(1)
+            return real_rev(*a, **kw)
+
+        monkeypatch.setattr(mcp_server, "_open_index_writer_safe", open_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress.get("status") == "complete", mcp_server._ingest_progress
+        return released, cons, rev
+
+    @staticmethod
+    def _assert_none_open(released):
+        open_at = sorted({line for line, open_ in released if open_})
+        assert not open_at, (
+            f"_run_ingestion released the graph lease with the fact-index write "
+            f"transaction still open at mcp_server.py line(s) {open_at} -- a "
+            f"hook taking the graph there blocks on SQLite while holding it, "
+            f"and ingestion's next lease cannot be acquired (#347)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_lease_is_released_with_an_open_index_transaction(
+        self, tmp_path, monkeypatch
+    ):
+        """Deterministic form, over every site a fresh multi-stream run
+        reaches (preload, Stage A, Stage B windows, the fold, _ingest_tags /
+        _last_run_write), naming the offending source lines."""
+        released, cons, rev = await self._released_with_open_txn(tmp_path, monkeypatch)
+        self._assert_none_open(released)
+        # Positive controls, after the defect assertion: the index writer was
+        # really opened, leases were really observed, and the reverse stream
+        # really wrote -- the site the issue is chiefly about.
+        assert cons and cons[0] is not None, "no batched index connection was opened"
+        assert len(released) >= 3, f"only {len(released)} lease(s) observed"
+        assert rev, "no reverse position was applied, so Stage A's reverse site went unexercised"
+
+    @pytest.mark.asyncio
+    async def test_the_skipped_span_flush_commits_the_index_too(
+        self, tmp_path, monkeypatch
+    ):
+        """The end-of-walk skipped-span flush is the one site a fresh run
+        never reaches: it needs a _skip_claim hit, and after #325 a loadable
+        completed region exists only on the narrow divergent-ref-regained
+        path. So _skip_claim is forced to retire the TOP reverse position.
+        That is a lie about completion, harmless here: this test inspects
+        only the index transaction at each release, never the graph's
+        content. The flush is a real _frontier_persist_span write through
+        index_con.
+        """
+        import mcp_server
+        real_skip = mcp_server._skip_claim
+        flushes = []
+        real_span = mcp_server._frontier_persist_span
+
+        def skip_top(tag, pos, regions):
+            if tag == "rev" and not flushes and pos == skip_top.top:
+                return True
+            return real_skip(tag, pos, regions)
+        skip_top.top = 11  # _prepare's n=12 -> positions 0..11
+
+        def span_spy(*a, **kw):
+            flushes.append(1)
+            return real_span(*a, **kw)
+
+        monkeypatch.setattr(mcp_server, "_skip_claim", skip_top)
+        monkeypatch.setattr(mcp_server, "_frontier_persist_span", span_spy)
+        released, _cons, _rev = await self._released_with_open_txn(tmp_path, monkeypatch)
+        self._assert_none_open(released)
+        assert flushes, (
+            "the skipped-span flush never ran, so this test did not reach the "
+            "site it exists for"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_hook_writing_between_stage_a_leases_lands_in_both(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end form, with a real hook PROCESS doing a real
+        handle_minigraf_transact (graph, then its own SQLite connection).
+
+        Stage A takes no pause between leases, so the graph is free only for
+        an instant and a real hook rarely lands there. The test widens that
+        instant into an interval deterministically: the first lease taken
+        after a reverse write sleeps before acquiring, and releases the
+        (pre-spawned, already imported) hook as it starts. Under the defect
+        the reverse write's index transaction is still open, the hook holds
+        the graph while blocked on SQLite, and the run ends `status: error`.
+        """
+        import mcp_server
+        import fact_index
+        repo, graph = self._prepare(tmp_path, monkeypatch)
+
+        ready = tmp_path / "hook_ready"
+        go = tmp_path / "hook_go"
+        script = (
+            "import json, os, sys, time\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n"
+            "import mcp_server\n"
+            f"open({str(ready)!r}, 'w').close()\n"
+            f"while not os.path.exists({str(go)!r}):\n"
+            "    time.sleep(0.002)\n"
+            "try:\n"
+            "    r = mcp_server.handle_minigraf_transact(\n"
+            "        '[[:decision/hook-fact :description \"written by hook\"]]', 'hook')\n"
+            "    print(json.dumps({'ok': bool(r.get('ok')), 'err': r.get('error'),\n"
+            "                      'written_at': time.time()}))\n"
+            "except Exception as e:\n"
+            "    print(json.dumps({'ok': False, 'err': repr(e), 'written_at': time.time()}))\n"
+            "sys.stdout.flush()\n"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MINIGRAF_")}
+        env["MINIGRAF_GRAPH_PATH"] = str(graph)
+        proc = _subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True, env=env,
+        )
+        state = {"rev": 0, "paused_at": None, "pause_end": None}
+        try:
+            deadline = time.monotonic() + 60
+            while not ready.exists():
+                assert proc.poll() is None, proc.communicate()
+                assert time.monotonic() < deadline, "the hook process never got ready"
+                await asyncio.sleep(0.01)
+
+            real_rev = mcp_server._reverse_apply
+            real_lease = mcp_server.db_lease_async
+
+            def rev_spy(*a, **kw):
+                out = real_rev(*a, **kw)
+                state["rev"] += 1
+                return out
+
+            @contextlib.asynccontextmanager
+            async def lease_spy():
+                if state["rev"] and state["paused_at"] is None:
+                    state["paused_at"] = time.time()
+                    go.touch()
+                    await asyncio.sleep(1.0)
+                    state["pause_end"] = time.time()
+                async with real_lease() as db:
+                    yield db
+
+            monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)
+            monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+            await mcp_server._run_ingestion(str(repo), "master")
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+        assert lines, f"the hook printed no result. stdout={out!r} stderr={err!r}"
+        hook = json.loads(lines[-1])
+        assert mcp_server._ingest_progress.get("status") == "complete", (
+            f"ingestion did not complete while a hook wrote between Stage A "
+            f"leases: {mcp_server._ingest_progress.get('status')!r}, error="
+            f"{mcp_server._ingest_progress.get('error')!r}. A reverse write "
+            f"released the graph lease with its fact-index transaction still "
+            f"open, so the hook held the graph while blocked on SQLite (#347)"
+        )
+        assert hook["ok"], f"the hook's transact failed: {hook!r}; stderr={err[-2000:]!r}"
+
+        mcp_server._reset_db_state()
+        with mcp_server.db_lease() as db:
+            graph_rows = json.loads(mcp_server._db_execute(
+                db, '(query [:find ?d :where [:decision/hook-fact :description ?d]])'
+            )).get("results", [])
+        con = fact_index.open_reader(fact_index.index_path_for(str(graph)))
+        try:
+            index_rows = con.execute(
+                "select value from facts_fts where entity = ':decision/hook-fact'"
+            ).fetchall()
+        finally:
+            con.close()
+        assert graph_rows, f"the hook's fact is not in the graph: {hook!r}"
+        assert index_rows, (
+            f"the hook's fact reached the graph but NOT the fact index (#302 "
+            f"divergence). hook stderr tail: {err[-2000:]!r}"
+        )
+        # Positive controls: the pause really followed a reverse write, and
+        # the hook really wrote INSIDE it -- not after the run finished.
+        assert state["paused_at"] is not None, "no lease followed a reverse write"
+        assert state["paused_at"] <= hook["written_at"] <= state["pause_end"], (
+            f"the hook wrote at {hook['written_at']:.3f}, outside the pause "
+            f"[{state['paused_at']:.3f}, {state['pause_end']:.3f}], so it did "
+            f"not go through the Stage A gap and this test proved nothing"
+        )
