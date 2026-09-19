@@ -10377,9 +10377,9 @@ class TestSkipFlushNeverCoversFailedWrites:
                                   pos, file_results, *args, **kwargs):
             # *args/**kwargs, not a fixed persist_claim/claim_ident/
             # absorbed_idents signature (#325 review round 2): forwards
-            # whatever _run_ingestion's write dispatch passes positionally,
-            # so this wrapper does not need updating again the next time
-            # _reverse_apply's signature grows.
+            # whatever _run_ingestion's write dispatch passes (keyword-only
+            # since #346), so this wrapper does not need updating again the
+            # next time _reverse_apply's signature grows.
             if linearization[pos] in failing:
                 raise RuntimeError("simulated per-commit write failure")
             return real_reverse_apply(
@@ -10811,7 +10811,7 @@ class TestPerIntervalReverseFloor:
         def fail_at_5(db, repo_path, linearization, commit_metadata, pos,
                       files, *args, **kwargs):
             # *args/**kwargs so this wrapper forwards whatever _run_ingestion's
-            # write dispatch passes positionally, unaffected by _reverse_apply
+            # write dispatch passes (keyword-only since #346), unaffected by _reverse_apply
             # growing more parameters later (matches the sibling wrappers in
             # TestSkipFlushNeverCoversFailedWrites / TestNonTipWriteFailureIsReWalked).
             if linearization[pos] == lin1[5]:
@@ -25356,10 +25356,8 @@ class TestStageBCorrectionSweep:
         real_forward_apply = mcp_server._forward_apply
 
         def failing_forward_apply(*args, **kwargs):
-            # _run_ingestion submits this via run_in_executor, which passes
-            # every argument positionally -- lifecycle_only is the 9th.
-            lifecycle_only = args[8] if len(args) > 8 else kwargs.get("lifecycle_only", False)
-            if lifecycle_only:
+            # lifecycle_only is keyword-only (#346).
+            if kwargs.get("lifecycle_only", False):
                 swept.append(args[3][0])  # commit tuple's hash
                 if len(swept) == 2:
                     raise RuntimeError("lifecycle pass boom")
@@ -30298,12 +30296,13 @@ class TestForwardClaimCeiling342:
         failed = {}
 
         def failing(*args, **kwargs):
-            lin = args[6] if len(args) > 6 else kwargs.get("linearization")
+            # linearization/pos are keyword-only (#346).
+            lin = kwargs.get("linearization")
             if lin is not None:
                 seen["n"] += 1
                 if seen["n"] == n:
                     failed["hash"] = args[3][0]
-                    failed["pos"] = args[7] if len(args) > 7 else kwargs["pos"]
+                    failed["pos"] = kwargs["pos"]
                     raise RuntimeError("injected forward write failure")
             return real(*args, **kwargs)
 
@@ -30524,9 +30523,8 @@ class TestStageBYieldsTheLock:
             return out
 
         def forward_spy(*a, **kw):
-            # run_in_executor passes everything positionally; lifecycle_only
-            # is the 9th argument.
-            lifecycle_only = a[8] if len(a) > 8 else kw.get("lifecycle_only", False)
+            # lifecycle_only is keyword-only (#346).
+            lifecycle_only = kw.get("lifecycle_only", False)
             out = real_forward(*a, **kw)
             if lifecycle_only:
                 counts["lifecycle"] += 1
@@ -31280,3 +31278,83 @@ class TestIngestionCommitsTheIndexBeforeReleasingTheGraph:
             f"[{state['paused_at']:.3f}, {state['pause_end']:.3f}], so it did "
             f"not go through the Stage A gap and this test proved nothing"
         )
+
+
+class TestApplyDispatchIsKeywordSafe:
+    """#346 prerequisite: every defaulted parameter of _forward_apply and
+    _reverse_apply is KEYWORD-ONLY, and _run_ingestion passes each of them by
+    keyword.
+
+    Both functions are submitted through run_in_executor, which takes no
+    kwargs, so until #346 every argument reached them POSITIONALLY --
+    _forward_apply's lifecycle_only was argument 9 and persist_claim argument
+    10, both defaulted, and Stage B's call already passed fewer than the full
+    count. Inserting a parameter ahead of them raised no TypeError: it
+    silently rebound the existing booleans, and a wrong lifecycle_only flips
+    the whole function's behaviour. Keyword-only parameters turn that into a
+    TypeError at the first call.
+    """
+
+    @staticmethod
+    def _defaulted_and_kw_only(fn):
+        import inspect
+        params = inspect.signature(fn).parameters.values()
+        defaulted = {p.name for p in params if p.default is not inspect.Parameter.empty}
+        kw_only = {p.name for p in params if p.kind is inspect.Parameter.KEYWORD_ONLY}
+        return defaulted, kw_only
+
+    @pytest.mark.parametrize("name", ["_forward_apply", "_reverse_apply"])
+    def test_every_defaulted_parameter_is_keyword_only(self, name):
+        import mcp_server
+        defaulted, kw_only = self._defaulted_and_kw_only(getattr(mcp_server, name))
+        assert defaulted, f"positive control: {name} has no defaulted parameters at all"
+        assert defaulted == kw_only, (
+            f"{name}: defaulted parameters {sorted(defaulted - kw_only)} can be "
+            f"bound positionally, so a parameter inserted ahead of them "
+            f"silently rebinds them instead of raising TypeError"
+        )
+
+    def test_ingestion_passes_every_optional_argument_by_keyword(self, tmp_path, monkeypatch):
+        """A real 1:1 run reaches all three dispatch sites: Stage A forward,
+        Stage A reverse, and Stage B's lifecycle pass. Each must hand over
+        exactly the required positionals and nothing more."""
+        import mcp_server
+        real_forward = mcp_server._forward_apply
+        real_reverse = mcp_server._reverse_apply
+        calls = []
+
+        def forward_spy(*args, **kwargs):
+            calls.append(("fwd", len(args), dict(kwargs)))
+            return real_forward(*args, **kwargs)
+
+        def reverse_spy(*args, **kwargs):
+            calls.append(("rev", len(args), dict(kwargs)))
+            return real_reverse(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", forward_spy)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", reverse_spy)
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        repo = _phase4_linear_repo(tmp_path, 10)
+        status, graph_commits = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        assert status["status"] == "complete"
+        assert graph_commits == 10
+
+        stage_a_fwd = [c for c in calls if c[0] == "fwd" and not c[2].get("lifecycle_only")]
+        stage_b = [c for c in calls if c[0] == "fwd" and c[2].get("lifecycle_only")]
+        rev = [c for c in calls if c[0] == "rev"]
+        # Positive control: a spy that saw no call at some site proves nothing
+        # about that site's argument passing.
+        assert stage_a_fwd and stage_b and rev, (
+            f"not every dispatch site was reached: fwd={len(stage_a_fwd)} "
+            f"lifecycle={len(stage_b)} rev={len(rev)}"
+        )
+        for tag, n_positional, kwargs in calls:
+            expected = 5 if tag == "fwd" else 6
+            assert n_positional == expected, (
+                f"{tag} dispatch passed {n_positional} positional arguments, "
+                f"expected {expected}; kwargs={sorted(kwargs)}"
+            )
+        for _, _, kwargs in stage_a_fwd:
+            assert {"lifecycle_only", "persist_claim", "linearization", "pos"} <= kwargs.keys()
+        for _, _, kwargs in rev:
+            assert {"persist_claim", "claim_ident", "absorbed_idents"} <= kwargs.keys()

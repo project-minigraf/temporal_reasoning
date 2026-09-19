@@ -12,6 +12,7 @@ import configparser
 import contextlib
 import datetime
 import fnmatch
+import functools
 import gc
 import hashlib
 import json
@@ -11423,6 +11424,7 @@ def _reverse_apply(
     commit_metadata: List[Tuple[str, str, str, str]],
     pos: int,
     file_results: List[tuple],
+    *,
     index_con: Optional[Any] = None,
     persist_claim: bool = True,
     claim_ident: Optional[str] = None,
@@ -11879,6 +11881,7 @@ def _forward_apply(
     state: "_ForwardWalkState",
     commit: Tuple[str, str, str, str],
     extracted: Tuple[list, list, dict, list],
+    *,
     index_con: Optional[Any] = None,
     linearization: Optional[List[str]] = None,
     pos: Optional[int] = None,
@@ -14084,16 +14087,21 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     async with _db_lease_async_committing_index(loop, write_executor, index_con) as db:
                         try:
                             if tag == "fwd":
+                                # functools.partial because run_in_executor
+                                # takes no kwargs, and every defaulted
+                                # parameter of _forward_apply is keyword-only
+                                # (#346): a positional flag here would be
+                                # silently rebound by any parameter inserted
+                                # ahead of it.
                                 await loop.run_in_executor(
-                                    write_executor, _forward_apply, db, repo_path, state,
+                                    write_executor, functools.partial(
+                                    _forward_apply, db, repo_path, state,
                                     commit_metadata[pos],
                                     (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
-                                    index_con, linearization, pos,
-                                    # lifecycle_only=False, then #342's
-                                    # persist_claim. Positional because
-                                    # run_in_executor takes no kwargs.
-                                    #
-                                    # Evaluated at DISPATCH time, not claim
+                                    index_con=index_con, linearization=linearization, pos=pos,
+                                    lifecycle_only=False,
+                                    # #342's persist_claim, evaluated at
+                                    # DISPATCH time, not claim
                                     # time, for the same reason the reverse
                                     # check is: claims run ahead of writes by
                                     # pipeline_depth, so the position that
@@ -14101,13 +14109,19 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     # when a higher position was ALLOCATED in
                                     # submit_next -- only by the time its own
                                     # write is dispatched here.
-                                    False,
-                                    fwd_claim_ceiling is None or pos < fwd_claim_ceiling,
+                                    persist_claim=(
+                                        fwd_claim_ceiling is None or pos < fwd_claim_ceiling
+                                    ),
+                                    ),
                                 )
                             else:
+                                # functools.partial: see the forward
+                                # dispatch above (#346).
                                 await loop.run_in_executor(
-                                    write_executor, _reverse_apply, db, repo_path, linearization,
-                                    commit_metadata, pos, extracted_files, index_con,
+                                    write_executor, functools.partial(
+                                    _reverse_apply, db, repo_path, linearization,
+                                    commit_metadata, pos, extracted_files,
+                                    index_con=index_con,
                                     # #326 Finding A / #325: below THIS
                                     # ident's floor we do the work but
                                     # withhold the claim. Keyed by
@@ -14141,7 +14155,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     # merging claim is first ALLOCATED in
                                     # submit_next, only by the time its write
                                     # is actually dispatched.
-                                    pos > max(
+                                    persist_claim=pos > max(
                                         [rev_claim_floor[i] for i in
                                          [claim_ident, *(absorbed_idents or [])]
                                          if i in rev_claim_floor] or [-1]
@@ -14152,7 +14166,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     # never re-derived here -- see
                                     # _reverse_claim_persist_target's
                                     # docstring.
-                                    claim_ident, absorbed_idents,
+                                    claim_ident=claim_ident,
+                                    absorbed_idents=absorbed_idents,
+                                    ),
                                 )
 
                         except Exception as e:
@@ -14503,9 +14519,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     # lineage is already authoritative before a
                                     # close in the same commit reads its window.
                                     await loop.run_in_executor(
-                                        write_executor, _forward_apply, db, repo_path, state,
-                                        commit_metadata[hash_to_pos[sweep_hash]],
-                                        sweep_extracted, index_con, None, None, True,
+                                        write_executor, functools.partial(
+                                            _forward_apply, db, repo_path, state,
+                                            commit_metadata[hash_to_pos[sweep_hash]],
+                                            sweep_extracted, index_con=index_con,
+                                            lifecycle_only=True,
+                                        ),
                                     )
                                     # Both halves landed -- only now is this commit
                                     # genuinely swept, so only now may the watermark
