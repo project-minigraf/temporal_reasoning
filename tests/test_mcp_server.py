@@ -18645,30 +18645,47 @@ class TestLooksLikeNavigationTask:
 
 class TestHandleMemoryPrepareTurnNavigationNudge:
     """#220: memory_prepare_turn appends a one-line code-graph navigation nudge
-    on build/fix/navigate-shaped messages, gated on ingestion being present."""
+    on build/fix/navigate-shaped messages, gated on ingestion being present.
 
-    def test_nudge_appended_when_task_shaped_and_ingestion_present(self, real_db, monkeypatch):
+    #353: "ingestion present" is answered from the fact index, never from a
+    graph lease. These tests seed REAL state -- a `:commit/...` entity written
+    through the public handler reaches both the graph and the index -- rather
+    than patching the gate, so they exercise the predicate that ships."""
+
+    @staticmethod
+    def _seed_commit(mcp_server):
+        # Ingestion's own shape (_forward_apply/_reverse_apply): the type
+        # AND a string :ident. The :ident is load-bearing -- an index
+        # backfill renames an :ident-less entity into UUID space, where the
+        # gate's `:commit/` range seek cannot see it.
+        result = mcp_server.handle_minigraf_transact(
+            '[[:commit/abc123 :entity-type :type/commit] '
+            '[:commit/abc123 :ident ":commit/abc123"] '
+            '[:commit/abc123 :description "seeded commit"]]', reason="test"
+        )
+        assert result["ok"] is True, result
+
+    def test_nudge_appended_when_task_shaped_and_ingestion_present(self, real_db):
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 5)
+        self._seed_commit(mcp_server)
         result = mcp_server.handle_memory_prepare_turn("fix the login bug")
         assert "minigraf_query" in result
         assert "Using ingested code structure to scope a change" in result
 
-    def test_no_nudge_when_task_shaped_but_no_ingestion(self, real_db, monkeypatch):
+    def test_no_nudge_when_task_shaped_but_no_ingestion(self, real_db):
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 0)
         result = mcp_server.handle_memory_prepare_turn("fix the login bug")
         assert result == ""
 
-    def test_no_nudge_when_ingestion_present_but_not_task_shaped(self, real_db, monkeypatch):
+    def test_no_nudge_when_ingestion_present_but_not_task_shaped(self, real_db):
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 5)
+        self._seed_commit(mcp_server)
         result = mcp_server.handle_memory_prepare_turn("what's the weather like today?")
         assert result == ""
 
-    def test_nudge_combined_with_memory_context(self, real_db, monkeypatch):
+    def test_nudge_combined_with_memory_context(self, real_db):
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_count_commit_entities", lambda db: 5)
+        self._seed_commit(mcp_server)
         mcp_server.handle_minigraf_transact(
             '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
         )
@@ -18679,17 +18696,39 @@ class TestHandleMemoryPrepareTurnNavigationNudge:
 
     def test_nudge_check_failure_does_not_break_memory_context(self, real_db, monkeypatch):
         import mcp_server
+        import fact_index
 
-        def _boom(db):
+        def _boom(path):
             raise RuntimeError("simulated ingestion-check failure")
 
-        monkeypatch.setattr(mcp_server, "_count_commit_entities", _boom)
+        self._seed_commit(mcp_server)
+        monkeypatch.setattr(fact_index, "has_commit_entities", _boom)
         mcp_server.handle_minigraf_transact(
             '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
         )
         result = mcp_server.handle_memory_prepare_turn("fix the redis caching bug")
         assert "use redis for caching" in result
         assert "minigraf_query" not in result
+
+    def test_nudge_takes_no_graph_lease(self, real_db, monkeypatch):
+        """#353: the gate must not open the graph. A lease costs a full handle
+        open plus an aggregate scan, and on contention (ingestion, or the
+        finalize hook, holding the kernel lock) it blocked ~3.1 s through the
+        retry budget and then dropped the nudge anyway.
+
+        The first call backfills the index -- that path legitimately leases
+        the graph, once per index lifetime -- so leasing is forbidden only
+        for the second call, which is the steady state every prompt pays."""
+        import mcp_server
+        self._seed_commit(mcp_server)
+        mcp_server.handle_memory_prepare_turn("hello")  # backfill, if needed
+
+        def _no_lease(*a, **k):
+            raise AssertionError("navigation nudge opened a graph lease")
+
+        monkeypatch.setattr(mcp_server, "db_lease", _no_lease)
+        result = mcp_server.handle_memory_prepare_turn("fix the login bug")
+        assert "minigraf_query" in result
 
 
 class TestIndexCacheInvalidation:

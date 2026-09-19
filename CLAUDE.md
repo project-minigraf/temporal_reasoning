@@ -314,8 +314,11 @@ holding no code is not a defect. An absent key stays clean, same precedent.
 
 The one false positive it cannot rule out: `module`/`function`/`class`/
 `variable`/`field` are registered in `MINIGRAF_SCHEMA` with `:introduced-by`
-optional, so `handle_minigraf_transact` accepts `[:module/foo :description
-"x"]` and produces a legitimately lineage-free `:type/module`. The at-scale
+optional, so `handle_minigraf_transact` accepts a caller-written
+`[:module/foo :entity-type :type/module]` and produces a legitimately
+lineage-free `:type/module`. It takes that explicit type triple: the handler
+adds no `:entity-type` of its own, so a bare `[:module/foo :description "x"]`
+is not a `:type/module` at all and cannot trip the check (measured, #353). The at-scale
 gate runs on a fresh ingestion-only graph so it cannot fire there; on a mixed
 graph the row is informational. The graph carries no discriminator between an
 ingested and a memory-written code entity.
@@ -368,8 +371,8 @@ one genuinely lost commit and the census would read clean on a graph that lost
 history. That duplicate is NOT reachable from ingestion (the commit triples are
 transacted at `commit_ts_iso`, so a #313 re-walk rewrites the identical triple
 at the identical valid-from and it collapses); it is reachable from the public
-handler, since `commit` is a registered `MINIGRAF_SCHEMA` type and
-`handle_minigraf_transact` writes `:entity-type` at wall-clock valid-from.
+handler, which transacts a caller-written `:entity-type :type/commit` at
+wall-clock valid-from (it adds no `:entity-type` of its own — measured in #353).
 `_STATUS_QUERY` keeps `count` deliberately — it is a latency instrument whose
 query is frozen for cross-run comparability, and its number is never read as a
 count. An absent `commit_census` key stays clean, same precedent as the rest.

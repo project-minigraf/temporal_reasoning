@@ -32,13 +32,12 @@ def main() -> None:
     if prompt:
         try:
             import mcp_server
-            # No explicit open: on the common path, handle_memory_prepare_turn
-            # takes NO lease at all -- it answers from the sqlite fact index
-            # (fact_index.query_facts), never opening the graph. It only
-            # takes a lease (db_lease(), released before it returns so the
-            # next turn's hook process can acquire the file lock) when the
-            # prompt looks navigation-shaped and the nav-nudge check runs
-            # (#255).
+            # No explicit open: handle_memory_prepare_turn answers from the
+            # sqlite fact index -- memory facts and the navigation nudge's
+            # "is this graph ingested?" gate alike (#353) -- and never opens
+            # the graph. The one exception is an index that needs backfill,
+            # which is rebuilt from the graph under a lease released before
+            # it returns (#255), once per index lifetime.
             context = mcp_server.handle_memory_prepare_turn(prompt)
         except Exception:
             pass  # Never block the turn on memory errors

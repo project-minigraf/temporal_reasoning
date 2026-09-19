@@ -186,8 +186,11 @@ def entities_without_introduced_by(
     THE ONE FALSE POSITIVE THIS CANNOT RULE OUT is a memory-written code
     entity. `module`/`function`/`class`/`variable`/`field` are registered in
     MINIGRAF_SCHEMA with `:introduced-by` optional, so
-    `handle_minigraf_transact` will accept `[:module/foo :description "x"]`
-    and produce a legitimately lineage-free `:type/module`. The at-scale gate
+    `handle_minigraf_transact` will accept a caller-written
+    `[:module/foo :entity-type :type/module]` and produce a legitimately
+    lineage-free `:type/module`. The handler adds no :entity-type of its own,
+    so a bare `[:module/foo :description "x"]` is not a `:type/module` and
+    cannot trip this check (measured, #353). The at-scale gate
     runs on a fresh ingestion-only graph, so it cannot fire there; on a mixed
     graph this row is informational. Narrowing further would need a
     discriminator between an ingested and a memory-written code entity, and

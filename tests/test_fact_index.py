@@ -1367,3 +1367,59 @@ def test_query_facts_stop_word_only_prompt_matches_nothing(tmp_path):
         assert fact_index.query_facts(
             path, prompt, top_n=10, boost=2.0, historical_discount=1.0, memory_only=True,
         ) == [], prompt
+
+
+# --- has_commit_entities (#353) -------------------------------------------
+# The navigation nudge asks "has this graph been ingested?" of the index
+# instead of taking a graph lease. The predicate must mean what the old
+# graph query meant: a LIVE `:entity-type :type/commit` row.
+
+def _index_with(tmp_path, rows):
+    path = str(tmp_path / "idx.sqlite3")
+    con = fact_index.open_writer(path)
+    fact_index.insert_facts(con, rows)
+    con.commit()
+    con.close()
+    return path
+
+
+def test_has_commit_entities_true_for_a_live_commit_type_row(tmp_path):
+    path = _index_with(tmp_path, [
+        (":commit/abc123", ":entity-type", ":type/commit", "2026-01-01T00:00:00Z", None),
+    ])
+    assert fact_index.has_commit_entities(path) is True
+
+
+def test_has_commit_entities_false_for_an_empty_index(tmp_path):
+    path = _index_with(tmp_path, [])
+    assert fact_index.has_commit_entities(path) is False
+
+
+def test_has_commit_entities_false_for_a_missing_file(tmp_path):
+    assert fact_index.has_commit_entities(str(tmp_path / "absent.sqlite3")) is False
+
+
+def test_has_commit_entities_ignores_historical_rows(tmp_path):
+    path = _index_with(tmp_path, [
+        (":commit/abc123", ":entity-type", ":type/commit",
+         "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"),
+    ])
+    assert fact_index.has_commit_entities(path) is False
+
+
+def test_has_commit_entities_ignores_other_commit_attributes(tmp_path):
+    path = _index_with(tmp_path, [
+        (":commit/abc123", ":description", "a commit", "2026-01-01T00:00:00Z", None),
+    ])
+    assert fact_index.has_commit_entities(path) is False
+
+
+def test_has_commit_entities_range_excludes_neighbouring_prefixes(tmp_path):
+    # ':commitment/' sorts after ':commit0', ':commit' (no slash) before
+    # ':commit/' -- both must fall outside the range seek.
+    path = _index_with(tmp_path, [
+        (":commitment/x", ":entity-type", ":type/commit", "2026-01-01T00:00:00Z", None),
+        (":commit", ":entity-type", ":type/commit", "2026-01-01T00:00:00Z", None),
+        (":decision/x", ":entity-type", ":type/commit", "2026-01-01T00:00:00Z", None),
+    ])
+    assert fact_index.has_commit_entities(path) is False
