@@ -12376,9 +12376,19 @@ def _fwd_close_removed_children(
     In-place renames (old -> new within this same file) are EXCLUDED. The
     renamed_pairs pass in _forward_apply closes those old idents itself, with
     :renamed-to linkage; closing them here as plain removals too is a double
-    close. Only pairs whose OLD file is this file are excluded -- a pair whose
-    old side lives in another file never appears in this file's
-    previous_idents in the first place.
+    close. Only pairs whose OLD file is this file are excluded, which ASSUMES
+    that a pair whose old side lives in another file cannot appear in this
+    file's previous_idents. That assumption holds for every ident pair R3
+    separates, but it is not absolute: under the documented R3 ident-collision
+    residual two different paths can collapse to one ident (`a/b.py` and
+    `a-b.py` both reach :module/a-b-py), so a foreign pair's old ident COULD
+    sit in this file's previous_idents while the `o_file == file_path` test
+    declines to exclude it -- and the renamed_pairs pass would then close it a
+    second time. That behaviour is PRE-EXISTING (the inline block this replaces
+    filtered identically) and is NOT in scope to change here; it is named only
+    so the exclusion is not read as a guarantee it never was. See
+    probe_ident_collision_new_history.py, the census that keeps measuring
+    whether real history has produced such a pair (#263/#267).
 
     Contract derived from the code, INDIRECT reaches included: most of what
     this touches is _fwd_close_entity's, and through it _resolve_introduced_by's
@@ -12403,9 +12413,11 @@ def _fwd_close_removed_children(
     before the build. Its KEY survives -- the file itself still exists (status
     "M"), so only the removed child's slot is dropped, unlike the "D" and
     renamed-away-path passes which pop the whole key.
-    Reads ctx: commit_ts_iso, the orig_ts fallback for a removed entity
-    carrying no recorded valid-from. commit_hash, commit_ident, reason and
-    index_con are not consulted.
+    Reads ctx: commit_ts_iso -- INDIRECT, through _fwd_close_entity, which
+    uses it as the orig_ts fallback for a removed entity carrying no recorded
+    valid-from. Nothing in this function's own body reads ctx at all.
+    commit_hash, commit_ident, reason and index_con are not consulted by
+    either.
     Appends to writes: close_items (one entry per removed ident), closed_idents
     (one entry per removed ident). add_triples, dep_add_triples and
     renamed_old_paths are untouched.
@@ -12458,6 +12470,157 @@ def _fwd_close_removed_children(
             close_entity_type=True, file_value=file_path,
             is_static=state.field_static_ident.get(ident),
         )
+
+
+def _fwd_diff_dependencies(
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    file_path: str,
+    precomputed: Dict[str, Any],
+    *,
+    status: str,
+) -> None:
+    """Diff this file's :depends-on edges and open stubs for unresolved imports.
+
+    Takes NO `db` handle, and that absence is a property worth keeping visible
+    rather than an oversight: every decision here reads preloaded
+    _ForwardWalkState. Do not add one "for symmetry" with the sibling helpers.
+    Each of those that takes `db` needs it for something this one has no
+    equivalent of -- _fwd_close_entity's _resolve_introduced_by fallback read
+    at the entity-close sites, and _lineage_is_provisional /
+    _forward_reconcile_provisional inside _fwd_reconcile_and_build. Nothing
+    here closes an entity or touches lineage. _fwd_close_dep_edges, the other
+    helper that closes only dep EDGES, takes no handle either, for the same
+    reason.
+
+    RESOLUTION ALREADY HAPPENED, in _extract_commit, against that commit's own
+    git-ls-tree state (precomputed["resolved_imports"] is its output: a list of
+    (import_name, dep_ident, is_resolved) triples). Nothing is resolved here --
+    this function only diffs the resulting edge set and reacts to the
+    is_resolved flag. The self-import guard (dep_ident != module_ident) is why
+    a module importing from itself records no edge.
+
+    An unresolved, NON-RELATIVE import naming no entity state already knows
+    opens a :type/external-dependency stub carrying exactly three facts --
+    :entity-type, :ident, :description -- and NEVER an :introduced-by. That
+    absence is deliberate and is precisely why :type/external-dependency is
+    excluded from the at-scale orphan check (#316,
+    entities_without_introduced_by): the lineage machinery can never give a
+    stub one later, so including the type would have made that gate
+    permanently red. Do not "fix" it by adding one here.
+
+    A relative import ("." prefix) never opens a stub even when unresolved:
+    it names something inside this repository that the extraction failed to
+    place, not a third-party package, so inventing an external dependency for
+    it would be wrong.
+
+    #112's submodule link runs here in ONE of its two directions: a NEW stub is
+    matched against the submodules state ALREADY knows (state.submodule_paths).
+    The other direction -- a NEWLY ADDED submodule matched against stubs opened
+    earlier -- lives in _forward_apply's gitlink "add" branch, which reads
+    state.unresolved_dep_idents, the dict this function writes. The two halves
+    are what make the linkage order-independent; neither covers the other.
+
+    The "M"-only close of `previous_deps - current_deps` STAYS HERE and is NOT
+    routed through _fwd_close_dep_edges. That helper closes EVERY recorded edge
+    and pops the whole file_deps key (the "D" branch and the renamed-away-path
+    pass, where the file is gone); this closes only the edges this commit
+    dropped and then REWRITES file_deps[file_path] with the current set. Same
+    triple shape, different operation -- the spec originally implied one helper
+    covered all three sites and was corrected. Do not re-merge them. The gate
+    is `status == "M"` exactly as it is today: an "A" file has no previous
+    edges to close, and an "R" file's old path is closed wholesale by the
+    renamed_old_paths pass under the OLD module ident, not here under the new
+    one.
+
+    `status` is KEYWORD-ONLY. It is mode-like -- it selects whether the close
+    branch runs at all -- so it takes the same treatment task 7 gave
+    _fwd_reconcile_and_build's status and lifecycle_only, and for the same
+    #360 reason: a parameter inserted ahead of a positional mode argument
+    rebinds it instead of raising, and a `status` silently bound to something
+    else here would either skip every dep close or run one on an "A" file.
+
+    lifecycle_only deliberately does not reach this helper. The dep diff runs
+    identically in both modes -- that is pre-existing behaviour, not a change:
+    writes.dep_add_triples and the close_items this appends are transacted by
+    _forward_apply's write tail unconditionally, unlike the built entity
+    triples _fwd_reconcile_and_build discards under the flag.
+
+    Contract derived from the code. There are no INDIRECT reaches to enumerate:
+    the only calls are _code_ident, _edn_escape and
+    _submodule_path_matches_import, all pure functions of their arguments that
+    touch neither state, ctx nor writes. Every entry below is therefore DIRECT.
+
+    Reads state: entity_valid_from (DIRECT -- the membership test deciding
+    whether an unresolved import still needs a stub; note this dict is also
+    WRITTEN in the same loop, so a second import of the same stub ident later
+    in this file, or in a later file of this same commit, correctly takes the
+    already-known branch), submodule_paths (DIRECT -- iterated in full for
+    #112's match), file_deps (DIRECT -- previous_deps, this file's edge set as
+    of the last commit that touched it), dep_valid_from (DIRECT -- each closed
+    edge's orig_ts, on the "M" path only).
+    Writes state: entity_valid_from (DIRECT -- the stub's valid-from),
+    entity_descriptions (DIRECT), unresolved_dep_idents (DIRECT),
+    dep_valid_from (DIRECT -- one entry per newly opened edge), file_deps
+    (DIRECT -- rewritten for this path, unconditionally, at the end).
+    Reads ctx: commit_ts_iso (DIRECT), in three distinct roles -- the stub's
+    entity_valid_from, a new edge's dep_valid_from, and the orig_ts fallback
+    for a closed edge carrying no recorded valid-from. commit_hash,
+    commit_ident, reason and index_con are not consulted; no lineage marker,
+    :introduced-by or :modified-in is written here, which is why the commit's
+    own identity never appears.
+    Appends to writes: add_triples (DIRECT -- three per stub opened, plus one
+    :resolves-to per matching submodule), dep_add_triples (DIRECT -- one per
+    newly opened edge; a separate list because :depends-on must be transacted
+    one per call, minigraf#287), close_items (DIRECT -- one per dropped edge,
+    "M" only). closed_idents and renamed_old_paths are untouched: closing a
+    dep EDGE is not closing an entity, so nothing here feeds the lineage-marker
+    discard batch.
+
+    Two of the written dicts are NEVER READ here, which is a property of this
+    function rather than an omission from the list above. entity_descriptions
+    is written so that a LATER close site can use the stub's description
+    (_fwd_close_entity's callers read it); the value needed here (import_name)
+    is already in hand. unresolved_dep_idents is written purely for
+    _forward_apply's gitlink "add" branch to read later, per the #112 note
+    above -- this function looks up nothing in it, not even to avoid
+    re-recording an ident, because the entity_valid_from test upstream already
+    made that impossible.
+    """
+    module_ident = _code_ident("module", file_path)
+    current_deps: set = set()
+    for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
+        if dep_ident != module_ident:
+            current_deps.add(dep_ident)
+            is_relative = import_name.startswith(".")
+            if not is_resolved and not is_relative and dep_ident not in state.entity_valid_from:
+                writes.add_triples.extend([
+                    f"[{dep_ident} :entity-type :type/external-dependency]",
+                    f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
+                    f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
+                ])
+                state.entity_valid_from[dep_ident] = ctx.commit_ts_iso
+                state.entity_descriptions[dep_ident] = import_name
+                state.unresolved_dep_idents[dep_ident] = import_name
+                # #112: an already-known submodule may be the real
+                # target this unresolvable import was reaching for
+                # (submodule directories are never in state.file_entities,
+                # so any import into one always falls through here).
+                for sub_ident, sub_path in state.submodule_paths.items():
+                    if _submodule_path_matches_import(sub_path, import_name):
+                        writes.add_triples.append(f"[{dep_ident} :resolves-to {sub_ident}]")
+    previous_deps = state.file_deps.get(file_path, set())
+    for dep_ident in current_deps - previous_deps:
+        writes.dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
+        state.dep_valid_from[(module_ident, dep_ident)] = ctx.commit_ts_iso
+    if status == "M":
+        for dep_ident in previous_deps - current_deps:
+            orig_ts = state.dep_valid_from.get((module_ident, dep_ident), ctx.commit_ts_iso)
+            writes.close_items.append(
+                ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+            )
+    state.file_deps[file_path] = current_deps
 
 
 def _forward_apply(
@@ -12592,39 +12755,9 @@ def _forward_apply(
             # Resolution itself already happened in _extract_commit
             # (precomputed["resolved_imports"]) against that commit's
             # own git-ls-tree state — nothing left to resolve here.
-            module_ident = _code_ident("module", file_path)
-            current_deps: set = set()
-            for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
-                if dep_ident != module_ident:
-                    current_deps.add(dep_ident)
-                    is_relative = import_name.startswith(".")
-                    if not is_resolved and not is_relative and dep_ident not in state.entity_valid_from:
-                        writes.add_triples.extend([
-                            f"[{dep_ident} :entity-type :type/external-dependency]",
-                            f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
-                            f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
-                        ])
-                        state.entity_valid_from[dep_ident] = commit_ts_iso
-                        state.entity_descriptions[dep_ident] = import_name
-                        state.unresolved_dep_idents[dep_ident] = import_name
-                        # #112: an already-known submodule may be the real
-                        # target this unresolvable import was reaching for
-                        # (submodule directories are never in state.file_entities,
-                        # so any import into one always falls through here).
-                        for sub_ident, sub_path in state.submodule_paths.items():
-                            if _submodule_path_matches_import(sub_path, import_name):
-                                writes.add_triples.append(f"[{dep_ident} :resolves-to {sub_ident}]")
-            previous_deps = state.file_deps.get(file_path, set())
-            for dep_ident in current_deps - previous_deps:
-                writes.dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
-                state.dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
-            if status == "M":
-                for dep_ident in previous_deps - current_deps:
-                    orig_ts = state.dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                    writes.close_items.append(
-                        ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
-                    )
-            state.file_deps[file_path] = current_deps
+            _fwd_diff_dependencies(
+                ctx, state, writes, file_path, precomputed, status=status,
+            )
 
     # Function/class rename linkage (Task 9's renamed_pairs).
     # Module-level linkage is handled separately per-file
