@@ -5730,6 +5730,18 @@ def _build_close_triples(
     Leaving this fact open was the whole of #231: a closed-and-purged entity
     still answered a bare [?e :introduced-by ?c] query, which made
     _entity_introduced_by_query an unsound liveness test.
+
+    DO NOT FOLD THIS INTO _fwd_close_entity (#346). Since that helper absorbed
+    the six repeated close sequences this function has exactly ONE production
+    caller, which makes it look like an inlining candidate. It is not: the
+    entity_type_kw-vs-close_entity_type branch above is load-bearing for the
+    submodule-remove case (#137), where the ident reuses the "module" prefix
+    while the real :entity-type is :type/external-dependency, so deriving the
+    keyword from the prefix would retract a fact that was never asserted.
+    Checked, #346 task 4: that branch is named by NO test in tests/ -- this
+    function's direct unit tests all exercise the close_entity_type side -- so
+    the only thing standing between a tidy-up and a false retract is this
+    paragraph.
     """
     triples = [
         f'[{ident} :ident "{_edn_escape(ident)}"]',
@@ -5803,6 +5815,24 @@ def _forget_closed_entity(
     None to skip the file_entities removal (e.g. idents not tracked per-file).
     Callers that iterate a file_entities list while calling this MUST iterate a
     copy, since this mutates file_entities[file_path] in place.
+
+    DO NOT FOLD THIS INTO _fwd_close_entity (#346). Since that helper absorbed
+    the six repeated close sequences this function has exactly ONE production
+    caller, which makes it look like an inlining candidate. It is not: the
+    per-dict rationale above is the whole of #231 and #113, and it is the only
+    place that reasoning is written down -- inlining would scatter six pops
+    into a helper whose docstring is about building close triples and lose it.
+
+    Coverage warning for anyone changing the file_entities branch: its only
+    direct unit test (test_forget_closed_entity_pops_it) passes file_path=None,
+    so that branch is asserted by no unit test. In production it is reached
+    only through _fwd_close_entity's derivation of the path from
+    close_kwargs["file_value"] -- and A GREEN SUITE WOULD NOT CATCH ITS LOSS.
+    Measured, #346 task 4, not reasoned: disabling this whole branch leaves the
+    entire suite green (2179 passed, 1 xfailed), the four write-parity classes
+    included. Only the write-sequence oracle
+    (evals/at_scale/probe_forward_apply_write_parity.py) or a real ingestion
+    over a history that deletes and then re-adds a path can see it.
     """
     entity_valid_from.pop(ident, None)
     entity_descriptions.pop(ident, None)
@@ -11904,11 +11934,43 @@ def _fwd_close_entity(
     explicit forget_path= parameter rather than let the derivation silently
     purge the wrong path's bookkeeping.
 
+    A site closing a PER-FILE-TRACKED entity (anything that appears in
+    state.file_entities[path]) MUST pass file_value. Omitting it is not the
+    harmless "close fewer secondary attributes" choice it looks like: the
+    derivation above then hands _forget_closed_entity a file_path of None, that
+    function's file_entities branch is skipped entirely, and the ident stays in
+    state.file_entities[path] with its entity_valid_from entry already gone. A
+    later commit's removal-detection diff (previous_idents - current)
+    re-discovers the stale ident and closes it a SECOND time -- at the ORIGINAL
+    orig_ts, since entity_valid_from no longer holds it, so the second close
+    spans the whole gap and silently resurrects the entity across its own
+    closed window (_forget_closed_entity's docstring, file_entities bullet).
+    Only a site closing something that is genuinely not tracked per file may
+    leave file_value out.
+
+    A caller iterating state.file_entities[path] while calling this helper MUST
+    iterate a COPY. _forget_closed_entity removes the ident from that very list
+    in place, so iterating it directly skips every second ident and leaves each
+    skipped entity open forever. Both such callers do
+    (_fwd_apply_deleted_file's `list(...)` and the renamed_old_paths pass's
+    `list(...)`); the obligation is restated here because the mutating call is
+    no longer visible at either site.
+
     Reads state: entity_valid_from (for orig_ts), entity_introduced_by (via
     _resolve_introduced_by).
     Writes state: entity_valid_from, entity_descriptions, field_class_ident,
     file_entities, field_static_ident, entity_introduced_by (all via
-    _forget_closed_entity).
+    _forget_closed_entity -- every dict it touches).
+    Reads ctx: commit_ts_iso, the orig_ts fallback for an ident carrying no
+    recorded valid-from.
+    Appends to writes: close_items (one entry), closed_idents (one entry).
+
+    The three other state dicts a close needs -- entity_descriptions,
+    field_class_ident, field_static_ident -- are read by the CALLER and arrive
+    as arguments, which is why they appear above under writes only.
+    file_entities is listed under writes alone for a different reason:
+    _forget_closed_entity does look the path's list up, but only to remove the
+    ident from it, so nothing here reads a value out of it.
 
     Never opens, closes or leases a handle: `db` is the caller's, and
     _resolve_introduced_by's fallback read rides it (single-handle invariant,
@@ -11952,6 +12014,9 @@ def _fwd_close_dep_edges(
 
     Reads state: file_deps, dep_valid_from.
     Writes state: file_deps (only when pop=True).
+    Reads ctx: commit_ts_iso, the orig_ts fallback for a dep edge carrying no
+    recorded valid-from.
+    Appends to writes: close_items (one entry per edge closed).
 
     Takes no `db`: closing a dep edge needs no lineage read, so this helper
     touches no handle at all.
@@ -11963,6 +12028,61 @@ def _fwd_close_dep_edges(
         )
     if pop:
         state.file_deps.pop(file_path, None)
+
+
+def _fwd_apply_deleted_file(
+    db: Any,
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    file_path: str,
+) -> None:
+    """Close a deleted file's module, every child entity and every dep edge.
+
+    Contract derived from the code, INDIRECT reads included: the per-ident
+    loop's reads and writes are mostly _fwd_close_entity's (and through it
+    _resolve_introduced_by's and _forget_closed_entity's), and the dep close's
+    are _fwd_close_dep_edges'. Enumerated in full rather than delegated by
+    reference, because a later task decomposing either helper is instructed to
+    trust this list.
+
+    Reads state: file_entities, entity_descriptions, field_class_ident,
+    field_static_ident, file_deps, dep_valid_from -- and, through
+    _fwd_close_entity, entity_valid_from (each close's orig_ts) and
+    entity_introduced_by (via _resolve_introduced_by, whose DB fallback rides
+    the caller's handle). entity_introduced_by is READ here, not only purged;
+    an earlier version of this docstring listed it under writes alone.
+    Writes state: file_entities (_forget_closed_entity removes each ident from
+    the list, then the key itself is popped after the loop), file_deps (key
+    popped), entity_valid_from, entity_descriptions, field_class_ident,
+    field_static_ident, entity_introduced_by -- those last five entirely
+    through _forget_closed_entity, which is every dict it touches.
+    Reads ctx: commit_ts_iso, the orig_ts fallback for an entity or a dep edge
+    carrying no recorded valid-from.
+    Appends to writes: close_items (one per closed entity, one per closed dep
+    edge), closed_idents (one per closed entity).
+
+    Never opens, closes or leases a handle: `db` is the caller's and is only
+    forwarded to _fwd_close_entity (single-handle invariant, #253).
+    """
+    # Close module and all known child entities for this file.
+    # Iterate a copy: _fwd_close_entity (via _forget_closed_entity) mutates
+    # state.file_entities[file_path] in place as it purges.
+    idents = list(state.file_entities.get(file_path, [_code_ident("module", file_path)]))
+    module_ident = _code_ident("module", file_path)
+    for ident in idents:
+        _fwd_close_entity(
+            db, ctx, state, writes,
+            ident, state.entity_descriptions.get(ident, ""), module_ident,
+            extra_contains_parent=state.field_class_ident.get(ident),
+            close_entity_type=True, file_value=file_path,
+            is_static=state.field_static_ident.get(ident),
+        )
+    # Whole file is gone: drop its (now-empty) state.file_entities key
+    # so nothing stale lingers under this path (matches state.file_deps).
+    state.file_entities.pop(file_path, None)
+    # Close all :depends-on edges for the deleted module
+    _fwd_close_dep_edges(ctx, state, writes, module_ident, file_path, pop=True)
 
 
 def _forward_apply(
@@ -12075,24 +12195,7 @@ def _forward_apply(
 
     for status, file_path, extracted, precomputed, old_path in extracted_files:
         if status == "D":
-            # Close module and all known child entities for this file.
-            # Iterate a copy: _forget_closed_entity mutates
-            # state.file_entities[file_path] in place as it purges.
-            idents = list(state.file_entities.get(file_path, [_code_ident("module", file_path)]))
-            module_ident = _code_ident("module", file_path)
-            for ident in idents:
-                _fwd_close_entity(
-                    db, ctx, state, writes,
-                    ident, state.entity_descriptions.get(ident, ""), module_ident,
-                    extra_contains_parent=state.field_class_ident.get(ident),
-                    close_entity_type=True, file_value=file_path,
-                    is_static=state.field_static_ident.get(ident),
-                )
-            # Whole file is gone: drop its (now-empty) state.file_entities key
-            # so nothing stale lingers under this path (matches state.file_deps).
-            state.file_entities.pop(file_path, None)
-            # Close all :depends-on edges for the deleted module
-            _fwd_close_dep_edges(ctx, state, writes, module_ident, file_path, pop=True)
+            _fwd_apply_deleted_file(db, ctx, state, writes, file_path)
         else:  # A or M or R
             if status == "R" and old_path:
                 writes.renamed_old_paths.add(old_path)
@@ -12328,8 +12431,8 @@ def _forward_apply(
         }
         for r_old_path in writes.renamed_old_paths:
             r_old_module_ident = _code_ident("module", r_old_path)
-            # Iterate a copy: _forget_closed_entity mutates
-            # state.file_entities[r_old_path] in place as it purges.
+            # Iterate a copy: _fwd_close_entity (via _forget_closed_entity)
+            # mutates state.file_entities[r_old_path] in place as it purges.
             for ident in list(state.file_entities.get(r_old_path, [])):
                 if ident == r_old_module_ident:
                     continue  # already closed+purged by the R block above
