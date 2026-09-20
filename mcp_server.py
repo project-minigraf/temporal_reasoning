@@ -12177,12 +12177,29 @@ def _fwd_reconcile_and_build(
     state: "_ForwardWalkState",
     writes: "_ForwardCommitWrites",
     file_path: str,
-    extracted: Any,
+    extracted: Dict[str, Any],
     precomputed: Dict[str, Any],
+    *,
     status: str,
     lifecycle_only: bool,
 ) -> None:
     """Reconcile this file's provisional lineage, then build its entities.
+
+    status and lifecycle_only are KEYWORD-ONLY, and that is the same rule
+    PR #360 (this issue's own prerequisite) applied to _forward_apply and
+    _reverse_apply: a parameter inserted ahead of a positional flag silently
+    REBINDS it rather than raising TypeError, and a wrong lifecycle_only
+    inverts everything below. Neither flag carries a default, which made the
+    hazard latent rather than absent -- an inserted parameter with no default
+    would still have bound status's value into it and pushed status into
+    lifecycle_only. Keep any future flag behind the `*` too.
+
+    `extracted` is _extract_from_source's return value, threaded through
+    _extract_commit's file_results 3-tuple slot. Dict[str, Any] rather than
+    the narrower Dict[str, List[str]] _build_code_triples declares, because
+    that narrower annotation is wrong: "fields" holds List[Tuple[str, str,
+    bool]], not a list of strings. It is never None here -- the only None
+    extraction is a "D" entry, and the "D" branch never reaches this function.
 
     ONE unit by construction, and it must stay one. The
     state.entity_valid_from.pop below exists PRECISELY SO THAT the
@@ -12331,6 +12348,118 @@ def _fwd_reconcile_and_build(
         writes.add_triples.extend(triples)
 
 
+def _fwd_close_removed_children(
+    db: Any,
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    file_path: str,
+    precomputed: Dict[str, Any],
+    previous_idents: Set[str],
+    renamed_pairs: List[Tuple[str, str, str, str, str]],
+) -> None:
+    """Close the entities a still-present ("M") file no longer defines.
+
+    previous_idents MUST be the snapshot of state.file_entities[file_path]
+    taken BEFORE _fwd_reconcile_and_build ran for this file.
+    _build_code_triples only ever APPENDS to that list, never removes, so the
+    diff is only meaningful against the pre-build snapshot. The capture
+    therefore stays at the call site (call-order contract item 2) and is passed
+    in; do not move it in here, where the build has already happened.
+
+    All FOUR entry kinds count as still-present -- functions, classes, globals
+    and fields. Globals and fields are tracked in state.file_entities exactly
+    as functions and classes are (see _build_code_triples), so omitting either
+    list would make every surviving global/field look "removed" on the next
+    edit of the file and wrongly close it (#113).
+
+    In-place renames (old -> new within this same file) are EXCLUDED. The
+    renamed_pairs pass in _forward_apply closes those old idents itself, with
+    :renamed-to linkage; closing them here as plain removals too is a double
+    close. Only pairs whose OLD file is this file are excluded -- a pair whose
+    old side lives in another file never appears in this file's
+    previous_idents in the first place.
+
+    Contract derived from the code, INDIRECT reaches included: most of what
+    this touches is _fwd_close_entity's, and through it _resolve_introduced_by's
+    and _forget_closed_entity's. Enumerated in full rather than delegated by
+    reference, since "everything _fwd_close_entity touches" stops resolving the
+    moment that helper is itself split.
+
+    Reads state: entity_descriptions (the removed entity's recorded
+    description, falling back to ""), field_class_ident (the field's owning
+    class, passed as extra_contains_parent), field_static_ident (the field's
+    recorded :static value) -- all three read directly at the close call --
+    and, through _fwd_close_entity, entity_valid_from (each close's orig_ts)
+    and entity_introduced_by (via _resolve_introduced_by, whose DB fallback
+    rides the caller's handle). entity_introduced_by is READ here, not only
+    purged.
+    Writes state: entity_valid_from, entity_descriptions, field_class_ident,
+    field_static_ident, entity_introduced_by, file_entities -- all six entirely
+    through _forget_closed_entity, which is every dict it touches.
+    file_entities is written but NEVER READ here: _forget_closed_entity looks
+    the path's list up only to remove the ident from it, and the one value this
+    function needs out of that dict (previous_idents) was read by the CALLER
+    before the build. Its KEY survives -- the file itself still exists (status
+    "M"), so only the removed child's slot is dropped, unlike the "D" and
+    renamed-away-path passes which pop the whole key.
+    Reads ctx: commit_ts_iso, the orig_ts fallback for a removed entity
+    carrying no recorded valid-from. commit_hash, commit_ident, reason and
+    index_con are not consulted.
+    Appends to writes: close_items (one entry per removed ident), closed_idents
+    (one entry per removed ident). add_triples, dep_add_triples and
+    renamed_old_paths are untouched.
+
+    Reads nothing out of precomputed except the four *_entries lists; the
+    module ident is re-derived from file_path with _code_ident rather than read
+    from precomputed["module_ident"], exactly as the inline block did.
+
+    Never opens, closes or leases a handle: `db` is the caller's and is only
+    forwarded to _fwd_close_entity (single-handle invariant, #253).
+
+    No boolean or mode-like flag reaches this helper, so it declares no
+    keyword-only parameters; every argument is data. Should one ever be added
+    it must go after a bare `*` (#360's rule, applied across this refactor's
+    helpers in task 7).
+    """
+    module_ident = _code_ident("module", file_path)
+    current_extracted_idents: set = {module_ident}
+    for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
+        current_extracted_idents.add(fn_ident)
+    for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
+        current_extracted_idents.add(cls_ident)
+    # Globals and fields are tracked in state.file_entities too
+    # (see _build_code_triples): omitting them here would
+    # make every still-present global/field look "removed"
+    # on any later edit and wrongly close it (#113).
+    for gvar_ident, _gvar_name, _gvar_triples in precomputed["global_entries"]:
+        current_extracted_idents.add(gvar_ident)
+    for field_ident, _field_name, _field_triples in precomputed["field_entries"]:
+        current_extracted_idents.add(field_ident)
+    removed_idents = previous_idents - current_extracted_idents
+    # An in-place rename (old->new in the same file) is
+    # closed with :renamed-to linkage by the renamed_pairs
+    # loop in _forward_apply; exclude those old idents here so they are
+    # not ALSO closed as a plain removal (double close).
+    same_file_renamed_old_idents = {
+        _code_ident(cat, o_file, o_name)
+        for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+        if o_file == file_path
+    }
+    removed_idents -= same_file_renamed_old_idents
+    for ident in removed_idents:
+        # File survives (M), only this child was removed: the
+        # helper's _forget_closed_entity purges just this ident
+        # from the file's list, leaving the key in place.
+        _fwd_close_entity(
+            db, ctx, state, writes,
+            ident, state.entity_descriptions.get(ident, ""), module_ident,
+            extra_contains_parent=state.field_class_ident.get(ident),
+            close_entity_type=True, file_value=file_path,
+            is_static=state.field_static_ident.get(ident),
+        )
+
+
 def _forward_apply(
     db: Any,
     repo_path: str,
@@ -12448,49 +12577,17 @@ def _forward_apply(
             previous_idents = set(state.file_entities.get(file_path, []))
             _fwd_reconcile_and_build(
                 db, ctx, state, writes, file_path, extracted, precomputed,
-                status, lifecycle_only,
+                status=status, lifecycle_only=lifecycle_only,
             )
             # Detect entities removed from a modified file.
             # _build_code_triples only appends to state.file_entities, never removes.
             # Compare previous idents against the idents derivable from the
             # current extraction to find what was deleted.
             if status == "M":
-                module_ident = _code_ident("module", file_path)
-                current_extracted_idents: set = {module_ident}
-                for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
-                    current_extracted_idents.add(fn_ident)
-                for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
-                    current_extracted_idents.add(cls_ident)
-                # Globals and fields are tracked in state.file_entities too
-                # (see _build_code_triples): omitting them here would
-                # make every still-present global/field look "removed"
-                # on any later edit and wrongly close it (#113).
-                for gvar_ident, _gvar_name, _gvar_triples in precomputed["global_entries"]:
-                    current_extracted_idents.add(gvar_ident)
-                for field_ident, _field_name, _field_triples in precomputed["field_entries"]:
-                    current_extracted_idents.add(field_ident)
-                removed_idents = previous_idents - current_extracted_idents
-                # An in-place rename (old->new in the same file) is
-                # closed with :renamed-to linkage by the renamed_pairs
-                # loop below; exclude those old idents here so they are
-                # not ALSO closed as a plain removal (double close).
-                same_file_renamed_old_idents = {
-                    _code_ident(cat, o_file, o_name)
-                    for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
-                    if o_file == file_path
-                }
-                removed_idents -= same_file_renamed_old_idents
-                for ident in removed_idents:
-                    # File survives (M), only this child was removed: the
-                    # helper's _forget_closed_entity purges just this ident
-                    # from the file's list, leaving the key in place.
-                    _fwd_close_entity(
-                        db, ctx, state, writes,
-                        ident, state.entity_descriptions.get(ident, ""), module_ident,
-                        extra_contains_parent=state.field_class_ident.get(ident),
-                        close_entity_type=True, file_value=file_path,
-                        is_static=state.field_static_ident.get(ident),
-                    )
+                _fwd_close_removed_children(
+                    db, ctx, state, writes, file_path, precomputed,
+                    previous_idents, renamed_pairs,
+                )
             # Compute dep edges for this file and diff against previous.
             # Resolution itself already happened in _extract_commit
             # (precomputed["resolved_imports"]) against that commit's
