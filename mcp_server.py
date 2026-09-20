@@ -11875,6 +11875,96 @@ def _reverse_bulk_fill_walk(
     return count
 
 
+def _fwd_close_entity(
+    db: Any,
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    ident: str,
+    description: str,
+    module_ident: str,
+    **close_kwargs: Any,
+) -> None:
+    """Close one entity: build its close triples, forget it, record the ident.
+
+    The three-step sequence this replaces appeared SIX times inside
+    _forward_apply (D children, the R old module, M removed children,
+    renamed_pairs, renamed_old_paths, gitlink remove). **close_kwargs passes
+    straight through to _build_close_triples so each site keeps its exact
+    arguments -- the gitlink site passes entity_type_kw and NO
+    close_entity_type, unlike the other five, and the R old-module site passes
+    extra_contains_parent=None explicitly.
+
+    The path handed to _forget_closed_entity is DERIVED from
+    close_kwargs["file_value"], not taken as its own parameter. That is sound
+    because all six sites pass the same string to both today (verified site by
+    site: D file_path/file_path, R old_path/old_path, M file_path/file_path,
+    renamed_pairs old_file/old_file, renamed_old_paths r_old_path/r_old_path,
+    gitlink remove path/path). A future site where the two differ must add an
+    explicit forget_path= parameter rather than let the derivation silently
+    purge the wrong path's bookkeeping.
+
+    Reads state: entity_valid_from (for orig_ts), entity_introduced_by (via
+    _resolve_introduced_by).
+    Writes state: entity_valid_from, entity_descriptions, field_class_ident,
+    file_entities, field_static_ident, entity_introduced_by (all via
+    _forget_closed_entity).
+
+    Never opens, closes or leases a handle: `db` is the caller's, and
+    _resolve_introduced_by's fallback read rides it (single-handle invariant,
+    #253).
+    """
+    orig_ts = state.entity_valid_from.get(ident, ctx.commit_ts_iso)
+    writes.close_items.append((
+        _build_close_triples(
+            ident, description, module_ident,
+            introduced_by=_resolve_introduced_by(db, state, ident),
+            **close_kwargs,
+        ),
+        orig_ts,
+    ))
+    _forget_closed_entity(
+        ident, close_kwargs.get("file_value"), state.entity_valid_from,
+        state.entity_descriptions, state.field_class_ident, state.file_entities,
+        state.field_static_ident, state.entity_introduced_by,
+    )
+    writes.closed_idents.append(ident)
+
+
+def _fwd_close_dep_edges(
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    module_ident: str,
+    file_path: str,
+    *,
+    pop: bool,
+) -> None:
+    """Close every :depends-on edge recorded for one module.
+
+    pop=True drops the file_deps key entirely -- the only two callers are the
+    "D" branch and the renamed-away-path pass, where the whole file is gone.
+
+    The "M" branch is NOT a caller: it closes only
+    `previous_deps - current_deps` and then rewrites file_deps[file_path] with
+    the current set, which is a different operation. It stays inline; do not
+    route it through here.
+
+    Reads state: file_deps, dep_valid_from.
+    Writes state: file_deps (only when pop=True).
+
+    Takes no `db`: closing a dep edge needs no lineage read, so this helper
+    touches no handle at all.
+    """
+    for dep_ident in state.file_deps.get(file_path, set()):
+        orig_ts = state.dep_valid_from.get((module_ident, dep_ident), ctx.commit_ts_iso)
+        writes.close_items.append(
+            ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+        )
+    if pop:
+        state.file_deps.pop(file_path, None)
+
+
 def _forward_apply(
     db: Any,
     repo_path: str,
@@ -11991,33 +12081,18 @@ def _forward_apply(
             idents = list(state.file_entities.get(file_path, [_code_ident("module", file_path)]))
             module_ident = _code_ident("module", file_path)
             for ident in idents:
-                orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
-                desc = state.entity_descriptions.get(ident, "")
-                writes.close_items.append(
-                    (_build_close_triples(
-                        ident, desc, module_ident,
-                        state.field_class_ident.get(ident),
-                        close_entity_type=True, file_value=file_path,
-                        is_static=state.field_static_ident.get(ident),
-                        introduced_by=_resolve_introduced_by(db, state, ident),
-                    ), orig_ts)
+                _fwd_close_entity(
+                    db, ctx, state, writes,
+                    ident, state.entity_descriptions.get(ident, ""), module_ident,
+                    extra_contains_parent=state.field_class_ident.get(ident),
+                    close_entity_type=True, file_value=file_path,
+                    is_static=state.field_static_ident.get(ident),
                 )
-                _forget_closed_entity(
-                    ident, file_path, state.entity_valid_from,
-                    state.entity_descriptions, state.field_class_ident, state.file_entities,
-                    state.field_static_ident, state.entity_introduced_by,
-                )
-                writes.closed_idents.append(ident)
             # Whole file is gone: drop its (now-empty) state.file_entities key
             # so nothing stale lingers under this path (matches state.file_deps).
             state.file_entities.pop(file_path, None)
             # Close all :depends-on edges for the deleted module
-            for dep_ident in state.file_deps.get(file_path, set()):
-                orig_ts = state.dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                writes.close_items.append(
-                    ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
-                )
-            state.file_deps.pop(file_path, None)
+            _fwd_close_dep_edges(ctx, state, writes, module_ident, file_path, pop=True)
         else:  # A or M or R
             if status == "R" and old_path:
                 writes.renamed_old_paths.add(old_path)
@@ -12030,28 +12105,25 @@ def _forward_apply(
                 # :renamed-from), NOT closed with the old entity's
                 # historical valid window via _ingest_close.
                 writes.add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
-                old_desc = state.entity_descriptions.get(old_module_ident, old_path)
-                orig_ts = state.entity_valid_from.get(old_module_ident, commit_ts_iso)
-                writes.close_items.append((
-                    _build_close_triples(
-                        old_module_ident, old_desc, old_module_ident,
-                        close_entity_type=True, file_value=old_path,
-                        introduced_by=_resolve_introduced_by(db, state, old_module_ident),
-                    ),
-                    orig_ts,
-                ))
-                # Purge the closed old module. Its remaining child
+                # Purges the closed old module as it goes. Its remaining child
                 # entities under old_path are closed+purged by the
                 # writes.renamed_old_paths pass below, which also pops the
                 # whole state.file_entities[old_path] key — so only the
                 # scalar dicts and the module's own list slot need
                 # dropping here.
-                _forget_closed_entity(
-                    old_module_ident, old_path, state.entity_valid_from,
-                    state.entity_descriptions, state.field_class_ident, state.file_entities,
-                    state.field_static_ident, state.entity_introduced_by,
+                #
+                # extra_contains_parent=None is passed EXPLICITLY: a module
+                # ident is never a key in field_class_ident, so the
+                # field_class_ident.get(...) the other five sites pass would
+                # return None here anyway. Same value, visible reason.
+                _fwd_close_entity(
+                    db, ctx, state, writes,
+                    old_module_ident,
+                    state.entity_descriptions.get(old_module_ident, old_path),
+                    old_module_ident,
+                    extra_contains_parent=None,
+                    close_entity_type=True, file_value=old_path,
                 )
-                writes.closed_idents.append(old_module_ident)
             previous_idents = set(state.file_entities.get(file_path, []))
             # #222 phase 2d: an entity Stream 2 already introduced
             # provisionally is NOT authoritatively introduced, so the
@@ -12171,25 +12243,16 @@ def _forward_apply(
                 }
                 removed_idents -= same_file_renamed_old_idents
                 for ident in removed_idents:
-                    orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
-                    desc = state.entity_descriptions.get(ident, "")
-                    writes.close_items.append(
-                        (_build_close_triples(
-                            ident, desc, module_ident,
-                            state.field_class_ident.get(ident),
-                            close_entity_type=True, file_value=file_path,
-                            is_static=state.field_static_ident.get(ident),
-                            introduced_by=_resolve_introduced_by(db, state, ident),
-                        ), orig_ts)
+                    # File survives (M), only this child was removed: the
+                    # helper's _forget_closed_entity purges just this ident
+                    # from the file's list, leaving the key in place.
+                    _fwd_close_entity(
+                        db, ctx, state, writes,
+                        ident, state.entity_descriptions.get(ident, ""), module_ident,
+                        extra_contains_parent=state.field_class_ident.get(ident),
+                        close_entity_type=True, file_value=file_path,
+                        is_static=state.field_static_ident.get(ident),
                     )
-                    # File survives (M), only this child was removed:
-                    # purge just this ident from the file's list.
-                    _forget_closed_entity(
-                        ident, file_path, state.entity_valid_from,
-                        state.entity_descriptions, state.field_class_ident, state.file_entities,
-                        state.field_static_ident, state.entity_introduced_by,
-                    )
-                    writes.closed_idents.append(ident)
             # Compute dep edges for this file and diff against previous.
             # Resolution itself already happened in _extract_commit
             # (precomputed["resolved_imports"]) against that commit's
@@ -12240,25 +12303,15 @@ def _forward_apply(
         # open-ended thereafter — transact it via the add path, do
         # NOT fold it into the old entity's _ingest_close window.
         writes.add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
-        old_desc = state.entity_descriptions.get(old_ident, old_name)
         old_module_ident = _code_ident("module", old_file)
-        orig_ts = state.entity_valid_from.get(old_ident, commit_ts_iso)
-        writes.close_items.append((
-            _build_close_triples(
-                old_ident, old_desc, old_module_ident,
-                state.field_class_ident.get(old_ident),
-                close_entity_type=True, file_value=old_file,
-                is_static=state.field_static_ident.get(old_ident),
-                introduced_by=_resolve_introduced_by(db, state, old_ident),
-            ),
-            orig_ts,
-        ))
-        _forget_closed_entity(
-            old_ident, old_file, state.entity_valid_from,
-            state.entity_descriptions, state.field_class_ident, state.file_entities,
-            state.field_static_ident, state.entity_introduced_by,
+        _fwd_close_entity(
+            db, ctx, state, writes,
+            old_ident, state.entity_descriptions.get(old_ident, old_name),
+            old_module_ident,
+            extra_contains_parent=state.field_class_ident.get(old_ident),
+            close_entity_type=True, file_value=old_file,
+            is_static=state.field_static_ident.get(old_ident),
         )
-        writes.closed_idents.append(old_ident)
 
     # A file rename (R status) only closes the old MODULE above.
     # Child entities and dependency edges under the old path are
@@ -12282,33 +12335,20 @@ def _forward_apply(
                     continue  # already closed+purged by the R block above
                 if ident in renamed_covered_idents:
                     continue  # already closed+purged with :renamed-to linkage
-                orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
-                desc = state.entity_descriptions.get(ident, "")
-                writes.close_items.append(
-                    (_build_close_triples(
-                        ident, desc, r_old_module_ident,
-                        state.field_class_ident.get(ident),
-                        close_entity_type=True, file_value=r_old_path,
-                        is_static=state.field_static_ident.get(ident),
-                        introduced_by=_resolve_introduced_by(db, state, ident),
-                    ), orig_ts)
+                _fwd_close_entity(
+                    db, ctx, state, writes,
+                    ident, state.entity_descriptions.get(ident, ""), r_old_module_ident,
+                    extra_contains_parent=state.field_class_ident.get(ident),
+                    close_entity_type=True, file_value=r_old_path,
+                    is_static=state.field_static_ident.get(ident),
                 )
-                _forget_closed_entity(
-                    ident, r_old_path, state.entity_valid_from,
-                    state.entity_descriptions, state.field_class_ident, state.file_entities,
-                    state.field_static_ident, state.entity_introduced_by,
-                )
-                writes.closed_idents.append(ident)
             # Whole old path is gone (renamed away): drop the key so
             # no stale ident lingers to be re-discovered by a later
             # commit that reuses this path (e.g. a shim at old_path).
             state.file_entities.pop(r_old_path, None)
-            for dep_ident in state.file_deps.get(r_old_path, set()):
-                orig_ts = state.dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)
-                writes.close_items.append(
-                    ([f"[{r_old_module_ident} :depends-on {dep_ident}]"], orig_ts)
-                )
-            state.file_deps.pop(r_old_path, None)
+            _fwd_close_dep_edges(
+                ctx, state, writes, r_old_module_ident, r_old_path, pop=True
+            )
 
     # Process gitlink changes (submodule add/bump/remove).
     # The "remove" case's interaction with the ordinary per-file module-open
@@ -12358,26 +12398,20 @@ def _forward_apply(
             writes.add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
             state.pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
         else:  # "remove"
-            orig_ts = state.entity_valid_from.get(ext_ident, commit_ts_iso)
-            desc = state.entity_descriptions.get(ext_ident, "")
-            writes.close_items.append(
-                (_build_close_triples(
-                    ext_ident, desc, ext_ident,
-                    entity_type_kw=":type/external-dependency",
-                    file_value=path,
-                    introduced_by=_resolve_introduced_by(db, state, ext_ident),
-                ), orig_ts)
+            # entity_type_kw, and NO close_entity_type: this ident reuses the
+            # "module" prefix but was asserted as :type/external-dependency
+            # (#137), so a derived entity-type would retract a false fact.
+            #
+            # The helper also purges lifecycle state so a later re-add at the
+            # same path is treated as genuinely new. (Submodule paths aren't
+            # tracked in state.file_entities, so the path the helper derives
+            # from file_value is a no-op there.)
+            _fwd_close_entity(
+                db, ctx, state, writes,
+                ext_ident, state.entity_descriptions.get(ext_ident, ""), ext_ident,
+                entity_type_kw=":type/external-dependency",
+                file_value=path,
             )
-            # Submodule removed: purge lifecycle state so a later
-            # re-add at the same path is treated as genuinely new.
-            # (Submodule paths aren't tracked in state.file_entities, so the
-            # path arg is a no-op there, but pass it for consistency.)
-            _forget_closed_entity(
-                ext_ident, path, state.entity_valid_from,
-                state.entity_descriptions, state.field_class_ident, state.file_entities,
-                state.field_static_ident, state.entity_introduced_by,
-            )
-            writes.closed_idents.append(ext_ident)
             old_sha, pin_orig_ts = state.pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
             if old_sha is not None:
                 writes.close_items.append(
