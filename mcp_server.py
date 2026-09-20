@@ -12085,6 +12085,92 @@ def _fwd_apply_deleted_file(
     _fwd_close_dep_edges(ctx, state, writes, module_ident, file_path, pop=True)
 
 
+def _fwd_apply_renamed_head(
+    db: Any,
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    file_path: str,
+    old_path: str,
+) -> None:
+    """Record a file rename's module-level linkage and close the old module.
+
+    :renamed-from and :renamed-to are both brand-new facts that become true at
+    the rename commit and stay true forever -- they go through
+    writes.add_triples, NOT through the old entity's close window. Folding
+    either into the close (writes.close_items) would hand it that entity's
+    historical, bounded valid interval, so the linkage would stop being true
+    at the very commit that created it.
+
+    The old path goes into writes.renamed_old_paths; its remaining child
+    entities and :depends-on edges are closed later, by the renamed_old_paths
+    pass, which runs AFTER the renamed_pairs pass so idents the matcher already
+    closed with :renamed-to linkage can be excluded. That ordering is the
+    call-order contract's item 3 -- do not pre-empt either pass here.
+
+    Contract derived from the code, INDIRECT reads included: most of what this
+    touches is _fwd_close_entity's (and through it _resolve_introduced_by's and
+    _forget_closed_entity's). Enumerated in full rather than delegated by
+    reference, since a later task decomposing either helper is instructed to
+    trust this list and "everything X touches" stops resolving the moment X is
+    split.
+
+    Reads state: entity_descriptions (the old module's recorded description,
+    falling back to old_path) -- and, through _fwd_close_entity,
+    entity_valid_from (the close's orig_ts) and entity_introduced_by (via
+    _resolve_introduced_by, whose DB fallback rides the caller's handle).
+    entity_introduced_by is READ here, not only purged.
+    Writes state: entity_valid_from, entity_descriptions, field_class_ident,
+    field_static_ident, entity_introduced_by, file_entities -- all six entirely
+    through _forget_closed_entity, which is every dict it touches. Only the old
+    module's own ident is removed from state.file_entities[old_path]; the KEY
+    itself is popped later, by the renamed_old_paths pass.
+    Reads ctx: commit_ts_iso, the orig_ts fallback for an old module carrying
+    no recorded valid-from.
+    Appends to writes: renamed_old_paths (old_path), add_triples (two entries
+    -- :renamed-from on the new module, :renamed-to on the old), close_items
+    (one entry), closed_idents (one entry).
+
+    field_class_ident and field_static_ident appear under writes but NOT under
+    reads, unlike at the D/M child-close sites: this close passes
+    extra_contains_parent=None explicitly and no is_static at all (see the
+    comment at the call), so neither dict is consulted -- both are purged only
+    because _forget_closed_entity purges every dict for the closed ident.
+
+    Never opens, closes or leases a handle: `db` is the caller's and is only
+    forwarded to _fwd_close_entity (single-handle invariant, #253).
+    """
+    writes.renamed_old_paths.add(old_path)
+    old_module_ident = _code_ident("module", old_path)
+    new_module_ident = _code_ident("module", file_path)
+    writes.add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
+    # :renamed-to is a brand-new fact that becomes
+    # true at the rename commit and stays true forever
+    # after — it must be transacted open-ended (like
+    # :renamed-from), NOT closed with the old entity's
+    # historical valid window via _ingest_close.
+    writes.add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
+    # Purges the closed old module as it goes. Its remaining child
+    # entities under old_path are closed+purged by the
+    # writes.renamed_old_paths pass in _forward_apply, which also pops
+    # the whole state.file_entities[old_path] key — so only the
+    # scalar dicts and the module's own list slot need
+    # dropping here.
+    #
+    # extra_contains_parent=None is passed EXPLICITLY: a module
+    # ident is never a key in field_class_ident, so the
+    # field_class_ident.get(...) the other five sites pass would
+    # return None here anyway. Same value, visible reason.
+    _fwd_close_entity(
+        db, ctx, state, writes,
+        old_module_ident,
+        state.entity_descriptions.get(old_module_ident, old_path),
+        old_module_ident,
+        extra_contains_parent=None,
+        close_entity_type=True, file_value=old_path,
+    )
+
+
 def _forward_apply(
     db: Any,
     repo_path: str,
@@ -12198,35 +12284,7 @@ def _forward_apply(
             _fwd_apply_deleted_file(db, ctx, state, writes, file_path)
         else:  # A or M or R
             if status == "R" and old_path:
-                writes.renamed_old_paths.add(old_path)
-                old_module_ident = _code_ident("module", old_path)
-                new_module_ident = _code_ident("module", file_path)
-                writes.add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
-                # :renamed-to is a brand-new fact that becomes
-                # true at the rename commit and stays true forever
-                # after — it must be transacted open-ended (like
-                # :renamed-from), NOT closed with the old entity's
-                # historical valid window via _ingest_close.
-                writes.add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
-                # Purges the closed old module as it goes. Its remaining child
-                # entities under old_path are closed+purged by the
-                # writes.renamed_old_paths pass below, which also pops the
-                # whole state.file_entities[old_path] key — so only the
-                # scalar dicts and the module's own list slot need
-                # dropping here.
-                #
-                # extra_contains_parent=None is passed EXPLICITLY: a module
-                # ident is never a key in field_class_ident, so the
-                # field_class_ident.get(...) the other five sites pass would
-                # return None here anyway. Same value, visible reason.
-                _fwd_close_entity(
-                    db, ctx, state, writes,
-                    old_module_ident,
-                    state.entity_descriptions.get(old_module_ident, old_path),
-                    old_module_ident,
-                    extra_contains_parent=None,
-                    close_entity_type=True, file_value=old_path,
-                )
+                _fwd_apply_renamed_head(db, ctx, state, writes, file_path, old_path)
             previous_idents = set(state.file_entities.get(file_path, []))
             # #222 phase 2d: an entity Stream 2 already introduced
             # provisionally is NOT authoritatively introduced, so the
