@@ -23,7 +23,11 @@ the flag, which strands 183 lines belonging to neither side.
 The repetition is the other half of the motivation. The three-step "close an
 entity" sequence (`_build_close_triples` → `_forget_closed_entity` →
 `closed_idents.append`) appears **six** times (verified: 6 `_build_close_triples` and 6 `_forget_closed_entity` calls in the body); the ":depends-on edge close"
-sequence appears **three** times. Both collapse into one helper each.
+sequence appears **three** times, two of which are the same operation.
+Both collapse into one helper each — but see the correction below: the M
+branch's dep close iterates `previous_deps - current_deps` rather than the
+whole recorded set, so `_fwd_close_dep_edges` covers two of the three sites and
+the M one stays inline.
 
 ## Decisions taken before design work (each chosen deliberately)
 
@@ -98,9 +102,11 @@ reason becomes visible instead of accidental.
 
 `_fwd_close_dep_edges(ctx, state, writes, module_ident, file_path, *, pop)`
 
-The three `:depends-on` close sites. `pop=True` for the D branch and the
-renamed-away path (both drop the `file_deps` key); the M branch closes
-individual edges without popping.
+Two of the three `:depends-on` close sites: the D branch and the renamed-away
+path, both of which close every recorded edge and drop the `file_deps` key
+(`pop=True`). **The M branch is NOT one of them** — it closes only
+`previous_deps - current_deps` and then rewrites `file_deps[file_path]`, a
+different operation, and it stays inline in `_fwd_diff_dependencies`.
 
 ### Status handlers and passes
 
