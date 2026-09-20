@@ -193,20 +193,32 @@ def test_two_recording_formats_are_refused(tmp_path):
     assert result["proved_nothing"] is True
 
 
-def test_a_changed_untagged_count_is_not_silently_uncompared(tmp_path):
+def test_a_changed_untagged_count_is_reported_but_does_not_gate(tmp_path):
     """Only commands issued inside an apply frame are compared. A change in
     what everything ELSE issued is invisible to the per-window diff, so the
-    dropped count rides in the trailer and any difference fails the compare.
+    dropped count rides in the trailer and is reported as `untagged_mismatch`
+    -- but it must not fail the comparison.
 
-    Ablation: drop `untagged_mismatch` from the `ok` conjunction and this
-    reports ok: True for two runs that demonstrably differ."""
+    Measured (task-1 report): the SAME 303-commit corpus, SAME code, on two
+    separate invocation batches produced untagged_commands 475641 vs 475623
+    with total `commands` identical at 566360 -- so this count drifts on
+    unmodified code between batches, and gating on it false-fails every task
+    whose baseline predates its comparison arm.
+
+    Ablation for the 'reported' half: delete the untagged_mismatch
+    computation entirely and `untagged_mismatch` reads False here even though
+    the two trailers plainly differ -- a test asserting only `ok is True`
+    would not catch that, so both halves are asserted below."""
     rows = [{"commit": "abc", "cmd": "X"}]
     a = _write_with_meta(tmp_path, "a.jsonl", rows, untagged=100)
     b = _write_with_meta(tmp_path, "b.jsonl", rows, untagged=101)
     result = probe.compare(a, b)
-    assert result["ok"] is False
+    # The informational half: still computed and surfaced.
     assert result["untagged_mismatch"] is True
-    # Not refused: the per-window diff is still meaningful and still clean.
+    assert result["untagged_a"] == 100
+    assert result["untagged_b"] == 101
+    # The gating half: an untagged-only difference must not fail the compare.
+    assert result["ok"] is True
     assert result["differing_commits"] == []
     assert result["proved_nothing"] is False
 

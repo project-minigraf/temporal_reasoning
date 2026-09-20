@@ -70,11 +70,22 @@ it is sound for a refactor confined to the apply functions: a write moved OUT
 of _forward_apply into its caller vanishes from that window's list and is
 caught as a shortened list, and one moved IN appears as an addition.
 
-That the refactor left nothing outside an apply frame is a CHECKED per-run
-assertion rather than a standing assumption: the dropped count is written
-into the recording's own trailer and compare() fails on any difference
-(`untagged_mismatch`). Without it, code that moved from one untagged site to
-another untagged site would be silently uncompared.
+The dropped count is written into the recording's own trailer and compare()
+reports any difference as `untagged_mismatch` -- but as of the measurement
+below, that count is INFORMATIONAL, not gating. Measured directly: recording
+the same 303-commit corpus, same 1:1 ratio, same PYTHONHASHSEED=0, produced
+untagged_commands 475641 on one batch and 475623 on a LATER batch of BOTH an
+edited arm and an unmodified-master control run in that same later batch
+(total `commands` identical at 566360 in all three) -- so the count drifts
+between invocation batches on completely unmodified code, and gating on it
+false-fails every task whose baseline was recorded in an earlier batch than
+its comparison arm. `untagged_mismatch` cannot be the thing that catches code
+moving between two untagged sites either: a write moving OUT of an apply
+frame disappears from that window's tagged sequence and the strict per-window
+comparison below already fails on exactly that movement. What it cannot see
+-- a reshuffle between two untagged call sites, neither of which ever enters
+an apply frame -- was already a documented invisible residual, not something
+this count newly covered.
 
 Usage:
 
@@ -188,11 +199,19 @@ def compare(path_a, path_b) -> dict:
       a refused comparison proved nothing about parity.
     * `format_mismatch` -- same reasoning, across PROBE_FORMAT versions.
     * `untagged_mismatch` -- the counts of commands issued OUTSIDE any apply
-      frame differ. Not refused (the per-window diff is still meaningful) but
-      `ok` is False: the recording only compares what an apply frame issued,
-      so a change in what everything else issued is otherwise invisible. This
-      is what makes "the refactor left nothing outside an apply frame" a
-      checked per-run assertion rather than a standing assumption.
+      frame differ. Computed and reported, but INFORMATIONAL -- it does not
+      set `ok` to False. Measured before this was decided: two arms recording
+      the SAME 303-commit corpus, SAME code, on separate invocation batches
+      reported 475641 vs 475623 untagged commands (total `commands` identical
+      at 566360), so this count drifts with the batch on unmodified code and
+      gating on it would false-fail every task whose baseline predates its
+      comparison arm. It is also not the thing that would catch a write
+      crossing the apply-frame boundary -- a write moved OUT of an apply frame
+      vanishes from that window's tagged sequence, which the strict per-window
+      comparison below already fails on. The only thing this count could ever
+      catch on its own is a reshuffle between two untagged call sites, which
+      never touches an apply frame -- an already-documented invisible residual,
+      not a new guarantee this count buys.
 
     A `ratio` difference is reported and deliberately does NOT refuse: the
     probe's own negative control compares a 1:1 recording against a
@@ -297,8 +316,10 @@ def compare(path_a, path_b) -> dict:
         and not result["commits_only_in_a"]
         and not result["commits_only_in_b"]
         and not differing
-        and not untagged_mismatch
         and not trailer_mismatch
+        # untagged_mismatch is deliberately NOT in this conjunction -- see the
+        # docstring's `untagged_mismatch` bullet. It stays in `result` so a
+        # reader can still see it; it must never gate `ok`.
     )
     return result
 
