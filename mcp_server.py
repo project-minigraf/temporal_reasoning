@@ -12171,6 +12171,166 @@ def _fwd_apply_renamed_head(
     )
 
 
+def _fwd_reconcile_and_build(
+    db: Any,
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    file_path: str,
+    extracted: Any,
+    precomputed: Dict[str, Any],
+    status: str,
+    lifecycle_only: bool,
+) -> None:
+    """Reconcile this file's provisional lineage, then build its entities.
+
+    ONE unit by construction, and it must stay one. The
+    state.entity_valid_from.pop below exists PRECISELY SO THAT the
+    _build_code_triples call underneath it takes its introduction branch for
+    that ident -- the pop is the purpose of the reconciliation block, not
+    incidental cleanup. Splitting the two, or extracting the gate without the
+    pop, mints a SECOND :introduced-by alongside the reverse stream's
+    provisional guess (#235). Do not "improve" this structure.
+
+    Both lifecycle_only gates below are kept verbatim and SEPARATE. They are
+    the same predicate today and are deliberately NOT fused into one boolean:
+    fusing is behaviour-neutral but removes the ability to change one without
+    the other, and the two exist for different documented reasons -- who owns
+    "A"/"M" lineage (the candidate-selection gate) versus whether the built
+    triples are emitted at all (the extend gate).
+
+    Contract derived from the code, INDIRECT reaches included -- through
+    _build_code_triples, _forward_reconcile_provisional, _lineage_is_provisional,
+    _forward_candidate_idents and _forward_structural_triples_by_ident.
+    Enumerated in full rather than delegated by reference, since "everything
+    _build_code_triples maintains" stops resolving the moment that function is
+    touched.
+
+    Reads state: entity_valid_from (_build_code_triples' membership gate at
+    all five introduction sites -- this is the dict the pop above edits, so it
+    is read AND written here), file_entities (_build_code_triples' setdefault
+    plus its `ident not in idents_for_file` test, so read as well as
+    appended), ts_by_commit_ident (read by _forward_reconcile_provisional, to
+    date the superseded guess commit's retroactive :modified-in edge; a miss
+    there downgrades to a stderr line rather than writing the edge).
+    Writes state: entity_valid_from (the reconciliation pop, plus
+    _build_code_triples' five introduction branches), entity_descriptions,
+    file_entities (one append per newly introduced ident), entity_introduced_by,
+    field_class_ident and field_static_ident -- the last two only from
+    _build_code_triples' field branch, and only for fields precomputed's
+    field_class_map / field_static_map actually carry. Those two are written
+    but never READ here; the maps they are filled from come from precomputed,
+    not from state.
+    Reads ctx: commit_ts_iso (the true introduction time handed to
+    _forward_reconcile_provisional for re-dating, and the valid-from
+    _build_code_triples stamps), commit_ident (both the :modified-in /
+    :introduced-by value and _forward_reconcile_provisional's
+    self-introduction guard), index_con (forwarded so the reconciliation's
+    retract / re-date / confirm / transact land in the caller's batched index
+    writer). commit_hash and reason are not consulted.
+    Appends to writes: add_triples only -- extended with _build_code_triples'
+    output, and only when the emission gate allows it. close_items,
+    closed_idents, dep_add_triples and renamed_old_paths are untouched.
+
+    Not everything this writes goes through `writes`: _lineage_is_provisional
+    reads the DB once per candidate ident, and _forward_reconcile_provisional
+    issues its retract, re-date, lineage-confirm and :modified-in transact
+    IMMEDIATELY against `db`, not into an accumulator. Those writes are
+    already ordered before the add_triples this function appends.
+
+    Never opens, closes or leases a handle: `db` is the caller's and is only
+    forwarded to _lineage_is_provisional and _forward_reconcile_provisional
+    (single-handle invariant, #253).
+    """
+    # #222 phase 2d: an entity Stream 2 already introduced
+    # provisionally is NOT authoritatively introduced, so the
+    # forward walk must treat it as new. Popping it out of
+    # entity_valid_from is what makes _build_code_triples's own
+    # gate (entity_valid_from membership) agree -- deliberately
+    # in preference to widening that function's signature, since
+    # its gate means "is this the introduction" for a forward
+    # walk and nothing else should depend on that meaning.
+    #
+    # It is also semantically right on its own terms: the
+    # valid_from Stream 2 recorded is a wrong guess, and must
+    # never be used as an orig_ts for a close.
+    #
+    # #235: _lineage_is_provisional(db, ident) is the SOLE authority
+    # for reconcilability, asked per ident, right here. There is no
+    # preloaded set, and none may be reintroduced as a prefilter --
+    # that is the bug this fix removed, in both directions:
+    #
+    #   * stale-NEGATIVE. A run-start snapshot is EMPTY on a fresh
+    #     ingest, and Stream 2 writes its guesses during that same
+    #     run. Prefiltering through it dropped every same-run guess
+    #     before the DB check could see it,
+    #     _forward_reconcile_provisional never fired, and
+    #     _build_code_triples minted a SECOND :introduced-by
+    #     alongside the guess. A prefilter's false negatives are
+    #     unrecoverable precisely because the authority never runs.
+    #   * stale-POSITIVE. By the time this commit is reached, an
+    #     ident such a snapshot listed may already be authoritative
+    #     in the DB (reconciled earlier in this same forward pass, or
+    #     by a previous run's correction sweep). Popping
+    #     entity_valid_from for it hands it to _build_code_triples as
+    #     "new" and mints the same second fact, while
+    #     _forward_reconcile_provisional no-ops and never retracts it.
+    #
+    # lifecycle_only (Stage B): _correction_sweep_apply owns "A"/"M"
+    # lineage and has already run for this very commit, so
+    # reconciling here would mint a second :introduced-by behind its
+    # back. An "R" file's NEW path is the one case that still needs
+    # it -- nothing wrote those entities in Stage A, so the reverse
+    # stream's provisional guess (if any) sits at a LATER commit that
+    # this rename supersedes.
+    candidates = (
+        _forward_candidate_idents(precomputed)
+        if (not lifecycle_only or status == "R") else []
+    )
+    reconcilable = [
+        ident for ident in candidates if _lineage_is_provisional(db, ident)
+    ]
+    # Built once per file rather than scanned per ident (matches
+    # _correction_sweep_apply's candidate_triples_by_ident
+    # precedent) -- a per-ident linear scan here is O(n^2) per file
+    # once there is more than one reconcilable entity.
+    structural_triples_by_ident = (
+        _forward_structural_triples_by_ident(precomputed) if reconcilable else {}
+    )
+    for ident in reconcilable:
+        state.entity_valid_from.pop(ident, None)
+        if ident not in structural_triples_by_ident:
+            # Unreachable in normal operation: _forward_candidate_idents
+            # and _forward_structural_triples_by_ident scan the same
+            # five sources. If they ever desynchronize, failing loudly
+            # beats a silent [] -- that would let
+            # _forward_reconcile_provisional retract the guess and
+            # confirm lineage while skipping the re-dating, stranding
+            # structural facts at the wrong valid-time.
+            raise RuntimeError(
+                f"_forward_structural_triples_by_ident has no entry for "
+                f"{ident!r}, but it came from _forward_candidate_idents, "
+                "which scans the same five sources -- the two have "
+                "desynchronized"
+            )
+        _forward_reconcile_provisional(
+            db, ident, structural_triples_by_ident[ident],
+            ctx.commit_ts_iso, state.ts_by_commit_ident, ctx.commit_ident,
+            index_con=ctx.index_con,
+        )
+    triples = _build_code_triples(
+        file_path, extracted, ctx.commit_ts_iso, state.entity_valid_from,
+        state.entity_descriptions, state.file_entities, ctx.commit_ident, precomputed,
+        state.field_class_ident, state.field_static_ident, state.entity_introduced_by,
+    )
+    # lifecycle_only: called for its dict side effects, output
+    # DISCARDED for "A"/"M" (see _forward_apply's docstring). "R" keeps
+    # it -- the reverse stream skipped renames entirely, so nothing
+    # ever wrote the new path's entities.
+    if not lifecycle_only or status == "R":
+        writes.add_triples.extend(triples)
+
+
 def _forward_apply(
     db: Any,
     repo_path: str,
@@ -12286,93 +12446,10 @@ def _forward_apply(
             if status == "R" and old_path:
                 _fwd_apply_renamed_head(db, ctx, state, writes, file_path, old_path)
             previous_idents = set(state.file_entities.get(file_path, []))
-            # #222 phase 2d: an entity Stream 2 already introduced
-            # provisionally is NOT authoritatively introduced, so the
-            # forward walk must treat it as new. Popping it out of
-            # entity_valid_from is what makes _build_code_triples's own
-            # gate (entity_valid_from membership) agree -- deliberately
-            # in preference to widening that function's signature, since
-            # its gate means "is this the introduction" for a forward
-            # walk and nothing else should depend on that meaning.
-            #
-            # It is also semantically right on its own terms: the
-            # valid_from Stream 2 recorded is a wrong guess, and must
-            # never be used as an orig_ts for a close.
-            #
-            # #235: _lineage_is_provisional(db, ident) is the SOLE authority
-            # for reconcilability, asked per ident, right here. There is no
-            # preloaded set, and none may be reintroduced as a prefilter --
-            # that is the bug this fix removed, in both directions:
-            #
-            #   * stale-NEGATIVE. A run-start snapshot is EMPTY on a fresh
-            #     ingest, and Stream 2 writes its guesses during that same
-            #     run. Prefiltering through it dropped every same-run guess
-            #     before the DB check could see it,
-            #     _forward_reconcile_provisional never fired, and
-            #     _build_code_triples minted a SECOND :introduced-by
-            #     alongside the guess. A prefilter's false negatives are
-            #     unrecoverable precisely because the authority never runs.
-            #   * stale-POSITIVE. By the time this commit is reached, an
-            #     ident such a snapshot listed may already be authoritative
-            #     in the DB (reconciled earlier in this same forward pass, or
-            #     by a previous run's correction sweep). Popping
-            #     entity_valid_from for it hands it to _build_code_triples as
-            #     "new" and mints the same second fact, while
-            #     _forward_reconcile_provisional no-ops and never retracts it.
-            #
-            # lifecycle_only (Stage B): _correction_sweep_apply owns "A"/"M"
-            # lineage and has already run for this very commit, so
-            # reconciling here would mint a second :introduced-by behind its
-            # back. An "R" file's NEW path is the one case that still needs
-            # it -- nothing wrote those entities in Stage A, so the reverse
-            # stream's provisional guess (if any) sits at a LATER commit that
-            # this rename supersedes.
-            candidates = (
-                _forward_candidate_idents(precomputed)
-                if (not lifecycle_only or status == "R") else []
+            _fwd_reconcile_and_build(
+                db, ctx, state, writes, file_path, extracted, precomputed,
+                status, lifecycle_only,
             )
-            reconcilable = [
-                ident for ident in candidates if _lineage_is_provisional(db, ident)
-            ]
-            # Built once per file rather than scanned per ident (matches
-            # _correction_sweep_apply's candidate_triples_by_ident
-            # precedent) -- a per-ident linear scan here is O(n^2) per file
-            # once there is more than one reconcilable entity.
-            structural_triples_by_ident = (
-                _forward_structural_triples_by_ident(precomputed) if reconcilable else {}
-            )
-            for ident in reconcilable:
-                state.entity_valid_from.pop(ident, None)
-                if ident not in structural_triples_by_ident:
-                    # Unreachable in normal operation: _forward_candidate_idents
-                    # and _forward_structural_triples_by_ident scan the same
-                    # five sources. If they ever desynchronize, failing loudly
-                    # beats a silent [] -- that would let
-                    # _forward_reconcile_provisional retract the guess and
-                    # confirm lineage while skipping the re-dating, stranding
-                    # structural facts at the wrong valid-time.
-                    raise RuntimeError(
-                        f"_forward_structural_triples_by_ident has no entry for "
-                        f"{ident!r}, but it came from _forward_candidate_idents, "
-                        "which scans the same five sources -- the two have "
-                        "desynchronized"
-                    )
-                _forward_reconcile_provisional(
-                    db, ident, structural_triples_by_ident[ident],
-                    commit_ts_iso, state.ts_by_commit_ident, commit_ident,
-                    index_con=index_con,
-                )
-            triples = _build_code_triples(
-                file_path, extracted, commit_ts_iso, state.entity_valid_from,
-                state.entity_descriptions, state.file_entities, commit_ident, precomputed,
-                state.field_class_ident, state.field_static_ident, state.entity_introduced_by,
-            )
-            # lifecycle_only: called for its dict side effects, output
-            # DISCARDED for "A"/"M" (see this function's docstring). "R" keeps
-            # it -- the reverse stream skipped renames entirely, so nothing
-            # ever wrote the new path's entities.
-            if not lifecycle_only or status == "R":
-                writes.add_triples.extend(triples)
             # Detect entities removed from a modified file.
             # _build_code_triples only appends to state.file_entities, never removes.
             # Compare previous idents against the idents derivable from the
