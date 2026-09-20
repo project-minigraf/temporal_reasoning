@@ -24,38 +24,57 @@ CAVEATS, all load-bearing:
   a running process changes nothing at all, so a probe that "fixed it up"
   would be silently unpinned while reporting that it was pinned. It must come
   from the command line.
-* Comparison is PER COMMIT, never one global list: the two streams interleave
-  through executors, so global order is not stable run to run.
+* Comparison is PER APPLY WINDOW, never one global list: the two streams
+  interleave through executors, so global order is not stable run to run. A
+  window is (commit hash, occurrence), not the hash alone -- one hash gets a
+  second window when Stage B's `_forward_apply(lifecycle_only=True)` sweeps
+  a commit Stage A already applied, and a write moved from the tail of the
+  first to the head of the second concatenates identically under a hash-only
+  key.
+* Two arms must walk the SAME history. The recording's header carries a
+  sha256 over the linearization and compare() REFUSES across corpora rather
+  than reporting every window as one-sided.
 * Two empty recordings are NOT clean -- see compare()'s proved_nothing key.
 * Absolute wall-clock numbers are NOT comparable across invocation batches
   (precedent: probe_sweep_window_cost.py, where a baseline drifted 2.4x
   between rounds with no code change). Do not read a timing delta here as a
   finding.
 
-WHAT IS RECORDED, AND WHAT IS NOT. Only commands issued while a
-_forward_apply / _reverse_apply call is on the recording thread's stack are
-written to the JSONL. Everything else an ingestion run does -- the preload
-lease, _frontier_load, the correction sweep's own reads, the status handler --
-is counted into the returned `untagged_commands` and then dropped, because
-those run on the event-loop thread interleaved with executor work and their
-global order is not stable run to run. This is a deliberate scope choice, not
-an oversight, and it is sound for THIS refactor for a reason worth stating:
-a write that the refactor accidentally moved OUT of _forward_apply into its
-caller vanishes from that commit's list and is caught as a shortened list,
-and one moved IN appears as an addition. Only an untagged-to-untagged change
-is invisible, and no such code is in scope.
+WHAT IS RECORDED. Four choke points, in the order they matter:
 
-_db_checkpoint_gated CALLS are recorded too, as the synthetic command
-"(checkpoint-gated)". Flag site 6 of `lifecycle_only` is exactly
-`if not lifecycle_only: _db_checkpoint_gated(db)`, so an oracle blind to it
-could not see that site change. What is recorded is the CALL, never the
-outcome: `_db_checkpoint` itself is deliberately NOT wrapped, because
-_CheckpointPolicy gates it on a WALL-CLOCK duty budget
-(MINIGRAF_INGEST_CHECKPOINT_DUTY, #241) and whether any given call actually
-checkpoints therefore varies run to run on identical code. Measured while
-building this probe: recording `_db_checkpoint` made the master-against-itself
-control report a difference at one commit (25 commands vs 26, the extra one a
-checkpoint) purely from that gate.
+  * `_db_execute` -- every graph read and write.
+  * `_index_write` -- every fact-index insert/delete, WITH its triples. The
+    index is the graph's only independent witness (#302) and it is written
+    from inside _forward_apply.
+  * `_commit_index_writer_safe` -- literally the last statement of
+    _forward_apply's write tail. Without it, a task that moved or dropped
+    that commit read `ok: true`.
+  * `_db_checkpoint_gated` CALLS, as "(checkpoint-gated)". Flag site 6 of
+    `lifecycle_only` is exactly `if not lifecycle_only:
+    _db_checkpoint_gated(db)`, so an oracle blind to it could not see that
+    site change. The CALL, never the outcome: `_db_checkpoint` itself is
+    deliberately NOT wrapped, because _CheckpointPolicy gates it on a
+    WALL-CLOCK duty budget (MINIGRAF_INGEST_CHECKPOINT_DUTY, #241) and
+    whether a given call actually checkpoints varies run to run on identical
+    code. Measured while building this probe: recording `_db_checkpoint`
+    made the master-against-itself control report a difference at one commit
+    (25 commands vs 26, the extra one a checkpoint) purely from that gate.
+
+WHAT IS NOT. Only calls issued while a _forward_apply / _reverse_apply frame
+is on the recording thread's stack are written to the JSONL. Everything else
+an ingestion run does -- the preload lease, _frontier_load, the correction
+sweep's own reads, the status handler -- is counted and dropped, because
+those run on the event-loop thread interleaved with executor work and their
+global order is not stable run to run. This is a deliberate scope choice, and
+it is sound for a refactor confined to the apply functions: a write moved OUT
+of _forward_apply into its caller vanishes from that window's list and is
+caught as a shortened list, and one moved IN appears as an addition.
+
+That the refactor left nothing outside an apply frame is a CHECKED per-run
+assertion rather than a standing assumption: the dropped count is written
+into the recording's own trailer and compare() fails on any difference
+(`untagged_mismatch`). Without it, code that moved from one untagged site to
+another untagged site would be silently uncompared.
 
 Usage:
 
@@ -78,6 +97,7 @@ that looks like an ingestion failure.
 """
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import pathlib
@@ -92,47 +112,163 @@ from typing import Dict, List, Optional
 # ---------------------------------------------------------------- comparison
 
 
-def _load(path) -> List[dict]:
-    rows = []
+PROBE_FORMAT = 2
+"""Recording format. Bump whenever a change makes an older JSONL
+uncomparable to a newer one -- compare() REFUSES across formats rather
+than reporting the difference as a finding about the code.
+
+  1  bare {"commit", "cmd"} rows.
+  2  header + trailer rows, an occurrence index on each row, and
+     fact-index traffic (_index_write / _commit_index_writer_safe)
+     recorded alongside the graph commands.
+"""
+
+
+def _read(path):
+    """Stream one recording into (grouped, n_rows, header, trailer).
+
+    Streamed rather than materialized: a repo-scale recording is ~250 MB of
+    JSONL and compare() holds TWO of them, so building an intermediate list
+    of row dicts on top of the grouping doubles peak memory for nothing.
+
+    The grouping key is `<commit>` for the first apply of that hash and
+    `<commit>#<n>` for each later one. One hash is legitimately applied more
+    than once in a run -- Stage A's forward or reverse pass, then Stage B's
+    `_forward_apply(lifecycle_only=True)` -- and an earlier version of this
+    function concatenated those windows into one list. That is exactly the
+    blind spot this refactor is most likely to produce: a write moved from
+    the TAIL of Stage A's apply to the HEAD of Stage B's lifecycle apply ON
+    THE SAME HASH concatenates identically and reports clean. The occurrence
+    index makes the two windows distinct sequences.
+
+    A row with no `occ` (format 1, and the comparator's own unit fixtures)
+    reads as occurrence 0, which renders as the bare hash -- so the key is
+    unambiguous either way, since a commit hash cannot contain `#`.
+    """
+    grouped = {}
+    header = trailer = None
+    n_rows = 0
     with open(path) as fh:
         for line in fh:
             line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
-
-
-def _group(rows: List[dict]) -> Dict[str, List[str]]:
-    """Commit hash -> its commands, in issue order.
-
-    A hash can legitimately be applied more than once in one run (Stage A's
-    forward or reverse pass, then Stage B's lifecycle pass), and those windows
-    concatenate here. That is deterministic -- Stage A completes before Stage
-    B -- so it needs no occurrence index.
-    """
-    grouped: Dict[str, List[str]] = {}
-    for row in rows:
-        grouped.setdefault(row["commit"], []).append(row["cmd"])
-    return grouped
+            if not line:
+                continue
+            row = json.loads(line)
+            if "header" in row:
+                header = row
+                continue
+            if "trailer" in row:
+                trailer = row
+                continue
+            occ = row.get("occ", 0)
+            key = row["commit"] if not occ else f"{row['commit']}#{occ}"
+            grouped.setdefault(key, []).append(row["cmd"])
+            n_rows += 1
+    return grouped, n_rows, header, trailer
 
 
 def compare(path_a, path_b) -> dict:
-    """Compare two recordings command-for-command, per commit.
+    """Compare two recordings command-for-command, per apply window.
 
-    `proved_nothing` is True when EITHER file has zero rows, and `ok` is then
-    False. A comparator that reads two empty files as clean fails OPEN: a
-    probe that recorded nothing at all would certify the refactor. One empty
-    side is treated the same way rather than as a huge real difference,
-    because an arm that crashed before its first write is a fact about the
-    RUN, not a finding about the code under test.
+    `proved_nothing` is True when EITHER file has zero command rows, and `ok`
+    is then False. A comparator that reads two empty files as clean fails
+    OPEN: a probe that recorded nothing at all would certify the refactor.
+    One empty side is treated the same way rather than as a huge real
+    difference, because an arm that crashed before its first write is a fact
+    about the RUN, not a finding about the code under test.
+
+    Three whole-recording checks run before the per-window diff, each with
+    its own key so a reader can tell them apart:
+
+    * `corpus_mismatch` -- the two arms walked different histories. REFUSED,
+      not diffed: every window would read as one-sided and the output would
+      look like catastrophic divergence in the code under test. The corpus id
+      is a sha256 over the linearization, so it is exact rather than a label
+      anyone could get wrong by hand. `proved_nothing` is set with it, because
+      a refused comparison proved nothing about parity.
+    * `format_mismatch` -- same reasoning, across PROBE_FORMAT versions.
+    * `untagged_mismatch` -- the counts of commands issued OUTSIDE any apply
+      frame differ. Not refused (the per-window diff is still meaningful) but
+      `ok` is False: the recording only compares what an apply frame issued,
+      so a change in what everything else issued is otherwise invisible. This
+      is what makes "the refactor left nothing outside an apply frame" a
+      checked per-run assertion rather than a standing assumption.
+
+    A `ratio` difference is reported and deliberately does NOT refuse: the
+    probe's own negative control compares a 1:1 recording against a
+    forward-only one to prove the comparator can see a real difference.
     """
-    rows_a, rows_b = _load(path_a), _load(path_b)
-    a, b = _group(rows_a), _group(rows_b)
+    a, rows_a, head_a, tail_a = _read(path_a)
+    b, rows_b, head_b, tail_b = _read(path_b)
 
-    proved_nothing = not rows_a or not rows_b
+    def field(h, key):
+        return h.get(key) if h else None
 
-    only_a = [c for c in a if c not in b]
-    only_b = [c for c in b if c not in a]
+    corpus_a, corpus_b = field(head_a, "corpus_id"), field(head_b, "corpus_id")
+    corpus_mismatch = bool(corpus_a and corpus_b and corpus_a != corpus_b)
+    fmt_a = field(head_a, "probe_format")
+    fmt_b = field(head_b, "probe_format")
+    format_mismatch = bool(fmt_a and fmt_b and fmt_a != fmt_b)
+
+    untagged_a, untagged_b = field(tail_a, "untagged_commands"), field(tail_b, "untagged_commands")
+    untagged_mismatch = (
+        untagged_a is not None and untagged_b is not None and untagged_a != untagged_b
+    )
+    # Exactly one side carrying a trailer means one recording was truncated
+    # (the trailer is the last thing record_run writes) or the two came from
+    # different probe versions. Neither is a finding about the code.
+    trailer_mismatch = (tail_a is None) != (tail_b is None)
+
+    refused = corpus_mismatch or format_mismatch
+    proved_nothing = (not rows_a) or (not rows_b) or refused
+
+    result = {
+        "ok": False,
+        "proved_nothing": proved_nothing,
+        "corpus_mismatch": corpus_mismatch,
+        "format_mismatch": format_mismatch,
+        "untagged_mismatch": untagged_mismatch,
+        "trailer_mismatch": trailer_mismatch,
+        "corpus_a": field(head_a, "corpus_label"),
+        "corpus_b": field(head_b, "corpus_label"),
+        "ratio_a": field(head_a, "ratio"),
+        "ratio_b": field(head_b, "ratio"),
+        "ratio_mismatch": bool(
+            field(head_a, "ratio") and field(head_b, "ratio")
+            and field(head_a, "ratio") != field(head_b, "ratio")
+        ),
+        "untagged_a": untagged_a,
+        "untagged_b": untagged_b,
+        "commands_a": rows_a,
+        "commands_b": rows_b,
+        # WINDOWS, not commits: one hash gets a second window when Stage B
+        # sweeps a commit Stage A already applied, so on a 303-commit corpus
+        # these read 454. A key named `commits_a` holding 454 is the kind of
+        # mislabelled number a later reader takes at face value, so both are
+        # shipped and each says what it counts.
+        "windows_a": len(a),
+        "windows_b": len(b),
+        "commits_a": len({k.split("#", 1)[0] for k in a}),
+        "commits_b": len({k.split("#", 1)[0] for k in b}),
+        "windows_only_in_a": [],
+        "windows_only_in_b": [],
+        "commits_only_in_a": [],
+        "commits_only_in_b": [],
+        "differing_commits": [],
+    }
+    if refused:
+        return result
+
+    # `commits_only_in_*` keeps its name and its meaning -- a WINDOW key,
+    # which is the bare hash for the first window and `<hash>#<n>` after --
+    # because that is what the per-window diff is keyed on and what a reader
+    # needs to look the finding up. `windows_only_in_*` is an alias kept
+    # beside it so the two count-keys above are not the only place the
+    # distinction is stated.
+    result["commits_only_in_a"] = [c for c in a if c not in b]
+    result["commits_only_in_b"] = [c for c in b if c not in a]
+    result["windows_only_in_a"] = result["commits_only_in_a"]
+    result["windows_only_in_b"] = result["commits_only_in_b"]
 
     differing = []
     for commit, cmds_a in a.items():
@@ -154,19 +290,17 @@ def compare(path_a, path_b) -> dict:
             "len_a": len(cmds_a),
             "len_b": len(cmds_b),
         })
+    result["differing_commits"] = differing
 
-    ok = (not proved_nothing) and not only_a and not only_b and not differing
-    return {
-        "ok": ok,
-        "proved_nothing": proved_nothing,
-        "commands_a": len(rows_a),
-        "commands_b": len(rows_b),
-        "commits_a": len(a),
-        "commits_b": len(b),
-        "commits_only_in_a": only_a,
-        "commits_only_in_b": only_b,
-        "differing_commits": differing,
-    }
+    result["ok"] = (
+        not proved_nothing
+        and not result["commits_only_in_a"]
+        and not result["commits_only_in_b"]
+        and not differing
+        and not untagged_mismatch
+        and not trailer_mismatch
+    )
+    return result
 
 
 # ----------------------------------------------------------------- recording
@@ -179,6 +313,46 @@ def _resolve_ratio(ratio: str) -> str:
     """'forward-only' is spelled 1000000:1 everywhere in the suite (see
     tests/test_mcp_server.py); _parse_stream_ratio rejects a zero side."""
     return _FORWARD_ONLY_RATIO if ratio == "forward-only" else ratio
+
+
+def arm_problems(result: dict, repo_commits: int) -> List[str]:
+    """Why this arm is not a usable baseline, or [] if it is.
+
+    All three conditions, not just the command count: a run can report
+    `error` after writing plenty of commands, and one can report `complete`
+    while having lost commits -- which is the entire reason #317's census
+    exists. A degraded arm that exits 0 feeds a red comparison that gets
+    misattributed to the code under test.
+    """
+    problems = []
+    if not result.get("commands"):
+        problems.append("recorded zero commands")
+    if result.get("status") != "complete":
+        problems.append(f"ingestion status is {result.get('status')!r}, not 'complete'")
+    if result.get("graph_commits") != repo_commits:
+        problems.append(
+            f"graph holds {result.get('graph_commits')} commit entities but the "
+            f"repo has {repo_commits}"
+        )
+    return problems
+
+
+def corpus_identity(repo, branch: str):
+    """(corpus_id, corpus_label) for the history `branch` names.
+
+    The id is a sha256 over the linearization itself, not a name anyone types:
+    two arms of one comparison must walk the SAME history, and a label like
+    "repo, truncated to 300" is exactly the kind of thing that stays true
+    while the history underneath it changes (this repo's `master` advancing
+    between two tasks re-cuts a different 303 commits). The label is carried
+    beside it for the reader, never for the check.
+    """
+    linearization = subprocess.run(
+        ["git", "rev-list", "--topo-order", "--reverse", branch], cwd=repo,
+        check=True, capture_output=True, text=True).stdout.split()
+    digest = hashlib.sha256("\n".join(linearization).encode()).hexdigest()
+    tip = linearization[-1] if linearization else "empty"
+    return digest, f"{pathlib.Path(repo).name}@{branch}@{tip[:12]}@{len(linearization)}commits"
 
 
 def record_run(repo_path, graph_path, ratio, out_path, branch: Optional[str] = None) -> dict:
@@ -216,6 +390,8 @@ def record_run(repo_path, graph_path, ratio, out_path, branch: Optional[str] = N
 
     real_db_execute = mcp_server._db_execute
     real_checkpoint_gated = mcp_server._db_checkpoint_gated
+    real_index_write = mcp_server._index_write
+    real_index_commit = mcp_server._commit_index_writer_safe
     real_forward = mcp_server._forward_apply
     real_reverse = mcp_server._reverse_apply
 
@@ -226,14 +402,32 @@ def record_run(repo_path, graph_path, ratio, out_path, branch: Optional[str] = N
     # happened to execute while an apply was in flight.
     tag = threading.local()
     counts = {"commands": 0, "untagged": 0}
+    # How many apply windows this hash has already had. Stage A's apply is
+    # occurrence 0, Stage B's lifecycle apply of the same hash is 1.
+    occurrences: Dict[str, int] = {}
     fh = open(out_path, "w")
+
+    corpus_id, corpus_label = corpus_identity(repo_path, branch)
+    fh.write(json.dumps({
+        "header": 1,
+        "probe_format": PROBE_FORMAT,
+        "corpus_id": corpus_id,
+        "corpus_label": corpus_label,
+        "ratio": ratio,
+        "resolved_ratio": _resolve_ratio(ratio),
+        "branch": branch,
+    }) + "\n")
 
     def _record(cmd: str) -> None:
         commit = getattr(tag, "commit", None)
         if commit is None:
             counts["untagged"] += 1
             return
-        fh.write(json.dumps({"commit": commit, "cmd": cmd}) + "\n")
+        row = {"commit": commit, "cmd": cmd}
+        occ = getattr(tag, "occ", 0)
+        if occ:
+            row["occ"] = occ
+        fh.write(json.dumps(row) + "\n")
         counts["commands"] += 1
 
     def spy_db_execute(db, datalog):
@@ -244,28 +438,53 @@ def record_run(repo_path, graph_path, ratio, out_path, branch: Optional[str] = N
         _record("(checkpoint-gated)")
         return real_checkpoint_gated(db)
 
+    # The fact index is the graph's only independent witness (#302), and it
+    # is written from inside _forward_apply -- `_commit_index_writer_safe`
+    # is literally the last statement of its write tail. Without these two
+    # wrappers a task that moved or dropped that commit, or that changed
+    # which triples reach the index, read `ok: true`.
+    def spy_index_write(action, triples, index_con=None):
+        _record(f"(index-{action} {json.dumps(triples, default=str)})")
+        return real_index_write(action, triples, index_con=index_con)
+
+    def spy_index_commit(index_con):
+        _record(f"(index-commit {index_con is not None})")
+        return real_index_commit(index_con)
+
     # *args/**kwargs with positional indexing only: every defaulted parameter
     # of both functions is keyword-only as of PR #360, so a wrapper sees
     # exactly 5 (forward) or 6 (reverse) positionals and the commit hash sits
     # at a fixed index that no future keyword parameter can shift.
+    def _enter(commit_hash):
+        previous = (getattr(tag, "commit", None), getattr(tag, "occ", 0))
+        tag.commit = commit_hash
+        # Counted on ENTRY, so the index names this apply window rather than
+        # the number of windows that have finished.
+        tag.occ = occurrences.get(commit_hash, 0)
+        occurrences[commit_hash] = tag.occ + 1
+        return previous
+
+    def _leave(previous):
+        tag.commit, tag.occ = previous
+
     def spy_forward(*args, **kwargs):
-        previous = getattr(tag, "commit", None)
-        tag.commit = args[3][0]          # commit_metadata[pos][0]
+        previous = _enter(args[3][0])    # commit_metadata[pos][0]
         try:
             return real_forward(*args, **kwargs)
         finally:
-            tag.commit = previous
+            _leave(previous)
 
     def spy_reverse(*args, **kwargs):
-        previous = getattr(tag, "commit", None)
-        tag.commit = args[2][args[4]]    # linearization[pos]
+        previous = _enter(args[2][args[4]])   # linearization[pos]
         try:
             return real_reverse(*args, **kwargs)
         finally:
-            tag.commit = previous
+            _leave(previous)
 
     mcp_server._db_execute = spy_db_execute
     mcp_server._db_checkpoint_gated = spy_checkpoint_gated
+    mcp_server._index_write = spy_index_write
+    mcp_server._commit_index_writer_safe = spy_index_commit
     mcp_server._forward_apply = spy_forward
     mcp_server._reverse_apply = spy_reverse
 
@@ -282,8 +501,18 @@ def record_run(repo_path, graph_path, ratio, out_path, branch: Optional[str] = N
         elapsed = time.monotonic() - started
         mcp_server._db_execute = real_db_execute
         mcp_server._db_checkpoint_gated = real_checkpoint_gated
+        mcp_server._index_write = real_index_write
+        mcp_server._commit_index_writer_safe = real_index_commit
         mcp_server._forward_apply = real_forward
         mcp_server._reverse_apply = real_reverse
+        # The trailer is the LAST thing written, so its absence means the
+        # recording was truncated -- which compare() reads as an integrity
+        # failure rather than as a finding about the code.
+        fh.write(json.dumps({
+            "trailer": 1,
+            "commands": counts["commands"],
+            "untagged_commands": counts["untagged"],
+        }) + "\n")
         fh.close()
         mcp_server._reset_db_state()
 
@@ -292,11 +521,14 @@ def record_run(repo_path, graph_path, ratio, out_path, branch: Optional[str] = N
         graph_commits = mcp_server._count_commit_entities(db)
     mcp_server._reset_db_state()
 
+    grouped, file_rows, _header, _trailer = _read(out_path)
     return {
-        "commands": counts["commands"],
-        # Recomputed from the file rather than from a counter, so a truncated
-        # or unflushed write is visible instead of being reported as recorded.
-        "commits": len(_group(_load(out_path))),
+        # Recomputed from the FILE rather than from the counter, so a
+        # truncated or unflushed write is visible instead of being reported
+        # as recorded.
+        "commands": file_rows,
+        "apply_windows": len(grouped),
+        "commits": len({k.split("#", 1)[0] for k in grouped}),
         "untagged_commands": counts["untagged"],
         "elapsed_s": round(elapsed, 1),
         "status": status["status"],
@@ -654,13 +886,22 @@ def truncate_repo(source, dest, keep: int, branch: str) -> pathlib.Path:
     # here" would silently hand back a differently-cut history and the
     # comparator would report every commit as one-sided.
     marker = dest / ".truncation"
-    key = f"{source}\n{branch}\n{keep}\n"
+    # The TIP SHA is part of the key, not just (source, branch, keep): those
+    # three stay identical while `master` advances underneath them, and the
+    # same `keep` then cuts a DIFFERENT set of commits. A reused workdir must
+    # be rejected in that case, or two arms of one comparison silently walk
+    # two histories -- which compare() would then report as every window
+    # being one-sided.
+    tip = subprocess.run(
+        ["git", "rev-parse", branch], cwd=source,
+        check=True, capture_output=True, text=True).stdout.strip()
+    key = f"{source}\n{branch}\n{keep}\n{tip}\n"
     if marker.exists() and marker.read_text() == key:
         return dest
     if dest.exists():
         raise RuntimeError(
             f"{dest} already exists and was not cut as ({source}, {branch}, "
-            f"{keep}); remove it or pass a different --workdir"
+            f"{keep}, tip {tip[:12]}); remove it or pass a different --workdir"
         )
 
     def rev(*args, cwd=source):
@@ -787,9 +1028,22 @@ def main(argv=None) -> int:
     result.update({"repo": str(repo), "branch": branch, "ratio": args.ratio,
                    "repo_commits": repo_commits, "truncate_by": args.truncate_by,
                    "graph": args.graph, "out": args.out, "workdir": str(workdir)})
+
+    # A DEGRADED arm must not exit 0. Its recording is short for a reason
+    # that has nothing to do with the code under test, and the comparison it
+    # feeds would come back red and be misattributed to the refactor. All
+    # three conditions are checked, not just the command count: a run can
+    # report `error` after writing plenty of commands, and one can report
+    # `complete` while having lost commits (the whole reason #317's census
+    # exists).
+    problems = arm_problems(result, repo_commits)
+    result["arm_ok"] = not problems
+    result["problems"] = problems
     print(json.dumps(result, indent=2))
-    # A baseline whose command count is zero proves nothing, and must not exit 0.
-    return 0 if result["commands"] else 1
+    if problems:
+        print("ARM DEGRADED, not a usable baseline: " + "; ".join(problems),
+              file=sys.stderr)
+    return 0 if result["arm_ok"] else 1
 
 
 if __name__ == "__main__":
