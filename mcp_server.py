@@ -11960,7 +11960,20 @@ def _forward_apply(
     commit_ident = f":commit/{commit_hash[:12]}"
     reason = f"git:{commit_hash} {author}: {subject}"
 
-    add_triples: List[str] = [] if lifecycle_only else [
+    ctx = _FwdCommitCtx(
+        commit_hash=commit_hash,
+        commit_ident=commit_ident,
+        commit_ts_iso=commit_ts_iso,
+        reason=reason,
+        index_con=index_con,
+    )
+    # writes.close_items holds (triples, original_ts_iso) pairs;
+    # writes.closed_idents the idents closed this commit (lineage discard);
+    # writes.dep_add_triples the :depends-on triples to transact individually;
+    # writes.renamed_old_paths the old paths of files renamed this commit (R
+    # status), whose unmatched child entities / dependency edges are closed in
+    # a final pass after renamed_pairs is consumed (see below).
+    writes = _ForwardCommitWrites(add_triples=[] if lifecycle_only else [
         f"[{commit_ident} :entity-type :type/commit]",
         f'[{commit_ident} :ident "{commit_ident}"]',
         f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
@@ -11968,14 +11981,7 @@ def _forward_apply(
         f'[{commit_ident} :author "{_edn_escape(author)}"]',
         f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
         f'[{commit_ident} :date "{commit_ts_iso}"]',
-    ]
-    close_items: List[tuple] = []  # (triples, original_ts_iso)
-    closed_idents: List[str] = []  # idents closed this commit (lineage discard)
-    dep_add_triples: List[str] = []  # :depends-on triples to transact individually
-    # Old paths of files renamed this commit (R status). Their
-    # unmatched child entities / dependency edges are closed in a
-    # final pass after renamed_pairs is consumed (see below).
-    renamed_old_paths: set = set()
+    ])
 
     for status, file_path, extracted, precomputed, old_path in extracted_files:
         if status == "D":
@@ -11987,7 +11993,7 @@ def _forward_apply(
             for ident in idents:
                 orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
                 desc = state.entity_descriptions.get(ident, "")
-                close_items.append(
+                writes.close_items.append(
                     (_build_close_triples(
                         ident, desc, module_ident,
                         state.field_class_ident.get(ident),
@@ -12001,32 +12007,32 @@ def _forward_apply(
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
                     state.field_static_ident, state.entity_introduced_by,
                 )
-                closed_idents.append(ident)
+                writes.closed_idents.append(ident)
             # Whole file is gone: drop its (now-empty) state.file_entities key
             # so nothing stale lingers under this path (matches state.file_deps).
             state.file_entities.pop(file_path, None)
             # Close all :depends-on edges for the deleted module
             for dep_ident in state.file_deps.get(file_path, set()):
                 orig_ts = state.dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                close_items.append(
+                writes.close_items.append(
                     ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
                 )
             state.file_deps.pop(file_path, None)
         else:  # A or M or R
             if status == "R" and old_path:
-                renamed_old_paths.add(old_path)
+                writes.renamed_old_paths.add(old_path)
                 old_module_ident = _code_ident("module", old_path)
                 new_module_ident = _code_ident("module", file_path)
-                add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
+                writes.add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
                 # :renamed-to is a brand-new fact that becomes
                 # true at the rename commit and stays true forever
                 # after — it must be transacted open-ended (like
                 # :renamed-from), NOT closed with the old entity's
                 # historical valid window via _ingest_close.
-                add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
+                writes.add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
                 old_desc = state.entity_descriptions.get(old_module_ident, old_path)
                 orig_ts = state.entity_valid_from.get(old_module_ident, commit_ts_iso)
-                close_items.append((
+                writes.close_items.append((
                     _build_close_triples(
                         old_module_ident, old_desc, old_module_ident,
                         close_entity_type=True, file_value=old_path,
@@ -12036,7 +12042,7 @@ def _forward_apply(
                 ))
                 # Purge the closed old module. Its remaining child
                 # entities under old_path are closed+purged by the
-                # renamed_old_paths pass below, which also pops the
+                # writes.renamed_old_paths pass below, which also pops the
                 # whole state.file_entities[old_path] key — so only the
                 # scalar dicts and the module's own list slot need
                 # dropping here.
@@ -12045,7 +12051,7 @@ def _forward_apply(
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
                     state.field_static_ident, state.entity_introduced_by,
                 )
-                closed_idents.append(old_module_ident)
+                writes.closed_idents.append(old_module_ident)
             previous_idents = set(state.file_entities.get(file_path, []))
             # #222 phase 2d: an entity Stream 2 already introduced
             # provisionally is NOT authoritatively introduced, so the
@@ -12133,7 +12139,7 @@ def _forward_apply(
             # it -- the reverse stream skipped renames entirely, so nothing
             # ever wrote the new path's entities.
             if not lifecycle_only or status == "R":
-                add_triples.extend(triples)
+                writes.add_triples.extend(triples)
             # Detect entities removed from a modified file.
             # _build_code_triples only appends to state.file_entities, never removes.
             # Compare previous idents against the idents derivable from the
@@ -12167,7 +12173,7 @@ def _forward_apply(
                 for ident in removed_idents:
                     orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
                     desc = state.entity_descriptions.get(ident, "")
-                    close_items.append(
+                    writes.close_items.append(
                         (_build_close_triples(
                             ident, desc, module_ident,
                             state.field_class_ident.get(ident),
@@ -12183,7 +12189,7 @@ def _forward_apply(
                         state.entity_descriptions, state.field_class_ident, state.file_entities,
                         state.field_static_ident, state.entity_introduced_by,
                     )
-                    closed_idents.append(ident)
+                    writes.closed_idents.append(ident)
             # Compute dep edges for this file and diff against previous.
             # Resolution itself already happened in _extract_commit
             # (precomputed["resolved_imports"]) against that commit's
@@ -12195,7 +12201,7 @@ def _forward_apply(
                     current_deps.add(dep_ident)
                     is_relative = import_name.startswith(".")
                     if not is_resolved and not is_relative and dep_ident not in state.entity_valid_from:
-                        add_triples.extend([
+                        writes.add_triples.extend([
                             f"[{dep_ident} :entity-type :type/external-dependency]",
                             f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
                             f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
@@ -12209,15 +12215,15 @@ def _forward_apply(
                         # so any import into one always falls through here).
                         for sub_ident, sub_path in state.submodule_paths.items():
                             if _submodule_path_matches_import(sub_path, import_name):
-                                add_triples.append(f"[{dep_ident} :resolves-to {sub_ident}]")
+                                writes.add_triples.append(f"[{dep_ident} :resolves-to {sub_ident}]")
             previous_deps = state.file_deps.get(file_path, set())
             for dep_ident in current_deps - previous_deps:
-                dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
+                writes.dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
                 state.dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
             if status == "M":
                 for dep_ident in previous_deps - current_deps:
                     orig_ts = state.dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                    close_items.append(
+                    writes.close_items.append(
                         ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
                     )
             state.file_deps[file_path] = current_deps
@@ -12229,15 +12235,15 @@ def _forward_apply(
     for category, old_file, old_name, new_file, new_name in renamed_pairs:
         old_ident = _code_ident(category, old_file, old_name)
         new_ident = _code_ident(category, new_file, new_name)
-        add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
+        writes.add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
         # :renamed-to becomes true at the rename commit and stays
         # open-ended thereafter — transact it via the add path, do
         # NOT fold it into the old entity's _ingest_close window.
-        add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
+        writes.add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
         old_desc = state.entity_descriptions.get(old_ident, old_name)
         old_module_ident = _code_ident("module", old_file)
         orig_ts = state.entity_valid_from.get(old_ident, commit_ts_iso)
-        close_items.append((
+        writes.close_items.append((
             _build_close_triples(
                 old_ident, old_desc, old_module_ident,
                 state.field_class_ident.get(old_ident),
@@ -12252,7 +12258,7 @@ def _forward_apply(
             state.entity_descriptions, state.field_class_ident, state.file_entities,
             state.field_static_ident, state.entity_introduced_by,
         )
-        closed_idents.append(old_ident)
+        writes.closed_idents.append(old_ident)
 
     # A file rename (R status) only closes the old MODULE above.
     # Child entities and dependency edges under the old path are
@@ -12262,12 +12268,12 @@ def _forward_apply(
     # consumed so those confirmed renames can be excluded; without
     # it, unmatched old children/deps leak open forever under the
     # old path while new ones open under the new path.
-    if renamed_old_paths:
+    if writes.renamed_old_paths:
         renamed_covered_idents = {
             _code_ident(cat, o_file, o_name)
             for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
         }
-        for r_old_path in renamed_old_paths:
+        for r_old_path in writes.renamed_old_paths:
             r_old_module_ident = _code_ident("module", r_old_path)
             # Iterate a copy: _forget_closed_entity mutates
             # state.file_entities[r_old_path] in place as it purges.
@@ -12278,7 +12284,7 @@ def _forward_apply(
                     continue  # already closed+purged with :renamed-to linkage
                 orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
                 desc = state.entity_descriptions.get(ident, "")
-                close_items.append(
+                writes.close_items.append(
                     (_build_close_triples(
                         ident, desc, r_old_module_ident,
                         state.field_class_ident.get(ident),
@@ -12292,14 +12298,14 @@ def _forward_apply(
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
                     state.field_static_ident, state.entity_introduced_by,
                 )
-                closed_idents.append(ident)
+                writes.closed_idents.append(ident)
             # Whole old path is gone (renamed away): drop the key so
             # no stale ident lingers to be re-discovered by a later
             # commit that reuses this path (e.g. a shim at old_path).
             state.file_entities.pop(r_old_path, None)
             for dep_ident in state.file_deps.get(r_old_path, set()):
                 orig_ts = state.dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)
-                close_items.append(
+                writes.close_items.append(
                     ([f"[{r_old_module_ident} :depends-on {dep_ident}]"], orig_ts)
                 )
             state.file_deps.pop(r_old_path, None)
@@ -12329,7 +12335,7 @@ def _forward_apply(
                 ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
             if url:
                 ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
-            add_triples.extend(ext_triples)
+            writes.add_triples.extend(ext_triples)
             state.entity_valid_from[ext_ident] = commit_ts_iso
             state.entity_descriptions[ext_ident] = description
             state.pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
@@ -12341,20 +12347,20 @@ def _forward_apply(
             # catch since the submodule wasn't known yet at that time.
             for stub_ident, import_name in state.unresolved_dep_idents.items():
                 if _submodule_path_matches_import(path, import_name):
-                    add_triples.append(f"[{stub_ident} :resolves-to {ext_ident}]")
+                    writes.add_triples.append(f"[{stub_ident} :resolves-to {ext_ident}]")
         elif kind == "bump":
             old_sha, orig_ts = state.pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
             if old_sha is not None:
-                close_items.append(
+                writes.close_items.append(
                     ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
                 )
-            add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
-            add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
+            writes.add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
+            writes.add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
             state.pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
         else:  # "remove"
             orig_ts = state.entity_valid_from.get(ext_ident, commit_ts_iso)
             desc = state.entity_descriptions.get(ext_ident, "")
-            close_items.append(
+            writes.close_items.append(
                 (_build_close_triples(
                     ext_ident, desc, ext_ident,
                     entity_type_kw=":type/external-dependency",
@@ -12371,10 +12377,10 @@ def _forward_apply(
                 state.entity_descriptions, state.field_class_ident, state.file_entities,
                 state.field_static_ident, state.entity_introduced_by,
             )
-            closed_idents.append(ext_ident)
+            writes.closed_idents.append(ext_ident)
             old_sha, pin_orig_ts = state.pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
             if old_sha is not None:
-                close_items.append(
+                writes.close_items.append(
                     ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
                 )
 
@@ -12383,16 +12389,16 @@ def _forward_apply(
     # [module :contains fn] facts in one transact silently drops all
     # but the last.  Each :contains triple gets its own transact so
     # they receive distinct tx_counts and avoid the index collision.
-    contains_triples = [t for t in add_triples if ":contains" in t]
-    other_triples = [t for t in add_triples if ":contains" not in t]
+    contains_triples = [t for t in writes.add_triples if ":contains" in t]
+    other_triples = [t for t in writes.add_triples if ":contains" not in t]
     _ingest_transact(db, other_triples, commit_ts_iso, reason, index_con)
     for ct in contains_triples:
         _ingest_transact(db, [ct], commit_ts_iso, reason, index_con)
     # :depends-on triples transacted individually — same EAVT collision risk
     # as :contains when multiple deps share the same source module
-    for dt in dep_add_triples:
+    for dt in writes.dep_add_triples:
         _ingest_transact(db, [dt], commit_ts_iso, reason, index_con)
-    for close_triples, orig_ts in close_items:
+    for close_triples, orig_ts in writes.close_items:
         _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason, index_con)
 
     # A closed entity must not leave its :type/lineage-marker behind:
@@ -12406,8 +12412,8 @@ def _forward_apply(
     # where six per-site calls would issue up to six. "confirm" is the
     # existing name for "retract the marker" -- semantically it is a discard
     # here, but delegating to the batch keeps the two from drifting (#233).
-    if closed_idents:
-        _lineage_confirm_batch(db, closed_idents, index_con=index_con)
+    if writes.closed_idents:
+        _lineage_confirm_batch(db, writes.closed_idents, index_con=index_con)
 
     # Ingest :parent edges — one transact per parent to avoid EAVT
     # collision for merge commits (which have two parent hashes).
@@ -13327,6 +13333,31 @@ def _reverse_claim_persist_target(
         _interval_persist_ident(iv, linearization) for iv in claim.absorbed
     ]
     return ident, absorbed_idents
+
+
+@dataclass(frozen=True)
+class _FwdCommitCtx:
+    """Per-commit constants every helper needs. Frozen: nothing mutates these."""
+    commit_hash: str
+    commit_ident: str
+    commit_ts_iso: str
+    reason: str
+    index_con: Optional[Any]
+
+
+@dataclass
+class _ForwardCommitWrites:
+    """The five accumulators the body threads through every branch.
+
+    Extracting any helper means extracting these first: `add_triples` alone is
+    appended to or extended at 11 sites spread across the whole body, which is
+    #346's stated obstacle at site 1.
+    """
+    add_triples: List[str]
+    dep_add_triples: List[str] = field(default_factory=list)
+    close_items: List[tuple] = field(default_factory=list)   # (triples, original_ts_iso)
+    closed_idents: List[str] = field(default_factory=list)
+    renamed_old_paths: set = field(default_factory=set)
 
 
 @dataclass
