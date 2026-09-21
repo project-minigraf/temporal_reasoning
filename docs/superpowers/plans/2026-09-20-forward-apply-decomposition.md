@@ -760,7 +760,14 @@ Against the Task 1 baselines. Record each arm's command count and `ok` in the PR
 
 - [ ] **Step 3: Measure the before/after shape**
 
-Record in the PR body: `_forward_apply`'s body length before (594 lines) and after, and the number of helpers extracted. These are descriptive, not a gate.
+Record in the PR body THREE reconciling figures, measured with `ast` (FunctionDef
+span, minus the leading `Expr(Constant)` span for the docstring) — never `wc -l`,
+which is what produced the wrong "594" this plan originally carried:
+**executable body** (master 525 -> 171, the headline), **docstring** (67 -> 119,
+grown by Task 10's own rewrite), and **def-to-end** (592 -> 290). State the
+executable figure first: it is the real result and, unlike def-to-end, it does not
+move when someone edits the prose. Also record the number of helpers extracted.
+These are descriptive, not a gate.
 
 - [ ] **Step 4: Scan every commit on the branch for closing keywords**
 
