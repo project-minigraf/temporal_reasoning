@@ -12152,7 +12152,8 @@ def _fwd_apply_renamed_head(
     writes.add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
     # Purges the closed old module as it goes. Its remaining child
     # entities under old_path are closed+purged by the
-    # writes.renamed_old_paths pass in _forward_apply, which also pops
+    # writes.renamed_old_paths pass (_fwd_close_renamed_old_paths),
+    # which also pops
     # the whole state.file_entities[old_path] key — so only the
     # scalar dicts and the module's own list slot need
     # dropping here.
@@ -12374,7 +12375,8 @@ def _fwd_close_removed_children(
     edit of the file and wrongly close it (#113).
 
     In-place renames (old -> new within this same file) are EXCLUDED. The
-    renamed_pairs pass in _forward_apply closes those old idents itself, with
+    renamed_pairs pass (_fwd_apply_renamed_pairs) closes those old idents
+    itself, with
     :renamed-to linkage; closing them here as plain removals too is a double
     close. Only pairs whose OLD file is this file are excluded, which ASSUMES
     that a pair whose old side lives in another file cannot appear in this
@@ -12451,7 +12453,7 @@ def _fwd_close_removed_children(
     removed_idents = previous_idents - current_extracted_idents
     # An in-place rename (old->new in the same file) is
     # closed with :renamed-to linkage by the renamed_pairs
-    # loop in _forward_apply; exclude those old idents here so they are
+    # pass (_fwd_apply_renamed_pairs); exclude those old idents here so they are
     # not ALSO closed as a plain removal (double close).
     same_file_renamed_old_idents = {
         _code_ident(cat, o_file, o_name)
@@ -12518,7 +12520,7 @@ def _fwd_diff_dependencies(
     #112's submodule link runs here in ONE of its two directions: a NEW stub is
     matched against the submodules state ALREADY knows (state.submodule_paths).
     The other direction -- a NEWLY ADDED submodule matched against stubs opened
-    earlier -- lives in _forward_apply's gitlink "add" branch, which reads
+    earlier -- lives in _fwd_apply_gitlinks' "add" branch, which reads
     state.unresolved_dep_idents, the dict this function writes. The two halves
     are what make the linkage order-independent; neither covers the other.
 
@@ -12583,10 +12585,25 @@ def _fwd_diff_dependencies(
     is written so that a LATER close site can use the stub's description
     (_fwd_close_entity's callers read it); the value needed here (import_name)
     is already in hand. unresolved_dep_idents is written purely for
-    _forward_apply's gitlink "add" branch to read later, per the #112 note
-    above -- this function looks up nothing in it, not even to avoid
-    re-recording an ident, because the entity_valid_from test upstream already
-    made that impossible.
+    _fwd_apply_gitlinks' "add" branch to read later, per the #112 note above --
+    this function looks up nothing in it, not even to avoid re-recording an
+    ident.
+
+    That last point is bounded and an earlier version of this docstring stated
+    it as absolute. WITHIN ONE RUN the upstream `dep_ident not in
+    state.entity_valid_from` test really does make a re-record impossible: the
+    stub's ident is written into entity_valid_from in the same block that
+    records it here, so every later import of the same name -- later in this
+    file, or in any later file of any later commit of this run -- takes the
+    already-known branch. ACROSS RUNS it is NOT impossible. A stub carries no
+    :introduced-by and no :path (see above), and _preload_known_entities both
+    joins on `[?e :introduced-by ?c]` to recover an entity's introduction
+    POSITION and skips placeholders carrying no :path -- so a resumed run
+    starts with the stub absent from entity_valid_from even though the graph
+    holds it, re-opens it, and re-records the same ident here with an
+    IDENTICAL import_name. The re-record is therefore a no-op in value, the
+    behaviour is PRE-EXISTING and is NOT in scope to change here, and it is
+    named only so the impossibility is not read as a guarantee it never was.
     """
     module_ident = _code_ident("module", file_path)
     current_deps: set = set()
@@ -12621,6 +12638,371 @@ def _fwd_diff_dependencies(
                 ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
             )
     state.file_deps[file_path] = current_deps
+
+
+def _fwd_apply_renamed_pairs(
+    db: Any,
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    renamed_pairs: List[Tuple[str, str, str, str, str]],
+) -> None:
+    """Link each function/class rename this commit matched, closing the old ident.
+
+    Commit-wide rather than per file: the matcher runs over the whole commit's
+    extraction (_extract_commit's fourth return element), which is why this is a
+    pass after the per-file loop and not a branch inside it. MODULE-level rename
+    linkage is not handled here at all -- it comes from git's own -M detection
+    and is written per file by _fwd_apply_renamed_head.
+
+    :renamed-from and :renamed-to both go through writes.add_triples and NEVER
+    through the old entity's close window. They become true at the rename commit
+    and stay true forever, so folding either into writes.close_items would hand
+    it that entity's bounded historical interval and the linkage would stop
+    being true at the very commit that created it. Same rule, same reason, as
+    _fwd_apply_renamed_head's module pair.
+
+    CALL-ORDER OBLIGATION (design call-order contract, item 3): this pass MUST
+    run BEFORE _fwd_close_renamed_old_paths. That pass closes a renamed-away
+    path's leftover children as PLAIN removals and excludes exactly the old
+    idents closed here -- it rebuilds the exclusion set from this same
+    renamed_pairs list. Reversing the two, or interleaving them, closes every
+    matched old ident TWICE: once with :renamed-to linkage here and once as a
+    bare removal there. The obligation is stated in both docstrings on purpose;
+    a reader who opens only one of them must still learn it.
+
+    Contract derived from the code, INDIRECT reaches included: the close itself
+    is _fwd_close_entity's, and through it _resolve_introduced_by's and
+    _forget_closed_entity's. Enumerated in full rather than delegated by
+    reference, since "everything _fwd_close_entity touches" stops resolving the
+    moment that helper is itself split.
+
+    Reads state: entity_descriptions (DIRECT -- the old entity's recorded
+    description, falling back to its old NAME rather than ""), field_class_ident
+    (DIRECT -- the field's owning class, passed as extra_contains_parent),
+    field_static_ident (DIRECT -- the field's recorded :static value),
+    entity_valid_from (INDIRECT, through _fwd_close_entity -- each close's
+    orig_ts), entity_introduced_by (INDIRECT, through _fwd_close_entity ->
+    _resolve_introduced_by, whose DB fallback rides the caller's handle; it is
+    READ here, not only purged).
+    Writes state: entity_valid_from, entity_descriptions, field_class_ident,
+    field_static_ident, entity_introduced_by, file_entities -- all six INDIRECT,
+    entirely through _forget_closed_entity, which is every dict it touches.
+    file_entities is written but NEVER READ here: the path's list is looked up
+    only to remove the closed ident from it. Its KEY survives this pass even for
+    an old path being renamed away -- _fwd_close_renamed_old_paths pops that.
+    Reads ctx: commit_ts_iso -- INDIRECT, through _fwd_close_entity, the orig_ts
+    fallback for an old ident carrying no recorded valid-from. Nothing in this
+    function's own body reads ctx at all; commit_hash, commit_ident, reason and
+    index_con are consulted by neither.
+    Appends to writes: add_triples (DIRECT -- exactly two per pair,
+    :renamed-from on the new ident and :renamed-to on the old), close_items
+    (INDIRECT -- one per pair), closed_idents (INDIRECT -- one per pair).
+    dep_add_triples and renamed_old_paths are untouched: a function/class rename
+    closes no dependency edge, and the old PATH set is populated only by
+    _fwd_apply_renamed_head, from git's file-level -M detection.
+
+    Never opens, closes or leases a handle: `db` is the caller's and is only
+    forwarded to _fwd_close_entity (single-handle invariant, #253).
+    """
+    for category, old_file, old_name, new_file, new_name in renamed_pairs:
+        old_ident = _code_ident(category, old_file, old_name)
+        new_ident = _code_ident(category, new_file, new_name)
+        writes.add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
+        # :renamed-to becomes true at the rename commit and stays
+        # open-ended thereafter — transact it via the add path, do
+        # NOT fold it into the old entity's _ingest_close window.
+        writes.add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
+        old_module_ident = _code_ident("module", old_file)
+        _fwd_close_entity(
+            db, ctx, state, writes,
+            old_ident, state.entity_descriptions.get(old_ident, old_name),
+            old_module_ident,
+            extra_contains_parent=state.field_class_ident.get(old_ident),
+            close_entity_type=True, file_value=old_file,
+            is_static=state.field_static_ident.get(old_ident),
+        )
+
+
+def _fwd_close_renamed_old_paths(
+    db: Any,
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    renamed_pairs: List[Tuple[str, str, str, str, str]],
+) -> None:
+    """Close what a renamed-away path still holds: unmatched children, dep edges.
+
+    A file rename ("R" status) closes only the old MODULE, in
+    _fwd_apply_renamed_head, which records the old path in
+    writes.renamed_old_paths. Everything else still standing under that path --
+    child entities the matcher did not pair up, and every :depends-on edge the
+    old module held -- is closed here, as a plain removal. Without this pass
+    those leak open forever under the old path while their replacements open
+    under the new one.
+
+    CALL-ORDER OBLIGATION (design call-order contract, item 3): this pass MUST
+    run AFTER _fwd_apply_renamed_pairs. renamed_covered_idents below is
+    rebuilt from renamed_pairs precisely to skip the idents that pass has
+    already closed WITH :renamed-to linkage; running this one first (or
+    interleaving them) closes each of those a SECOND time, as a bare removal.
+    The obligation is stated in both docstrings on purpose; a reader who opens
+    only this one must still learn it. Note that it is the ORDER that carries
+    the guarantee, not the exclusion set: the set is computed from the same
+    list either way, but the entities are only already closed+purged if the
+    other pass has run.
+
+    THE `list(...)` COPY IS LOAD-BEARING, not stylistic. _fwd_close_entity
+    (via _forget_closed_entity) removes the ident from
+    state.file_entities[r_old_path] IN PLACE as it purges, so iterating that
+    list directly would skip every second ident and leave each skipped entity
+    open forever. _fwd_apply_deleted_file's loop carries the identical hazard
+    and the identical copy.
+
+    The old module ident is skipped explicitly. Under today's ordering that
+    guard is redundant, and the redundancy rests on TWO facts rather than one:
+    _fwd_apply_renamed_head already closed it and _forget_closed_entity removed
+    it from state.file_entities[old_path] before the copy below was taken, AND
+    the ident can only have been in that list once (both append sites --
+    _build_code_triples' module branch and _preload_known_entities -- guard on
+    `not in`), which matters because list.remove drops only the FIRST
+    occurrence. The guard is kept anyway: it is the same ordering this
+    docstring is asking future readers not to assume, so the pass declines to
+    depend on it.
+
+    Contract derived from the code, INDIRECT reaches included: the entity
+    closes are _fwd_close_entity's (and through it _resolve_introduced_by's and
+    _forget_closed_entity's), the edge closes _fwd_close_dep_edges'. Enumerated
+    in full rather than delegated by reference.
+
+    Reads writes: renamed_old_paths (DIRECT) -- both the guard and the outer
+    loop. This is the only helper in the refactor that READS an accumulator
+    rather than only appending to one, which is why it gets a line of its own
+    above the four standard parts: the field is written by
+    _fwd_apply_renamed_head, one per "R" file, earlier in the same commit.
+    Reads state: file_entities (DIRECT -- the old path's ident list, copied
+    before the loop), entity_descriptions (DIRECT -- each child's recorded
+    description, falling back to ""), field_class_ident (DIRECT --
+    extra_contains_parent), field_static_ident (DIRECT -- the :static value),
+    entity_valid_from (INDIRECT, through _fwd_close_entity -- each close's
+    orig_ts), entity_introduced_by (INDIRECT, through _fwd_close_entity ->
+    _resolve_introduced_by, whose DB fallback rides the caller's handle; READ
+    here, not only purged), file_deps (INDIRECT, through _fwd_close_dep_edges
+    -- the old module's recorded edge set), dep_valid_from (INDIRECT, through
+    _fwd_close_dep_edges -- each closed edge's orig_ts).
+    Writes state: file_entities (BOTH -- INDIRECT per ident, as
+    _forget_closed_entity removes it from the list, then DIRECT as the whole
+    KEY is popped after the loop, unlike the "M" removal diff which leaves the
+    key in place because the file still exists), file_deps (INDIRECT, through
+    _fwd_close_dep_edges with pop=True -- the key is dropped), entity_valid_from,
+    entity_descriptions, field_class_ident, field_static_ident,
+    entity_introduced_by (all INDIRECT, entirely through _forget_closed_entity,
+    which is every dict it touches).
+    Reads ctx: commit_ts_iso -- INDIRECT, and through TWO helpers rather than
+    one: _fwd_close_entity's orig_ts fallback for an entity carrying no
+    recorded valid-from, and _fwd_close_dep_edges' for an edge carrying none.
+    Nothing in this function's own body reads ctx at all; commit_hash,
+    commit_ident, reason and index_con are consulted by none of the three.
+    Appends to writes: close_items (INDIRECT -- one per closed child entity,
+    plus one per closed dep edge), closed_idents (INDIRECT -- one per closed
+    child entity; a dep EDGE close appends nothing here, since closing an edge
+    is not closing an entity and nothing feeds it to the lineage-marker discard
+    batch). add_triples and dep_add_triples are untouched: this pass only
+    closes, and the rename's own :renamed-to/:renamed-from linkage was written
+    earlier, by the two passes named above. renamed_old_paths is READ, never
+    appended to, and is deliberately NOT cleared -- it is per-commit state on a
+    carrier _forward_apply rebuilds for every commit.
+
+    Never opens, closes or leases a handle: `db` is the caller's and is only
+    forwarded to _fwd_close_entity (single-handle invariant, #253).
+    _fwd_close_dep_edges takes no handle at all.
+    """
+    if writes.renamed_old_paths:
+        renamed_covered_idents = {
+            _code_ident(cat, o_file, o_name)
+            for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+        }
+        for r_old_path in writes.renamed_old_paths:
+            r_old_module_ident = _code_ident("module", r_old_path)
+            # Iterate a copy: _fwd_close_entity (via _forget_closed_entity)
+            # mutates state.file_entities[r_old_path] in place as it purges.
+            for ident in list(state.file_entities.get(r_old_path, [])):
+                if ident == r_old_module_ident:
+                    continue  # already closed+purged by _fwd_apply_renamed_head
+                if ident in renamed_covered_idents:
+                    continue  # already closed+purged with :renamed-to linkage
+                _fwd_close_entity(
+                    db, ctx, state, writes,
+                    ident, state.entity_descriptions.get(ident, ""), r_old_module_ident,
+                    extra_contains_parent=state.field_class_ident.get(ident),
+                    close_entity_type=True, file_value=r_old_path,
+                    is_static=state.field_static_ident.get(ident),
+                )
+            # Whole old path is gone (renamed away): drop the key so
+            # no stale ident lingers to be re-discovered by a later
+            # commit that reuses this path (e.g. a shim at old_path).
+            state.file_entities.pop(r_old_path, None)
+            _fwd_close_dep_edges(
+                ctx, state, writes, r_old_module_ident, r_old_path, pop=True
+            )
+
+
+def _fwd_apply_gitlinks(
+    db: Any,
+    ctx: "_FwdCommitCtx",
+    state: "_ForwardWalkState",
+    writes: "_ForwardCommitWrites",
+    gitlink_changes: List[Tuple[str, str, str]],
+    gitmodules_map: Dict[str, Dict[str, str]],
+) -> None:
+    """Apply this commit's submodule changes: add, bump or remove a gitlink.
+
+    A gitlink is modelled as a :type/external-dependency entity whose ident
+    reuses the "module" prefix (_code_ident("module", path)) even though its
+    :entity-type is not :type/module -- see #137, and the remove branch's
+    comment below, which is what makes that reuse safe at close time.
+
+    The "remove" case's interaction with the ordinary per-file module-open
+    logic (_fwd_apply_deleted_file and _fwd_reconcile_and_build, in
+    _forward_apply's per-file loop) is only sound because real submodule paths
+    are extensionless: no tree-sitter parser matches them, so no :type/module
+    is ever opened for a bare gitlink path and the two never contend for the
+    same ident. A gitlink path that happened to carry a recognized source
+    extension is an untested, unreachable-in-practice edge case.
+
+    gitmodules_map is consulted by the "add" branch alone; _extract_commit
+    only populates it for a commit that actually adds a gitlink, so on every
+    other commit it is legitimately empty.
+
+    #112 HAS TWO DIRECTIONS AND THE "add" BRANCH IS THE SECOND OF THEM. It
+    READS state.unresolved_dep_idents -- the dict _fwd_diff_dependencies
+    WRITES, one entry per unresolved-import stub it opens -- to link a stub
+    created BEFORE this submodule existed, which is the ordering in the issue's
+    own repro and the one the per-import check inside that helper cannot catch
+    (the submodule was not known yet at the time). The first direction lives
+    there: a NEW stub matched against state.submodule_paths, the dict THIS
+    function writes. Neither half covers the other, and together they make the
+    linkage order-independent. That cross-helper read is the one thing about
+    this pass a contract must not omit: it is invisible at the call site.
+
+    Contract derived from the code, INDIRECT reaches included: only the
+    "remove" branch reaches anything, through _fwd_close_entity and thence
+    _resolve_introduced_by and _forget_closed_entity. Every other entry below
+    is DIRECT, in this function's own body.
+
+    Reads state: unresolved_dep_idents (DIRECT -- iterated in full on "add",
+    per the #112 note above), pinned_commit_state (DIRECT -- the recorded
+    (sha, valid_from) pair, on "bump" via .get and on "remove" via .pop, whose
+    RETURNED value is read before the entry is dropped), entity_descriptions
+    (DIRECT -- the removed gitlink's recorded description, falling back to ""),
+    entity_valid_from (INDIRECT, through _fwd_close_entity -- the close's
+    orig_ts), entity_introduced_by (INDIRECT, through _fwd_close_entity ->
+    _resolve_introduced_by, whose DB fallback rides the caller's handle; READ
+    here, not only purged). submodule_paths is NOT read here -- see below.
+    Writes state: pinned_commit_state (DIRECT -- set on "add" and "bump",
+    popped on "remove"), entity_valid_from (DIRECT on "add"; INDIRECT purge on
+    "remove"), entity_descriptions (DIRECT on "add"; INDIRECT purge on
+    "remove"), submodule_paths (DIRECT on "add"), field_class_ident,
+    field_static_ident, file_entities, entity_introduced_by (all INDIRECT, on
+    "remove" only, entirely through _forget_closed_entity, which is every dict
+    it touches).
+    Reads ctx: commit_ident (DIRECT -- the :introduced-by value on "add" and
+    the :modified-in value on "bump"), commit_ts_iso (DIRECT -- the new
+    entity_valid_from and pinned_commit_state timestamps on "add" and "bump",
+    and the fallback second element of both the "bump" .get and the "remove"
+    .pop; also INDIRECT, as _fwd_close_entity's orig_ts fallback). commit_hash,
+    reason and index_con are not consulted: this pass builds triples and
+    close items, and _forward_apply's write tail is what transacts them.
+    Appends to writes: add_triples (DIRECT -- six fixed triples per "add", plus
+    :submodule-name and/or :submodule-url when .gitmodules supplied them, plus
+    one :resolves-to per matching pre-existing stub; two per "bump"),
+    close_items (BOTH -- DIRECT for the superseded :pinned-commit fact on
+    "bump" and on "remove", INDIRECT for the entity close itself on "remove"),
+    closed_idents (INDIRECT -- one per "remove"). dep_add_triples and
+    renamed_old_paths are untouched.
+
+    Two asymmetries worth stating rather than leaving to be rediscovered.
+    submodule_paths is WRITTEN here and never read here; it exists for
+    _fwd_diff_dependencies to read, per the #112 note above -- and it is NOT
+    purged on "remove", unlike pinned_commit_state, so a stub opened after a
+    submodule is removed can still match its stale path entry. That behaviour
+    is PRE-EXISTING (the inline block this replaces did exactly the same) and
+    is NOT in scope here; it is named only so the absence of a pop is not read
+    as a deliberate guarantee. And the "remove" branch closes the entity
+    BEFORE popping pinned_commit_state, which matters: _forget_closed_entity
+    does not touch that dict, so the order is free, but the pop's returned
+    old_sha is what builds the second close item and must not be dropped
+    first.
+
+    Never opens, closes or leases a handle: `db` is the caller's and is only
+    forwarded to _fwd_close_entity (single-handle invariant, #253).
+    """
+    for kind, sha, path in gitlink_changes:
+        ext_ident = _code_ident("module", path)
+        if kind == "add":
+            info = gitmodules_map.get(path, {})
+            name = info.get("name", "")
+            url = info.get("url", "")
+            description = name or path
+            ext_triples = [
+                f"[{ext_ident} :entity-type :type/external-dependency]",
+                f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
+                f'[{ext_ident} :description "{_edn_escape(description)}"]',
+                f'[{ext_ident} :path "{_edn_escape(path)}"]',
+                f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
+                f"[{ext_ident} :introduced-by {ctx.commit_ident}]",
+            ]
+            if name:
+                ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
+            if url:
+                ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
+            writes.add_triples.extend(ext_triples)
+            state.entity_valid_from[ext_ident] = ctx.commit_ts_iso
+            state.entity_descriptions[ext_ident] = description
+            state.pinned_commit_state[ext_ident] = (sha, ctx.commit_ts_iso)
+            state.submodule_paths[ext_ident] = path
+            # #112: link any pre-existing unresolved-import stub whose
+            # import path reaches into this submodule — the ordering in
+            # the issue's own repro (stub created before the submodule
+            # was ever added), which _fwd_diff_dependencies' per-import
+            # check can't catch since the submodule wasn't known yet at
+            # that time.
+            for stub_ident, import_name in state.unresolved_dep_idents.items():
+                if _submodule_path_matches_import(path, import_name):
+                    writes.add_triples.append(f"[{stub_ident} :resolves-to {ext_ident}]")
+        elif kind == "bump":
+            old_sha, orig_ts = state.pinned_commit_state.get(
+                ext_ident, (None, ctx.commit_ts_iso)
+            )
+            if old_sha is not None:
+                writes.close_items.append(
+                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
+                )
+            writes.add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
+            writes.add_triples.append(f"[{ext_ident} :modified-in {ctx.commit_ident}]")
+            state.pinned_commit_state[ext_ident] = (sha, ctx.commit_ts_iso)
+        else:  # "remove"
+            # entity_type_kw, and NO close_entity_type: this ident reuses the
+            # "module" prefix but was asserted as :type/external-dependency
+            # (#137), so a derived entity-type would retract a false fact.
+            #
+            # The helper also purges lifecycle state so a later re-add at the
+            # same path is treated as genuinely new. (Submodule paths aren't
+            # tracked in state.file_entities, so the path the helper derives
+            # from file_value is a no-op there.)
+            _fwd_close_entity(
+                db, ctx, state, writes,
+                ext_ident, state.entity_descriptions.get(ext_ident, ""), ext_ident,
+                entity_type_kw=":type/external-dependency",
+                file_value=path,
+            )
+            old_sha, pin_orig_ts = state.pinned_commit_state.pop(
+                ext_ident, (None, ctx.commit_ts_iso)
+            )
+            if old_sha is not None:
+                writes.close_items.append(
+                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
+                )
 
 
 def _forward_apply(
@@ -12763,128 +13145,14 @@ def _forward_apply(
     # Module-level linkage is handled separately per-file
     # above (Task 5) since it comes from git's own -M
     # detection, not this commit-wide matcher.
-    for category, old_file, old_name, new_file, new_name in renamed_pairs:
-        old_ident = _code_ident(category, old_file, old_name)
-        new_ident = _code_ident(category, new_file, new_name)
-        writes.add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
-        # :renamed-to becomes true at the rename commit and stays
-        # open-ended thereafter — transact it via the add path, do
-        # NOT fold it into the old entity's _ingest_close window.
-        writes.add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
-        old_module_ident = _code_ident("module", old_file)
-        _fwd_close_entity(
-            db, ctx, state, writes,
-            old_ident, state.entity_descriptions.get(old_ident, old_name),
-            old_module_ident,
-            extra_contains_parent=state.field_class_ident.get(old_ident),
-            close_entity_type=True, file_value=old_file,
-            is_static=state.field_static_ident.get(old_ident),
-        )
-
-    # A file rename (R status) only closes the old MODULE above.
-    # Child entities and dependency edges under the old path are
-    # closed here as plain removals UNLESS the matcher established
-    # a rename continuity edge for them (handled with :renamed-to
-    # by the loop above). This runs after renamed_pairs is fully
-    # consumed so those confirmed renames can be excluded; without
-    # it, unmatched old children/deps leak open forever under the
-    # old path while new ones open under the new path.
-    if writes.renamed_old_paths:
-        renamed_covered_idents = {
-            _code_ident(cat, o_file, o_name)
-            for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
-        }
-        for r_old_path in writes.renamed_old_paths:
-            r_old_module_ident = _code_ident("module", r_old_path)
-            # Iterate a copy: _fwd_close_entity (via _forget_closed_entity)
-            # mutates state.file_entities[r_old_path] in place as it purges.
-            for ident in list(state.file_entities.get(r_old_path, [])):
-                if ident == r_old_module_ident:
-                    continue  # already closed+purged by the R block above
-                if ident in renamed_covered_idents:
-                    continue  # already closed+purged with :renamed-to linkage
-                _fwd_close_entity(
-                    db, ctx, state, writes,
-                    ident, state.entity_descriptions.get(ident, ""), r_old_module_ident,
-                    extra_contains_parent=state.field_class_ident.get(ident),
-                    close_entity_type=True, file_value=r_old_path,
-                    is_static=state.field_static_ident.get(ident),
-                )
-            # Whole old path is gone (renamed away): drop the key so
-            # no stale ident lingers to be re-discovered by a later
-            # commit that reuses this path (e.g. a shim at old_path).
-            state.file_entities.pop(r_old_path, None)
-            _fwd_close_dep_edges(
-                ctx, state, writes, r_old_module_ident, r_old_path, pop=True
-            )
-
-    # Process gitlink changes (submodule add/bump/remove).
-    # The "remove" case's interaction with the ordinary per-file module-open
-    # logic (elsewhere in this loop) is only sound because real submodule paths
-    # are extensionless (no tree-sitter parser matches them, so no module is
-    # ever opened for a bare gitlink path) — a gitlink path that happened to
-    # carry a recognized source extension is an untested, unreachable-in-practice edge case.
-    for kind, sha, path in gitlink_changes:
-        ext_ident = _code_ident("module", path)
-        if kind == "add":
-            info = gitmodules_map.get(path, {})
-            name = info.get("name", "")
-            url = info.get("url", "")
-            description = name or path
-            ext_triples = [
-                f"[{ext_ident} :entity-type :type/external-dependency]",
-                f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
-                f'[{ext_ident} :description "{_edn_escape(description)}"]',
-                f'[{ext_ident} :path "{_edn_escape(path)}"]',
-                f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
-                f"[{ext_ident} :introduced-by {commit_ident}]",
-            ]
-            if name:
-                ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
-            if url:
-                ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
-            writes.add_triples.extend(ext_triples)
-            state.entity_valid_from[ext_ident] = commit_ts_iso
-            state.entity_descriptions[ext_ident] = description
-            state.pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
-            state.submodule_paths[ext_ident] = path
-            # #112: link any pre-existing unresolved-import stub whose
-            # import path reaches into this submodule — the ordering in
-            # the issue's own repro (stub created before the submodule
-            # was ever added), which the per-import check above can't
-            # catch since the submodule wasn't known yet at that time.
-            for stub_ident, import_name in state.unresolved_dep_idents.items():
-                if _submodule_path_matches_import(path, import_name):
-                    writes.add_triples.append(f"[{stub_ident} :resolves-to {ext_ident}]")
-        elif kind == "bump":
-            old_sha, orig_ts = state.pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
-            if old_sha is not None:
-                writes.close_items.append(
-                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
-                )
-            writes.add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
-            writes.add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
-            state.pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
-        else:  # "remove"
-            # entity_type_kw, and NO close_entity_type: this ident reuses the
-            # "module" prefix but was asserted as :type/external-dependency
-            # (#137), so a derived entity-type would retract a false fact.
-            #
-            # The helper also purges lifecycle state so a later re-add at the
-            # same path is treated as genuinely new. (Submodule paths aren't
-            # tracked in state.file_entities, so the path the helper derives
-            # from file_value is a no-op there.)
-            _fwd_close_entity(
-                db, ctx, state, writes,
-                ext_ident, state.entity_descriptions.get(ext_ident, ""), ext_ident,
-                entity_type_kw=":type/external-dependency",
-                file_value=path,
-            )
-            old_sha, pin_orig_ts = state.pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
-            if old_sha is not None:
-                writes.close_items.append(
-                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
-                )
+    #
+    # These three passes are ORDER-DEPENDENT and must stay in this order (the
+    # design's call-order contract, items 3 and 4): _fwd_close_renamed_old_paths
+    # excludes exactly the idents _fwd_apply_renamed_pairs has just closed with
+    # :renamed-to linkage, so swapping them double-closes every matched rename.
+    _fwd_apply_renamed_pairs(db, ctx, state, writes, renamed_pairs)
+    _fwd_close_renamed_old_paths(db, ctx, state, writes, renamed_pairs)
+    _fwd_apply_gitlinks(db, ctx, state, writes, gitlink_changes, gitmodules_map)
 
     # Split :contains triples out before batching.  Minigraf's EAVT
     # pending index lacks value bytes in the key, so batching multiple
