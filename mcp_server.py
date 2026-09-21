@@ -14159,7 +14159,24 @@ def _reverse_claim_persist_target(
 
 @dataclass(frozen=True)
 class _FwdCommitCtx:
-    """Per-commit constants every helper needs. Frozen: nothing mutates these."""
+    """The complete per-commit constant set, carried together for uniformity.
+
+    Not every field is read by today's helpers: `commit_ident`, `commit_ts_iso`
+    and `index_con` are, but `commit_hash` and `reason` currently have zero
+    readers through `ctx` (the write tail at the bottom of `_forward_apply`
+    uses its own bare `reason` local, not `ctx.reason`). They are carried here
+    anyway so the object stays the complete set rather than a moving subset,
+    which is one part of the design, not a claim that every field is
+    consulted. Frozen: nothing mutates these.
+
+    The hazard this leaves: a future helper that takes `ctx` alone and, from
+    this class existing, assumes it carries every per-commit constant a
+    transact needs, may reach for `ctx.reason` and get it — while the actual
+    write tail still builds its transacts from the bare `reason` local a few
+    lines up. Two sources of truth for the same value, one read from each.
+    Before relying on `ctx.reason` anywhere, check that the write tail was
+    changed to match, or thread the bare local through instead.
+    """
     commit_hash: str
     commit_ident: str
     commit_ts_iso: str

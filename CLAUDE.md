@@ -1675,11 +1675,24 @@ that on its own. `evals/at_scale/probe_forward_apply_write_parity.py`
 records every `_db_execute`/`_index_write`/`_commit_index_writer_safe` call
 and every `_db_checkpoint_gated` CALL (never its outcome, since
 `_CheckpointPolicy`'s duty gate makes whether a given call actually
-checkpoints vary run to run on identical code) issued while a
-`_forward_apply`/`_reverse_apply` frame is on the stack, tagged by commit,
-and compares two recordings per commit rather than as one global list (the
-two streams interleave through executors, so global order is not stable run
-to run). **`PYTHONHASHSEED=0` is required in every arm**: several sites
+checkpoints vary run to run on identical code) issued while a THREAD-LOCAL
+tag names the commit currently being applied — not while any frame is "on
+the stack" in a general sense. The probe's `spy_forward`/`spy_reverse`
+wrappers set that tag on entry to the real `_forward_apply`/`_reverse_apply`
+call and clear it on exit, on whichever thread makes that call (the write
+executor thread, synchronously); a command is tagged if and only if it runs
+on that same thread while the tag is set. It is a thread-local rather than a
+plain global for exactly this reason — a plain global would also mis-tag
+work the event-loop thread happens to run while an apply is in flight — and
+the same property cuts the other way: work an apply call dispatches onto a
+DIFFERENT thread would carry no tag at all, tagged nowhere and compared by
+nothing, even though it is logically part of that apply. Nothing in either
+apply function does this today, so the oracle's coverage is currently
+complete, but this is a property to re-check before trusting the oracle
+again, not a guarantee that survives such a change automatically. The probe
+compares two recordings per commit rather than as one global list (the two
+streams interleave through executors, so global order is not stable run to
+run). **`PYTHONHASHSEED=0` is required in every arm**: several sites
 iterate sets/dicts of strings (`current_deps - previous_deps`,
 `submodule_paths`, `renamed_old_paths`), so hash randomization alone
 reorders emitted triples between two runs of IDENTICAL code and would make
@@ -1687,8 +1700,8 @@ a real difference look like noise, or a non-difference look like one. The
 probe's own `record_run()` refuses to run unless it is set from the command
 line, since assigning it to `os.environ` from inside a running process
 changes nothing. The recording's own dropped-command count
-(`untagged_mismatch`, everything outside an apply-function frame) is
-reported but deliberately NOT gating: measured directly, it drifted between
+(`untagged_mismatch`, everything recorded while the executing thread carries
+no tag) is reported but deliberately NOT gating: measured directly, it drifted between
 invocation batches on completely unmodified code (475641 vs. 475623 of the
 same corpus, same ratio, same seed), so treating a difference there as a
 finding would be exactly the kind of batch-drift noise this repo has
