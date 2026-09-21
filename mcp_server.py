@@ -9638,7 +9638,10 @@ def _first_entry_per_ident(
 
 def _precompute_file_triples(
     file_path: str,
-    extracted: Dict[str, List[str]],
+    # Dict[str, Any], not Dict[str, List[str]] (#362): this is
+    # _extract_from_source's return value, whose "fields" key holds
+    # List[Tuple[str, str, bool]] -- destructured below/at the field loop.
+    extracted: Dict[str, Any],
     commit_ident: str,
     known_files: Dict[str, List[str]],
     segment_index: Optional[_SegmentSuffixIndex] = None,
@@ -9804,7 +9807,10 @@ def _precompute_file_triples(
 
 def _build_code_triples(
     file_path: str,
-    extracted: Dict[str, List[str]],
+    # Dict[str, Any], not Dict[str, List[str]] (#362): this is
+    # _extract_from_source's return value, whose "fields" key holds
+    # List[Tuple[str, str, bool]] -- destructured below/at the field loop.
+    extracted: Dict[str, Any],
     commit_ts_iso: str,
     entity_valid_from: Dict[str, str],
     entity_descriptions: Dict[str, str],
