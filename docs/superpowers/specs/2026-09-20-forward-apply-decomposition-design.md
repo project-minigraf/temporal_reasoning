@@ -12,7 +12,10 @@ commands* before and after.
 
 ## Why
 
-`_forward_apply` (`mcp_server.py:11878`, 594-line body) threads five distinct
+`_forward_apply` (`mcp_server.py:11878` as of this design's date -- this
+document is point-in-time and the extraction below moves surrounding code,
+so the line number drifts; `git grep -n 'def _forward_apply'` finds it
+wherever it lands, 592-line body by AST span) threads five distinct
 behaviours through one `lifecycle_only` flag across six sites, and its per-file
 loop holds 16 in-place mutations of `_ForwardWalkState` across 8 of its 12
 dicts. #346 measured the seams and declined a mechanical extraction. This
@@ -110,7 +113,13 @@ different operation, and it stays inline in `_fwd_diff_dependencies`.
 
 ### Status handlers and passes
 
-Each takes `(db, ctx, state, writes, …)`:
+Each takes `(db, ctx, state, writes, …)`, with one deliberate exception:
+`_fwd_diff_dependencies` takes no `db`, because every decision it makes reads
+preloaded `_ForwardWalkState` and closes no entity, so it needs no lineage
+read. Keeping that absence visible was an explicit requirement of its own
+task, not an oversight to tidy up — do not add a handle to it "for
+signature consistency" with the rest of this table; that would erase the
+property its own docstring exists to keep visible.
 
 | Helper | Replaces | State fields written |
 |--------|----------|---------------------|

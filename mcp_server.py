@@ -13051,39 +13051,91 @@ def _forward_apply(
     so there is nothing to deduplicate against, whereas re-running the A/M
     emission WOULD duplicate (minigraf mints a genuinely live duplicate when
     the same (entity, attribute, value) is re-transacted at a different
-    valid-from -- issue #156). Concretely, when true:
+    valid-from -- issue #156). It reaches exactly SIX sites. #346 PR 2 moved
+    the per-file loop and the three post-loop passes out into module-level
+    helpers (see "Structure" below), so the sites are enumerated here by
+    WHERE EACH NOW LIVES rather than as behavioural bullets -- an earlier,
+    five-bullet version of this docstring did not map one-to-one onto them,
+    had no bullet at all for site 6, and described "D"/"R"/gitlink handling
+    as a bullet even though the flag does not touch it:
 
-    * The commit's own :type/commit entity and its :parent edges are skipped
-      -- _reverse_apply already wrote both for every commit in this range
-      (the same reason _correction_sweep_apply gives for not writing them).
-    * "D" files, "R" files and gitlink changes are processed unchanged. "R"
-      keeps its _build_code_triples emission for the NEW path: the reverse
-      stream skipped renames entirely, so nothing ever wrote those entities.
-    * "A"/"M" files still CALL _build_code_triples, and its returned triples
-      are DISCARDED -- including for an entity reborn after a removal this
-      pass already closed, whose introduction _correction_sweep_apply has
-      written just before this call (#349). This looks redundant and is
-      not: state.entity_valid_from
-      after Stage A covers only positions 0..meeting_point, so an entity
-      introduced INSIDE the reverse region is absent from it and a later
-      deletion of that entity within the same region would close with
-      orig_ts falling back to the delete commit's own timestamp -- a wrong,
-      often zero-width valid interval. Calling the function and dropping its
-      output keeps entity_valid_from / entity_descriptions / file_entities /
-      field_class_ident / field_static_ident current at zero fact cost, and
-      the sweep's ascending order makes the recorded timestamp the correct
-      EARLIEST one (_build_code_triples only writes entity_valid_from[ident]
-      when the ident is not already present).
-    * Provisional-lineage reconciliation is skipped for "A"/"M" --
-      _correction_sweep_apply owns those entities' lineage and has already
-      run for this commit. It is still performed for an "R" file's new path,
-      where the reverse stream may hold a provisional guess at a LATER
-      commit that this rename supersedes; there the DB
-      (_lineage_is_provisional) is consulted directly, per ident.
-    * _watermark_update, _frontier_persist_claim and
-      _lineage_confirmed_through_update are skipped. Stage B tracks its own
-      progress through :ingestion/correction-sweep-through, and the forward
-      frontier must not appear to advance into the reverse region.
+    1. The `writes.add_triples` seed, in this function's body: the commit's
+       own seven :type/commit triples are omitted -- _reverse_apply already
+       wrote the entity for every commit in this range (same reason
+       _correction_sweep_apply gives for not writing it).
+    2. Inside `_fwd_reconcile_and_build`: the reconciliation gate
+       (`state.entity_valid_from.pop`, which makes the following
+       `_build_code_triples` treat the ident as newly introduced) is skipped
+       for "A"/"M" -- provisional lineage for those entities belongs to
+       _correction_sweep_apply, which has already run for this commit -- but
+       NOT for "R", where the reverse stream may hold a provisional guess at
+       a LATER commit that this rename supersedes; there the DB
+       (_lineage_is_provisional) is consulted directly, per ident.
+    3. Also inside `_fwd_reconcile_and_build`: the emission gate. "A"/"M"
+       still CALL _build_code_triples and DISCARD its returned triples --
+       including for an entity reborn after a removal this pass already
+       closed, whose introduction _correction_sweep_apply has written just
+       before this call (#349). This looks redundant and is not:
+       state.entity_valid_from after Stage A covers only positions
+       0..meeting_point, so an entity introduced INSIDE the reverse region
+       is absent from it and a later deletion of that entity within the
+       same region would close with orig_ts falling back to the delete
+       commit's own timestamp -- a wrong, often zero-width valid interval.
+       Calling the function and dropping its output keeps entity_valid_from
+       / entity_descriptions / file_entities / field_class_ident /
+       field_static_ident current at zero fact cost, and the sweep's
+       ascending order makes the recorded timestamp the correct EARLIEST
+       one (_build_code_triples only writes entity_valid_from[ident] when
+       the ident is not already present). "R" keeps the emission for its
+       NEW path: the reverse stream skipped renames entirely, so nothing
+       else ever wrote those entities. Gates 2 and 3 are the SAME predicate
+       today and are deliberately NOT fused into one boolean: they exist for
+       different documented reasons (reconciliation ownership vs.
+       emission), and fusing would remove the ability to change one without
+       the other.
+    4. The write tail below, `if not lifecycle_only:` around the :parent-edge
+       transacts -- _reverse_apply already wrote them for every commit in
+       this range (same reason as site 1).
+    5. The write tail below, `if not lifecycle_only and persist_claim:`
+       around _watermark_update / _frontier_persist_claim /
+       _lineage_confirmed_through_update. See the persist_claim (#342)
+       paragraph above: Stage B tracks its own progress through
+       :ingestion/correction-sweep-through (written by
+       _correction_sweep_apply), and none of these three may appear to
+       advance the forward frontier into the reverse region.
+    6. The write tail below, `if not lifecycle_only: _db_checkpoint_gated(db)`
+       -- Stage B's lifecycle pass is followed immediately by
+       _correction_sweep_through_update and a checkpoint in
+       _run_ingestion's sweep loop, so checkpointing here would be a pure
+       duplicate.
+
+    Structure (#346 PR 2). Per file, dispatch is by status: "D" goes to
+    _fwd_apply_deleted_file. "A"/"M"/"R" run, in order,
+    _fwd_apply_renamed_head (R only), _fwd_reconcile_and_build (sites 2-3
+    above -- one indivisible unit; see its own docstring for why the pop and
+    the build must not be separated), _fwd_close_removed_children (M only),
+    then _fwd_diff_dependencies. Three passes follow the per-file loop:
+    _fwd_apply_renamed_pairs, _fwd_close_renamed_old_paths,
+    _fwd_apply_gitlinks. Sites 1 and 4-6 are NOT moved -- they stay in this
+    function's own body/write-tail, so #342's watermark rationale above
+    keeps its single copy site rather than being duplicated into a helper.
+
+    Call-order contract (load-bearing, #346 PR 2):
+
+    * Per file, in `extracted_files` order. "D" and "A"/"M"/"R" are mutually
+      exclusive.
+    * Within "A"/"M"/"R": _fwd_apply_renamed_head (R only) runs first, THEN
+      `previous_idents` is captured from state.file_entities, THEN
+      _fwd_reconcile_and_build runs. The capture MUST precede the build,
+      which appends to that same file_entities list -- capturing after would
+      read the file's own new idents as "previously" present and never
+      detect them as removed.
+    * _fwd_apply_renamed_pairs runs BEFORE _fwd_close_renamed_old_paths: the
+      latter excludes exactly the idents the former has just closed with
+      :renamed-to linkage, so reversing the two double-closes every matched
+      rename.
+    * _fwd_apply_gitlinks runs after both of the above, and then the write
+      tail below runs last.
     """
     commit_hash, commit_ts_iso, author, subject = commit
     extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = extracted
