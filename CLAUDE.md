@@ -1580,15 +1580,136 @@ forward, a Stage A reverse AND a Stage B lifecycle call — a spy that never saw
 a site proves nothing about it. Test spies read these flags from `kwargs`, never
 by argument index.
 
-The decomposition itself was DECLINED and filed as #346 rather than attempted.
-Every seam that would meaningfully decompose the function moves mutable
-`_ForwardWalkState` across a new boundary: the per-file loop alone is 243
-lines carrying 16 in-place mutations that touch 8 of the state's 12 dicts,
-with further mutation happening indirectly through `_forget_closed_entity` and
-`_build_code_triples`. Splitting by `lifecycle_only` is also the wrong axis —
-the mutations partition by FILE STATUS (D / R / A-M), not by the flag, which
-is why the flag leaves 183 unguarded lines stranded in the middle belonging to
-neither side. A status-based split is the more promising direction.
+The decomposition was DECLINED on a first pass and filed as #346 rather than
+attempted, then done as a second PR (design doc
+`docs/superpowers/specs/2026-09-20-forward-apply-decomposition-design.md`) once
+the axis problem below had an answer. Every seam that would meaningfully
+decompose the function moves mutable `_ForwardWalkState` across a new
+boundary: the per-file loop alone was 243 lines carrying 16 in-place mutations
+that touch 8 of the state's 12 dicts, with further mutation happening
+indirectly through `_forget_closed_entity` and `_build_code_triples`.
+Splitting by `lifecycle_only` is the wrong axis — the mutations partition by
+FILE STATUS (D / R / A-M), not by the flag, which is why the flag leaves 183
+unguarded lines stranded in the middle belonging to neither side, measured
+before the shipped design was chosen.
+
+**What shipped splits by file status into ten module-level helpers, behind
+two carriers extracted first.** `_FwdCommitCtx` (frozen: commit_hash,
+commit_ident, commit_ts_iso, reason, index_con) and `_ForwardCommitWrites`
+(the five accumulators — add_triples, dep_add_triples, close_items,
+closed_idents, renamed_old_paths — previously threaded through every branch
+by hand) are what made any extraction possible at all: `add_triples` alone
+was appended to or extended at 11 sites spread across the whole body, so
+extracting a helper without first giving it somewhere to write meant either
+returning a value from every call site or reaching back into the caller's
+locals. `_forward_apply`'s EXECUTABLE body — the function's AST span minus its
+own docstring's span, the number that does not rot when the prose around it
+changes — shrank by two-thirds doing this: 525 lines (master `428ac7e`) to
+171 (post-extraction, `86cd586`), and it stays 171 here, since this
+documentation pass adds no code. Two numbers around it, stated separately so
+neither is mistaken for the other: def-to-end (the whole `def` block,
+docstring included) went 592 to 238 over the same two commits, then to 290 as
+this pass grew the docstring itself from 67 lines to 119 documenting exactly
+this change — at every revision, def-to-end equals docstring plus executable,
+so any one of the three is checkable against the other two. (The plan
+recorded the pre-refactor figure as 594; that came from a line-slice that
+swept in trailing blank lines — AST says 592.) The ten helpers:
+`_fwd_close_entity` and `_fwd_close_dep_edges` (two repeated sequences
+collapsed into shared helpers — a three-step entity close that appeared six
+times, and a dep-edge close that appeared in two of its three sites, the
+third staying inline because it closes only a diffed subset rather than
+everything recorded); `_fwd_apply_deleted_file`, `_fwd_apply_renamed_head`,
+`_fwd_reconcile_and_build`, `_fwd_close_removed_children`,
+`_fwd_diff_dependencies` (the per-status/per-file dispatch); and
+`_fwd_apply_renamed_pairs`, `_fwd_close_renamed_old_paths`,
+`_fwd_apply_gitlinks` (the three post-loop passes). The write tail —
+:parent edges, the three watermarks, the checkpoint — was NOT moved; see
+below.
+
+**`_fwd_reconcile_and_build` is INDIVISIBLE, and the reason is a specific
+ordering dependency, not a size judgment.** It is the single helper covering
+BOTH of the old flag's sites 2 and 3 (the reconciliation gate and the
+emission gate) because site 2's `state.entity_valid_from.pop(ident, None)`
+exists precisely so that site 3's `_build_code_triples` treats that ident as
+newly introduced. Extracting the pop into one helper and the build into
+another — or extracting the gate without the pop — mints a SECOND
+`:introduced-by` alongside the reverse stream's provisional guess (#235).
+The two gates stay separate booleans inside the one function rather than
+being fused into a single predicate, even though they evaluate identically
+today: fusing would remove the ability to change reconciliation ownership
+without also changing emission, and the two exist for different documented
+reasons.
+
+**Call-order contract (load-bearing).** Per file, in `extracted_files`
+order, "D" and "A"/"M"/"R" are mutually exclusive. Within "A"/"M"/"R":
+`_fwd_apply_renamed_head` (R only) runs first; `previous_idents` is captured
+from `state.file_entities` BEFORE `_fwd_reconcile_and_build` runs, because
+that call appends to the same list — capturing after would read the file's
+own new idents as "previously" present and never detect them as removed;
+`_fwd_close_removed_children` (M only) then `_fwd_diff_dependencies` follow.
+After the per-file loop, `_fwd_apply_renamed_pairs` runs BEFORE
+`_fwd_close_renamed_old_paths` — the latter excludes exactly the idents the
+former has just closed with `:renamed-to` linkage, so reversing them
+double-closes every matched rename — then `_fwd_apply_gitlinks`, then the
+retained write tail.
+
+**State mutation is DECLARED, not enforced, and that distinction is
+deliberate rather than a shortfall to close later.** Each helper's
+docstring states which `_ForwardWalkState` fields it reads and writes
+(direct or via `_forget_closed_entity`/`_build_code_triples`) and which
+`_FwdCommitCtx` fields it reads and `_ForwardCommitWrites` fields it
+appends to — but nothing raises if a future edit touches a dict a helper's
+docstring does not mention; the state object stays a plain mutable dataclass
+passed by reference. A narrowed view object that raises on access outside
+its declared field set was considered (approach C in the design doc) and
+deferred, not rejected: it costs a wrapper class and per-access indirection
+on a hot path, and two of the shared helpers take raw dicts positionally in
+a way that fights it. It can be layered on top of the current shape later
+without redoing the split.
+
+**Verification was a differential write-sequence oracle, not the suite
+alone.** This is a pure refactor — no new fact shape, no `GRAPH_FORMAT_VERSION`
+bump — so its acceptance criterion is that ingestion issues the identical
+sequence of database commands before and after, and the suite cannot show
+that on its own. `evals/at_scale/probe_forward_apply_write_parity.py`
+records every `_db_execute`/`_index_write`/`_commit_index_writer_safe` call
+and every `_db_checkpoint_gated` CALL (never its outcome, since
+`_CheckpointPolicy`'s duty gate makes whether a given call actually
+checkpoints vary run to run on identical code) issued while a THREAD-LOCAL
+tag names the commit currently being applied — not while any frame is "on
+the stack" in a general sense. The probe's `spy_forward`/`spy_reverse`
+wrappers set that tag on entry to the real `_forward_apply`/`_reverse_apply`
+call and clear it on exit, on whichever thread makes that call (the write
+executor thread, synchronously); a command is tagged if and only if it runs
+on that same thread while the tag is set. It is a thread-local rather than a
+plain global for exactly this reason — a plain global would also mis-tag
+work the event-loop thread happens to run while an apply is in flight — and
+the same property cuts the other way: work an apply call dispatches onto a
+DIFFERENT thread would carry no tag at all, tagged nowhere and compared by
+nothing, even though it is logically part of that apply. Nothing in either
+apply function does this today, so the oracle's coverage is currently
+complete, but this is a property to re-check before trusting the oracle
+again, not a guarantee that survives such a change automatically. The probe
+compares two recordings per commit rather than as one global list (the two
+streams interleave through executors, so global order is not stable run to
+run). **`PYTHONHASHSEED=0` is required in every arm**: several sites
+iterate sets/dicts of strings (`current_deps - previous_deps`,
+`submodule_paths`, `renamed_old_paths`), so hash randomization alone
+reorders emitted triples between two runs of IDENTICAL code and would make
+a real difference look like noise, or a non-difference look like one. The
+probe's own `record_run()` refuses to run unless it is set from the command
+line, since assigning it to `os.environ` from inside a running process
+changes nothing. The recording's own dropped-command count
+(`untagged_mismatch`, everything recorded while the executing thread carries
+no tag) is reported but deliberately NOT gating: measured directly, it drifted between
+invocation batches on completely unmodified code (475641 vs. 475623 of the
+same corpus, same ratio, same seed), so treating a difference there as a
+finding would be exactly the kind of batch-drift noise this repo has
+already been burned by elsewhere (`probe_sweep_window_cost.py`'s 2.4x
+baseline drift). It was run over four corpora arms — this repo's own
+history and a mandatory synthetic repo covering gitlink and rename branches
+this repo's history barely exercises, at both the 1:1 and forward-only
+stream ratios — and reported zero diffs.
 
 **`_lineage_marker_ident` is injective only over `_code_ident` output, and the
 precondition is structural rather than conventional.** It collapses every `/`
