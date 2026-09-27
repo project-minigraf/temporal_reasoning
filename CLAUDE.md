@@ -477,16 +477,21 @@ opens clean, scans and counts are right, and every entity-bound lookup returns
 (`[#uuid "…" :entity-type ?t]`) — minigraf's `selective_fact_fetch` routes an
 entity-literal pattern to `get_facts_by_entity` and an attribute-only one to
 `get_facts_by_attribute`, so the two queries compare the two indexes exactly
-for PRESENCE — but not for which of several same-transaction values each index
-returns. Two `:entity-type` values written in ONE transact share
-`(entity, attribute, tx_count, asserted)`; the index keys carry no value bytes,
-each index is sorted with `sort_unstable_by`, and `selective_fact_fetch` dedups
-on that tuple keeping whichever comes first — so a HEALTHY entity can read
+for PRESENCE. On minigraf 2.0.0 they did NOT agree on which of several
+same-transaction values each index returned: two `:entity-type` values written
+in ONE transact share `(entity, attribute, tx_count, asserted)`, and 2.0.0's
+`selective_fact_fetch` deduped on that value-blind tuple keeping whichever each
+index's unstable sort put first — so a HEALTHY entity could read
 `{:type/decision}` through AEVT and `{:type/constraint}` through EAVT (3 of 6
-graphs built through `handle_minigraf_transact`, measured). The check therefore
-refuses ONLY when exactly one side is empty; both non-empty but different is
+graphs built through `handle_minigraf_transact`, measured). **minigraf 2.0.2
+(#380) dropped that dedup, and the floor is now 2.0.2 (#239):** both indexes
+return every value (40 of 40 graphs, measured), and
+`tests/test_index_cross_check.py` pins it. The check still refuses ONLY when
+exactly one side is empty; both non-empty but different — unreachable on real
+graphs now, and tested by injecting 2.0.0's answer at `_db_execute` — is
 counted and summarized in one stderr line, never refused, and deliberately has
-no `stderr_capture` pattern. It probes every control entity and up to 512
+no `stderr_capture` pattern. It is kept because a minigraf regression would
+make it reachable again, and wrongly refusing costs the user a healthy graph. It probes every control entity and up to 512
 random others, and raises `GraphIndexDamageError` on an empty-vs-non-empty
 disagreement that survives one re-read.
 
@@ -520,14 +525,14 @@ entity AEVT lost is never sampled unless it is a fixed control ident; only
 `:entity-type` is compared, so partial loss inside one entity's EAVT range
 passes — and because refusal needs one side EMPTY, so does an entity holding
 `:entity-type` values from different transactions that loses some but not all
-of them, in either index; an entity given two same-transaction types that
-later has ANY of them retracted (one, or both in a single retract, whose
-retractions dedup the same way) can read empty through one index and a value
-through the other, and is then refused on a healthy graph (measured: 1 of 8
-graphs each way); light damage
+of them, in either index; light damage
 can escape a 512 sample ((1 − f)^512, 0.6% at f = 1%); and readers outside
 ingestion — `minigraf_query`, the memory hooks, `minigraf_ingest_status`'s own
-`:ingestion/last-run-at` read — are unguarded. The rest of #336 (per-file
+`:ingestion/last-run-at` read — are unguarded. A residual this list used to
+carry — two same-transaction types, one or both later retracted, reading empty
+through one index and refused although healthy — was the same 2.0.0 dedup and
+is gone on 2.0.2 (0 of 16 graphs; the same construction refused 6 of 8 on
+2.0.0). The rest of #336 (per-file
 batched marker probe → #239; watermark singletons → minigraf#323) is open.
 
 **Single-handle invariant.** At most one live `MiniGrafDb` handle may exist per
@@ -537,7 +542,17 @@ project-minigraf/minigraf#304). minigraf has enforced this since 1.2.2: a second
 open raises `Database is already open in this process` instead of silently
 succeeding. That makes the bug visible, not absent.
 
-**The floor is `minigraf>=2.0.0,<3.0.0`** as of #284 item 6. The upper bound is
+**The floor is `minigraf>=2.0.2,<3.0.0`** as of #239 (2.0.0 from #284 item 6
+until then). It was raised on a same-batch A/B
+(`evals/at_scale/probe_minigraf_upgrade_cost.py`,
+`results/239-minigraf-2.0.2-ab.json`): full-history ingestion of this repo,
+interleaved 2.0.0/2.0.2/2.0.0/2.0.2 under twin venvs differing only in
+minigraf, wrote identical graphs (fact_audit divergence 0 in all four), both
+2.0.2 runs beat both 2.0.0 runs on wall clock, and point-query time fell ~45%.
+**2.0.2 graph FILES are ~70% larger for identical facts** (597 MB vs 352 MB
+full history; 8.2 MB vs 5.0 MB at 151 commits) and stable across further
+checkpoints — not a correctness issue, not gated, cause unverified. Handle-drop
+cost was too noisy across the two 2.0.2 runs (59% spread) to call. The upper bound is
 deliberate: with no cap, CI silently resolved 2.0.0 the day it shipped and ran
 red for days before anyone connected the two (#286). A major bump must be a
 decision, not a resolver outcome. `install.py` mirrors this spec and is
@@ -583,8 +598,14 @@ against a built, stamped wheel, not just the checkout.
 **project-minigraf/minigraf#287 is still OPEN and is worked around here, not
 fixed.** Batching facts that share `(entity, attribute, valid_from)` into one
 transact silently keeps only the last, because the EAVT pending index omits
-value bytes. It is VERSION-INVARIANT — measured identically on 1.2.3 and 2.0.0
-— so the upgrade neither helped nor hurt. `:contains`, `:depends-on` and
+value bytes. The PENDING-index half is version-invariant — measured
+identically on 1.2.3, 2.0.0 and 2.0.2 — and it is what the workaround needs:
+ingestion reads mid-run, between checkpoints. **On 2.0.2 the collapse ends at
+the checkpoint** (#239, measured: five same-transaction `:contains` read 1
+before checkpoint and 5 after, and after reopen; 2.0.0 reads 1 throughout), so
+on 2.0.0 the facts were stored all along and hidden on every read by the
+value-blind dedup #380 removed. A 2.0.0 graph holding such batched values will
+show them again under 2.0.2. `:contains`, `:depends-on` and
 `:parent` are therefore transacted ONE PER CALL at four sites; never "simplify"
 those loops into a single batch. All four are now regression-guarded.
 

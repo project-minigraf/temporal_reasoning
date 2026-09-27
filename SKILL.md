@@ -780,7 +780,7 @@ below 1.0 demote history, 1.0 is neutral).
 
 ## Dependencies
 
-- **minigraf >= 2.0.0, < 3.0.0** — run `python install.py`, which pip-installs this spec into the project venv. The upper bound is deliberate: with no cap, CI silently resolved 2.0.0 the day it shipped and ran red for days before anyone connected the two (#286). A major bump must be a decision, not a resolver outcome. `pyproject.toml` is canonical; `install.py` (`_MINIGRAF_SPEC`) mirrors it, and the two have drifted before.
+- **minigraf >= 2.0.2, < 3.0.0** — run `python install.py`, which pip-installs this spec into the project venv. The upper bound is deliberate: with no cap, CI silently resolved 2.0.0 the day it shipped and ran red for days before anyone connected the two (#286). A major bump must be a decision, not a resolver outcome. `pyproject.toml` is canonical; `install.py` (`_MINIGRAF_SPEC`) mirrors it, and the two have drifted before.
 - **Python 3** — for the wrapper
 
 ## Examples

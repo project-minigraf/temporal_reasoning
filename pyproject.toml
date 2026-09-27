@@ -66,7 +66,21 @@ dependencies = [
     # a resolver outcome. That is the whole lesson of this cap's own history:
     # with no upper bound, CI silently resolved 2.0.0 the day it shipped and
     # ran red for days before anyone connected the two (#286).
-    "minigraf>=2.0.0,<3.0.0",
+    #
+    # Raised to 2.0.2 in #239, conditional on a same-batch A/B that held:
+    # full-history ingestion of this repo under twin venvs differing only in
+    # minigraf, interleaved 2.0.0/2.0.2/2.0.0/2.0.2, wrote IDENTICAL graphs
+    # (facts, entities, commits; fact_audit divergence 0 in all four) and both
+    # 2.0.2 runs beat both 2.0.0 runs on wall clock. Point-query time fell
+    # ~45% (minigraf #380). Two #336 residuals are gone on 2.0.2 as well:
+    # same-transaction multi-valued facts now read identically through AEVT
+    # and EAVT (#380 dropped a value-blind dedup), and tests pin that. Only a
+    # partial fix for #287: batched same-transaction values now survive a
+    # checkpoint, but still collapse in the PENDING index before one, which is
+    # what ingestion reads mid-run -- so the one-per-call workaround stands.
+    # FORMAT_VERSION is still 7 at v2.0.2; format v8 is v3.0.0 only.
+    # evals/at_scale/results/239-minigraf-2.0.2-ab.json.
+    "minigraf>=2.0.2,<3.0.0",
     # Capped below 2.0: mcp 2.0.0 removed Server.list_tools, which
     # mcp_server.py registers its handlers through. With the bound open, CI
     # resolved 2.0.0 and every test that imports mcp_server errored at import

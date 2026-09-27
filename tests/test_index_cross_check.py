@@ -166,28 +166,48 @@ def _build_same_transaction_types_graph(graph, tag):
     return x
 
 
-def _open_graph_with_differing_types(tmp_path):
-    """Open a healthy graph whose AEVT and EAVT return DIFFERENT single
-    :entity-type values for one entity; returns (handle, ident, eavt, aevt).
+def _open_graph_with_same_transaction_types(tmp_path):
+    """Open a healthy graph holding one entity typed :type/decision AND
+    :type/constraint in ONE transact; returns (handle, ident)."""
+    graph = tmp_path / "h.graph"
+    x = _build_same_transaction_types_graph(graph, "h0")
+    return MiniGrafDb.open(str(graph)), x
 
-    Deterministic for a given tag; tag h0 disagrees on minigraf 2.0.0, and the
-    loop only guards against a sort change moving the disagreement to another
-    tag. The precondition is witnessed independently of the functions under
-    test, and fails red rather than passing vacuously if no tag qualifies.
+
+def _inject_single_eavt_value(monkeypatch, x, keep):
+    """Make the check's EAVT probe of x return only `keep`, as minigraf 2.0.0
+    did for a same-transaction multi-valued attribute.
+
+    2.0.0's selective_fact_fetch deduped on (entity, attribute, tx_count,
+    asserted), a key with no value bytes, so each index kept whichever
+    same-transaction value its unstable sort put first and AEVT and EAVT could
+    each return a DIFFERENT single value on a healthy graph (21 of 40 graphs
+    measured). 2.0.2 (minigraf #380) dropped that dedup, so a real graph no
+    longer produces the disagreement and it has to be injected. The answer is
+    minigraf's REAL response with rows filtered out, so the check's own
+    parsing still runs. Returns the list of population scans observed.
     """
-    for tag in (f"h{i}" for i in range(6)):
-        graph = tmp_path / f"{tag}.graph"
-        x = _build_same_transaction_types_graph(graph, tag)
-        handle = MiniGrafDb.open(str(graph))
-        eavt, aevt = _eavt_types(handle, x), _aevt_types(handle, x)
-        if eavt and aevt and eavt != aevt:
-            assert eavt | aevt <= {":type/decision", ":type/constraint"}
-            return handle, x, eavt, aevt
-        del handle
-    pytest.fail(
-        "precondition: no tag produced an AEVT/EAVT :entity-type "
-        "disagreement on a healthy graph"
+    probe = (
+        f'(query [:find ?t :where [#uuid "{_entity_uuid(x)}" :entity-type ?t]])'
     )
+    real_execute = mcp_server._db_execute
+    population_scans = []
+
+    def execute(handle, datalog):
+        raw = real_execute(handle, datalog)
+        if datalog == mcp_server._INDEX_CROSS_CHECK_POPULATION_QUERY:
+            population_scans.append(datalog)
+        if datalog == probe:
+            body = json.loads(raw)
+            assert {r[0] for r in body["results"]} == {
+                ":type/decision", ":type/constraint"
+            }, "precondition: EAVT no longer returns both values"
+            body["results"] = [r for r in body["results"] if r[0] == keep]
+            return json.dumps(body)
+        return raw
+
+    monkeypatch.setattr(mcp_server, "_db_execute", execute)
+    return population_scans
 
 
 class TestGraphIndexCrossCheck:
@@ -255,16 +275,36 @@ class TestGraphIndexCrossCheck:
         with pytest.raises(mcp_server.GraphIndexDamageError):
             mcp_server._graph_index_cross_check(db, rng=random.Random(0))
 
-    def test_same_transaction_types_read_differently_are_not_refused(
+    def test_same_transaction_types_read_identically_through_both_indexes(
         self, tmp_path, capsys
     ):
-        """Two :entity-type values in ONE transact share (entity, attribute,
-        tx_count, asserted), and minigraf keeps one per read -- whichever its
-        unstable per-index sort put first -- so AEVT and EAVT can each return
-        a DIFFERENT single value on a healthy graph. Refusing that tells the
-        user to discard a healthy graph.
+        """Pins minigraf >= 2.0.2 (#380): both indexes return BOTH values of a
+        same-transaction multi-valued attribute, so a healthy graph produces
+        no disagreement at all. 2.0.0 returned one arbitrary value per index;
+        if a minigraf upgrade brings that back, this goes red and the
+        differing-values branch below is reachable again on real graphs.
         """
-        db, _x, _eavt, _aevt = _open_graph_with_differing_types(tmp_path)
+        db, x = _open_graph_with_same_transaction_types(tmp_path)
+        both = {":type/decision", ":type/constraint"}
+        assert _eavt_types(db, x) == both
+        assert _aevt_types(db, x) == both
+        capsys.readouterr()
+        report = mcp_server._graph_index_cross_check(db, rng=random.Random(0))
+        assert report["population"] == 31
+        assert report["probed"] == _fixed_count() + 31
+        assert capsys.readouterr().err == ""
+
+    def test_same_transaction_types_read_differently_are_not_refused(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Both non-empty but DIFFERENT is what minigraf 2.0.0 produced on a
+        healthy graph (see _inject_single_eavt_value). Refusing it tells the
+        user to discard a healthy graph. Unreachable on real graphs since
+        2.0.2, kept because a minigraf regression would make it reachable
+        again, and the cost of being wrong is a refused healthy graph.
+        """
+        db, x = _open_graph_with_same_transaction_types(tmp_path)
+        _inject_single_eavt_value(monkeypatch, x, ":type/constraint")
         capsys.readouterr()
         report = mcp_server._graph_index_cross_check(db, rng=random.Random(0))
         assert report["population"] == 31
@@ -284,16 +324,10 @@ class TestGraphIndexCrossCheck:
         1.6M entities (extrapolated), paid per such entity on a HEALTHY run.
         Only an empty-vs-non-empty disagreement may cost a rescan.
         """
-        db, _x, _eavt, _aevt = _open_graph_with_differing_types(tmp_path)
-        real_execute = mcp_server._db_execute
-        population_scans = []
-
-        def counting_execute(handle, datalog):
-            if datalog == mcp_server._INDEX_CROSS_CHECK_POPULATION_QUERY:
-                population_scans.append(datalog)
-            return real_execute(handle, datalog)
-
-        monkeypatch.setattr(mcp_server, "_db_execute", counting_execute)
+        db, x = _open_graph_with_same_transaction_types(tmp_path)
+        population_scans = _inject_single_eavt_value(
+            monkeypatch, x, ":type/constraint"
+        )
         mcp_server._graph_index_cross_check(db, rng=random.Random(0))
         assert len(population_scans) == 1
 
