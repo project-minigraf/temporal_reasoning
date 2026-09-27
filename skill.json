@@ -15,7 +15,7 @@
     "tools/transact.json"
   ],
   "requires": {
-    "minigraf": ">=2.0.0,<3.0.0"
+    "minigraf": ">=2.0.2,<3.0.0"
   },
   "languages": [
     "python"

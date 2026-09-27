@@ -215,8 +215,8 @@ def _venv_pip_install(*specs: str, timeout: int = 300) -> bool:
 # drifted before: the floor was stale here (1.2.1 vs pyproject's 1.2.3) and the
 # cap was missing entirely, so a fresh install pulled minigraf 2.0.0 the day it
 # shipped. See #284.
-_MINIGRAF_SPEC = "minigraf>=2.0.0,<3.0.0"
-_MINIGRAF_FLOOR = "2.0.0"
+_MINIGRAF_SPEC = "minigraf>=2.0.2,<3.0.0"
+_MINIGRAF_FLOOR = "2.0.2"
 
 
 def check_minigraf_package():

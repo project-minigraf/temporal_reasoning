@@ -6406,22 +6406,23 @@ def _graph_index_cross_check(
     with EAVT non-empty is the shape AEVT damage leaves on a fixed ident. Both
     empty agrees. That catches loss in either index for the entities probed.
 
-    Both non-empty but DIFFERENT is not refused, because a healthy graph
-    produces it. An entity given two :entity-type values in ONE transact
-    carries two facts sharing (entity, attribute, tx_count, asserted), and
-    minigraf keeps only one of them per read: its EAVT/AEVT keys carry no value
-    bytes, build_sorted_index_entries sorts each index with sort_unstable_by
-    (storage/persistent_facts.rs), and selective_fact_fetch dedups on exactly
-    that tuple, keeping whichever fact comes first (query/datalog/executor.rs).
-    So each index can return a DIFFERENT single value -- measured 3 of 6
-    healthy graphs built through handle_minigraf_transact, e.g. AEVT
-    {:type/decision} against EAVT {:type/constraint}. Such entities are
-    counted and summarized in one stderr line, never refused, and never
-    re-read. Two residuals follow from the same dedup. An entity given two
-    same-transaction types that later has ANY of them retracted -- one, or both
-    in a single retract, whose retractions share the tuple too -- can read empty
-    through one index and a value through the other, and is then refused
-    although the graph is healthy. And since refusal needs one side EMPTY, an
+    Both non-empty but DIFFERENT is not refused, because minigraf 2.0.0
+    produced it on healthy graphs. An entity given two :entity-type values in
+    ONE transact carries two facts sharing (entity, attribute, tx_count,
+    asserted), and 2.0.0's selective_fact_fetch deduped on exactly that
+    value-blind tuple, keeping whichever fact each index's unstable sort put
+    first -- so AEVT could read {:type/decision} and EAVT {:type/constraint}
+    (3 of 6 healthy graphs built through handle_minigraf_transact). minigraf
+    2.0.2 (#380) dropped that dedup, and the floor is now 2.0.2, so a real
+    graph no longer produces this shape: both indexes return every value
+    (#239, 40 of 40 graphs). The branch is kept because a minigraf regression
+    would make it reachable again, and wrongly refusing costs the user a
+    healthy graph. Such entities are counted and summarized in one stderr
+    line, never refused, and never re-read. The same dedup's retract residual
+    -- one or both same-transaction types retracted, reading empty through
+    one index and a value through the other, and refused although healthy --
+    is likewise gone on 2.0.2 (0 of 16 graphs; the same construction refused
+    6 of 8 on 2.0.0). What remains: since refusal needs one side EMPTY, an
     entity holding :entity-type values from DIFFERENT transactions that loses
     some but not all of them, in either index, passes.
 
