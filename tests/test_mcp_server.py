@@ -30373,6 +30373,192 @@ class TestForwardClaimCeiling342:
             )
 
 
+class TestLeaseWindow:
+    """#280. _LeaseWindow holds ONE outer lease across several Stage A commits
+    so the per-commit lease joins it (refcount 1 -> 2) instead of dropping the
+    handle -- and with it a full O(graph size) checkpoint in minigraf's
+    `Drop for Inner` -- after every commit. It releases for real only at a
+    boundary (commit count or clock), then pauses OUTSIDE any lease so an
+    out-of-process hook can take the graph lock.
+
+    Driven against a real graph and a real batched index connection, never a
+    fake: the properties under test (who holds the file lock, whether SQLite
+    is mid-transaction) exist only in the real backends.
+    """
+
+    def _setup(self, tmp_path, monkeypatch):
+        import concurrent.futures
+        import fact_index
+        import mcp_server
+        graph = tmp_path / "g.graph"
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(graph))
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph))
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Opened ON the executor's single worker thread, not inline here --
+        # matching _open_index_writer_safe's own contract ("always invoked
+        # via write_executor, never inline on the loop") and real ingestion
+        # (mcp_server.py:14585). sqlite3 connections are thread-affined
+        # (check_same_thread=True by default): _LeaseWindow's real release
+        # commits index_con via write_executor (_db_lease_async_committing_
+        # index), so the connection must belong to that same thread or the
+        # commit raises "SQLite objects created in a thread can only be used
+        # in that same thread" -- silently swallowed by
+        # _commit_index_writer_safe, which would make a real release look
+        # like a no-op to any test that checks in_transaction afterward.
+        index_con = executor.submit(
+            mcp_server._open_index_writer_safe,
+            fact_index.index_path_for(str(graph)),
+        ).result()
+        return graph, executor, index_con
+
+    def _window(self, executor, index_con, **kw):
+        import mcp_server
+        kw.setdefault("max_commits", 10**9)
+        kw.setdefault("max_seconds", 10**9)
+        kw.setdefault("pause_seconds", 0.0)
+        return mcp_server._LeaseWindow(
+            asyncio.get_running_loop(), executor, index_con, **kw
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_lazy_and_a_yield_before_opening_does_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        try:
+            w = self._window(executor, index_con, max_commits=0, max_seconds=0.0)
+            assert not w.is_open
+            assert mcp_server._lease_manager.lease_count == 0
+            assert await w.maybe_yield() == 0.0
+            assert not w.is_open, "maybe_yield opened a window nobody asked for"
+            assert mcp_server._lease_manager.lease_count == 0
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_a_nested_lease_joins_and_does_not_release_the_graph(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        loop = asyncio.get_running_loop()
+        try:
+            w = self._window(executor, index_con)
+            await w.ensure_open()
+            assert mcp_server._lease_manager.lease_count == 1
+            async with mcp_server._db_lease_async_committing_index(
+                loop, executor, index_con
+            ):
+                assert mcp_server._lease_manager.lease_count == 2
+            assert mcp_server._lease_manager.lease_count == 1, (
+                "the per-commit lease's exit dropped the window's handle"
+            )
+            assert not _another_process_can_open(str(graph)), (
+                "another process could open the graph while the window was "
+                "open -- the window is not holding the lock"
+            )
+            await w.close()
+            assert mcp_server._lease_manager.lease_count == 0
+            assert _another_process_can_open(str(graph))
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_the_commit_count_closes_the_window_and_pauses(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        try:
+            w = self._window(executor, index_con, max_commits=2, pause_seconds=0.05)
+            await w.ensure_open()
+            w.note_commit()
+            assert await w.maybe_yield() == 0.0
+            assert w.is_open
+            w.note_commit()
+            spent = await w.maybe_yield()
+            assert not w.is_open
+            assert mcp_server._lease_manager.lease_count == 0
+            assert spent >= 0.05, f"the boundary paid no pause ({spent:.4f}s)"
+            # Reopening starts a fresh count.
+            await w.ensure_open()
+            w.note_commit()
+            assert await w.maybe_yield() == 0.0
+            await w.close()
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_the_clock_alone_closes_the_window(self, tmp_path, monkeypatch):
+        """count is unreachable (10**9), so only the clock operand of the
+        boundary's `or` can fire. A count-driven test never EVALUATES the
+        clock operand (short-circuit) -- see TestStageBYieldsTheLock's
+        test_the_clock_alone_closes_a_window."""
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        try:
+            w = self._window(executor, index_con, max_seconds=0.0)
+            await w.ensure_open()
+            await w.maybe_yield()
+            assert not w.is_open, "the clock operand never closed the window"
+            assert mcp_server._lease_manager.lease_count == 0
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_close_pays_no_pause_and_is_idempotent(self, tmp_path, monkeypatch):
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        try:
+            w = self._window(executor, index_con, pause_seconds=5.0)
+            await w.ensure_open()
+            t = time.perf_counter()
+            await w.close()
+            await w.close()
+            assert time.perf_counter() - t < 1.0, "close() paid the boundary pause"
+            assert mcp_server._lease_manager.lease_count == 0
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_a_real_release_commits_the_index_first(self, tmp_path, monkeypatch):
+        """#347: a release with index_con mid-transaction is a lock-order
+        inversion against the hooks. The window's own lease is the committing
+        wrapper, so its release commits by construction."""
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        assert index_con is not None, "no batched index connection to test against"
+        try:
+            w = self._window(executor, index_con)
+            await w.ensure_open()
+            # Routed through the same executor thread the connection was
+            # opened on (see _setup) -- sqlite3 raises cross-thread on
+            # execute()/commit() (but not on the in_transaction read below,
+            # confirmed empirically), and a raised exception here would be
+            # silently swallowed by fact_index's own safe wrappers.
+            executor.submit(
+                index_con.execute, "create table if not exists _t280(x)"
+            ).result()
+            executor.submit(
+                index_con.execute, "insert into _t280 values (1)"
+            ).result()
+            assert index_con.in_transaction, "setup did not open a transaction"
+            await w.close()
+            assert not index_con.in_transaction, (
+                "the window released the graph with the index transaction open"
+            )
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+
 class TestStageBYieldsTheLock:
     """#222 phase 5 item C. Stage B held ONE lease across the whole sweep.
 

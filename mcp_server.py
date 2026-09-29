@@ -3821,6 +3821,105 @@ async def _db_lease_async_committing_index(loop, write_executor, index_con):
             await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
 
 
+class _LeaseWindow:
+    """#280. One graph lease held across several Stage A commits.
+
+    Stage A used to take a lease per commit. Its two streams essentially
+    never overlap their leases, so the refcount hit 0 after every commit and
+    _DbLeaseManager.release() dropped the handle -- and minigraf's `Drop for
+    Inner` runs a full O(graph size) checkpoint, outside _CheckpointPolicy's
+    duty gate and invisible to the trace's ckpt_d_seconds. Measured at 110 s
+    of a 277 s Stage A over 600 commits (minigraf 2.0.2), i.e. ~1 drop per
+    commit.
+
+    The window holds its OWN lease; Stage A's per-commit lease then JOINS it
+    at refcount 1 -> 2 and its exit is 2 -> 1, which drops nothing. The
+    window releases for real only at a boundary (maybe_yield), then sleeps
+    OUTSIDE any lease so an out-of-process auto-memory hook -- which retries
+    for only ~2.6 s of wall clock and then silently discards its write --
+    can take the graph file lock. Holding one lease for all of Stage A
+    instead would discard every hook write for its duration (#280's own
+    correction comment).
+
+    The window's lease is _db_lease_async_committing_index, so every REAL
+    release commits index_con first (#347) by construction, not by call-site
+    care.
+
+    Lazy: nothing is opened until ensure_open(), so a Stage A that never
+    reaches write dispatch (empty, or every extraction failed) takes no
+    lease, as before.
+
+    Stage B keeps its own inline window loop (#222 phase 5 item C). Both use
+    the same _SWEEP_YIELD_* constants, which bound hook lockout, not sweep
+    behaviour.
+    """
+
+    def __init__(self, loop, write_executor, index_con, *,
+                 max_commits: int, max_seconds: float, pause_seconds: float) -> None:
+        self._loop = loop
+        self._write_executor = write_executor
+        self._index_con = index_con
+        self._max_commits = max_commits
+        self._max_seconds = max_seconds
+        self._pause_seconds = pause_seconds
+        self._stack: Optional[contextlib.AsyncExitStack] = None
+        self._opened_at = 0.0
+        self._count = 0
+
+    @property
+    def is_open(self) -> bool:
+        return self._stack is not None
+
+    async def ensure_open(self) -> None:
+        """Take the window's lease if it is not already held."""
+        if self._stack is not None:
+            return
+        stack = contextlib.AsyncExitStack()
+        await stack.enter_async_context(
+            _db_lease_async_committing_index(
+                self._loop, self._write_executor, self._index_con,
+            )
+        )
+        self._stack = stack
+        self._opened_at = time.monotonic()
+        self._count = 0
+
+    def note_commit(self) -> None:
+        """Count one commit that reached write dispatch inside this window."""
+        if self._stack is not None:
+            self._count += 1
+
+    async def maybe_yield(self) -> float:
+        """At a boundary, release for real and pause; return seconds spent.
+
+        A boundary is `count >= max_commits or elapsed >= max_seconds`. The
+        COUNT bounds how many drop-checkpoints the releases cost; the CLOCK
+        bounds how long a hook is locked out when one window's commits are
+        individually slow, which on a large graph they are. Neither is
+        redundant. The pause is what makes the release usable: a bare
+        release-then-reacquire leaves the lock free for microseconds, not an
+        interval (see _SWEEP_YIELD_PAUSE_SECONDS).
+        """
+        if self._stack is None:
+            return 0.0
+        if not (
+            self._count >= self._max_commits
+            or time.monotonic() - self._opened_at >= self._max_seconds
+        ):
+            return 0.0
+        started = time.perf_counter()
+        await self.close()
+        # asyncio.sleep, never time.sleep: this runs on the event loop (#99).
+        await asyncio.sleep(self._pause_seconds)
+        return time.perf_counter() - started
+
+    async def close(self) -> None:
+        """Release the window's lease, with no pause. Idempotent."""
+        stack, self._stack = self._stack, None
+        if stack is not None:
+            await stack.aclose()
+
+
 def _graph_path_current() -> str:
     """The bound graph path, falling back to the environment."""
     return _lease_manager.path or _get_graph_path()
