@@ -1329,6 +1329,73 @@ accounting kept reading healthy while real per-commit cost grew. General form: a
 duty-cycle gate governs only the sites routed through it, and a later refactor
 can add an ungoverned one without touching the gate or any of its tests.
 
+### Stage A lease window — #280
+
+- Script: `evals/at_scale/probe_lease_drop_cost.py` (extended with a per-phase
+  split and auto-checkpoint counter for #280; the same script measures both
+  arms via `PROBE_CODE_DIR`)
+- Raw: `evals/at_scale/results/280-stage-a-window-ab.json`
+- Question: does holding one lease across a bounded Stage A window
+  (`_LeaseWindow`, reusing Stage B's `_SWEEP_YIELD_COMMITS`/
+  `_SWEEP_YIELD_SECONDS`/`_SWEEP_YIELD_PAUSE_SECONDS`) amortise the
+  per-commit handle-drop checkpoint the "Handle drop" section above
+  attributes, without breaking graph equivalence?
+
+**Batch caveat.** Both arms ran interleaved on one machine in one batch
+(master worktree at `9131b17` vs. branch `280-stage-a-lease-window` in
+place, `PYTHONHASHSEED=0`, minigraf 2.0.2 both arms) — 600-master-1,
+600-branch-1, 600-master-2, 600-branch-2, full-master, full-branch, in that
+order, 2026-09-29 13:25–14:58. Absolute numbers here are comparable only
+*within* this batch, the same caveat `probe_sweep_window_cost.py`'s numbers
+carry elsewhere in this file (a 2.4x baseline drift was measured between two
+unrelated batches on unchanged code).
+
+| Metric (Stage A / "converging" phase only) | master, 600 commits | branch, 600 commits | master, full (1024) | branch, full (1024) |
+|---|---|---|---|---|
+| Stage A wall (median of 2 reps at 600) | 277.3 s | 207.5 s (**−25.2%**) | 653.9 s | 395.1 s (**−39.6%**) |
+| Handle drops | 601 / 601 | 72 / 75 | 1025 | 117 |
+| Drops per commit | 1.002 | 0.12 / 0.125 | 1.001 | 0.114 |
+| Drop + reopen time | 112.6 s / 112.8 s | 16.5 s / 17.4 s | 344.5 s | 45.7 s |
+| Auto-checkpoints (WAL-shrink detector) | 1 / 1 | 1 / 1 | 1 | 2 |
+| `fact_audit` divergence / `audit_error` | 0 / `None` | 0 / `None` | 0 / `None` | 0 / `None` |
+| `:type/commit` entities | 600 / 600 | 600 / 600 | 1024 | 1024 |
+
+Stage B ("sweeping" phase), unaffected by #280, recorded alongside as an
+out-of-scope observation: ~237 WAL writes per swept commit at 600
+(142512/600), 75-77 minigraf auto-checkpoints (≈23.5-24.5 s) and ~22-24 s of
+its own handle drops across both arms — all essentially identical
+master-vs-branch, confirming Stage B's window loop was not touched. At full
+history (1024 commits) Stage B shows 157 auto-checkpoints (≈80 s) on both
+arms, growing from the 600-commit figure as expected with WAL volume but
+still small against Stage B's own ~845-865 s wall.
+
+**Verdict.**
+
+- **Stage A wall ≤ 0.80× master at 600 commits: PASS.** Median ratio
+  207.5/277.3 = **0.748**. Full history reproduces it more strongly (0.604).
+- **Stage A auto-checkpoints ≤ 1 per run at 600 commits: PASS.** All four
+  600-commit runs (both arms, both reps) read exactly 1. At full history the
+  branch rose to 2 (master stayed 1) — not large against Stage B's 157, and
+  the acceptance criterion is scoped to 600 commits, but recorded per the
+  plan's "record as a finding" instruction rather than silently dropped.
+- **Graph equivalence: PASS.** `fact_audit` divergence 0 and `audit_error`
+  `None` on all six runs; `:type/commit` entity counts equal between arms at
+  both 600 and full history (600=600, 1024=1024).
+- **Drops per commit ≤ 0.06 (plan's original criterion): REPLACED, not met
+  as stated, and that is not a regression.** The plan assumed the 25-commit
+  count bound (`_SWEEP_YIELD_COMMITS`) would govern window closure (~1/25).
+  Measured, Stage A processes about 0.33 s/commit on this repo (196.7 s /
+  600 on branch rep 1), so the 2.0 s clock bound (`_SWEEP_YIELD_SECONDS`)
+  closes every window after roughly 6-8 commits, well short of 25 — matching
+  the design spike's 70/600. Measured drops per commit are **0.12 and
+  0.125** at 600 commits and **0.114** at full history, against **~1.0** on
+  master throughout: an ~8x reduction, not the ~25x the original criterion
+  implied, because the clock bound — which exists specifically to cap hook
+  lockout at `_SWEEP_YIELD_SECONDS` regardless of per-commit pace — is the
+  one actually governing here. Full result and reasoning:
+  `evals/at_scale/results/280-stage-a-window-ab.json`,
+  `verdict.acceptance.stage_a_drops_per_commit_le_0_06`.
+
 ### Hot-ident version chains — real, O(N²), but ~2% at this history length
 
 - Script: `evals/at_scale/probe_hot_ident_chain_cost.py`
