@@ -1,0 +1,734 @@
+{
+  "issue": 280,
+  "date": "2026-09-29",
+  "provenance": {
+    "machine": "one machine, one interleaved batch (log order below); absolute numbers are comparable only WITHIN this batch, not against any other probe run recorded elsewhere in this repo",
+    "minigraf_version": "2.0.2 (both arms; floor raised in #239, PR #365, master 9131b17)",
+    "master_arm": {
+      "description": "PROBE_CODE_DIR worktree checked out at master",
+      "commit": "9131b178aa910bfde2e102de4a146d878ac64e01"
+    },
+    "branch_arm": {
+      "description": "280-stage-a-lease-window branch, HEAD in place (no worktree)",
+      "commit": "28ee49da47bf701c3d561b60ba57da4865224983"
+    },
+    "600_commit_ref": "d00fa2a58b9cadb86f79091f1fede597bfae54ac (git rev-list --reverse master | sed -n 600p)",
+    "full_history_ref": "master (9131b17, 1024 commits)",
+    "run_log_order": [
+      "13:25:53 start 600-master-1",
+      "13:37:55 end 600-master-1 rc=0",
+      "13:37:55 start 600-branch-1",
+      "13:48:43 end 600-branch-1 rc=0",
+      "13:48:43 start 600-master-2",
+      "14:01:10 end 600-master-2 rc=0",
+      "14:01:10 start 600-branch-2",
+      "14:12:29 end 600-branch-2 rc=0",
+      "14:12:29 start full-master",
+      "14:37:47 end full-master rc=0",
+      "14:37:47 start full-branch",
+      "14:58:29 end full-branch rc=0"
+    ],
+    "command": ".venv/bin/python evals/at_scale/probe_lease_drop_cost.py --repo . --ref <REF> --out <OUT>.json, PYTHONHASHSEED=0, PROBE_CODE_DIR=<master worktree> for the master arm only"
+  },
+  "notes": "Each embedded run JSON drops the raw `opens`/`drops` per-event time-series lists (743-1203 floats/pairs each) to keep this file a reasonable size; every other key from the probe's summary() output is kept verbatim, including per_phase (opens/drops/wal_writes/auto_ckpt broken out by preload='other'/converging=Stage A/sweeping=Stage B), audit and commit_entities. The full per-event series for each run is still on disk at the scratchpad path recorded in provenance if it is ever needed again.",
+  "runs": {
+    "600_master_1": {
+      "issue": 260,
+      "wall_s": 720.5430874750018,
+      "commits_traced": 600,
+      "handle_opens": 743,
+      "handle_drops": 743,
+      "opens_per_commit": 1.2383333333333333,
+      "apply_total_s": 267.5000324209541,
+      "apply_share_of_wall": 0.3712477949907952,
+      "explicit_ckpt_total_s": 12.073101926915115,
+      "explicit_ckpt_share_of_apply": 0.04513308584544826,
+      "drop_total_s": 107.6879472349392,
+      "drop_share_of_wall": 0.14945386210325037,
+      "drop_share_of_apply": 0.40257171657263574,
+      "drop_thirds": {
+        "first_mean_s": 0.07177789377751817,
+        "middle_mean_s": 0.1797743536155343,
+        "last_mean_s": 0.1829499683889769,
+        "growth": 2.5488344497269066
+      },
+      "per_phase": {
+        "other": {
+          "opens": 1,
+          "opens_s": 0.000713151996023953,
+          "drops": 1,
+          "drops_s": 1.5981990145519376e-05
+        },
+        "converging": {
+          "opens": 601,
+          "opens_s": 27.517777225075406,
+          "wal_writes": 12958,
+          "wal_writes_s": 14.682136131377774,
+          "drops": 601,
+          "drops_s": 85.12395264697261,
+          "explicit_ckpt": 76,
+          "explicit_ckpt_s": 12.070688042062102,
+          "explicit_ckpt_wal_shrank": 76,
+          "auto_ckpt": 1,
+          "auto_ckpt_s": 0.01677826100785751
+        },
+        "sweeping": {
+          "opens": 141,
+          "opens_s": 10.425896606931929,
+          "wal_writes": 142512,
+          "wal_writes_s": 33.753686428055516,
+          "explicit_ckpt": 72,
+          "explicit_ckpt_s": 19.24292835308006,
+          "explicit_ckpt_wal_shrank": 71,
+          "drops": 141,
+          "drops_s": 22.563978605976445,
+          "auto_ckpt": 77,
+          "auto_ckpt_s": 24.00567886000499
+        }
+      },
+      "code_dir": "/tmp/claude-1000/-home-aditya-Work-AMC-Minigraf-temporal-reasoning/4c1b4c5b-e945-4a6b-b010-215ea8b569b2/scratchpad/wt-master280",
+      "phase_wall_s": {
+        "other": 0.053616834004060365,
+        "converging": 273.0843556239997,
+        "sweeping": 447.3929560079996
+      },
+      "audit": {
+        "divergence": 0,
+        "audit_error": null,
+        "graph_facts": 20055
+      },
+      "commit_entities": 600
+    },
+    "600_master_2": {
+      "issue": 260,
+      "wall_s": 745.8298003939999,
+      "commits_traced": 600,
+      "handle_opens": 745,
+      "handle_drops": 745,
+      "opens_per_commit": 1.2416666666666667,
+      "apply_total_s": 274.80559861411166,
+      "apply_share_of_wall": 0.36845617923679097,
+      "explicit_ckpt_total_s": 12.329686839904753,
+      "explicit_ckpt_share_of_apply": 0.044866941947636164,
+      "drop_total_s": 108.93747553670255,
+      "drop_share_of_wall": 0.14606211159590846,
+      "drop_share_of_apply": 0.39641650710935866,
+      "drop_thirds": {
+        "first_mean_s": 0.07140823968931669,
+        "middle_mean_s": 0.17876548074156978,
+        "last_mean_s": 0.18833089505960926,
+        "growth": 2.6373832470734504
+      },
+      "per_phase": {
+        "other": {
+          "opens": 1,
+          "opens_s": 0.0007300120050786063,
+          "drops": 1,
+          "drops_s": 1.7766011296771467e-05
+        },
+        "converging": {
+          "opens": 601,
+          "opens_s": 27.433176850972814,
+          "wal_writes": 12958,
+          "wal_writes_s": 15.625859567255247,
+          "drops": 601,
+          "drops_s": 85.33122239472868,
+          "explicit_ckpt": 77,
+          "explicit_ckpt_s": 12.32731276396953,
+          "explicit_ckpt_wal_shrank": 77,
+          "auto_ckpt": 1,
+          "auto_ckpt_s": 0.01927208599227015
+        },
+        "sweeping": {
+          "opens": 143,
+          "opens_s": 10.87886397006514,
+          "wal_writes": 142512,
+          "wal_writes_s": 34.72691689936619,
+          "explicit_ckpt": 70,
+          "explicit_ckpt_s": 19.669736967858626,
+          "explicit_ckpt_wal_shrank": 69,
+          "drops": 143,
+          "drops_s": 23.60623537596257,
+          "auto_ckpt": 75,
+          "auto_ckpt_s": 24.49847378685081
+        }
+      },
+      "code_dir": "/tmp/claude-1000/-home-aditya-Work-AMC-Minigraf-temporal-reasoning/4c1b4c5b-e945-4a6b-b010-215ea8b569b2/scratchpad/wt-master280",
+      "phase_wall_s": {
+        "other": 0.05038723199686501,
+        "converging": 281.486756015991,
+        "sweeping": 464.27995747300156
+      },
+      "audit": {
+        "divergence": 0,
+        "audit_error": null,
+        "graph_facts": 20055
+      },
+      "commit_entities": 600
+    },
+    "600_branch_1": {
+      "issue": 260,
+      "wall_s": 646.8564656300005,
+      "commits_traced": 600,
+      "handle_opens": 214,
+      "handle_drops": 214,
+      "opens_per_commit": 0.3566666666666667,
+      "apply_total_s": 167.75407627609093,
+      "apply_share_of_wall": 0.2593374035655781,
+      "explicit_ckpt_total_s": 8.480069672994432,
+      "explicit_ckpt_share_of_apply": 0.05055060277067646,
+      "drop_total_s": 35.51355069603596,
+      "drop_share_of_wall": 0.054901748043049765,
+      "drop_share_of_apply": 0.21170007599450216,
+      "drop_thirds": {
+        "first_mean_s": 0.1824178443801455,
+        "middle_mean_s": 0.16293178653548648,
+        "last_mean_s": 0.1526906514031402,
+        "growth": 0.8370379110770765
+      },
+      "per_phase": {
+        "other": {
+          "opens": 1,
+          "opens_s": 0.000654158997349441,
+          "drops": 1,
+          "drops_s": 1.6898004105314612e-05
+        },
+        "converging": {
+          "opens": 72,
+          "opens_s": 3.1092503759864485,
+          "wal_writes": 12958,
+          "wal_writes_s": 16.085673734909506,
+          "drops": 72,
+          "drops_s": 13.4143024719815,
+          "explicit_ckpt": 50,
+          "explicit_ckpt_s": 8.478463211038616,
+          "explicit_ckpt_wal_shrank": 50,
+          "auto_ckpt": 1,
+          "auto_ckpt_s": 0.028354622991173528
+        },
+        "sweeping": {
+          "opens": 141,
+          "opens_s": 10.294077104015741,
+          "wal_writes": 142512,
+          "wal_writes_s": 33.355620480302605,
+          "drops": 141,
+          "drops_s": 22.099231326050358,
+          "explicit_ckpt": 71,
+          "explicit_ckpt_s": 18.83079212003213,
+          "explicit_ckpt_wal_shrank": 70,
+          "auto_ckpt": 76,
+          "auto_ckpt_s": 23.515770707002957
+        }
+      },
+      "code_dir": "/home/aditya/Work/AMC/Minigraf/temporal_reasoning",
+      "phase_wall_s": {
+        "other": 0.05131273799634073,
+        "converging": 196.67414514700067,
+        "sweeping": 450.11851672299963
+      },
+      "audit": {
+        "divergence": 0,
+        "audit_error": null,
+        "graph_facts": 20055
+      },
+      "commit_entities": 600
+    },
+    "600_branch_2": {
+      "issue": 260,
+      "wall_s": 677.6201789019979,
+      "commits_traced": 600,
+      "handle_opens": 218,
+      "handle_drops": 218,
+      "opens_per_commit": 0.36333333333333334,
+      "apply_total_s": 187.410904431963,
+      "apply_share_of_wall": 0.2765722011638435,
+      "explicit_ckpt_total_s": 9.51277858595131,
+      "explicit_ckpt_share_of_apply": 0.05075893857288755,
+      "drop_total_s": 37.649971205886686,
+      "drop_share_of_wall": 0.055562057297192574,
+      "drop_share_of_apply": 0.20089530713275547,
+      "drop_thirds": {
+        "first_mean_s": 0.18044180901334686,
+        "middle_mean_s": 0.18796480238840255,
+        "last_mean_s": 0.15033371871568552,
+        "growth": 0.8331423827864953
+      },
+      "per_phase": {
+        "other": {
+          "opens": 1,
+          "opens_s": 0.0007517710037063807,
+          "drops": 1,
+          "drops_s": 2.019299427047372e-05
+        },
+        "converging": {
+          "opens": 75,
+          "opens_s": 3.330660209103371,
+          "wal_writes": 12958,
+          "wal_writes_s": 17.887104036126402,
+          "drops": 75,
+          "drops_s": 14.052106401970377,
+          "explicit_ckpt": 52,
+          "explicit_ckpt_s": 9.510829592996743,
+          "explicit_ckpt_wal_shrank": 52,
+          "auto_ckpt": 1,
+          "auto_ckpt_s": 0.022058955000829883
+        },
+        "sweeping": {
+          "opens": 142,
+          "opens_s": 10.648017954910756,
+          "wal_writes": 142512,
+          "wal_writes_s": 34.17231387796346,
+          "drops": 142,
+          "drops_s": 23.59784461092204,
+          "explicit_ckpt": 70,
+          "explicit_ckpt_s": 19.186709203000646,
+          "explicit_ckpt_wal_shrank": 69,
+          "auto_ckpt": 76,
+          "auto_ckpt_s": 24.113353820022894
+        }
+      },
+      "code_dir": "/home/aditya/Work/AMC/Minigraf/temporal_reasoning",
+      "phase_wall_s": {
+        "other": 0.05166590500448365,
+        "converging": 218.33652503299527,
+        "sweeping": 459.2187211080018
+      },
+      "audit": {
+        "divergence": 0,
+        "audit_error": null,
+        "graph_facts": 20055
+      },
+      "commit_entities": 600
+    },
+    "full_master": {
+      "issue": 260,
+      "wall_s": 1515.7291676919995,
+      "commits_traced": 1024,
+      "handle_opens": 1203,
+      "handle_drops": 1203,
+      "opens_per_commit": 1.1748046875,
+      "apply_total_s": 649.7962937651755,
+      "apply_share_of_wall": 0.4287021109151183,
+      "explicit_ckpt_total_s": 29.986425001043244,
+      "explicit_ckpt_share_of_apply": 0.04614742387539654,
+      "drop_total_s": 308.8508027791395,
+      "drop_share_of_wall": 0.20376384473053755,
+      "drop_share_of_apply": 0.4753040387311789,
+      "drop_thirds": {
+        "first_mean_s": 0.13355012687287923,
+        "middle_mean_s": 0.29948425028210984,
+        "last_mean_s": 0.3371671260348849,
+        "growth": 2.5246484891461027
+      },
+      "per_phase": {
+        "other": {
+          "opens": 1,
+          "opens_s": 0.0007019890035735443,
+          "drops": 1,
+          "drops_s": 1.6990990843623877e-05
+        },
+        "converging": {
+          "opens": 1025,
+          "opens_s": 84.2393172608281,
+          "wal_writes": 25448,
+          "wal_writes_s": 28.022640791736194,
+          "drops": 1025,
+          "drops_s": 260.28994340915233,
+          "explicit_ckpt": 111,
+          "explicit_ckpt_s": 29.98273692908697,
+          "explicit_ckpt_wal_shrank": 111,
+          "auto_ckpt": 1,
+          "auto_ckpt_s": 0.06896463999873959
+        },
+        "sweeping": {
+          "opens": 177,
+          "opens_s": 22.453685647051316,
+          "wal_writes": 238466,
+          "wal_writes_s": 96.86919724434847,
+          "drops": 177,
+          "drops_s": 48.56084237899631,
+          "explicit_ckpt": 76,
+          "explicit_ckpt_s": 34.83510439301608,
+          "explicit_ckpt_wal_shrank": 75,
+          "auto_ckpt": 157,
+          "auto_ckpt_s": 80.1941780148336
+        }
+      },
+      "code_dir": "/tmp/claude-1000/-home-aditya-Work-AMC-Minigraf-temporal-reasoning/4c1b4c5b-e945-4a6b-b010-215ea8b569b2/scratchpad/wt-master280",
+      "phase_wall_s": {
+        "other": 0.05651739799941424,
+        "converging": 653.8766391359968,
+        "sweeping": 861.7762504650018
+      },
+      "audit": {
+        "divergence": 0,
+        "audit_error": null,
+        "graph_facts": 38951
+      },
+      "commit_entities": 1024
+    },
+    "full_branch": {
+      "issue": 260,
+      "wall_s": 1240.1711198590056,
+      "commits_traced": 1024,
+      "handle_opens": 295,
+      "handle_drops": 295,
+      "opens_per_commit": 0.2880859375,
+      "apply_total_s": 328.1128699837427,
+      "apply_share_of_wall": 0.2645706424941146,
+      "explicit_ckpt_total_s": 17.330177935917163,
+      "explicit_ckpt_share_of_apply": 0.052817732924575124,
+      "drop_total_s": 84.01580549105711,
+      "drop_share_of_wall": 0.06774533299937578,
+      "drop_share_of_apply": 0.25605763496939304,
+      "drop_thirds": {
+        "first_mean_s": 0.301083816489358,
+        "middle_mean_s": 0.2723593260513497,
+        "last_mean_s": 0.2809937123441187,
+        "growth": 0.9332740484709864
+      },
+      "per_phase": {
+        "other": {
+          "opens": 1,
+          "opens_s": 0.0006658620113739744,
+          "drops": 1,
+          "drops_s": 1.6160003724507987e-05
+        },
+        "converging": {
+          "opens": 117,
+          "opens_s": 9.505782699037809,
+          "wal_writes": 25448,
+          "wal_writes_s": 29.187626588114654,
+          "drops": 117,
+          "drops_s": 36.228919854955166,
+          "explicit_ckpt": 66,
+          "explicit_ckpt_s": 17.32800679501088,
+          "explicit_ckpt_wal_shrank": 66,
+          "auto_ckpt": 2,
+          "auto_ckpt_s": 0.08711133000906557
+        },
+        "sweeping": {
+          "opens": 177,
+          "opens_s": 22.22536333606695,
+          "wal_writes": 238466,
+          "wal_writes_s": 96.08241566632933,
+          "drops": 177,
+          "drops_s": 47.78686947609822,
+          "explicit_ckpt": 75,
+          "explicit_ckpt_s": 33.75192813594185,
+          "explicit_ckpt_wal_shrank": 74,
+          "auto_ckpt": 157,
+          "auto_ckpt_s": 79.68145183898741
+        }
+      },
+      "code_dir": "/home/aditya/Work/AMC/Minigraf/temporal_reasoning",
+      "phase_wall_s": {
+        "other": 0.050377571998978965,
+        "converging": 395.1334906809934,
+        "sweeping": 844.9670427429955
+      },
+      "audit": {
+        "divergence": 0,
+        "audit_error": null,
+        "graph_facts": 38951
+      },
+      "commit_entities": 1024
+    }
+  },
+  "verdict": {
+    "at_600_commits": {
+      "ref": "d00fa2a58b9cadb86f79091f1fede597bfae54ac",
+      "stage_a_wall_s": {
+        "master": {
+          "reps": [
+            273.0843556239997,
+            281.486756015991
+          ],
+          "median": 277.28555581999535,
+          "spread": 8.40240039199125
+        },
+        "branch": {
+          "reps": [
+            196.67414514700067,
+            218.33652503299527
+          ],
+          "median": 207.50533508999797,
+          "spread": 21.662379885994596
+        },
+        "branch_over_master_median_ratio": 0.7483452734361093
+      },
+      "stage_a_drops_per_commit": {
+        "master": {
+          "reps": [
+            1.0016666666666667,
+            1.0016666666666667
+          ],
+          "median": 1.0016666666666667,
+          "spread": 0.0
+        },
+        "branch": {
+          "reps": [
+            0.12,
+            0.125
+          ],
+          "median": 0.1225,
+          "spread": 0.0050000000000000044
+        }
+      },
+      "stage_a_drop_plus_open_s": {
+        "master": {
+          "reps": [
+            112.64172987204802,
+            112.7643992457015
+          ],
+          "median": 112.70306455887476,
+          "spread": 0.12266937365347985
+        },
+        "branch": {
+          "reps": [
+            16.52355284796795,
+            17.382766611073748
+          ],
+          "median": 16.95315972952085,
+          "spread": 0.8592137631057994
+        }
+      },
+      "stage_a_auto_ckpt": {
+        "master": {
+          "reps": [
+            1,
+            1
+          ],
+          "median": 1.0,
+          "spread": 0
+        },
+        "branch": {
+          "reps": [
+            1,
+            1
+          ],
+          "median": 1.0,
+          "spread": 0
+        }
+      },
+      "audit": {
+        "master_1": {
+          "divergence": 0,
+          "audit_error": null,
+          "graph_facts": 20055
+        },
+        "master_2": {
+          "divergence": 0,
+          "audit_error": null,
+          "graph_facts": 20055
+        },
+        "branch_1": {
+          "divergence": 0,
+          "audit_error": null,
+          "graph_facts": 20055
+        },
+        "branch_2": {
+          "divergence": 0,
+          "audit_error": null,
+          "graph_facts": 20055
+        }
+      },
+      "commit_entities": {
+        "master_1": 600,
+        "master_2": 600,
+        "branch_1": 600,
+        "branch_2": 600
+      },
+      "stage_b_sweeping_out_of_scope": {
+        "master_1": {
+          "opens": 141,
+          "opens_s": 10.425896606931929,
+          "wal_writes": 142512,
+          "wal_writes_s": 33.753686428055516,
+          "explicit_ckpt": 72,
+          "explicit_ckpt_s": 19.24292835308006,
+          "explicit_ckpt_wal_shrank": 71,
+          "drops": 141,
+          "drops_s": 22.563978605976445,
+          "auto_ckpt": 77,
+          "auto_ckpt_s": 24.00567886000499
+        },
+        "master_2": {
+          "opens": 143,
+          "opens_s": 10.87886397006514,
+          "wal_writes": 142512,
+          "wal_writes_s": 34.72691689936619,
+          "explicit_ckpt": 70,
+          "explicit_ckpt_s": 19.669736967858626,
+          "explicit_ckpt_wal_shrank": 69,
+          "drops": 143,
+          "drops_s": 23.60623537596257,
+          "auto_ckpt": 75,
+          "auto_ckpt_s": 24.49847378685081
+        },
+        "branch_1": {
+          "opens": 141,
+          "opens_s": 10.294077104015741,
+          "wal_writes": 142512,
+          "wal_writes_s": 33.355620480302605,
+          "drops": 141,
+          "drops_s": 22.099231326050358,
+          "explicit_ckpt": 71,
+          "explicit_ckpt_s": 18.83079212003213,
+          "explicit_ckpt_wal_shrank": 70,
+          "auto_ckpt": 76,
+          "auto_ckpt_s": 23.515770707002957
+        },
+        "branch_2": {
+          "opens": 142,
+          "opens_s": 10.648017954910756,
+          "wal_writes": 142512,
+          "wal_writes_s": 34.17231387796346,
+          "drops": 142,
+          "drops_s": 23.59784461092204,
+          "explicit_ckpt": 70,
+          "explicit_ckpt_s": 19.186709203000646,
+          "explicit_ckpt_wal_shrank": 69,
+          "auto_ckpt": 76,
+          "auto_ckpt_s": 24.113353820022894
+        }
+      }
+    },
+    "full_history": {
+      "ref": "master (9131b17, 1024 commits)",
+      "commits_traced": 1024,
+      "stage_a_wall_s": {
+        "master": 653.8766391359968,
+        "branch": 395.1334906809934,
+        "branch_over_master_ratio": 0.6042936343514352
+      },
+      "stage_a_drops_per_commit": {
+        "master": 1.0009765625,
+        "branch": 0.1142578125
+      },
+      "stage_a_drop_plus_open_s": {
+        "master": 344.52926066998043,
+        "branch": 45.734702553992975
+      },
+      "stage_a_auto_ckpt": {
+        "master": 1,
+        "branch": 2
+      },
+      "stage_a_auto_ckpt_finding": "Branch auto_ckpt rose from 1 (at 600 commits, both reps) to 2 at full history (1024 commits); master stayed at 1. Not large -- 2 firings in 1025 window opens is not a trend, and it stays far under the sweeping phase's 157 -- but it is a real, nonzero data point per the brief's 'if it becomes large, record it' instruction, not zero as the 600-commit slice alone would suggest. Not gated: the acceptance criterion is stated for 600 commits only.",
+      "audit": {
+        "master": {
+          "divergence": 0,
+          "audit_error": null,
+          "graph_facts": 38951
+        },
+        "branch": {
+          "divergence": 0,
+          "audit_error": null,
+          "graph_facts": 38951
+        }
+      },
+      "commit_entities": {
+        "master": 1024,
+        "branch": 1024
+      },
+      "stage_b_sweeping_out_of_scope": {
+        "master": {
+          "opens": 177,
+          "opens_s": 22.453685647051316,
+          "wal_writes": 238466,
+          "wal_writes_s": 96.86919724434847,
+          "drops": 177,
+          "drops_s": 48.56084237899631,
+          "explicit_ckpt": 76,
+          "explicit_ckpt_s": 34.83510439301608,
+          "explicit_ckpt_wal_shrank": 75,
+          "auto_ckpt": 157,
+          "auto_ckpt_s": 80.1941780148336
+        },
+        "branch": {
+          "opens": 177,
+          "opens_s": 22.22536333606695,
+          "wal_writes": 238466,
+          "wal_writes_s": 96.08241566632933,
+          "drops": 177,
+          "drops_s": 47.78686947609822,
+          "explicit_ckpt": 75,
+          "explicit_ckpt_s": 33.75192813594185,
+          "explicit_ckpt_wal_shrank": 74,
+          "auto_ckpt": 157,
+          "auto_ckpt_s": 79.68145183898741
+        }
+      }
+    },
+    "acceptance": {
+      "stage_a_drops_per_commit_le_0_06": {
+        "status": "REPLACED (ruling 1)",
+        "measured": {
+          "master_median": 1.0016666666666667,
+          "branch_median": 0.1225
+        },
+        "reason": "The plan's <=0.06 acceptance criterion was WRONG and is replaced. It implicitly assumed the 25-commit COUNT bound (_SWEEP_YIELD_COMMITS) would govern window closure. Measured Stage A commit processing runs ~0.33 s/commit (196.7s converging wall / 600 commits on branch-1), so the 2.0s CLOCK bound (_SWEEP_YIELD_SECONDS) closes each window after roughly 6-8 commits, well before the 25-commit count is ever reached: 72/600 and 75/600 (~0.12-0.125 drops/commit), matching the spike's 70/600 (design doc, 'Evidence this is worth doing'). The clock bound is the hook-lockout bound and is kept deliberately -- it, not the count, is what guarantees a hook is never locked out longer than _SWEEP_YIELD_SECONDS, so lowering it further would trade hook availability for fewer drops. Do not read this as a regression from plan; the ~8x reduction from master's ~1.0 drops/commit to the branch's ~0.12 is the real, load-bearing result, and the ~1/25 figure was never achievable at this repo's per-commit pace without lengthening hook lockout past its budget."
+      },
+      "stage_a_wall_le_0_80x_master_at_600": {
+        "status": "PASS",
+        "measured_ratio": 0.7483452734361093,
+        "threshold": 0.8
+      },
+      "stage_a_auto_ckpt_le_1_per_run_at_600": {
+        "status": "PASS",
+        "measured": {
+          "master": [
+            1,
+            1
+          ],
+          "branch": [
+            1,
+            1
+          ]
+        },
+        "threshold": 1
+      },
+      "divergence_0_and_equal_commit_entities": {
+        "status": "PASS",
+        "at_600": {
+          "divergence": [
+            0,
+            0,
+            0,
+            0
+          ],
+          "audit_error": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "commit_entities": {
+            "master": [
+              600,
+              600
+            ],
+            "branch": [
+              600,
+              600
+            ]
+          }
+        },
+        "at_full_history": {
+          "divergence": [
+            0,
+            0
+          ],
+          "audit_error": [
+            null,
+            null
+          ],
+          "commit_entities": {
+            "master": 1024,
+            "branch": 1024
+          }
+        }
+      }
+    }
+  }
+}

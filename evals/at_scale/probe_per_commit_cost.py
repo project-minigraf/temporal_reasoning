@@ -211,6 +211,9 @@ def build_result(
         # that W fails to measure work.
         "await_s_total_seconds": await_total,
         "apply_s_total_seconds": apply_total,
+        # #280: Stage A lease-window boundary time (handle drop + pause).
+        # Absent from traces written before #280, hence .get.
+        "yield_s_total_seconds": sum(float(r.get("yield_s", 0.0)) for r in records),
         "await_s_to_apply_s_ratio": (
             (await_total / apply_total) if apply_total > 0.0 else None
         ),

@@ -16262,6 +16262,14 @@ class TestRunIngestion:
         # falsify trivially).
         baseline = mcp_server._lease_manager.lease_count
         db_none_snapshots = []
+        # #280: Stage A now holds a _LeaseWindow lease across up to
+        # _SWEEP_YIELD_COMMITS commits, so the per-commit `asyncio.sleep(0)`
+        # at the end of each loop iteration runs INSIDE the window by design
+        # and no longer sees the baseline. Stage A's between-commits release
+        # is now the window boundary, whose pause is the only nonzero sleep
+        # it takes. Pinning the window to 1 commit puts a boundary between
+        # this fixture's two commits, and snapshots are taken at that pause.
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
 
         original_sleep = asyncio.sleep
         async def patched_sleep(t):
@@ -16270,15 +16278,16 @@ class TestRunIngestion:
             # internal commits -- confirmed unchanged from the pre-#255 code
             # (it held the old `_db` global the same way). This test's name
             # and intent are about Stage A's per-commit release cadence, so
-            # only snapshot outside Stage B.
-            if mcp_server._ingest_progress.get("phase") != "sweeping":
+            # only snapshot outside Stage B -- and, since #280, only at the
+            # window boundary's pause (t > 0), see above.
+            if mcp_server._ingest_progress.get("phase") != "sweeping" and t > 0:
                 db_none_snapshots.append(mcp_server._lease_manager.lease_count == baseline)
             await original_sleep(t)
 
         with patch("mcp_server.asyncio.sleep", patched_sleep):
             await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
-        assert db_none_snapshots, "expected at least one per-commit yield to check"
+        assert db_none_snapshots, "expected at least one Stage A window boundary to check"
         assert all(db_none_snapshots), f"_db was not None at yield: {db_none_snapshots}"
 
     @pytest.mark.asyncio
@@ -16930,6 +16939,11 @@ class TestRunIngestionBatchedIndexWrites:
         import fact_index
 
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
+        # Pin the count below to one Stage A window: the assertion is an
+        # exact tally that assumes 2 commits never cross a window boundary,
+        # and a slow CI runner could otherwise open a second window on the
+        # clock alone.
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
         commit_calls = []
         open_calls = []
         original_open_writer = fact_index.open_writer
@@ -16967,17 +16981,20 @@ class TestRunIngestionBatchedIndexWrites:
         #   2  the Stage A dispatch lease around each of those, x2
         #      (a no-op at the SQLite level: _forward_apply already committed,
         #      and sqlite3's commit() with no open transaction does nothing)
+        #   1  the Stage A _LeaseWindow's own lease (#280), which the two
+        #      dispatch leases above JOIN; one window here, since 2 commits
+        #      never reach _SWEEP_YIELD_COMMITS, closed by the loop's finally
         #   1  Stage B's single sweep window (the first window is always
         #      entered, because that is where the sweep is planned, even when
         #      it then declines)
         #   1  the lineage fold's lease
         #   1  the _ingest_tags/_last_run_write lease
         #   1  the final flush inside fact_index.close_writer
-        # = 9. A tight equality, not an upper bound: 0 (nothing wired up) and
+        # = 10. A tight equality, not an upper bound: 0 (nothing wired up) and
         # any count that scaled with the ~36 individual facts these 2 commits
         # produce would both fail it. Every term is per-lease or per-commit,
         # never per-triple, which is the property this test guards.
-        assert len(commit_calls) == 9
+        assert len(commit_calls) == 10
 
 
 class TestOpenIndexWriterSafeRetry:
@@ -29114,6 +29131,16 @@ class TestIngestTrace:
         assert r["n_functions"] == 4
         assert r["files_by_status"] == {"M": 1}
 
+    def test_record_carries_yield_s_defaulting_to_zero(self, tmp_path):
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        trace.emit(1, "rev", "b", 0.0, 0.0, [], None, yield_s=0.25)
+        trace.close()
+        records = self._read(path)
+        assert [r["yield_s"] for r in records] == [0.0, 0.25]
+
     def test_t_since_start_is_measured_from_construction(self, tmp_path):
         """A fake clock, so this asserts the arithmetic rather than a duration."""
         import mcp_server
@@ -30373,6 +30400,625 @@ class TestForwardClaimCeiling342:
             )
 
 
+class TestLeaseWindow:
+    """#280. _LeaseWindow holds ONE outer lease across several Stage A commits
+    so the per-commit lease joins it (refcount 1 -> 2) instead of dropping the
+    handle -- and with it a full O(graph size) checkpoint in minigraf's
+    `Drop for Inner` -- after every commit. It releases for real only at a
+    boundary (commit count or clock), then pauses OUTSIDE any lease so an
+    out-of-process hook can take the graph lock.
+
+    Driven against a real graph and a real batched index connection, never a
+    fake: the properties under test (who holds the file lock, whether SQLite
+    is mid-transaction) exist only in the real backends.
+    """
+
+    def _setup(self, tmp_path, monkeypatch):
+        import concurrent.futures
+        import fact_index
+        import mcp_server
+        graph = tmp_path / "g.graph"
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(graph))
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph))
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Opened ON the executor's single worker thread, not inline here --
+        # matching _open_index_writer_safe's own contract ("always invoked
+        # via write_executor, never inline on the loop") and real ingestion
+        # (mcp_server.py:14585). sqlite3 connections are thread-affined
+        # (check_same_thread=True by default): _LeaseWindow's real release
+        # commits index_con via write_executor (_db_lease_async_committing_
+        # index), so the connection must belong to that same thread or the
+        # commit raises "SQLite objects created in a thread can only be used
+        # in that same thread" -- silently swallowed by
+        # _commit_index_writer_safe, which would make a real release look
+        # like a no-op to any test that checks in_transaction afterward.
+        index_con = executor.submit(
+            mcp_server._open_index_writer_safe,
+            fact_index.index_path_for(str(graph)),
+        ).result()
+        return graph, executor, index_con
+
+    def _window(self, executor, index_con, **kw):
+        import mcp_server
+        kw.setdefault("max_commits", 10**9)
+        kw.setdefault("max_seconds", 10**9)
+        kw.setdefault("pause_seconds", 0.0)
+        return mcp_server._LeaseWindow(
+            asyncio.get_running_loop(), executor, index_con, **kw
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_lazy_and_a_yield_before_opening_does_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        try:
+            w = self._window(executor, index_con, max_commits=0, max_seconds=0.0)
+            assert not w.is_open
+            assert mcp_server._lease_manager.lease_count == 0
+            assert await w.maybe_yield() == 0.0
+            assert not w.is_open, "maybe_yield opened a window nobody asked for"
+            assert mcp_server._lease_manager.lease_count == 0
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_a_nested_lease_joins_and_does_not_release_the_graph(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        loop = asyncio.get_running_loop()
+        try:
+            w = self._window(executor, index_con)
+            await w.ensure_open()
+            assert mcp_server._lease_manager.lease_count == 1
+            async with mcp_server._db_lease_async_committing_index(
+                loop, executor, index_con
+            ):
+                assert mcp_server._lease_manager.lease_count == 2
+            assert mcp_server._lease_manager.lease_count == 1, (
+                "the per-commit lease's exit dropped the window's handle"
+            )
+            assert not _another_process_can_open(str(graph)), (
+                "another process could open the graph while the window was "
+                "open -- the window is not holding the lock"
+            )
+            await w.close()
+            assert mcp_server._lease_manager.lease_count == 0
+            assert _another_process_can_open(str(graph))
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_the_commit_count_closes_the_window_and_pauses(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        try:
+            w = self._window(executor, index_con, max_commits=2, pause_seconds=0.05)
+            await w.ensure_open()
+            w.note_commit()
+            assert await w.maybe_yield() == 0.0
+            assert w.is_open
+            w.note_commit()
+            spent = await w.maybe_yield()
+            assert not w.is_open
+            assert mcp_server._lease_manager.lease_count == 0
+            assert spent >= 0.05, f"the boundary paid no pause ({spent:.4f}s)"
+            # Reopening starts a fresh count.
+            await w.ensure_open()
+            w.note_commit()
+            assert await w.maybe_yield() == 0.0
+            await w.close()
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_the_clock_alone_closes_the_window(self, tmp_path, monkeypatch):
+        """count is unreachable (10**9), so only the clock operand of the
+        boundary's `or` can fire. A count-driven test never EVALUATES the
+        clock operand (short-circuit) -- see TestStageBYieldsTheLock's
+        test_the_clock_alone_closes_a_window."""
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        try:
+            w = self._window(executor, index_con, max_seconds=0.0)
+            await w.ensure_open()
+            await w.maybe_yield()
+            assert not w.is_open, "the clock operand never closed the window"
+            assert mcp_server._lease_manager.lease_count == 0
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_close_pays_no_pause_and_is_idempotent(self, tmp_path, monkeypatch):
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        try:
+            w = self._window(executor, index_con, pause_seconds=5.0)
+            await w.ensure_open()
+            t = time.perf_counter()
+            await w.close()
+            await w.close()
+            assert time.perf_counter() - t < 1.0, "close() paid the boundary pause"
+            assert mcp_server._lease_manager.lease_count == 0
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_a_real_release_commits_the_index_first(self, tmp_path, monkeypatch):
+        """#347: a release with index_con mid-transaction is a lock-order
+        inversion against the hooks. The window's own lease is the committing
+        wrapper, so its release commits by construction."""
+        import mcp_server
+        _graph, executor, index_con = self._setup(tmp_path, monkeypatch)
+        assert index_con is not None, "no batched index connection to test against"
+        try:
+            w = self._window(executor, index_con)
+            await w.ensure_open()
+            # Routed through the same executor thread the connection was
+            # opened on (see _setup) -- sqlite3 raises cross-thread on
+            # execute()/commit() (but not on the in_transaction read below,
+            # confirmed empirically), and a raised exception here would be
+            # silently swallowed by fact_index's own safe wrappers.
+            executor.submit(
+                index_con.execute, "create table if not exists _t280(x)"
+            ).result()
+            executor.submit(
+                index_con.execute, "insert into _t280 values (1)"
+            ).result()
+            assert index_con.in_transaction, "setup did not open a transaction"
+            await w.close()
+            assert not index_con.in_transaction, (
+                "the window released the graph with the index transaction open"
+            )
+        finally:
+            executor.shutdown(wait=True)
+            mcp_server._reset_db_state()
+
+
+class TestStageAYieldsTheLock:
+    """#280. Stage A takes one _LeaseWindow lease across several commits, so
+    its per-commit leases JOIN rather than drop the handle every commit.
+
+    Drops are counted at the lease seam: inside the real lease, after the
+    body, `_lease_manager.lease_count == 1` means THIS exit takes the count
+    to 0 and drops the handle. Only exits after the first Stage A apply and
+    before RunProgress.stage_a_finished are counted -- phase is already
+    "converging" during the preload lease, which is not a Stage A drop.
+    """
+
+    def _prepare(self, tmp_path, monkeypatch, n=12):
+        return TestStageBYieldsTheLock()._prepare(tmp_path, monkeypatch, n=n)
+
+    async def _run_counting_drops(self, tmp_path, monkeypatch):
+        import ingest_progress
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        applied, drops, over = [], [], []
+        real_fwd = mcp_server._forward_apply
+        real_rev = mcp_server._reverse_apply
+        real_lease = mcp_server.db_lease_async
+        real_finished = ingest_progress.RunProgress.stage_a_finished
+
+        def fwd_spy(*a, **kw):
+            if not kw.get("lifecycle_only"):
+                applied.append("fwd")
+            return real_fwd(*a, **kw)
+
+        def rev_spy(*a, **kw):
+            applied.append("rev")
+            return real_rev(*a, **kw)
+
+        def finished_spy(self_, *a, **kw):
+            over.append(True)
+            return real_finished(self_, *a, **kw)
+
+        @contextlib.asynccontextmanager
+        async def lease_spy():
+            async with real_lease() as db:
+                try:
+                    yield db
+                finally:
+                    if applied and not over and mcp_server._lease_manager.lease_count == 1:
+                        drops.append(len(applied))
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", fwd_spy)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        monkeypatch.setattr(ingest_progress.RunProgress, "stage_a_finished", finished_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress.get("status") == "complete", mcp_server._ingest_progress
+        return applied, drops
+
+    @pytest.mark.asyncio
+    async def test_stage_a_drops_the_handle_once_per_window_not_per_commit(
+        self, tmp_path, monkeypatch
+    ):
+        import math
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 4)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
+        applied, drops = await self._run_counting_drops(tmp_path, monkeypatch)
+        assert len(applied) >= 8, (
+            f"only {len(applied)} Stage A applies -- too few for a 4-commit "
+            f"window to be distinguishable from a per-commit lease"
+        )
+        assert len(drops) == math.ceil(len(applied) / 4), (
+            f"{len(drops)} handle drops over {len(applied)} Stage A commits "
+            f"with a 4-commit window; expected {math.ceil(len(applied) / 4)}. "
+            f"{len(applied)} drops means Stage A is still dropping the handle "
+            f"-- and paying minigraf's O(graph size) Drop checkpoint -- per commit"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_clock_alone_closes_a_stage_a_window(self, tmp_path, monkeypatch):
+        """Count unreachable, clock 0 s: only the clock operand can end a
+        window. Also the Stage A run that reaches the boundary's pause
+        repeatedly, so it carries the blocking-sleep guard."""
+        import mcp_server
+        _forbid_blocking_sleep_on_event_loop(monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 10**9)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 0.0)
+        applied, drops = await self._run_counting_drops(tmp_path, monkeypatch)
+        assert len(applied) >= 2
+        assert len(drops) >= 2, (
+            f"{len(drops)} drop(s) with the count disjunct unreachable -- the "
+            f"clock never closed a Stage A window"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_exception_mid_window_leaks_no_lease(self, tmp_path, monkeypatch):
+        """Something raising out of the Stage A loop (here: the third
+        RunProgress.retired, which sits outside every per-commit try) must
+        still release the window's lease. A leaked lease leaves the count at 1
+        after the run; the outer finally's final-checkpoint lease would just
+        JOIN it, so nothing else notices."""
+        import ingest_progress
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        real_retired = ingest_progress.RunProgress.retired
+        calls = []
+
+        def retired_spy(self_, stream, outcome, pos):
+            calls.append(pos)
+            if len(calls) == 3:
+                raise RuntimeError("injected mid-window failure (#280 test)")
+            return real_retired(self_, stream, outcome, pos)
+
+        monkeypatch.setattr(ingest_progress.RunProgress, "retired", retired_spy)
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+            assert mcp_server._ingest_progress.get("status") == "error", (
+                "the injected failure did not reach the run -- test proves nothing"
+            )
+            assert "injected mid-window" in (mcp_server._ingest_progress.get("error") or "")
+            assert mcp_server._lease_manager.lease_count == 0, (
+                f"lease_count is {mcp_server._lease_manager.lease_count} after "
+                f"the run -- the Stage A window's lease leaked past an exception"
+            )
+        finally:
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_mid_window_leaks_no_lease_and_pays_no_pause(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        # N=3 and the flag set on the 3rd apply: the FIRST boundary would fall
+        # at exactly the loop head that sees the shutdown flag. That is what
+        # lets the ablation (maybe_yield above the shutdown check) pay the
+        # boundary pause and redden -- at the default N=25 no boundary would ever be
+        # reached in a 3-commit Stage A, and the elapsed check would pass
+        # whether or not the order was right.
+        #
+        # 30 s, not 5: this run's own wall clock (spawn-context worker pool,
+        # preload, three commits) measured 4-5 s with NO pause at all, so a
+        # 5 s pause against a 5 s threshold had no margin and failed on the
+        # correct code. The pause has to dwarf the run for elapsed to
+        # discriminate.
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 3)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_PAUSE_SECONDS", 30.0)
+        real_rev = mcp_server._reverse_apply
+        real_fwd = mcp_server._forward_apply
+        n = [0]
+
+        def interrupt(*a, **kw):
+            n[0] += 1
+            if n[0] >= 3:
+                mcp_server._shutdown_requested.set()
+
+        def rev_spy(*a, **kw):
+            out = real_rev(*a, **kw)
+            interrupt()
+            return out
+
+        def fwd_spy(*a, **kw):
+            out = real_fwd(*a, **kw)
+            if not kw.get("lifecycle_only"):
+                interrupt()
+            return out
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)
+        monkeypatch.setattr(mcp_server, "_forward_apply", fwd_spy)
+        t = time.perf_counter()
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+            elapsed = time.perf_counter() - t
+            assert n[0] >= 3, "the shutdown was never requested -- test proves nothing"
+            assert mcp_server._lease_manager.lease_count == 0, (
+                "the Stage A window's lease leaked past the shutdown break"
+            )
+            assert elapsed < 30.0, (
+                f"the run took {elapsed:.1f}s with a 30 s boundary pause -- the "
+                f"shutdown path paid a window pause it must skip"
+            )
+        finally:
+            mcp_server._shutdown_requested.clear()
+            mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_the_trace_accounts_for_every_boundary(self, tmp_path, monkeypatch):
+        """#280's lesson is that a drop the trace cannot see gets blamed on
+        nothing. yield_s carries each boundary's drop + pause, accumulated
+        onto the next EMITTED record -- so a boundary before a commit whose
+        write fails (no record) is still counted, on the one after it."""
+        import json
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        trace_path = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace_path))
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_PAUSE_SECONDS", 0.05)
+        real_rev = mcp_server._reverse_apply
+        failed = []
+
+        def rev_spy(*a, **kw):
+            if not failed:
+                failed.append(1)
+                raise RuntimeError("injected write failure (#280 trace test)")
+            return real_rev(*a, **kw)
+
+        spent = []
+        real_yield = mcp_server._LeaseWindow.maybe_yield
+
+        async def yield_spy(self_):
+            s = await real_yield(self_)
+            spent.append(s)
+            return s
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)
+        monkeypatch.setattr(mcp_server._LeaseWindow, "maybe_yield", yield_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        records = [json.loads(l) for l in trace_path.read_text().splitlines() if l.strip()]
+        assert failed, "no write failure was injected -- test proves nothing"
+        assert all("yield_s" in r for r in records)
+        boundaries = [s for s in spent if s > 0]
+        assert len(boundaries) >= 2
+        assert sum(r["yield_s"] for r in records) == pytest.approx(sum(boundaries), abs=1e-9), (
+            f"trace yield_s sums to {sum(r['yield_s'] for r in records):.4f}s but "
+            f"the boundaries took {sum(boundaries):.4f}s -- boundary time was "
+            f"dropped (e.g. across the failed commit that emitted no record)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_polling_hook_lands_mid_stage_a_at_shipped_window_settings(
+        self, tmp_path, monkeypatch
+    ):
+        """A real hook process doing a real handle_minigraf_transact while
+        Stage A is running, with the window at its SHIPPED constants (25
+        commits / 2.0 s / 0.1 s, none monkeypatched here). Every Stage A write
+        is slowed to 0.4 s so Stage A (~4.8 s) outlasts a single window
+        boundary's opening -- the hook can only succeed if that boundary
+        releases the graph for long enough that an ACTIVELY POLLING hook
+        catches it. The positive control requires the write to land BEFORE
+        Stage A ended, so a hook that merely waited for Stage B proves
+        nothing.
+
+        What this proves: the WINDOW's side of the #280 contract at shipped
+        constants -- the graph is genuinely released, for a real interval (not
+        a microsecond release-then-reacquire), within _SWEEP_YIELD_SECONDS.
+
+        What this does NOT prove: that the SHIPPED hook retry schedule
+        (_LOCK_RETRY_MAX=5, _LOCK_RETRY_BASE=0.05 doubling) reliably lands in
+        that interval. It does not, and that is a separate, pre-existing
+        defect on the hook side, not a #280 regression: measured, a hook
+        using its own shipped schedule missed the shipped 0.1 s window in
+        8/8 runs (it sleeps up to 0.4 s between ~0.377 s open-polls, so it can
+        go fully idle for longer than the window stays open), and the SAME
+        hook schedule also landed 0 of 6 on the pre-#280 per-commit-lease code
+        (which offers no explicit pause at all, only a release-then-reacquire
+        across no `await`) -- so #280 did not make hook access worse, it just
+        did not by itself fix the hook's coarse backoff. This test therefore
+        drives the hook with a finer, deliberately non-shipped retry
+        configuration (continuous polling, no inter-attempt sleep) so it can
+        isolate and pin the window's own guarantee without being gated by
+        that separate defect, filed as issue #366.
+        """
+        import fact_index
+        import ingest_progress
+        import mcp_server
+        repo, graph = self._prepare(tmp_path, monkeypatch)
+
+        go = tmp_path / "hook_go"
+        ready = tmp_path / "hook_ready"
+        script = (
+            "import json, os, sys, time\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n"
+            "import mcp_server\n"
+            # The SHIPPED hook schedule (_LOCK_RETRY_MAX=5,
+            # _LOCK_RETRY_BASE=0.05 doubling) sleeps up to 0.4 s between
+            # ~0.377 s open-polls and can miss a 0.1 s release entirely --
+            # measured: missed 8 of 8 at shipped settings, and landed 0 of 6
+            # on the pre-#280 per-commit-lease code too. That is a pre-existing
+            # hook-side gap, tracked separately as issue #366, not a #280
+            # regression. This
+            # test pins the WINDOW's side of the contract instead: with the
+            # hook polling continuously (no inter-attempt sleep, more
+            # attempts than it could ever need), it must catch a release
+            # that genuinely happens within _SWEEP_YIELD_SECONDS.
+            "mcp_server._LOCK_RETRY_BASE = 0.0\n"
+            "mcp_server._LOCK_RETRY_MAX = 20\n"
+            f"open({str(ready)!r}, 'w').close()\n"
+            f"while not os.path.exists({str(go)!r}):\n"
+            "    time.sleep(0.002)\n"
+            "started = time.time()\n"
+            "try:\n"
+            "    r = mcp_server.handle_minigraf_transact(\n"
+            "        '[[:decision/hook-280 :description \"written mid stage A\"]]', 'hook')\n"
+            "    print(json.dumps({'ok': bool(r.get('ok')), 'err': r.get('error'),\n"
+            "                      'started': started, 'written_at': time.time()}))\n"
+            "except Exception as e:\n"
+            "    print(json.dumps({'ok': False, 'err': repr(e), 'started': started,\n"
+            "                      'written_at': time.time()}))\n"
+            "sys.stdout.flush()\n"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MINIGRAF_")}
+        env["MINIGRAF_GRAPH_PATH"] = str(graph)
+        proc = _subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True, env=env,
+        )
+        state = {"stage_a_end": None}
+        try:
+            deadline = time.monotonic() + 60
+            while not ready.exists():
+                assert proc.poll() is None, proc.communicate()
+                assert time.monotonic() < deadline, "the hook process never got ready"
+                await asyncio.sleep(0.01)
+
+            real_fwd = mcp_server._forward_apply
+            real_rev = mcp_server._reverse_apply
+            real_finished = ingest_progress.RunProgress.stage_a_finished
+
+            def slow(real):
+                def spy(*a, **kw):
+                    out = real(*a, **kw)
+                    if not kw.get("lifecycle_only"):
+                        go.touch()
+                        time.sleep(0.4)  # write-executor thread, not the event loop
+                    return out
+                return spy
+
+            def finished_spy(self_, *a, **kw):
+                state["stage_a_end"] = time.time()
+                return real_finished(self_, *a, **kw)
+
+            monkeypatch.setattr(mcp_server, "_forward_apply", slow(real_fwd))
+            monkeypatch.setattr(mcp_server, "_reverse_apply", slow(real_rev))
+            monkeypatch.setattr(ingest_progress.RunProgress, "stage_a_finished", finished_spy)
+            await mcp_server._run_ingestion(str(repo), "master")
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+        assert lines, f"the hook printed no result. stdout={out!r} stderr={err!r}"
+        hook = json.loads(lines[-1])
+        assert mcp_server._ingest_progress.get("status") == "complete", mcp_server._ingest_progress
+        assert hook["ok"], (
+            f"the hook could not write while Stage A ran at shipped window "
+            f"settings: {hook!r}. The window held the graph longer than the "
+            f"hook's acquire budget. stderr tail: {err[-2000:]!r}"
+        )
+        assert state["stage_a_end"] is not None
+        assert hook["written_at"] < state["stage_a_end"], (
+            f"the hook wrote at {hook['written_at']:.3f}, after Stage A ended at "
+            f"{state['stage_a_end']:.3f} -- it did not get in through a Stage A "
+            f"boundary, so this test proved nothing"
+        )
+
+        mcp_server._reset_db_state()
+        with mcp_server.db_lease() as db:
+            graph_rows = json.loads(mcp_server._db_execute(
+                db, '(query [:find ?d :where [:decision/hook-280 :description ?d]])'
+            )).get("results", [])
+        con = fact_index.open_reader(fact_index.index_path_for(str(graph)))
+        try:
+            index_rows = con.execute(
+                "select value from facts_fts where entity = ':decision/hook-280'"
+            ).fetchall()
+        finally:
+            con.close()
+        assert graph_rows, "the hook's fact is not in the graph"
+        assert index_rows, "the hook's fact reached the graph but not the index (#302)"
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_during_the_boundary_itself_applies_no_further_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """The shutdown flag can be set DURING maybe_yield's own boundary (its
+        close() drop or its asyncio.sleep pause), not just between boundaries.
+        Without a re-check immediately after `maybe_yield()`, the loop falls
+        through to `window.ensure_open()` and applies one more commit before
+        the next loop head sees the flag. This wraps maybe_yield to set the
+        flag itself, right after a REAL boundary (return value > 0) has
+        already run its close+pause, and records how many Stage A applies had
+        happened by that moment -- the count the fix must not exceed."""
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 2)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
+
+        applied = []
+        applied_at_flag = [None]
+        real_fwd = mcp_server._forward_apply
+        real_rev = mcp_server._reverse_apply
+        real_yield = mcp_server._LeaseWindow.maybe_yield
+
+        def fwd_spy(*a, **kw):
+            if not kw.get("lifecycle_only"):
+                applied.append("fwd")
+            return real_fwd(*a, **kw)
+
+        def rev_spy(*a, **kw):
+            applied.append("rev")
+            return real_rev(*a, **kw)
+
+        async def yield_spy(self_):
+            s = await real_yield(self_)
+            if s > 0 and not mcp_server._shutdown_requested.is_set():
+                applied_at_flag[0] = len(applied)
+                mcp_server._shutdown_requested.set()
+            return s
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", fwd_spy)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)
+        monkeypatch.setattr(mcp_server._LeaseWindow, "maybe_yield", yield_spy)
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+            assert applied_at_flag[0] is not None, (
+                "no real boundary was ever reached -- test proves nothing"
+            )
+            assert len(applied) == applied_at_flag[0], (
+                f"{len(applied)} Stage A applies but the shutdown flag was set "
+                f"after {applied_at_flag[0]} of them -- a commit was applied "
+                f"after shutdown was requested mid-boundary"
+            )
+            assert mcp_server._lease_manager.lease_count == 0, (
+                f"lease_count is {mcp_server._lease_manager.lease_count} after "
+                f"the run -- the Stage A window's lease leaked past the "
+                f"boundary-shutdown break"
+            )
+        finally:
+            mcp_server._shutdown_requested.clear()
+            mcp_server._reset_db_state()
+
+
 class TestStageBYieldsTheLock:
     """#222 phase 5 item C. Stage B held ONE lease across the whole sweep.
 
@@ -31164,6 +31810,80 @@ class TestIngestionCommitsTheIndexBeforeReleasingTheGraph:
         )
 
     @pytest.mark.asyncio
+    async def test_every_real_stage_a_release_commits_the_index(
+        self, tmp_path, monkeypatch
+    ):
+        """#280 moved Stage A's REAL releases from the per-commit lease to the
+        window's boundary. Check the index transaction at exactly those: exits
+        where this lease takes the count to 0, after a reverse write. A 2-commit
+        window guarantees several of them mid-Stage-A, and the test fails if it
+        saw none -- a check that never saw a window close proves nothing
+        about one.
+
+        In Stage A the per-commit lease (mcp_server.py:15115) is ALSO
+        `_db_lease_async_committing_index`, so its own 2 -> 1 JOIN exit
+        already commits `index_con` unconditionally after every commit --
+        by the time the window's own boundary release runs, there is no
+        open transaction left for it to close. This test therefore guards
+        the PROPERTY (no real Stage A release ever sees an open
+        transaction), not that the window's own commit is load-bearing for
+        it here; belt-and-braces, covering a future change to the
+        per-commit lease rather than anything true of today's code path.
+        The two-step ablation recorded in the "Hold one lease across each
+        Stage A window instead of per commit (#280)" commit is what shows
+        the window's commit ALONE suffices: step 1, the per-commit lease
+        switched to a non-committing `db_lease_async()` -- still GREEN,
+        because the window's own committing lease still covers every real
+        release; step 2, additionally switching the window's own
+        `ensure_open` to non-committing -- FAILS, `in_transaction` true at
+        every real release."""
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 2)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
+        cons = []
+        real_open = mcp_server._open_index_writer_safe
+
+        def open_spy(path):
+            con = real_open(path)
+            cons.append(con)
+            return con
+
+        real_releases = []  # in_transaction at each real Stage A release
+        rev = []
+        real_rev = mcp_server._reverse_apply
+        real_lease = mcp_server.db_lease_async
+
+        def rev_spy(*a, **kw):
+            rev.append(1)
+            return real_rev(*a, **kw)
+
+        @contextlib.asynccontextmanager
+        async def lease_spy():
+            async with real_lease() as db:
+                try:
+                    yield db
+                finally:
+                    if (rev and mcp_server._ingest_progress.get("phase") == "converging"
+                            and mcp_server._lease_manager.lease_count == 1
+                            and cons and cons[0] is not None):
+                        real_releases.append(cons[0].in_transaction)
+
+        monkeypatch.setattr(mcp_server, "_open_index_writer_safe", open_spy)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)
+        monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress.get("status") == "complete"
+        assert not any(real_releases), (
+            f"a Stage A window released the graph with the fact-index "
+            f"transaction open: {real_releases} (#347)"
+        )
+        assert len(real_releases) >= 2, (
+            f"only {len(real_releases)} real Stage A release(s) after a reverse "
+            f"write were observed -- the window boundary went unexercised"
+        )
+
+    @pytest.mark.asyncio
     async def test_a_hook_writing_between_stage_a_leases_lands_in_both(
         self, tmp_path, monkeypatch
     ):
@@ -31177,10 +31897,18 @@ class TestIngestionCommitsTheIndexBeforeReleasingTheGraph:
         (pre-spawned, already imported) hook as it starts. Under the defect
         the reverse write's index transaction is still open, the hook holds
         the graph while blocked on SQLite, and the run ends `status: error`.
+        Since #280 the release after a reverse write is the Stage A window's
+        boundary, so the window is pinned to 1 commit.
         """
         import mcp_server
         import fact_index
         repo, graph = self._prepare(tmp_path, monkeypatch)
+        # #280: under a multi-commit window the lease after a reverse write is
+        # a JOIN -- the graph is still held -- so the 1 s widening below would
+        # lock the hook out instead of letting it in. A 1-commit window makes
+        # every commit's boundary a real release again, which is the gap this
+        # test widens (#347's per-release index commit).
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
 
         ready = tmp_path / "hook_ready"
         go = tmp_path / "hook_go"

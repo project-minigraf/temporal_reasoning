@@ -167,9 +167,12 @@ try:
 except ValueError:
     _OWNER_HINT_TTL = 30.0
 
-# #222 phase 5 item C. Stage B releases its lease every _SWEEP_YIELD_COMMITS
-# swept commits or _SWEEP_YIELD_SECONDS, whichever comes first, so the
-# out-of-process auto-memory hooks can win the graph file lock.
+# #222 phase 5 item C, extended to Stage A by #280. Stage B releases its lease
+# every _SWEEP_YIELD_COMMITS swept commits or _SWEEP_YIELD_SECONDS, whichever
+# comes first, and Stage A's _LeaseWindow applies the same bounds -- so the
+# out-of-process auto-memory hooks can win the graph file lock. The constants
+# bound hook lockout, not anything specific to the sweep, which is why both
+# stages share them.
 #
 # Stage B used to hold ONE lease across its whole sweep. A lease is cheap
 # in-process (at count > 0 try_acquire joins and returns the same handle, so a
@@ -210,9 +213,11 @@ except ValueError:
 # something is actually waiting" is not available without building one. The
 # trigger has to be a counter or a clock; it is both.
 #
-# When #280 lands (blocked on upstream minigraf#322), the drop checkpoint is
-# suppressed and N can safely go to 1 -- which is why this is a constant to
-# lower rather than a structure to rewrite.
+# When upstream minigraf#322 exposes OpenOptions (wal_checkpoint_threshold =
+# usize::MAX suppresses the Drop checkpoint), N can safely go to 1 -- which is
+# why this is a constant to lower rather than a structure to rewrite. #280
+# itself landed as this window, which amortises the drop checkpoint but does
+# not remove it.
 #
 # Read at import, so the conftest MINIGRAF_* scrub cannot reach it: a test that
 # depends on a value must patch the CONSTANT, not the variable.
@@ -3821,6 +3826,105 @@ async def _db_lease_async_committing_index(loop, write_executor, index_con):
             await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
 
 
+class _LeaseWindow:
+    """#280. One graph lease held across several Stage A commits.
+
+    Stage A used to take a lease per commit. Its two streams essentially
+    never overlap their leases, so the refcount hit 0 after every commit and
+    _DbLeaseManager.release() dropped the handle -- and minigraf's `Drop for
+    Inner` runs a full O(graph size) checkpoint, outside _CheckpointPolicy's
+    duty gate and invisible to the trace's ckpt_d_seconds. Measured at 110 s
+    of a 277 s Stage A over 600 commits (minigraf 2.0.2), i.e. ~1 drop per
+    commit.
+
+    The window holds its OWN lease; Stage A's per-commit lease then JOINS it
+    at refcount 1 -> 2 and its exit is 2 -> 1, which drops nothing. The
+    window releases for real only at a boundary (maybe_yield), then sleeps
+    OUTSIDE any lease so an out-of-process auto-memory hook -- which retries
+    for only ~2.6 s of wall clock and then silently discards its write --
+    can take the graph file lock. Holding one lease for all of Stage A
+    instead would discard every hook write for its duration (#280's own
+    correction comment).
+
+    The window's lease is _db_lease_async_committing_index, so every REAL
+    release commits index_con first (#347) by construction, not by call-site
+    care.
+
+    Lazy: nothing is opened until ensure_open(), so a Stage A that never
+    reaches write dispatch (empty, or every extraction failed) takes no
+    lease, as before.
+
+    Stage B keeps its own inline window loop (#222 phase 5 item C). Both use
+    the same _SWEEP_YIELD_* constants, which bound hook lockout, not sweep
+    behaviour.
+    """
+
+    def __init__(self, loop, write_executor, index_con, *,
+                 max_commits: int, max_seconds: float, pause_seconds: float) -> None:
+        self._loop = loop
+        self._write_executor = write_executor
+        self._index_con = index_con
+        self._max_commits = max_commits
+        self._max_seconds = max_seconds
+        self._pause_seconds = pause_seconds
+        self._stack: Optional[contextlib.AsyncExitStack] = None
+        self._opened_at = 0.0
+        self._count = 0
+
+    @property
+    def is_open(self) -> bool:
+        return self._stack is not None
+
+    async def ensure_open(self) -> None:
+        """Take the window's lease if it is not already held."""
+        if self._stack is not None:
+            return
+        stack = contextlib.AsyncExitStack()
+        await stack.enter_async_context(
+            _db_lease_async_committing_index(
+                self._loop, self._write_executor, self._index_con,
+            )
+        )
+        self._stack = stack
+        self._opened_at = time.monotonic()
+        self._count = 0
+
+    def note_commit(self) -> None:
+        """Count one commit that reached write dispatch inside this window."""
+        if self._stack is not None:
+            self._count += 1
+
+    async def maybe_yield(self) -> float:
+        """At a boundary, release for real and pause; return seconds spent.
+
+        A boundary is `count >= max_commits or elapsed >= max_seconds`. The
+        COUNT bounds how many drop-checkpoints the releases cost; the CLOCK
+        bounds how long a hook is locked out when one window's commits are
+        individually slow, which on a large graph they are. Neither is
+        redundant. The pause is what makes the release usable: a bare
+        release-then-reacquire leaves the lock free for microseconds, not an
+        interval (see _SWEEP_YIELD_PAUSE_SECONDS).
+        """
+        if self._stack is None:
+            return 0.0
+        if not (
+            self._count >= self._max_commits
+            or time.monotonic() - self._opened_at >= self._max_seconds
+        ):
+            return 0.0
+        started = time.perf_counter()
+        await self.close()
+        # asyncio.sleep, never time.sleep: this runs on the event loop (#99).
+        await asyncio.sleep(self._pause_seconds)
+        return time.perf_counter() - started
+
+    async def close(self) -> None:
+        """Release the window's lease, with no pause. Idempotent."""
+        stack, self._stack = self._stack, None
+        if stack is not None:
+            await stack.aclose()
+
+
 def _graph_path_current() -> str:
     """The bound graph path, falling back to the environment."""
     return _lease_manager.path or _get_graph_path()
@@ -3980,6 +4084,13 @@ class _IngestTrace:
     Writes only, no locks, no awaits, no DB access -- see this module's
     _db_native_lock invariant comment for why the per-commit loop tolerates
     nothing else.
+
+    `yield_s` (#280) is Stage A lease-window boundary time -- the handle
+    drop (a full O(graph size) checkpoint in minigraf's `Drop for Inner`)
+    plus the pause -- accumulated since the previous EMITTED record, so the
+    sum over a trace equals total boundary time even across commits that
+    emit no record. One drop is outside it: the window's final close after
+    the last record.
     """
 
     def __init__(self, path: str, clock: "Callable[[], float]" = time.monotonic) -> None:
@@ -3999,6 +4110,7 @@ class _IngestTrace:
         apply_s: float,
         extracted_files: Sequence[tuple],
         policy: Optional["_CheckpointPolicy"],
+        yield_s: float = 0.0,
     ) -> None:
         if self._fh is None:
             return
@@ -4017,6 +4129,7 @@ class _IngestTrace:
             "t_since_start": self._clock() - self._started_at,
             "await_s": await_s,
             "apply_s": apply_s,
+            "yield_s": yield_s,
             "ckpt_d_count": d_count,
             "ckpt_d_seconds": d_seconds,
         }
@@ -14882,208 +14995,253 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     pending.append((tag, pos, fut, claim_ident, absorbed_idents))
                     return True
 
+                # #280: one lease across up to _SWEEP_YIELD_COMMITS commits /
+                # _SWEEP_YIELD_SECONDS, instead of one per commit. Every
+                # per-commit lease below JOINS the window's (refcount 1 -> 2),
+                # so its exit no longer drops the handle and with it a full
+                # O(graph size) checkpoint in minigraf's `Drop for Inner`. The
+                # window releases for real at the loop head, between commits,
+                # and pauses outside any lease so the out-of-process hooks can
+                # get in. See _LeaseWindow. The constants are read HERE, not at
+                # import, so tests patching them are honoured.
+                window = _LeaseWindow(
+                    loop, write_executor, index_con,
+                    max_commits=_SWEEP_YIELD_COMMITS,
+                    max_seconds=_SWEEP_YIELD_SECONDS,
+                    pause_seconds=_SWEEP_YIELD_PAUSE_SECONDS,
+                )
+                _trace_yield_s = 0.0
                 run_progress.stage_a_started()
                 for _ in range(pipeline_depth):
                     if not submit_next():
                         break
 
-                while pending:
-                    if _shutdown_requested.is_set():
-                        completed_all = False
-                        break
+                # try/finally, not a bare close after the loop: the shutdown
+                # break, BrokenProcessPool and anything else propagating out of
+                # this loop must all release the window's lease. A leaked one
+                # is silent -- the outer finally's final-checkpoint lease would
+                # just join it -- and the count would stay 1 after the run.
+                try:
+                    while pending:
+                        if _shutdown_requested.is_set():
+                            completed_all = False
+                            break
+                        # The ONLY boundary: between commits, whatever path the
+                        # previous one took. Never after the last commit (the
+                        # head runs only while `pending` is non-empty) and never
+                        # on shutdown (checked just above). Before
+                        # _trace_t_await so await_s stays pure extraction stall.
+                        _trace_yield_s += await window.maybe_yield()
 
-                    tag, pos, fut, claim_ident, absorbed_idents = pending.popleft()
-                    commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
-                    # renamed_pairs (Task 9's 4th _extract_commit return element) is
-                    # unpacked here but not yet consumed — Task 10 wires it into
-                    # :renamed-from/:renamed-to triple emission for functions/classes.
-                    # Widening this unpack now (rather than leaving it a 3-tuple) is
-                    # required as soon as _extract_commit returns 4 elements: every
-                    # ingestion run — including the many existing tests that drive
-                    # _run_ingestion through a real ProcessPoolExecutor worker — would
-                    # otherwise fail with "too many values to unpack".
-                    _trace_t_await = time.perf_counter()
-                    try:
-                        extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
-                    except concurrent.futures.process.BrokenProcessPool:
-                        # The whole worker pool died (OOM kill, native segfault) --
-                        # every other pending future in the sliding window is
-                        # equally poisoned, so this is not isolable to one commit
-                        # (see this function's docstring). Propagate to the outer
-                        # handler as before.
-                        raise
-                    except Exception as e:
-                        # Ordinary extraction failure (bad git ref, unreadable
-                        # blob, unsupported syntax) -- isolate it to this one
-                        # commit instead of aborting the whole run, matching this
-                        # function's own documented "fail only the one commit"
-                        # contract and the per-file try/except _extract_commit
-                        # already uses one level down for content-fetch failures.
-                        print(
-                            f"[_run_ingestion] skipping unreadable commit {commit_hash} "
-                            f"({subject!r}): {e}",
-                            file=sys.stderr,
-                        )
-                        _note_incomplete_rev(tag, pos, claim_ident)
-                        _note_incomplete_fwd(tag, pos)
-                        submit_next()
-                        _ingest_progress["current_commit"] = commit_hash
-                        run_progress.retired(tag, "failed", pos)
-                        await asyncio.sleep(0)  # yield to event loop
-                        continue
-                    # #260 M1: read BEFORE submit_next(), not after -- await_s
-                    # is documented as extraction stall (wall clock stalled on
-                    # `await fut`), and submit_next() does real work (queues
-                    # the next commit's extraction). Reading the clock after it
-                    # would fold submission cost into a field the spec defines
-                    # as pure stall. Immaterial in magnitude on the shipped
-                    # trace (5.10s total over 767 commits), but the field
-                    # should mean what it says.
-                    _trace_await_s = time.perf_counter() - _trace_t_await
-                    submit_next()
+                        # The flag can be set DURING the boundary (its drop or
+                        # its pause); re-check before reopening the graph for
+                        # another commit.
+                        if _shutdown_requested.is_set():
+                            completed_all = False
+                            break
 
-                    _ingest_progress["current_commit"] = commit_hash
-
-                    # A lease, not a manual acquire/release pair. The old code
-                    # cleared the local before the global because a concurrent
-                    # thread calling get_db() inside that window would open a
-                    # SECOND handle (#251/#253). There is no window now: the
-                    # count is authoritative and the handle drops exactly when
-                    # it reaches zero.
-                    # #260: apply_s deliberately spans the lease ACQUIRE as
-                    # well as the executor call -- the acquire is real serial
-                    # per-commit cost, and a reader must not take apply_s for
-                    # pure write time. #260 M2: it also spans the lease
-                    # RELEASE -- the timer below is read after `async with
-                    # db_lease_async()` has exited, and at refcount 0 that
-                    # release drops the handle. A follow-up attribution task
-                    # narrowing apply_s further needs to know handle open AND
-                    # drop are both inside the measured span, not just open.
-                    _trace_t_apply = time.perf_counter()
-                    _trace_write_ok = True
-                    async with _db_lease_async_committing_index(loop, write_executor, index_con) as db:
+                        tag, pos, fut, claim_ident, absorbed_idents = pending.popleft()
+                        commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
+                        # renamed_pairs (Task 9's 4th _extract_commit return element) is
+                        # unpacked here but not yet consumed — Task 10 wires it into
+                        # :renamed-from/:renamed-to triple emission for functions/classes.
+                        # Widening this unpack now (rather than leaving it a 3-tuple) is
+                        # required as soon as _extract_commit returns 4 elements: every
+                        # ingestion run — including the many existing tests that drive
+                        # _run_ingestion through a real ProcessPoolExecutor worker — would
+                        # otherwise fail with "too many values to unpack".
+                        _trace_t_await = time.perf_counter()
                         try:
-                            if tag == "fwd":
-                                # functools.partial because run_in_executor
-                                # takes no kwargs, and every defaulted
-                                # parameter of _forward_apply is keyword-only
-                                # (#346): a positional flag here would be
-                                # silently rebound by any parameter inserted
-                                # ahead of it.
-                                await loop.run_in_executor(
-                                    write_executor, functools.partial(
-                                    _forward_apply, db, repo_path, state,
-                                    commit_metadata[pos],
-                                    (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
-                                    index_con=index_con, linearization=linearization, pos=pos,
-                                    lifecycle_only=False,
-                                    # #342's persist_claim, evaluated at
-                                    # DISPATCH time, not claim
-                                    # time, for the same reason the reverse
-                                    # check is: claims run ahead of writes by
-                                    # pipeline_depth, so the position that
-                                    # fails may not have set the ceiling yet
-                                    # when a higher position was ALLOCATED in
-                                    # submit_next -- only by the time its own
-                                    # write is dispatched here.
-                                    persist_claim=(
-                                        fwd_claim_ceiling is None or pos < fwd_claim_ceiling
-                                    ),
-                                    ),
-                                )
-                            else:
-                                # functools.partial: see the forward
-                                # dispatch above (#346).
-                                await loop.run_in_executor(
-                                    write_executor, functools.partial(
-                                    _reverse_apply, db, repo_path, linearization,
-                                    commit_metadata, pos, extracted_files,
-                                    index_con=index_con,
-                                    # #326 Finding A / #325: below THIS
-                                    # ident's floor we do the work but
-                                    # withhold the claim. Keyed by
-                                    # claim_ident, not a run-global scalar --
-                                    # a floor set by a failure in one
-                                    # interval must not block a claim
-                                    # targeting a different, disjoint one.
-                                    #
-                                    # #325 review (Finding 1, CRITICAL): a
-                                    # merging claim's target is the SURVIVOR,
-                                    # never the interval that was actually
-                                    # floored. A minted tip interval T
-                                    # floored at position X by a failed write
-                                    # descends and eventually touches a
-                                    # retained base -- _coalesce makes the
-                                    # base the survivor and T absorbed, so
-                                    # claim_ident becomes :ingestion/frontier-
-                                    # high, which carries no floor entry of
-                                    # its own. Checking claim_ident alone
-                                    # reads that as unrestricted and persists
-                                    # a union spanning the gap X sits in --
-                                    # sweeping the failed position into the
-                                    # graph permanently, the exact
-                                    # closed-range defect #326 exists to
-                                    # prevent, reintroduced across a merge.
-                                    # This MUST be evaluated at dispatch
-                                    # time, not claim time (as it already is,
-                                    # here): claims run ahead of writes by
-                                    # pipeline_depth, so the ident that fails
-                                    # may not have a floor entry yet when the
-                                    # merging claim is first ALLOCATED in
-                                    # submit_next, only by the time its write
-                                    # is actually dispatched.
-                                    persist_claim=pos > max(
-                                        [rev_claim_floor[i] for i in
-                                         [claim_ident, *(absorbed_idents or [])]
-                                         if i in rev_claim_floor] or [-1]
-                                    ),
-                                    # #325 review round 2: the ident this
-                                    # claim's interval resolved to when it
-                                    # was MADE (captured in submit_next),
-                                    # never re-derived here -- see
-                                    # _reverse_claim_persist_target's
-                                    # docstring.
-                                    claim_ident=claim_ident,
-                                    absorbed_idents=absorbed_idents,
-                                    ),
-                                )
-
+                            extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
+                        except concurrent.futures.process.BrokenProcessPool:
+                            # The whole worker pool died (OOM kill, native segfault) --
+                            # every other pending future in the sliding window is
+                            # equally poisoned, so this is not isolable to one commit
+                            # (see this function's docstring). Propagate to the outer
+                            # handler as before.
+                            raise
                         except Exception as e:
-                            # Ordinary per-commit write failure (malformed EDN, a
-                            # transient constraint violation, ...) -- isolate it to
-                            # this one commit rather than aborting every commit
-                            # still pending, matching this function's own
-                            # documented "fail only the one commit" contract and
-                            # the extraction-phase isolation above. Opening the DB
-                            # itself (the lease acquire, just above this try) is
-                            # deliberately NOT covered here -- that failure is
-                            # unrecoverable for every remaining commit too, so it
-                            # still propagates to the outer handler.
+                            # Ordinary extraction failure (bad git ref, unreadable
+                            # blob, unsupported syntax) -- isolate it to this one
+                            # commit instead of aborting the whole run, matching this
+                            # function's own documented "fail only the one commit"
+                            # contract and the per-file try/except _extract_commit
+                            # already uses one level down for content-fetch failures.
                             print(
-                                f"[_run_ingestion] skipping commit {commit_hash} "
-                                f"({subject!r}): write failed: {e}",
+                                f"[_run_ingestion] skipping unreadable commit {commit_hash} "
+                                f"({subject!r}): {e}",
                                 file=sys.stderr,
                             )
-                            _trace_write_ok = False
                             _note_incomplete_rev(tag, pos, claim_ident)
                             _note_incomplete_fwd(tag, pos)
+                            submit_next()
+                            _ingest_progress["current_commit"] = commit_hash
+                            run_progress.retired(tag, "failed", pos)
+                            await asyncio.sleep(0)  # yield to event loop
+                            continue
+                        # #260 M1: read BEFORE submit_next(), not after -- await_s
+                        # is documented as extraction stall (wall clock stalled on
+                        # `await fut`), and submit_next() does real work (queues
+                        # the next commit's extraction). Reading the clock after it
+                        # would fold submission cost into a field the spec defines
+                        # as pure stall. Immaterial in magnitude on the shipped
+                        # trace (5.10s total over 767 commits), but the field
+                        # should mean what it says.
+                        _trace_await_s = time.perf_counter() - _trace_t_await
+                        submit_next()
 
-                    # #260: no record for a commit whose write failed -- same
-                    # contamination class the brief excluded extraction
-                    # failures for. apply_s on a failed attempt does not
-                    # measure the quantity the downstream regression models
-                    # (the cost of successfully applying a commit), so
-                    # recording it would inject a bad point into the fit.
-                    if _ingest_trace is not None and _trace_write_ok:
-                        _ingest_trace.emit(
-                            pos, tag, commit_hash,
-                            _trace_await_s,
-                            time.perf_counter() - _trace_t_apply,
-                            extracted_files,
-                            _ingest_checkpoint_policy,
-                        )
-                    run_progress.retired(tag, "written" if _trace_write_ok else "failed", pos)
-                    await asyncio.sleep(0)  # yield to event loop
+                        _ingest_progress["current_commit"] = commit_hash
+
+                        # A lease, not a manual acquire/release pair. The old code
+                        # cleared the local before the global because a concurrent
+                        # thread calling get_db() inside that window would open a
+                        # SECOND handle (#251/#253). There is no window now: the
+                        # count is authoritative and the handle drops exactly when
+                        # it reaches zero.
+                        # #260: apply_s deliberately spans the lease ACQUIRE as
+                        # well as the executor call -- the acquire is real serial
+                        # per-commit cost, and a reader must not take apply_s for
+                        # pure write time. #260 M2: it also spans the lease
+                        # RELEASE. Since #280 that release is a JOIN's 2 -> 1
+                        # and drops nothing; the handle open lands in the first
+                        # apply_s of each window, and the drop lands at the
+                        # window boundary (yield_s).
+                        _trace_t_apply = time.perf_counter()
+                        _trace_write_ok = True
+                        # Inside apply_s, which already documents that it spans
+                        # the lease ACQUIRE: on the first commit of a window this
+                        # is the handle open; otherwise a no-op.
+                        await window.ensure_open()
+                        async with _db_lease_async_committing_index(loop, write_executor, index_con) as db:
+                            try:
+                                if tag == "fwd":
+                                    # functools.partial because run_in_executor
+                                    # takes no kwargs, and every defaulted
+                                    # parameter of _forward_apply is keyword-only
+                                    # (#346): a positional flag here would be
+                                    # silently rebound by any parameter inserted
+                                    # ahead of it.
+                                    await loop.run_in_executor(
+                                        write_executor, functools.partial(
+                                        _forward_apply, db, repo_path, state,
+                                        commit_metadata[pos],
+                                        (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
+                                        index_con=index_con, linearization=linearization, pos=pos,
+                                        lifecycle_only=False,
+                                        # #342's persist_claim, evaluated at
+                                        # DISPATCH time, not claim
+                                        # time, for the same reason the reverse
+                                        # check is: claims run ahead of writes by
+                                        # pipeline_depth, so the position that
+                                        # fails may not have set the ceiling yet
+                                        # when a higher position was ALLOCATED in
+                                        # submit_next -- only by the time its own
+                                        # write is dispatched here.
+                                        persist_claim=(
+                                            fwd_claim_ceiling is None or pos < fwd_claim_ceiling
+                                        ),
+                                        ),
+                                    )
+                                else:
+                                    # functools.partial: see the forward
+                                    # dispatch above (#346).
+                                    await loop.run_in_executor(
+                                        write_executor, functools.partial(
+                                        _reverse_apply, db, repo_path, linearization,
+                                        commit_metadata, pos, extracted_files,
+                                        index_con=index_con,
+                                        # #326 Finding A / #325: below THIS
+                                        # ident's floor we do the work but
+                                        # withhold the claim. Keyed by
+                                        # claim_ident, not a run-global scalar --
+                                        # a floor set by a failure in one
+                                        # interval must not block a claim
+                                        # targeting a different, disjoint one.
+                                        #
+                                        # #325 review (Finding 1, CRITICAL): a
+                                        # merging claim's target is the SURVIVOR,
+                                        # never the interval that was actually
+                                        # floored. A minted tip interval T
+                                        # floored at position X by a failed write
+                                        # descends and eventually touches a
+                                        # retained base -- _coalesce makes the
+                                        # base the survivor and T absorbed, so
+                                        # claim_ident becomes :ingestion/frontier-
+                                        # high, which carries no floor entry of
+                                        # its own. Checking claim_ident alone
+                                        # reads that as unrestricted and persists
+                                        # a union spanning the gap X sits in --
+                                        # sweeping the failed position into the
+                                        # graph permanently, the exact
+                                        # closed-range defect #326 exists to
+                                        # prevent, reintroduced across a merge.
+                                        # This MUST be evaluated at dispatch
+                                        # time, not claim time (as it already is,
+                                        # here): claims run ahead of writes by
+                                        # pipeline_depth, so the ident that fails
+                                        # may not have a floor entry yet when the
+                                        # merging claim is first ALLOCATED in
+                                        # submit_next, only by the time its write
+                                        # is actually dispatched.
+                                        persist_claim=pos > max(
+                                            [rev_claim_floor[i] for i in
+                                             [claim_ident, *(absorbed_idents or [])]
+                                             if i in rev_claim_floor] or [-1]
+                                        ),
+                                        # #325 review round 2: the ident this
+                                        # claim's interval resolved to when it
+                                        # was MADE (captured in submit_next),
+                                        # never re-derived here -- see
+                                        # _reverse_claim_persist_target's
+                                        # docstring.
+                                        claim_ident=claim_ident,
+                                        absorbed_idents=absorbed_idents,
+                                        ),
+                                    )
+
+                            except Exception as e:
+                                # Ordinary per-commit write failure (malformed EDN, a
+                                # transient constraint violation, ...) -- isolate it to
+                                # this one commit rather than aborting every commit
+                                # still pending, matching this function's own
+                                # documented "fail only the one commit" contract and
+                                # the extraction-phase isolation above. Opening the DB
+                                # itself (the lease acquire, just above this try) is
+                                # deliberately NOT covered here -- that failure is
+                                # unrecoverable for every remaining commit too, so it
+                                # still propagates to the outer handler.
+                                print(
+                                    f"[_run_ingestion] skipping commit {commit_hash} "
+                                    f"({subject!r}): write failed: {e}",
+                                    file=sys.stderr,
+                                )
+                                _trace_write_ok = False
+                                _note_incomplete_rev(tag, pos, claim_ident)
+                                _note_incomplete_fwd(tag, pos)
+
+                        # Written or failed, this commit touched the graph.
+                        window.note_commit()
+
+                        # #260: no record for a commit whose write failed -- same
+                        # contamination class the brief excluded extraction
+                        # failures for. apply_s on a failed attempt does not
+                        # measure the quantity the downstream regression models
+                        # (the cost of successfully applying a commit), so
+                        # recording it would inject a bad point into the fit.
+                        if _ingest_trace is not None and _trace_write_ok:
+                            _ingest_trace.emit(
+                                pos, tag, commit_hash,
+                                _trace_await_s,
+                                time.perf_counter() - _trace_t_apply,
+                                extracted_files,
+                                _ingest_checkpoint_policy,
+                                yield_s=_trace_yield_s,
+                            )
+                            _trace_yield_s = 0.0
+                        run_progress.retired(tag, "written" if _trace_write_ok else "failed", pos)
+                        await asyncio.sleep(0)  # yield to event loop
+                finally:
+                    await window.close()
 
                 run_progress.stage_a_finished(completed_all)
 

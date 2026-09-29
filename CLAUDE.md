@@ -676,10 +676,26 @@ is published only around LONG-held ownership (ingestion), not every lease.
 
 **Dropping the handle is not free: it runs a full O(graph size) checkpoint**
 inside minigraf's `Drop for Inner`, outside `_CheckpointPolicy`'s duty gate and
-invisible to the trace's `ckpt_d_seconds`. Ingestion currently drops it ~1.02
-times per commit, measured at 48% of write time and growing 3.47x within a
-220-commit run (#280). See `evals/at_scale/benchmark.md`, "Per-Commit Cost
-Attribution".
+invisible to the trace's `ckpt_d_seconds`. Pre-#280, ingestion dropped it
+~1.02 times per commit, measured at 48% of write time and growing 3.47x
+within a 220-commit run — that figure is now HISTORY, not the shipped
+behaviour: see `evals/at_scale/benchmark.md`, "Per-Commit Cost Attribution".
+**#280 amortises it with `_LeaseWindow`**, a lease held across a bounded run
+of Stage A commits instead of one per commit (Stage B has done the
+equivalent since #222 phase 5 item C; see below). Measured on a same-batch,
+interleaved A/B against master
+(`evals/at_scale/results/280-stage-a-window-ab.json`): at 600 commits, drops per commit fall from ~1.0 (master) to
+0.12-0.125 (branch, 2 reps) and Stage A wall time falls to 0.748x of
+master's (207.5s vs 277.3s, median of 2 reps); at full history (1024
+commits) drops per commit are 0.114 and Stage A wall falls to 0.604x
+(395.1s vs 653.9s). `fact_audit` divergence is 0 with `audit_error: None`
+and `:type/commit` counts equal between arms at both slice sizes. The
+plan's original ≤0.06-drops-per-commit target assumed the 25-commit count
+bound (`_SWEEP_YIELD_COMMITS`) would govern; measured, this repo's Stage A
+paces ~0.33s/commit, so the 2.0s clock bound (`_SWEEP_YIELD_SECONDS`) closes
+every window after ~6-8 commits, well short of 25 — the clock bound is the
+hook-lockout guarantee and is kept deliberately, so ~0.12 is the real
+result, not a shortfall against ~0.04.
 
 **Re-walking an already-ingested position is now skipped, and the witness is
 the thing that decides whether that is safe (#326 — narrowed by #325 below;
@@ -1462,6 +1478,67 @@ every window commits the fact index before releasing the lease; without that
 the yield deadlocks the hook against ingestion instead (see "The fact index
 must be COMMITTED" below).
 
+**Stage A takes the same window since #280.** `_LeaseWindow` (`mcp_server.py`,
+beside `_db_lease_async_committing_index`) holds its OWN lease across a
+bounded run of Stage A commits; Stage A's existing per-commit
+`async with _db_lease_async_committing_index(...)` then JOINS it at refcount
+1 → 2 instead of opening a second handle, so its exit is 2 → 1 and drops
+nothing. `window.maybe_yield()` is called at exactly one place — the dispatch
+loop's HEAD, after the shutdown check and before the next commit's future is
+awaited — and closes the window (a real release) when `count >= max_commits
+or elapsed >= max_seconds`, then pauses `_SWEEP_YIELD_PAUSE_SECONDS` OUTSIDE
+the lease. The shutdown flag is re-checked immediately after that call
+(`mcp_server.py:15039`), because it can be set DURING the boundary itself —
+inside `maybe_yield`'s drop or its pause — and without the re-check the loop
+falls through to `window.ensure_open()` and applies one more commit before
+the next head would have seen it. Because that boundary sits at the loop head and nowhere else,
+**the window's lease is held across the NEXT commit's extraction wait
+(`await fut`)** — a window stays open through however long that one
+extraction takes — and since `maybe_yield` checks the clock only there, a
+long extraction stall or an individually slow commit can stretch hook
+lockout past `_SWEEP_YIELD_SECONDS`, the same shape as Stage B's own
+per-swept-commit boundary check above. `try: ... finally: await
+window.close()` wraps the whole dispatch loop, so the shutdown `break`,
+`BrokenProcessPool` and any other propagating exception all release the
+window's lease — no pause paid, since `close()` never sleeps — and no lease
+leaks past Stage A. Stage A reuses Stage B's `_SWEEP_YIELD_COMMITS`,
+`_SWEEP_YIELD_SECONDS` and `_SWEEP_YIELD_PAUSE_SECONDS` rather than minting
+its own knobs: both stages exist to bound how long an out-of-process hook is
+locked out, not to describe anything specific to either stage's own work,
+so a second set of constants would be two answers to one question. The
+`_IngestTrace` record gains a `yield_s` field — seconds spent inside
+`maybe_yield` boundaries since the previously emitted record — so the cost
+this section exists to expose stays visible in the per-commit trace and does
+not go dark the way it did before #280 (#260).
+`test_a_hook_writing_between_stage_a_leases_lands_in_both` (adapted from
+its pre-#280 form) pins `_SWEEP_YIELD_COMMITS = 1`: under a multi-commit
+window the lease after a reverse write is a JOIN, so the test's 1 s
+widening would lock the hook OUT instead of letting it in, and only a
+1-commit window makes every commit's boundary a real release again — the
+gap the test needs to exercise #347's per-release index commit.
+Measured, same-batch A/B against master
+(`evals/at_scale/results/280-stage-a-window-ab.json`,
+`probe_lease_drop_cost.py`): Stage B's own window already crosses minigraf's 1000-WAL-entry
+auto-checkpoint threshold mid-sweep — Stage B makes about 237 WAL writes per
+swept commit (142512/600 at 600 commits), so its 25-commit window is ~5.9k
+WAL entries — and this is unaffected by #280 and recorded only as an
+out-of-scope observation: 75-77 auto-checkpoint firings (≈23.5-24.5 s) plus
+~22-24 s of drops at 600 commits, both essentially identical between arms,
+rising to 157 firings (≈80 s) at full history (1024 commits) — small against
+Stage B's own ~845-865 s wall.
+
+A hook using its OWN shipped retry schedule (`_LOCK_RETRY_MAX=5,
+_LOCK_RETRY_BASE=0.05` doubling) cannot reliably land in the window's
+0.1 s release even though the window itself is genuine: measured 8/8 misses
+at shipped settings on this branch, and the SAME schedule also landed 0 of 6
+on the pre-#280 per-commit-lease code (which offered no explicit pause at all).
+So #280 did not make hook access worse — it did not by itself fix the
+hook's coarse backoff either. That gap is pre-existing and separate from
+this window's own guarantee, and is filed as issue #366; the branch's own
+`TestStageAYieldsTheLock` test for the window's release interval therefore
+drives the hook with a deliberately non-shipped continuous-polling retry
+configuration instead, to isolate the window's own contract from #366's.
+
 **A WINDOW rather than a per-commit release, because the release is not
 free.** `_DbLeaseManager.release()` at refcount 1 → 0 drops the handle, and
 minigraf's `Drop for Inner` then runs a full O(graph size) checkpoint — #280,
@@ -1473,10 +1550,13 @@ shipped `_SWEEP_YIELD_COMMITS` of 25, +5.3% (60 commits, 0.9 MB graph) and
 default is not 1. Marginal cost per extra handle drop was 4.4 ms at 0.9 MB and
 14.4 ms at 2.9 MB — the graph grew 3.2x and the cost 3.3x, confirming the drop
 checkpoint is O(graph size). Every config swept the same commits and reported
-complete, so the window costs time, not outcome. When #280 lands (blocked on
-upstream minigraf#322) the drop checkpoint is suppressed and N can safely go
-to 1 — which is why this is a constant to lower rather than a structure to
-rewrite.
+complete, so the window costs time, not outcome. When upstream minigraf#322
+exposes `OpenOptions` (`wal_checkpoint_threshold = usize::MAX` suppresses the
+Drop checkpoint), the drop checkpoint is suppressed and N can safely go to 1
+— which is why this is a constant to lower rather than a structure to
+rewrite. #280 itself landed as the `_LeaseWindow` described above, which
+amortises the drop checkpoint over a window but does not remove it — the
+constant still cannot go to 1 after #280, only after minigraf#322.
 
 **The fact index must be COMMITTED before every window's lease release, and
 for a while it was not — so the window, as first shipped, broke ingestion
