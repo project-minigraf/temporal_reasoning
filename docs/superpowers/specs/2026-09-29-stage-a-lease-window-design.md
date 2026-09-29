@@ -100,9 +100,14 @@ class _LeaseWindow:
   `while pending:` loop in `try: ... finally: await window.close()`. This is a
   one-level re-indent of the loop body, reviewable with `git diff -w`. The
   `finally` covers the shutdown `break`, `BrokenProcessPool` and any other
-  propagating exception, so no lease can leak past Stage A. A leaked lease
-  would make the outer `finally`'s final checkpoint fail with "Database is
-  already open in this process", the hazard the Stage B abort path documents.
+  propagating exception, so no lease can leak past Stage A. A leaked lease is
+  silent, not loud: in-process, the outer `finally`'s final-checkpoint lease
+  would simply JOIN a leaked one (refcount 1 → 2 → 1, "Database is already
+  open in this process" is a cross-PROCESS error minigraf raises on a second
+  OS-level open, never on an in-process join) and the count would stay 1
+  after the run instead of reaching 0 — which is exactly why the leak test
+  asserts `_lease_manager.lease_count == 0` directly rather than expecting
+  any exception.
 - **The boundary sits at the loop head, after the shutdown check and before
   `_trace_t_await` is read.** That is between two commits whatever path the
   previous one took (written, write failed, or extraction failed). It never
@@ -224,9 +229,13 @@ Acceptance runs, with master and the branch interleaved on one machine and
 **both arms run back to back**, because absolute numbers drift between
 batches:
 
-- 600-commit slice, ≥2 runs per arm. Stage A opens and drops per commit
-  ≈ 1/25 (not ~1.0). The Stage A wall-time reduction reproduces the spike
-  (≥20%). Stage A auto-checkpoints stay ≤ 1 per run.
+- 600-commit slice, ≥2 runs per arm. Stage A opens and drops per commit fall
+  to the CLOCK-bound figure, not ≈ 1/25 (not ~1.0): this repo's Stage A paces
+  ~0.33 s/commit, so `_SWEEP_YIELD_SECONDS` (2.0 s) closes every window after
+  ~6-8 commits, well before the 25-commit `_SWEEP_YIELD_COMMITS` bound is
+  reached — measured 0.12-0.125, matching the spike's 70/600. The Stage A
+  wall-time reduction reproduces the spike (≥20%). Stage A auto-checkpoints
+  stay ≤ 1 per run.
 - One full-history run per arm. This is the issue's "not measured yet:
   full history". Report Stage A drop totals and auto-checkpoint counts at
   full graph size. If auto-checkpoints become frequent at depth, that is a
