@@ -55,6 +55,10 @@ def main() -> None:
     if conversation_delta:
         try:
             import mcp_server
+            # Poll back to back to a deadline instead of the server's gapped
+            # retry schedule, or ingestion's 0.1 s lease-window releases are
+            # missed and this turn's facts are silently lost (#366).
+            mcp_server.use_hook_lease_deadline()
             # No explicit open: handle_memory_finalize_turn takes its own
             # lease (db_lease_async(), conditional on
             # MINIGRAF_EXTRACTION_STRATEGY), which carries the same

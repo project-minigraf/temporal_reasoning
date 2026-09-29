@@ -30624,8 +30624,8 @@ class TestStageAYieldsTheLock:
             return real_finished(self_, *a, **kw)
 
         @contextlib.asynccontextmanager
-        async def lease_spy():
-            async with real_lease() as db:
+        async def lease_spy(**kw):
+            async with real_lease(**kw) as db:
                 try:
                     yield db
                 finally:
@@ -30845,7 +30845,10 @@ class TestStageAYieldsTheLock:
         drives the hook with a finer, deliberately non-shipped retry
         configuration (continuous polling, no inter-attempt sleep) so it can
         isolate and pin the window's own guarantee without being gated by
-        that separate defect, filed as issue #366.
+        that separate defect, filed as issue #366. #366 is now fixed on the
+        hook side -- the hooks poll to a deadline via
+        use_hook_lease_deadline(), pinned by TestHooksCatchLeaseWindowReleases
+        -- and this test stays as the window's own contract.
         """
         import fact_index
         import ingest_progress
@@ -30863,7 +30866,7 @@ class TestStageAYieldsTheLock:
             # ~0.377 s open-polls and can miss a 0.1 s release entirely --
             # measured: missed 8 of 8 at shipped settings, and landed 0 of 6
             # on the pre-#280 per-commit-lease code too. That is a pre-existing
-            # hook-side gap, tracked separately as issue #366, not a #280
+            # hook-side gap, fixed separately by #366, not a #280
             # regression. This
             # test pins the WINDOW's side of the contract instead: with the
             # hook polling continuously (no inter-attempt sleep, more
@@ -31019,6 +31022,195 @@ class TestStageAYieldsTheLock:
             mcp_server._reset_db_state()
 
 
+class TestHooksCatchLeaseWindowReleases:
+    """#366. The auto-memory hooks used _LOCK_RETRY_*'s gapped schedule: an
+    open() polls for ~0.377 s, then the hook sleeps up to 0.4 s, so a lease
+    window's 0.1 s release could fall entirely inside a sleep. Measured 0 of 8
+    landed at shipped window settings, and both hooks swallow the failure.
+    The hooks now call use_hook_lease_deadline() and poll back to back.
+
+    Everything here runs at SHIPPED constants: neither the window nor any
+    retry parameter is monkeypatched. Only each Stage A write is slowed, so
+    Stage A outlasts its first window boundary."""
+
+    _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _prepare(self, tmp_path, monkeypatch, n=12):
+        return TestStageBYieldsTheLock()._prepare(tmp_path, monkeypatch, n=n)
+
+    def _spawn(self, tmp_path, graph, body):
+        """A real process that imports mcp_server BEFORE signalling ready (so
+        import time is not in the race), then waits for `go` and runs body."""
+        go = tmp_path / "hook_go"
+        ready = tmp_path / "hook_ready"
+        script = (
+            "import io, json, os, runpy, sys, time\n"
+            f"sys.path.insert(0, {self._REPO_ROOT!r})\n"
+            "import mcp_server\n"
+            f"open({str(ready)!r}, 'w').close()\n"
+            f"while not os.path.exists({str(go)!r}):\n"
+            "    time.sleep(0.002)\n"
+            + body
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MINIGRAF_")}
+        env["MINIGRAF_GRAPH_PATH"] = str(graph)
+        env["MINIGRAF_EXTRACTION_STRATEGY"] = "heuristic"
+        proc = _subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True, env=env,
+        )
+        return proc, go, ready
+
+    async def _ingest_with_slow_stage_a(self, monkeypatch, repo, proc, go, ready, state):
+        """Run ingestion with every Stage A write slowed to 0.4 s, touching
+        `go` at the first one. Records Stage A's end and the process's exit
+        time (polled, so it is observed while ingestion is still running)."""
+        import ingest_progress
+        import mcp_server
+        deadline = time.monotonic() + 60
+        while not ready.exists():
+            assert proc.poll() is None, proc.communicate()
+            assert time.monotonic() < deadline, "the hook process never got ready"
+            await asyncio.sleep(0.01)
+
+        real_fwd = mcp_server._forward_apply
+        real_rev = mcp_server._reverse_apply
+        real_finished = ingest_progress.RunProgress.stage_a_finished
+
+        def slow(real):
+            def spy(*a, **kw):
+                out = real(*a, **kw)
+                if not kw.get("lifecycle_only"):
+                    go.touch()
+                    time.sleep(0.4)  # write-executor thread, not the event loop
+                return out
+            return spy
+
+        def finished_spy(self_, *a, **kw):
+            state["stage_a_end"] = time.time()
+            return real_finished(self_, *a, **kw)
+
+        async def watch_exit():
+            while proc.poll() is None:
+                await asyncio.sleep(0.01)
+            state["proc_exit"] = time.time()
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", slow(real_fwd))
+        monkeypatch.setattr(mcp_server, "_reverse_apply", slow(real_rev))
+        monkeypatch.setattr(ingest_progress.RunProgress, "stage_a_finished", finished_spy)
+        watcher = asyncio.ensure_future(watch_exit())
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+            await asyncio.wait_for(watcher, timeout=60)
+        finally:
+            watcher.cancel()
+        return proc.communicate(timeout=60)
+
+    @pytest.mark.asyncio
+    async def test_the_real_finalize_hook_lands_mid_stage_a_in_graph_and_index(
+        self, tmp_path, monkeypatch
+    ):
+        """hooks/finalize_hook.py itself, run as Claude Code runs it (JSON on
+        stdin naming a transcript), so the opt-in call in the hook is what is
+        under test -- not a copy of it. Ablation: delete the hook's
+        use_hook_lease_deadline() call and this reddens on the fact not
+        reaching the graph."""
+        import fact_index
+        import mcp_server
+        repo, graph = self._prepare(tmp_path, monkeypatch)
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text(
+            json.dumps({"role": "user", "content": "we will use valkeyhook366"}) + "\n"
+        )
+        ident = mcp_server._canonical_ident("decision", "valkeyhook366")
+        assert mcp_server.heuristic_extract("we will use valkeyhook366"), (
+            "the transcript extracts no fact -- this test would prove nothing"
+        )
+        hook = os.path.join(self._REPO_ROOT, "hooks", "finalize_hook.py")
+        proc, go, ready = self._spawn(tmp_path, graph, (
+            f"sys.stdin = io.StringIO(json.dumps({{'transcript_path': {str(transcript)!r}}}))\n"
+            f"runpy.run_path({hook!r}, run_name='__main__')\n"
+        ))
+        state = {"stage_a_end": None, "proc_exit": None}
+        try:
+            out, err = await self._ingest_with_slow_stage_a(
+                monkeypatch, repo, proc, go, ready, state)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        assert mcp_server._ingest_progress.get("status") == "complete", mcp_server._ingest_progress
+        mcp_server._reset_db_state()
+        with mcp_server.db_lease() as db:
+            graph_rows = json.loads(mcp_server._db_execute(
+                db, f'(query [:find ?d :where [{ident} :description ?d]])'
+            )).get("results", [])
+        con = fact_index.open_reader(fact_index.index_path_for(str(graph)))
+        try:
+            index_rows = con.execute(
+                "select value from facts_fts where entity = ?", (ident,)
+            ).fetchall()
+        finally:
+            con.close()
+        assert graph_rows, (
+            f"the finalize hook's fact never reached the graph: it gave up "
+            f"before a lease-window release it could catch (#366). hook "
+            f"stdout={out!r} stderr tail={err[-2000:]!r}"
+        )
+        assert index_rows, "the hook's fact reached the graph but not the index (#302)"
+        assert state["stage_a_end"] is not None and state["proc_exit"] is not None
+        assert state["proc_exit"] < state["stage_a_end"], (
+            f"the hook exited at {state['proc_exit']:.3f}, after Stage A ended "
+            f"at {state['stage_a_end']:.3f} -- it did not get in through a "
+            f"Stage A boundary, so this test proved nothing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ingestion_outwaits_a_hook_holding_the_graph_past_the_old_budget(
+        self, tmp_path, monkeypatch
+    ):
+        """Once a hook can land in a window's release, it can hold the graph
+        longer than the ~2.6 s _LOCK_RETRY_* budget ingestion used to
+        re-acquire with -- the LLM strategy holds its lease across a network
+        call. The next re-acquire must wait it out, not end the run
+        `status: error`. Ablation: _db_lease_async_committing_index back on
+        db_lease_async() reddens on the status."""
+        import mcp_server
+        repo, graph = self._prepare(tmp_path, monkeypatch)
+        hold = 4.0
+        proc, go, ready = self._spawn(tmp_path, graph, (
+            "mcp_server.use_hook_lease_deadline()\n"
+            "with mcp_server.db_lease():\n"
+            "    got = time.time()\n"
+            f"    time.sleep({hold})\n"
+            "print(json.dumps({'got': got, 'released': time.time()}))\n"
+            "sys.stdout.flush()\n"
+        ))
+        state = {"stage_a_end": None, "proc_exit": None}
+        try:
+            out, err = await self._ingest_with_slow_stage_a(
+                monkeypatch, repo, proc, go, ready, state)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+        assert lines, f"the holder never acquired the graph. stderr={err[-2000:]!r}"
+        held = json.loads(lines[-1])
+        assert state["stage_a_end"] is not None
+        assert held["got"] < state["stage_a_end"], (
+            "the holder acquired only after Stage A ended -- no Stage A "
+            "re-acquire had to wait on it, so this test proved nothing"
+        )
+        assert held["released"] - held["got"] >= hold
+        assert mcp_server._ingest_progress.get("status") == "complete", (
+            f"ingestion did not survive a {hold}s out-of-process hold landing "
+            f"in a window release: {mcp_server._ingest_progress!r}"
+        )
+
+
 class TestStageBYieldsTheLock:
     """#222 phase 5 item C. Stage B held ONE lease across the whole sweep.
 
@@ -31094,10 +31286,10 @@ class TestStageBYieldsTheLock:
             swept.append(1)
             return real_apply(*a, **kw)
 
-        def lease_spy():
+        def lease_spy(**kw):
             if mcp_server._ingest_progress.get("phase") == "sweeping":
                 observed.append((len(swept), _another_process_can_open(str(graph))))
-            return real_lease()
+            return real_lease(**kw)
 
         monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
         monkeypatch.setattr(mcp_server, "db_lease_async", lease_spy)
@@ -31181,10 +31373,10 @@ class TestStageBYieldsTheLock:
             counts["through"] += 1
             return out
 
-        def lease_spy():
+        def lease_spy(**kw):
             if mcp_server._ingest_progress.get("phase") == "sweeping" and not sweep_over:
                 boundaries.append(dict(counts))
-            return real_lease()
+            return real_lease(**kw)
 
         monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
         monkeypatch.setattr(mcp_server, "_forward_apply", forward_spy)
@@ -31255,10 +31447,10 @@ class TestStageBYieldsTheLock:
                 calls.append(1)
             return real_extra(*a, **kw)
 
-        def lease_spy():
+        def lease_spy(**kw):
             if in_sweep():
                 windows.append(1)
-            return real_lease()
+            return real_lease(**kw)
 
         monkeypatch.setattr(mcp_server, "_intervals_read_extra", extra_spy)
         monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
@@ -31422,10 +31614,10 @@ class TestStageBYieldsTheLock:
             swept.append(1)
             return real_apply(*a, **kw)
 
-        def lease_spy():
+        def lease_spy(**kw):
             if mcp_server._ingest_progress.get("phase") == "sweeping" and not sweep_over:
                 windows.append(1)
-            return real_lease()
+            return real_lease(**kw)
 
         monkeypatch.setattr(mcp_server, "_correction_sweep_log_summary", summary_spy)
         monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
@@ -31623,10 +31815,10 @@ class TestStageBYieldsTheLock:
             def in_sweep():
                 return mcp_server._ingest_progress.get("phase") == "sweeping" and not over
 
-            def lease_spy():
+            def lease_spy(**kw):
                 if in_sweep():
                     leases.append(1)
-                return real_lease()
+                return real_lease(**kw)
 
             async def sleep_spy(delay, *a, **kw):
                 if in_sweep() and delay == mcp_server._SWEEP_YIELD_PAUSE_SECONDS and delay > 0:
@@ -31723,9 +31915,9 @@ class TestIngestionCommitsTheIndexBeforeReleasingTheGraph:
         real_lease = mcp_server.db_lease_async
 
         @contextlib.asynccontextmanager
-        async def lease_spy():
+        async def lease_spy(**kw):
             line = self._run_ingestion_line()
-            async with real_lease() as db:
+            async with real_lease(**kw) as db:
                 try:
                     yield db
                 finally:
@@ -31859,8 +32051,8 @@ class TestIngestionCommitsTheIndexBeforeReleasingTheGraph:
             return real_rev(*a, **kw)
 
         @contextlib.asynccontextmanager
-        async def lease_spy():
-            async with real_lease() as db:
+        async def lease_spy(**kw):
+            async with real_lease(**kw) as db:
                 try:
                     yield db
                 finally:
@@ -31951,13 +32143,13 @@ class TestIngestionCommitsTheIndexBeforeReleasingTheGraph:
                 return out
 
             @contextlib.asynccontextmanager
-            async def lease_spy():
+            async def lease_spy(**kw):
                 if state["rev"] and state["paused_at"] is None:
                     state["paused_at"] = time.time()
                     go.touch()
                     await asyncio.sleep(1.0)
                     state["pause_end"] = time.time()
-                async with real_lease() as db:
+                async with real_lease(**kw) as db:
                     yield db
 
             monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)

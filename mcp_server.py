@@ -119,9 +119,50 @@ _server_ref: Optional[Server] = None
 
 # Retry parameters for acquiring the DB file lock when another process
 # (hook subprocess or background ingestion) is briefly holding it.
-# Total max wait: 0.05 + 0.10 + 0.20 + 0.40 + 0.80 = 1.55s.
+# Five attempts with 0.05/0.10/0.20/0.40 s sleeps between them. Under
+# minigraf >= 2.0 each attempt's MiniGrafDb.open itself blocks ~0.377 s
+# polling the kernel lock before failing, so the real wall-clock budget is
+# ~2.6 s, not the 0.75 s of sleeps alone (#366, measured).
 _LOCK_RETRY_MAX = 5
 _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
+
+# #366. The auto-memory hooks' acquire budget, separate from _LOCK_RETRY_*
+# for the same reason _INGEST_LOCK_RETRY_* is: those gate the MCP server's
+# synchronous per-request paths. A hook process opts in with
+# use_hook_lease_deadline(), so nothing in the server process changes.
+#
+# The _LOCK_RETRY_* schedule has DEAD GAPS: it is listening only while an
+# open() is polling, and sleeps up to 0.4 s between attempts. Ingestion's
+# lease windows release the graph for _SWEEP_YIELD_PAUSE_SECONDS (0.1 s), so a
+# release inside a gap is missed deterministically -- measured 0 of 8 landed
+# at shipped window settings (0 of 6 on the pre-#280 per-commit leases), and
+# both hooks swallow the failure, so the turn's memory write is silently
+# lost. Here the hook retries back to back until a wall-clock deadline;
+# open() already polls internally at 5-50 ms, so there is no gap for a 0.1 s
+# release to fall into. The poll sleep is only a floor against a hot spin
+# should open() ever fail fast instead of polling.
+#
+# The deadline must outlast one ingestion window (_SWEEP_YIELD_SECONDS, 2 s,
+# checked only between commits, so one slow commit stretches it -- ~0.3 s in
+# Stage A and ~0.8 s per swept commit in Stage B on this repo's full history)
+# and stay inside the hooks' own timeouts: 30 s / 60 s in
+# hooks/claude-code.json, but 5 s / 10 s in codex.toml and hermes.yaml. A
+# hook killed at its timeout while still polling holds nothing, so 5 s costs
+# at worst the write it would have lost anyway. It is paid only while
+# something else holds the graph.
+_HOOK_LOCK_DEADLINE_SECONDS = 5.0
+_HOOK_LOCK_POLL_SECONDS = 0.005
+_hook_lease_deadline: Optional[float] = None  # set by use_hook_lease_deadline()
+
+
+def use_hook_lease_deadline(seconds: float = _HOOK_LOCK_DEADLINE_SECONDS) -> None:
+    """Switch this PROCESS's non-extended lease acquires to the hook budget.
+
+    Called by hooks/finalize_hook.py and hooks/prepare_hook.py, each a
+    short-lived process of its own. Never called by the MCP server (#366).
+    """
+    global _hook_lease_deadline
+    _hook_lease_deadline = seconds
 
 # Extended retry budget for the one-time startup/manual-trigger lock
 # acquisition only (_load_ingestion_preload_state) — separate from
@@ -130,7 +171,13 @@ _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
 # This path runs on a dedicated worker thread and can
 # afford to be patient enough to survive a typical orphan-process cleanup
 # window (SIGTERM grace period before SIGKILL) instead of giving up in
-# ~1.55s and entering a permanent "error" state (#106).
+# ~2.6s and entering a permanent "error" state (#106).
+#
+# db_lease_async(extended=True) uses the same budget for every lease
+# _run_ingestion re-acquires mid-run (#366). Once hooks can land in a window's
+# release, a hook holding the graph longer than ~2.6 s -- the LLM extraction
+# strategy holds its lease across a network call -- would otherwise end the
+# run `status: error` at the next re-acquire.
 _INGEST_LOCK_RETRY_BASE = 0.05     # seconds; matches _LOCK_RETRY_BASE for consistency
 _INGEST_LOCK_RETRY_CAP = 15.0      # seconds; per-attempt sleep never exceeds this
 _INGEST_LOCK_RETRY_BUDGET = 120.0  # seconds; total time before giving up
@@ -179,8 +226,9 @@ except ValueError:
 # concurrent call_tool never blocks) but EXCLUSIVE out-of-process, and BOTH
 # auto-memory hooks (hooks/claude-code.json) are `command` hooks in separate
 # processes -- finalize_hook.py takes a lease to write each turn's facts. Their
-# retry budget is _LOCK_RETRY_MAX x _LOCK_RETRY_BASE doubling = 0.75 s total and
-# both swallow failures with `except Exception: pass`. So the whole-sweep hold
+# acquire budget is bounded (_HOOK_LOCK_DEADLINE_SECONDS since #366; ~2.6 s of
+# _LOCK_RETRY_* before it) and both swallow failures with
+# `except Exception: pass`. So the whole-sweep hold
 # did not block queries; it SILENTLY DISCARDED every auto-memory write for the
 # sweep's duration, which on a large repo is a large fraction of the ingest.
 #
@@ -189,9 +237,10 @@ except ValueError:
 # _db_lease_async_committing_index. A window released with the batched
 # index_con's SQLite write transaction still open is a lock-order inversion:
 # the hook takes the graph lock then blocks on SQLite (5 s busy timeout)
-# holding it, ingestion holds SQLite and cannot get the graph back (~2.6 s),
-# the run ends `status: error`, and the hook's index insert is swallowed --
-# fact in graph, missing from index (#302). Measured, not supposed: see
+# holding it, ingestion holds SQLite and cannot get the graph back (~2.6 s
+# then; since #366 it waits on the extended budget instead), the run ended
+# `status: error`, and the hook's index insert is swallowed -- fact in graph,
+# missing from index (#302). Measured, not supposed: see
 # CLAUDE.md, "The fact index must be COMMITTED". Every other index-writing
 # lease in _run_ingestion goes through the same wrapper since #347.
 #
@@ -202,9 +251,9 @@ except ValueError:
 # invisible to the trace's ckpt_d_seconds. A window amortises that over N
 # commits.
 #
-# _SWEEP_YIELD_SECONDS is sized against the hooks' own retry budget (0.75 s
-# total): the lock must come free often enough that a hook already retrying can
-# win it. It is the SECOND trigger, not the first -- on a large graph one
+# _SWEEP_YIELD_SECONDS is sized against the hooks' own acquire budget
+# (_HOOK_LOCK_DEADLINE_SECONDS): the lock must come free often enough that a
+# hook already retrying can win it. It is the SECOND trigger, not the first -- on a large graph one
 # window's worth of commits can take far longer than the clock bound, and
 # without it the hooks' window would be set by graph size rather than by
 # anything anyone chose.
@@ -229,16 +278,18 @@ _SWEEP_YIELD_SECONDS = float(os.environ.get("MINIGRAF_SWEEP_YIELD_SECONDS", "2.0
 # Without this the window is worthless in practice, and the reason is worth
 # stating exactly. Releasing the lease and re-acquiring it costs no awaits --
 # `window_started = ...`, `window_count = 0`, `try_acquire` -- so the graph is
-# free for MICROSECONDS. That is a free instant, not a free interval, and a
-# hook polling 5 times over its 0.75 s budget will essentially never land in
-# it. The boundary creates the right PLACE to yield; this constant is what
+# free for MICROSECONDS. That is a free instant, not a free interval, and no
+# hook -- however it polls -- can reliably land in it. The boundary creates the right PLACE to yield; this constant is what
 # makes the yield real.
 #
 # Why 0.1 s. Under minigraf 2.0.0 `open()` does not fail fast: it blocks for
 # ~375 ms, adaptively polling 5->50 ms, and returns as soon as the lock frees.
 # So a hook ALREADY blocked in open() acquires within ~5-50 ms of the lock
 # becoming free, and 100 ms clears that comfortably while costing ~5% of a 2 s
-# window. A hook that has not started yet gains nothing from any PARTICULAR
+# window. That holds only for a hook that is IN open() when the release comes:
+# the old _LOCK_RETRY_* hook schedule slept up to 0.4 s between opens and
+# missed this pause 8 of 8 times, which is why the hooks poll back to back
+# under _HOOK_LOCK_DEADLINE_SECONDS since #366. A hook that has not started yet gains nothing from any PARTICULAR
 # boundary -- it simply blocks and wins at the next one.
 #
 # Paid only between windows, never after the last one (the sweep sets
@@ -3690,7 +3741,7 @@ def db_lease(extended: bool = False):
     already-held async lease (where the count is already positive and no open
     happens). extended=True selects the long time-budgeted backoff that
     _load_ingestion_preload_state needs to survive an orphan-process cleanup
-    window (#106) instead of giving up in ~1.55s.
+    window (#106) instead of giving up in ~2.6s.
     """
     # No path resolved here: try_acquire(None) resolves self._path (falling
     # back to _get_graph_path()) itself, INSIDE its own lock, on every
@@ -3719,6 +3770,23 @@ def db_lease(extended: bool = False):
                 )
             time.sleep(min(delay, remaining))
             delay = min(delay * 2, _INGEST_LOCK_RETRY_CAP)
+    elif _hook_lease_deadline is not None:
+        # #366: back-to-back attempts to a wall-clock deadline -- no dead gap
+        # for a lease window's 0.1 s release to fall into.
+        deadline = time.monotonic() + _hook_lease_deadline
+        while True:
+            handle = _lease_manager.try_acquire()
+            if handle is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(_HOOK_LOCK_POLL_SECONDS)
+        if handle is None:
+            path = _lease_manager.path or _get_graph_path()
+            raise RuntimeError(
+                f"could not acquire a lease on {path!r} within the hook "
+                f"deadline of {_hook_lease_deadline}s: the graph file lock did "
+                f"not clear -- see the preceding [db_lease] diagnostic for who "
+                f"is still holding it"
+            )
     else:
         delay = _LOCK_RETRY_BASE
         for attempt in range(_LOCK_RETRY_MAX):
@@ -3750,13 +3818,20 @@ def db_lease(extended: bool = False):
 
 
 @contextlib.asynccontextmanager
-async def db_lease_async():
+async def db_lease_async(extended: bool = False):
     """Hold a lease, backing off with asyncio.sleep instead of time.sleep.
 
     Await this from any event-loop coroutine (call_tool, _run_ingestion). A
     blocking sleep here would freeze the single-threaded loop for the whole
     retry budget, and worse, would prevent the very coroutine holding the lock
     from ever releasing it during the wait (#99).
+
+    extended=True is _run_ingestion's mid-run budget (_INGEST_LOCK_RETRY_*):
+    a hook that won a lease window's release may hold the graph for longer
+    than the ~2.6 s default, and giving up then would end the run
+    `status: error` (#366). Otherwise, in a hook process that called
+    use_hook_lease_deadline(), attempts run back to back to that deadline, as
+    in db_lease().
     """
     # See db_lease()'s matching comment: try_acquire(None) resolves the path
     # itself, inside its own lock, on every attempt -- resolving it once here
@@ -3764,14 +3839,34 @@ async def db_lease_async():
     # window for a bind_path(new) at count 0 to silently redirect this
     # acquire to a stale path (#255 review).
     handle = None
-    delay = _LOCK_RETRY_BASE
-    for attempt in range(_LOCK_RETRY_MAX):
-        handle = _lease_manager.try_acquire()
-        if handle is not None:
-            break
-        if attempt < _LOCK_RETRY_MAX - 1:
-            await asyncio.sleep(delay)
-            delay *= 2
+    if extended or _hook_lease_deadline is not None:
+        budget = _INGEST_LOCK_RETRY_BUDGET if extended else _hook_lease_deadline
+        deadline = time.monotonic() + budget
+        delay = _INGEST_LOCK_RETRY_BASE if extended else _HOOK_LOCK_POLL_SECONDS
+        while True:
+            handle = _lease_manager.try_acquire()
+            if handle is not None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                path = _lease_manager.path or _get_graph_path()
+                raise RuntimeError(
+                    f"could not acquire a lease on {path!r} within {budget}s: "
+                    f"the graph file lock did not clear -- see the preceding "
+                    f"[db_lease] diagnostic for who is still holding it"
+                )
+            await asyncio.sleep(min(delay, remaining))
+            if extended:
+                delay = min(delay * 2, _INGEST_LOCK_RETRY_CAP)
+    else:
+        delay = _LOCK_RETRY_BASE
+        for attempt in range(_LOCK_RETRY_MAX):
+            handle = _lease_manager.try_acquire()
+            if handle is not None:
+                break
+            if attempt < _LOCK_RETRY_MAX - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
     if handle is None:
         path = _lease_manager.path or _get_graph_path()
         raise RuntimeError(
@@ -3804,9 +3899,11 @@ async def _db_lease_async_committing_index(loop, write_executor, index_con):
     (finalize_hook.py -> handle_minigraf_transact -> _transact with no
     index_con) takes the graph lock and THEN blocks on SQLite for up to
     fact_index.open_writer's 5 s busy timeout, still holding the graph lock;
-    ingestion holds SQLite and needs the graph lock back, gives up after
-    _LOCK_RETRY_MAX attempts (~2.6 s), and the run ends `status: error`. The
-    hook's index insert then fails "database is locked" and is swallowed by
+    ingestion holds SQLite and needs the graph lock back, gave up after
+    _LOCK_RETRY_MAX attempts (~2.6 s), and the run ended `status: error`
+    (since #366 it waits on db_lease_async(extended=True) instead, which
+    removes the error but not the divergence below). The hook's index insert
+    then fails "database is locked" and is swallowed by
     _index_write, so the fact is in the graph and missing from the index --
     a #302 divergence. Reproduced 2 of 2 at shipped defaults (100 commits)
     before this existed; see CLAUDE.md, "Stage B now yields its lease".
@@ -3819,7 +3916,7 @@ async def _db_lease_async_committing_index(loop, write_executor, index_con):
     Looks up db_lease_async by module global at call time, so tests that
     patch it still see every window's acquire.
     """
-    async with db_lease_async() as db:
+    async with db_lease_async(extended=True) as db:
         try:
             yield db
         finally:
@@ -3840,9 +3937,9 @@ class _LeaseWindow:
     The window holds its OWN lease; Stage A's per-commit lease then JOINS it
     at refcount 1 -> 2 and its exit is 2 -> 1, which drops nothing. The
     window releases for real only at a boundary (maybe_yield), then sleeps
-    OUTSIDE any lease so an out-of-process auto-memory hook -- which retries
-    for only ~2.6 s of wall clock and then silently discards its write --
-    can take the graph file lock. Holding one lease for all of Stage A
+    OUTSIDE any lease so an out-of-process auto-memory hook -- which polls
+    for only _HOOK_LOCK_DEADLINE_SECONDS and then silently discards its
+    write (#366) -- can take the graph file lock. Holding one lease for all of Stage A
     instead would discard every hook write for its duration (#280's own
     correction comment).
 
@@ -11029,7 +11126,7 @@ def _load_ingestion_preload_state(
 
     Takes an extended lease (db_lease(extended=True)): this runs off the event
     loop, so blocking backoff is correct here, and it can afford to wait out a
-    typical orphan-process cleanup window rather than giving up in ~1.55s and
+    typical orphan-process cleanup window rather than giving up in ~2.6s and
     entering a permanent "error" state (#106). The lease -- not a manual
     `_db = None` -- is what releases the graph file lock when this returns.
 
@@ -15740,7 +15837,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # one already covers it; see the comment left at its old
                 # call site.)
                 try:
-                    async with db_lease_async() as final_db:
+                    async with db_lease_async(extended=True) as final_db:
                         await loop.run_in_executor(write_executor, _db_checkpoint, final_db)
                 except Exception as e:
                     print(f"[_run_ingestion] final checkpoint failed: {e}", file=sys.stderr)

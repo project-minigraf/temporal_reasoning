@@ -141,7 +141,7 @@ def main(argv=None) -> int:
     real_apply = mcp_server._correction_sweep_apply
     real_summary = mcp_server._correction_sweep_log_summary
 
-    def lease_spy():
+    def lease_spy(**kw):
         # Bracketed on the sweep's real end, never on `phase` alone: `phase`
         # stays "sweeping" through the lineage fold, _ingest_tags and the
         # final checkpoint, so a phase-only filter counts 3 leases that are
@@ -151,7 +151,7 @@ def main(argv=None) -> int:
             stats["windows"] += 1
             if stats["sweep_start"] is None:
                 stats["sweep_start"] = time.monotonic()
-        return real_lease()
+        return real_lease(**kw)
 
     def apply_spy(*a, **k):
         stats["swept"] += 1

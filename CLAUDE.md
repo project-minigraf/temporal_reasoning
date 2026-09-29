@@ -650,9 +650,9 @@ decides design questions.** At count > 0 `try_acquire` joins and returns the
 same handle, so a concurrent `call_tool` never blocks. But `try_acquire` returns
 None while another PROCESS holds minigraf's lock on the graph file, and BOTH
 auto-memory hooks (`hooks/claude-code.json`) are `command` hooks in separate
-processes — `finalize_hook.py` takes a lease to write each turn's facts. The
-retry budget is `_LOCK_RETRY_MAX` x `_LOCK_RETRY_BASE` doubling = **0.75 s
-total**, and both hooks swallow failures (`except Exception: pass`). So
+processes — `finalize_hook.py` takes a lease to write each turn's facts. Their
+acquire budget is bounded — **`_HOOK_LOCK_DEADLINE_SECONDS` (5 s)** since #366,
+see below — and both hooks swallow failures (`except Exception: pass`). So
 lengthening how long ingestion holds a lease does not block queries — it
 **silently discards auto-memory writes**. Do not "just hold one lease for the
 whole run".
@@ -1469,8 +1469,8 @@ it replaced was silently discarding auto-memory writes (#222 phase 5, item
 C).** Stage B held ONE lease across its entire sweep. A lease is cheap
 in-process — at count > 0 `try_acquire` joins and returns the same handle, so
 a concurrent `call_tool` never blocks — but EXCLUSIVE out-of-process, and both
-auto-memory hooks are `command` hooks in separate processes whose retry budget
-is 0.75 s total and which swallow failures with `except Exception: pass`. So
+auto-memory hooks are `command` hooks in separate processes whose acquire
+budget is bounded and which swallow failures with `except Exception: pass`. So
 the hold did not block queries; it silently discarded every auto-memory write
 for the sweep's duration, which on a large repo is a large fraction of the
 ingest. Yielding only lets a hook's write SUCCEED because
@@ -1534,10 +1534,49 @@ at shipped settings on this branch, and the SAME schedule also landed 0 of 6
 on the pre-#280 per-commit-lease code (which offered no explicit pause at all).
 So #280 did not make hook access worse — it did not by itself fix the
 hook's coarse backoff either. That gap is pre-existing and separate from
-this window's own guarantee, and is filed as issue #366; the branch's own
+this window's own guarantee, and was filed as issue #366; the branch's own
 `TestStageAYieldsTheLock` test for the window's release interval therefore
 drives the hook with a deliberately non-shipped continuous-polling retry
 configuration instead, to isolate the window's own contract from #366's.
+
+**#366 fixed it on the hook side: the hooks poll back to back to a deadline.**
+The `_LOCK_RETRY_*` schedule had DEAD GAPS — under minigraf ≥2.0 each `open()`
+polls the kernel lock for ~0.377 s, then the schedule sleeps 0.05/0.1/0.2/0.4 s,
+so it listened only during `[0,.377] [.428,.805] [.905,1.282] [1.482,1.859]
+[2.260,2.637]` (real budget ~2.6 s, not the "1.55 s" an old comment claimed).
+A 0.1 s release inside a 0.4 s gap is missed deterministically, not unluckily.
+Both hooks now call `mcp_server.use_hook_lease_deadline()`, which switches
+THAT PROCESS's non-extended `db_lease`/`db_lease_async` to back-to-back
+attempts until `_HOOK_LOCK_DEADLINE_SECONDS` (5 s) passes; `open()`'s own
+5-50 ms internal polling leaves no gap, and `_HOOK_LOCK_POLL_SECONDS` only
+floors a hot spin should `open()` ever fail fast. The MCP server never calls
+it, so `call_tool`'s `_LOCK_RETRY_*` paths are unchanged — separate for the
+same reason `_INGEST_LOCK_RETRY_*` is. 5 s, not more, because `codex.toml` and
+`hermes.yaml` give the hooks 5 s / 10 s (`claude-code.json`: 30 s / 60 s); a
+hook killed while still polling holds nothing. Raising the shared
+`_SWEEP_YIELD_PAUSE_SECONDS` to ≥0.45 s instead was rejected: ~18% of wall at
+2 s windows in both stages, and still no guarantee.
+
+**Once hooks can land, ingestion must outwait them — the second half of the
+same fix.** A hook that wins a release can hold the graph past ~2.6 s (the LLM
+strategy holds its lease across a network call), and ingestion's next
+re-acquire used `_LOCK_RETRY_*`, so the run would end `status: error`.
+`_db_lease_async_committing_index` (every mid-run ingestion lease, both
+stages' windows included) and the final-checkpoint lease now take
+`db_lease_async(extended=True)`, the `_INGEST_LOCK_RETRY_*` 120 s budget.
+Residual, stated not fixed: `try_acquire`'s blocking `open()` runs ON the event
+loop, so each retry freezes it for ~0.377 s — pre-existing, now reachable for
+longer while a hook holds the graph.
+
+`TestHooksCatchLeaseWindowReleases` runs at SHIPPED window and retry constants.
+One test runs the real `hooks/finalize_hook.py` (via `runpy`, JSON on stdin)
+mid-Stage A and requires its fact in graph AND index, with the positive control
+that the hook process EXITED before Stage A ended. The other has a hook-mode
+process hold the graph 4 s from inside a Stage A release and requires
+`status: complete`. Ablation-proven: deleting the hook's opt-in call reddened
+the first 4 of 4; putting the committing lease back on the short budget
+reddened the second 3 of 3 (`could not acquire a lease ... after 5 attempts`).
+Both passed 8 of 8 under 2x-nproc CPU load.
 
 **A WINDOW rather than a per-commit release, because the release is not
 free.** `_DbLeaseManager.release()` at refcount 1 → 0 drops the handle, and
@@ -1620,9 +1659,8 @@ the same reason.
 
 **The pause is what makes the yield real, and without it the window is
 worthless.** Releasing the lease and re-acquiring it crosses no await, so the
-graph is free for MICROSECONDS — a free instant, not a free interval, and a
-hook polling 5 times across its 0.75 s budget would essentially never land in
-it. `_SWEEP_YIELD_PAUSE_SECONDS` (0.1) is awaited at the boundary, OUTSIDE the
+graph is free for MICROSECONDS — a free instant, not a free interval, and no
+hook, however it polls, can reliably land in it. `_SWEEP_YIELD_PAUSE_SECONDS` (0.1) is awaited at the boundary, OUTSIDE the
 lease by construction, and skipped once the sweep is done so the last window
 never pays it. 0.1 s is sized against minigraf 2.0.0's `open()`, which does
 not fail fast: it blocks ~375 ms polling 5 → 50 ms and returns as soon as the
