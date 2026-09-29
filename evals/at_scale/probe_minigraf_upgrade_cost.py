@@ -39,6 +39,11 @@ WHAT IS MEASURED, per arm (`arm` mode, one real `_run_ingestion`):
 `classify` and `verdict` are pure and unit-tested
 (tests/test_at_scale_minigraf_upgrade_probe.py).
 
+`batch --lineage-cache-ab` reuses all of this for #239 instead: ONE
+interpreter, arm A with `_LINEAGE_CACHE_ENABLED` off and arm B with it on,
+same interleaving and the same parity witnesses. Cache hits never reach
+`_db_execute`, so the point-query buckets show the saving directly.
+
 THE TWO INTERPRETERS SHOULD DIFFER ONLY IN MINIGRAF. Build twin venvs from the
 same base interpreter and diff their `pip freeze` before trusting a delta.
 `batch` refuses two interpreters reporting the same minigraf version unless
@@ -180,6 +185,10 @@ def _arm(args: argparse.Namespace) -> int:
 
     import fact_index
     import mcp_server as m
+
+    # #239: the same harness A/Bs the lineage point-query cache (batch
+    # --lineage-cache-ab). Set before anything runs; read at call time.
+    m._LINEAGE_CACHE_ENABLED = args.lineage_cache == "on"
     from evals.at_scale.commit_census import (
         collect_commit_census,
         walk_claimed_from_progress,
@@ -278,6 +287,8 @@ def _arm(args: argparse.Namespace) -> int:
         "ref": args.ref,
         "wall_s": wall,
         "graph_bytes": graph_bytes,
+        "lineage_cache": args.lineage_cache,
+        "lineage_cache_stats": dict(m._lineage_cache.stats),
         "leaf": {key: {"n": v[0], "exec_s": v[1], "wait_s": v[2]}
                  for key, v in sorted(leaf.items())},
         "named": {key: {"n": v[0], "s": v[1]} for key, v in sorted(named.items())},
@@ -456,12 +467,14 @@ def _minigraf_version(python: str) -> str:
         env=_child_env(), text=True).strip()
 
 
-def _run_arm(python: str, repo: str, sha: str, workdir: pathlib.Path) -> Dict[str, Any]:
+def _run_arm(python: str, repo: str, sha: str, workdir: pathlib.Path,
+             lineage_cache: str = "on") -> Dict[str, Any]:
     workdir.mkdir(parents=True, exist_ok=True)
     out = workdir / "result.json"
     out.unlink(missing_ok=True)
     cmd = [python, str(pathlib.Path(__file__).resolve()), "arm", "--repo", repo,
-           "--ref", sha, "--workdir", str(workdir), "--out", str(out)]
+           "--ref", sha, "--workdir", str(workdir), "--out", str(out),
+           "--lineage-cache", lineage_cache]
     with open(workdir / "console.log", "w") as log:
         proc = subprocess.Popen(cmd, env=_child_env(), stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True,
@@ -479,6 +492,16 @@ def _run_arm(python: str, repo: str, sha: str, workdir: pathlib.Path) -> Dict[st
 
 
 def _batch(args: argparse.Namespace) -> int:
+    if args.lineage_cache_ab:
+        # #239: ONE interpreter, A = cache off, B = cache on.
+        if len(args.python) != 1:
+            print("--lineage-cache-ab takes exactly one --python", file=sys.stderr)
+            return 2
+        args.python = args.python * 2
+        args.allow_same_version = True
+        caches = {"A": "off", "B": "on"}
+    else:
+        caches = {"A": "on", "B": "on"}
     if len(args.python) != 2:
         print("need exactly two --python interpreters (A then B)", file=sys.stderr)
         return 2
@@ -500,12 +523,13 @@ def _batch(args: argparse.Namespace) -> int:
             wd = root / f"{rep}-{arm}"
             t = time.strftime("%H:%M:%S")
             print(f"[{t}] rep {rep} arm {arm} ({py})", flush=True)
-            res = _run_arm(py, args.repo, sha, wd)
+            res = _run_arm(py, args.repo, sha, wd, caches[arm])
             print(f"    wall {res['wall_s']:.1f}s  minigraf {res['minigraf_version']}",
                   flush=True)
             runs.append({"rep": rep, "arm": arm, "python": py, "result": res})
     out = {
         "issue": 239,
+        "mode": "lineage-cache-ab" if args.lineage_cache_ab else "interpreter-ab",
         "repo": args.repo, "ref": args.ref, "sha": sha,
         "order": [f"{r['rep']}-{r['arm']}" for r in runs],
         "verdict": verdict(runs),
@@ -534,6 +558,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     a.add_argument("--workdir", required=True)
     a.add_argument("--out", required=True)
     a.add_argument("--keep-graph", action="store_true")
+    a.add_argument("--lineage-cache", choices=["on", "off"], default="on")
     b = sub.add_parser("batch", help="interleaved A/B over two interpreters")
     b.add_argument("--repo", required=True)
     b.add_argument("--ref", required=True)
@@ -542,6 +567,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     b.add_argument("--workroot", required=True)
     b.add_argument("--out", required=True)
     b.add_argument("--allow-same-version", action="store_true")
+    b.add_argument("--lineage-cache-ab", action="store_true",
+                   help="#239: one --python; arm A runs with the lineage "
+                        "cache off, arm B with it on")
     args = p.parse_args(argv)
     return _arm(args) if args.mode == "arm" else _batch(args)
 

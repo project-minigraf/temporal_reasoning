@@ -1942,6 +1942,74 @@ Each half was ablated separately and reddens its own tests
 keep their self-edges and stale `:static` facts and get rebuilt, per the
 standing decision.
 
+**Lineage point queries are cached for the length of an ingestion run
+(#239).** minigraf 2.0.2 (#380) cut a bound-entity point query to O(that
+attribute's own history), which leaves exactly the attributes lineage keeps
+rewriting — `:introduced-by`, `:modified-in` — expensive until minigraf#379
+(v3.0.0, excluded by our cap). `_LineageQueryCache` (mcp_server.py) caches
+`[<e> <attr> ?v]` for `:introduced-by`, `:modified-in`, `:ident` and the
+lineage marker's `:entity`, read through `_point_query_values`. Measured before
+it was built (`evals/at_scale/probe_lineage_cache_hit_rate.py`, full history):
+2.64M such queries, 653 s of exec time; write-through at whole-run scope hits
+**99.4% with zero mismatches** against the real query, where a
+never-invalidating control mismatches 482,079 times. A/B:
+`results/239-lineage-cache-ab.json` — full history at `15bcb6d`, one
+interpreter, cache off/on interleaved A B A B: **wall 2272 s → 1644 s median
+(0.72x)**, both cache-on runs faster than both cache-off runs (spread 4–5%
+per arm), point-query exec time 584 s → 2.5 s, handle drops unchanged
+(403 s → 391 s) — the explicit pre-drop checkpoint moved that work rather
+than adding to it. Parity identical across all four runs (fact_audit
+divergence 0, census clean).
+Spec: `docs/superpowers/specs/2026-09-29-lineage-point-query-cache-design.md`.
+
+Four things it rests on, each ablation-proven in `tests/test_lineage_cache.py`:
+
+  * **Write-through lives in `_transact`/`_retract`, the only graph writers in
+    the module**, so no call site maintains it by hand. A current transact adds
+    the value, a retract removes it (minigraf removes a value even when it was
+    asserted twice), and anything it cannot model — a bounded or future window,
+    a `#uuid` entity, an escaped string, a write that raised, a watched
+    attribute `_FACTS_TRIPLE_PATTERN` did not parse — drops the key. A new
+    writer that bypasses those two functions breaks the cache silently.
+  * **`_db_native_lock` is an `RLock` now**, held across a read's query AND
+    store and a write's execute AND update. A write landing between a fill's
+    query and its store would otherwise be a no-op on the uncached key and the
+    fill would store the pre-write answer.
+  * **Across handles it is kept only while no other process can have
+    written.** Per-handle scope would forfeit ~510 of the 650 s (a run opens
+    ~319 handles, #280's windows). `before_drop` checkpoints while we still
+    hold the handle and records `_graph_stamp` — the v7 header's
+    `last_checkpointed_tx_count` (bytes 24..32) plus the `.wal` size — and
+    `on_open` compares it right after the next open, clearing on any
+    difference, a missing stamp, or a header version other than 7. **The
+    stamp is taken BEFORE the drop, never after**: the drop releases the
+    kernel lock, and a foreign writer landing in that gap would be baked into
+    the stamp. It costs nothing, because minigraf's drop-time checkpoint skips
+    when nothing is pending — the work moves, it is not repeated. A foreign
+    read or bare open/close moves neither half (measured, and pinned by
+    `TestGraphStamp`), so the hooks' reads do not cost the cache.
+  * **Active only inside `_run_ingestion`** (enabled in its try, disabled in
+    the outer finally, and by `_lease_manager.reset()`), so `call_tool` and the
+    long-lived server's memory are unchanged. `_LINEAGE_CACHE_ENABLED` is the
+    kill switch — a CONSTANT, patched, never an env var.
+
+**The whole suite runs in verify mode** (`tests/conftest.py` sets
+`_LINEAGE_CACHE_VERIFY`): every hit also runs the real query and raises on a
+difference, so every ingestion test re-proves the probe's zero-mismatch result.
+`TestVerifyMode` is its positive control. Write parity with the cache on vs
+off was checked with `probe_forward_apply_write_parity.py` on reads-filtered
+recordings (hits skip their queries by design): identical on the synthetic
+corpus (428 = 428 write commands) and a 300-commit slice of this repo
+(22,146 = 22,146), with a forward-only arm as the negative control.
+
+`_point_query_values` returns values SORTED, where the old helpers returned
+the backend's order, so a hit and a miss agree and `_entity_introduced_by_query`
+picks the same value of a corrupt two-valued entity (#235) with the cache on
+or off. Residual, stated not fixed: a fill reflects the clock at fill time, so
+a fact already stored with a FUTURE `:valid-from` (a commit dated ahead of the
+clock) that becomes current mid-run stays invisible to the cache until the run
+ends. No `GRAPH_FORMAT_VERSION` bump: nothing written changes.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.

@@ -1,0 +1,298 @@
+{
+  "issue": 239,
+  "repo": ".",
+  "ref": "15bcb6dc778c6adddad32661d0e3379615300cb9",
+  "status": "complete",
+  "wall_s": 2406.4651818249986,
+  "events": 2914843,
+  "opens": 319,
+  "unparsed_writes": 0,
+  "policies": [
+    {
+      "policy": "invalidate",
+      "scope": "run",
+      "reads": 2640158,
+      "hits": 2139790,
+      "hit_rate": 0.8104780092706573,
+      "read_exec_s": 652.6156283649616,
+      "hit_exec_s": 444.3736382993811,
+      "mismatches": 0,
+      "mismatch_sample": [],
+      "by_attr": {
+        ":entity": {
+          "reads": 1209074,
+          "hits": 1196247,
+          "read_s": 115.46181976293155,
+          "hit_s": 114.36138693116663
+        },
+        ":ident": {
+          "reads": 299573,
+          "hits": 290230,
+          "read_s": 25.867722256851266,
+          "hit_s": 25.051547407958424
+        },
+        ":introduced-by": {
+          "reads": 834806,
+          "hits": 590656,
+          "read_s": 331.23264522850513,
+          "hit_s": 280.1651631332934
+        },
+        ":modified-in": {
+          "reads": 296705,
+          "hits": 62657,
+          "read_s": 180.05344111667364,
+          "hit_s": 24.79554082696268
+        }
+      }
+    },
+    {
+      "policy": "invalidate",
+      "scope": "handle",
+      "reads": 2640158,
+      "hits": 1042270,
+      "hit_rate": 0.39477561570178754,
+      "read_exec_s": 652.6156283649616,
+      "hit_exec_s": 124.76217742092558,
+      "mismatches": 0,
+      "mismatch_sample": [],
+      "by_attr": {
+        ":entity": {
+          "reads": 1209074,
+          "hits": 691074,
+          "read_s": 115.46181976293155,
+          "hit_s": 61.82505838217912
+        },
+        ":ident": {
+          "reads": 299573,
+          "hits": 92217,
+          "read_s": 25.867722256851266,
+          "hit_s": 7.522270275556366
+        },
+        ":introduced-by": {
+          "reads": 834806,
+          "hits": 258214,
+          "read_s": 331.23264522850513,
+          "hit_s": 55.26127866721072
+        },
+        ":modified-in": {
+          "reads": 296705,
+          "hits": 765,
+          "read_s": 180.05344111667364,
+          "hit_s": 0.15357009597937576
+        }
+      }
+    },
+    {
+      "policy": "write_through",
+      "scope": "run",
+      "reads": 2640158,
+      "hits": 2623066,
+      "hit_rate": 0.9935261450261689,
+      "read_exec_s": 652.6156283649616,
+      "hit_exec_s": 650.4307416228548,
+      "mismatches": 0,
+      "mismatch_sample": [],
+      "by_attr": {
+        ":entity": {
+          "reads": 1209074,
+          "hits": 1204400,
+          "read_s": 115.46181976293155,
+          "hit_s": 115.1299001929001
+        },
+        ":ident": {
+          "reads": 299573,
+          "hits": 295319,
+          "read_s": 25.867722256851266,
+          "hit_s": 25.52919689049304
+        },
+        ":introduced-by": {
+          "reads": 834806,
+          "hits": 830551,
+          "read_s": 331.23264522850513,
+          "hit_s": 330.93614852691826
+        },
+        ":modified-in": {
+          "reads": 296705,
+          "hits": 292796,
+          "read_s": 180.05344111667364,
+          "hit_s": 178.83549601254344
+        }
+      }
+    },
+    {
+      "policy": "write_through",
+      "scope": "handle",
+      "reads": 2640158,
+      "hits": 1123249,
+      "hit_rate": 0.42544764366375043,
+      "read_exec_s": 652.6156283649616,
+      "hit_exec_s": 140.21464572091645,
+      "mismatches": 0,
+      "mismatch_sample": [],
+      "by_attr": {
+        ":entity": {
+          "reads": 1209074,
+          "hits": 693013,
+          "read_s": 115.46181976293155,
+          "hit_s": 62.02189305833599
+        },
+        ":ident": {
+          "reads": 299573,
+          "hits": 92493,
+          "read_s": 25.867722256851266,
+          "hit_s": 7.5479829506220995
+        },
+        ":introduced-by": {
+          "reads": 834806,
+          "hits": 333006,
+          "read_s": 331.23264522850513,
+          "hit_s": 69.4192220448167
+        },
+        ":modified-in": {
+          "reads": 296705,
+          "hits": 4737,
+          "read_s": 180.05344111667364,
+          "hit_s": 1.2255476671416545
+        }
+      }
+    },
+    {
+      "policy": "never_invalidate",
+      "scope": "run",
+      "reads": 2640158,
+      "hits": 2623067,
+      "hit_rate": 0.9935265237913792,
+      "read_exec_s": 652.6156283649616,
+      "hit_exec_s": 650.4308539478516,
+      "mismatches": 482079,
+      "mismatch_sample": [
+        {
+          "key": [
+            ":module/mcp_server-py",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":module/mcp_server-py"
+          ]
+        },
+        {
+          "key": [
+            ":function/mcp_server-py--_build_parser",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":function/mcp_server-py--_build_parser"
+          ]
+        },
+        {
+          "key": [
+            ":function/mcp_server-py--_get_parser",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":function/mcp_server-py--_get_parser"
+          ]
+        },
+        {
+          "key": [
+            ":function/mcp_server-py--_thread_parser",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":function/mcp_server-py--_thread_parser"
+          ]
+        },
+        {
+          "key": [
+            ":function/mcp_server-py--_rust_use_root",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":function/mcp_server-py--_rust_use_root"
+          ]
+        },
+        {
+          "key": [
+            ":function/mcp_server-py--leftmost_ident",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":function/mcp_server-py--leftmost_ident"
+          ]
+        },
+        {
+          "key": [
+            ":function/mcp_server-py--root_from_path",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":function/mcp_server-py--root_from_path"
+          ]
+        },
+        {
+          "key": [
+            ":function/mcp_server-py--_c_include_name",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":function/mcp_server-py--_c_include_name"
+          ]
+        },
+        {
+          "key": [
+            ":function/mcp_server-py--_csharp_using_name",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":function/mcp_server-py--_csharp_using_name"
+          ]
+        },
+        {
+          "key": [
+            ":function/mcp_server-py--_ruby_require_name",
+            ":ident"
+          ],
+          "cached": [],
+          "actual": [
+            ":function/mcp_server-py--_ruby_require_name"
+          ]
+        }
+      ],
+      "by_attr": {
+        ":entity": {
+          "reads": 1209074,
+          "hits": 1204400,
+          "read_s": 115.46181976293155,
+          "hit_s": 115.1299001929001
+        },
+        ":ident": {
+          "reads": 299573,
+          "hits": 295319,
+          "read_s": 25.867722256851266,
+          "hit_s": 25.52919689049304
+        },
+        ":introduced-by": {
+          "reads": 834806,
+          "hits": 830552,
+          "read_s": 331.23264522850513,
+          "hit_s": 330.936260851915
+        },
+        ":modified-in": {
+          "reads": 296705,
+          "hits": 292796,
+          "read_s": 180.05344111667364,
+          "hit_s": 178.83549601254344
+        }
+      }
+    }
+  ]
+}
