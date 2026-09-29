@@ -184,8 +184,11 @@ def install_wal_counters() -> None:
     the transact that crosses wal_checkpoint_threshold (1000 entries,
     one per transact/retract). So a write after which the WAL SHRANK was
     an auto-checkpoint. Positive control: explicit checkpoints are counted
-    the same way (explicit_ckpt_wal_shrank), and the suppressed-duty run
-    in benchmark.md shows the detector firing."""
+    the same way (explicit_ckpt_wal_shrank). Measured directly: forcing
+    MINIGRAF_INGEST_CHECKPOINT_DUTY near zero and disabling the Stage B
+    window yield (MINIGRAF_SWEEP_YIELD_COMMITS/_SECONDS huge) produced
+    converging.auto_ckpt == 3 of 3940 writes on a 250-commit slice, so the
+    detector is not blind."""
     orig_exec, orig_ckpt = m._db_execute, m._db_checkpoint
 
     def db_execute(db, datalog):
@@ -252,10 +255,24 @@ def summarize(wall: float) -> dict:
         with open(TRACE_PATH) as f:
             records = [json.loads(line) for line in f if line.strip()]
 
+    # Snapshot the live counters under the same lock _bump() uses, and return
+    # only the snapshots below -- never the module-level opens/drops/per_phase
+    # objects themselves. main() takes further leases (the post-run audit,
+    # _count_commit_entities) AFTER calling this function, and those leases
+    # run through the very wrappers installed by install_counters()/
+    # install_wal_counters(), so the live objects keep growing after this
+    # call returns. Returning them by reference would make the persisted
+    # JSON's opens/drops/per_phase silently drift from the handle_opens/
+    # handle_drops counts computed right here and from what report() prints.
+    with _lock:
+        opens_snapshot = list(opens)
+        drops_snapshot = list(drops)
+        per_phase_snapshot = {p: dict(s) for p, s in per_phase.items()}
+
     n = len(records)
     apply_total = sum(r["apply_s"] for r in records)
     ckpt_total = sum(r["ckpt_d_seconds"] for r in records)
-    durations = [d for _, d in drops]
+    durations = [d for _, d in drops_snapshot]
     drop_total = sum(durations)
 
     thirds = {}
@@ -273,9 +290,9 @@ def summarize(wall: float) -> dict:
         "issue": 260,
         "wall_s": wall,
         "commits_traced": n,
-        "handle_opens": len(opens),
-        "handle_drops": len(drops),
-        "opens_per_commit": len(opens) / n if n else None,
+        "handle_opens": len(opens_snapshot),
+        "handle_drops": len(drops_snapshot),
+        "opens_per_commit": len(opens_snapshot) / n if n else None,
         "apply_total_s": apply_total,
         "apply_share_of_wall": apply_total / wall if wall else None,
         "explicit_ckpt_total_s": ckpt_total,
@@ -284,11 +301,11 @@ def summarize(wall: float) -> dict:
         "drop_share_of_wall": drop_total / wall if wall else None,
         "drop_share_of_apply": drop_total / apply_total if apply_total else None,
         "drop_thirds": thirds,
-        "drops": drops,
-        "opens": opens,
-        "per_phase": per_phase,
+        "drops": drops_snapshot,
+        "opens": opens_snapshot,
+        "per_phase": per_phase_snapshot,
         "code_dir": CODE_DIR,
-        "phase_wall_s": phase_wall_s,
+        "phase_wall_s": dict(phase_wall_s),
     }
 
 
@@ -340,10 +357,15 @@ def main() -> int:
 
     report(result)
 
-    # The audit takes its own lease (through handle_minigraf_query) AFTER the
-    # summary above is already built, so its reads never land in opens/drops
-    # or per_phase -- by then _ingest_progress["phase"] is back to None
-    # ("other"), same as any other post-run query.
+    # The audit takes its own lease (through handle_minigraf_query), and
+    # _count_commit_entities below takes another, both AFTER `result` is
+    # already built. Those leases run through the SAME install_counters()/
+    # install_wal_counters() wrappers as the ingestion run -- by then
+    # _ingest_progress["phase"] is back to None ("other") -- so they keep
+    # appending to the live module-level opens/drops/per_phase objects. That
+    # is harmless only because summarize() returned snapshots of those
+    # objects rather than the objects themselves; `result` does not observe
+    # this further growth.
     from evals.at_scale.fact_audit import audit_graph_against_index
     audit = audit_graph_against_index(
         os.environ["MINIGRAF_INDEX_PATH"],
