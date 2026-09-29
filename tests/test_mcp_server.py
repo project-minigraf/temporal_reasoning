@@ -30840,7 +30840,7 @@ class TestStageAYieldsTheLock:
         drives the hook with a finer, deliberately non-shipped retry
         configuration (continuous polling, no inter-attempt sleep) so it can
         isolate and pin the window's own guarantee without being gated by
-        that separate defect.
+        that separate defect, filed as issue #366.
         """
         import fact_index
         import ingest_progress
@@ -30858,7 +30858,8 @@ class TestStageAYieldsTheLock:
             # ~0.377 s open-polls and can miss a 0.1 s release entirely --
             # measured: 8/8 miss at shipped settings, and 0/6 on the
             # pre-#280 per-commit-lease code too. That is a pre-existing
-            # hook-side gap, tracked separately, not a #280 regression. This
+            # hook-side gap, tracked separately as issue #366, not a #280
+            # regression. This
             # test pins the WINDOW's side of the contract instead: with the
             # hook polling continuously (no inter-attempt sleep, more
             # attempts than it could ever need), it must catch a release
