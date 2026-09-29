@@ -1,6 +1,6 @@
 # Lineage point-query cache (#239) — design
 
-Status: DRAFT, awaiting review. Branch `239-lineage-cache` (from master `15bcb6d`).
+Status: APPROVED 2026-09-29 and implemented, with one amendment (stamp timing, below). Branch `239-lineage-cache` (from master `15bcb6d`).
 
 ## Problem
 
@@ -56,8 +56,21 @@ Measured with minigraf 2.0.2 (scratch experiments, reproduced in the tests):
 * Our own drop checkpoints, so right after it the WAL is absent.
 
 So **stamp = (format version @4..8, tx count @24..32, WAL size or absent)**,
-recorded right after our 1 -> 0 drop and compared right after the next
-0 -> 1 open (while we hold the kernel lock, so nobody can write in between).
+recorded at our 1 -> 0 drop and compared right after the next 0 -> 1 open
+(while we hold the kernel lock, so nobody can write in between).
+
+**Amendment (found during implementation): the stamp is taken BEFORE the
+drop, after an explicit checkpoint, not after the drop.** Dropping the handle
+releases the kernel lock, so a stamp read after it races a foreign process
+that opens, writes and checkpoints in the gap — its write would be baked into
+the stamp we later compare against, and the cache would survive it. So
+`before_drop` checkpoints while we still hold the handle and reads the stamp
+then. It costs nothing extra: minigraf's `Drop for Inner` checkpoint skips
+when `wal_entry_count == 0 && !pfs.is_dirty()` (minigraf `src/db.rs`), so the
+work is moved, not repeated. The header count is `max(tx_count)` over stored
+facts, written at checkpoint time — which is why predicting our own expected
+count instead was rejected: a burned tx count (a failed or empty transact)
+makes the prediction wrong in a direction a foreign write could cancel.
 Equal: keep the cache. Different, unreadable, or a format version other than
 7: clear it. This fails safe — every doubt costs one cold refill, never a
 wrong answer — and it is exact, unlike mtime (coarse-grained timestamps
