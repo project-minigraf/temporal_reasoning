@@ -32,6 +32,9 @@ def main() -> None:
     if prompt:
         try:
             import mcp_server
+            # The backfill lease below polls to a deadline rather than on the
+            # server's gapped retry schedule, as in finalize_hook.py (#366).
+            mcp_server.use_hook_lease_deadline()
             # No explicit open: handle_memory_prepare_turn answers from the
             # sqlite fact index -- memory facts and the navigation nudge's
             # "is this graph ingested?" gate alike (#353) -- and never opens

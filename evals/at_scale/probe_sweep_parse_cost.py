@@ -102,11 +102,11 @@ def main(argv=None) -> int:
     real_lease = mcp_server.db_lease_async
     real_summary = mcp_server._correction_sweep_log_summary
 
-    def lease_spy():
+    def lease_spy(**kw):
         if (mcp_server._ingest_progress.get("phase") == "sweeping"
                 and marks["sweep_start"] is None):
             marks["sweep_start"] = time.monotonic()
-        return real_lease()
+        return real_lease(**kw)
 
     def summary_spy(skipped):
         if marks["sweep_end"] is None:
