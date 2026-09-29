@@ -197,8 +197,16 @@ class TestVerifyMode:
 
 class TestAcrossHandles:
     def test_the_cache_survives_our_own_drop_and_reopen(self, graph):
-        _write("[[:function/f :introduced-by :commit/c1]]")
-        assert _read(":function/f") == [":commit/c1"]
+        """Written and read in ONE lease, so the drop has a pending WAL entry.
+        That is what makes the explicit pre-drop checkpoint observable: a
+        stamp taken with the entry still in the WAL no longer matches the
+        header the drop-time checkpoint then writes, and the cache would be
+        thrown away on every window boundary (a performance loss, not a
+        correctness one -- the correctness half, no foreign write between
+        checkpoint and stamp, holds by construction and cannot be timed)."""
+        with m.db_lease() as db:
+            m._transact(db, "[[:function/f :introduced-by :commit/c1]]", _TS)
+            assert m._point_query_values(db, ":function/f", ":introduced-by") == [":commit/c1"]
         assert m._lease_manager.lease_count == 0  # the handle really dropped
         before = _stats()
         assert _read(":function/f") == [":commit/c1"]
