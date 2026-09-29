@@ -22,6 +22,7 @@ import random
 import socket
 import re
 import signal
+import struct
 import subprocess as _subprocess
 import sys
 import threading
@@ -76,7 +77,11 @@ _user_rules: List[str] = []
 # It serializes calls into ONE handle. It does not, and cannot, stop a second
 # handle being opened on the same file — those are distinct Rust objects with
 # distinct internal mutexes. See the single-handle invariant below.
-_db_native_lock = threading.Lock()
+#
+# Reentrant since #239: the lineage point-query cache holds it across a read's
+# query-and-store and across a write's execute-and-update, and each of those
+# calls _db_execute, which takes it again. See _LineageQueryCache.
+_db_native_lock = threading.RLock()
 
 # THE SINGLE-HANDLE INVARIANT (#255, #253, #251, project-minigraf/minigraf#304)
 #
@@ -3553,6 +3558,8 @@ class _DbLeaseManager:
                     f"cannot bind {path!r}: {self._count} lease(s) outstanding "
                     f"on {self._path!r}"
                 )
+            if path != self._path:
+                _lineage_cache.clear()  # entries describe the old graph (#239)
             self._path = path
 
     def try_acquire(self, path: Optional[str] = None) -> Optional[MiniGrafDb]:
@@ -3622,6 +3629,9 @@ class _DbLeaseManager:
             self._path = path
             self._count = 1
             self._prev_ref = None
+            # Still under self._lock with the kernel lock held: nobody can
+            # write between this check and the first cached read (#239).
+            _lineage_cache.on_open(path)
             return handle
 
     def release(self) -> None:
@@ -3633,6 +3643,12 @@ class _DbLeaseManager:
                 )
             self._count -= 1
             if self._count == 0:
+                if self._handle is not None:
+                    # Checkpoint and stamp WHILE the handle -- and so the
+                    # kernel lock -- is still ours; see
+                    # _LineageQueryCache.before_drop (#239). A no-op unless
+                    # an ingestion run has the cache active.
+                    _lineage_cache.before_drop(self._handle, self._path)
                 handle, self._handle = self._handle, None
                 if handle is not None:
                     # The detector's input. If this weakref is still live at the
@@ -3692,6 +3708,7 @@ class _DbLeaseManager:
             self._handle = None
             self._count = 0
             self._prev_ref = None
+            _lineage_cache.disable()
             # The path must clear too, or a graph path set by one test leaks
             # into the next one that never binds its own -- nothing else
             # resets this manager between tests.
@@ -4088,6 +4105,260 @@ def _db_checkpoint(db: Any) -> None:
     """Checkpoint db, serialized via _db_native_lock. See _db_execute."""
     with _db_native_lock:
         db.checkpoint()
+
+
+# --------------------------------------------------------------------------
+# #239: in-run cache of lineage point queries
+# --------------------------------------------------------------------------
+#
+# minigraf 2.0.2 (#380) cut a bound-entity point query to O(that attribute's
+# own history), and the attributes lineage reconciliation keeps rewriting --
+# :introduced-by, :modified-in -- are exactly the ones that keep their cost
+# (the structural fix, minigraf#379, is v3.0.0 only). Measured before building
+# this (evals/at_scale/probe_lineage_cache_hit_rate.py, full history of this
+# repo): 2.64M point queries, 653 s of exec time; a write-through cache kept
+# for the whole run answers 99.4% of them with ZERO mismatches against the
+# real query, where a never-invalidating control mismatches 482,079 times.
+# Design: docs/superpowers/specs/2026-09-29-lineage-point-query-cache-design.md.
+#
+# Kill switch and the test-suite oracle. Both are read at CALL time, so a
+# test patches the constant (there is deliberately no environment variable:
+# conftest's MINIGRAF_* scrub could not reach a module-level read anyway).
+_LINEAGE_CACHE_ENABLED = True
+# When True every HIT also runs the real query and raises on a difference.
+# tests/conftest.py switches it on for the whole suite, which makes every
+# ingestion test re-prove the probe's zero-mismatch result.
+_LINEAGE_CACHE_VERIFY = False
+
+# The query each cached attribute is read with. The variable names are the
+# ones the call sites used before #239, kept so the datalog text -- which the
+# at-scale probes bucket and the write-parity oracle compares -- is unchanged.
+_LINEAGE_CACHE_QUERY_VAR = {
+    ":introduced-by": "?c",
+    ":modified-in": "?c",
+    ":ident": "?i",
+    ":entity": "?e",  # lineage-marker companion entities (_lineage_is_provisional)
+}
+
+# minigraf's v7 file header (FileHeader, minigraf src/storage/mod.rs): magic
+# "MGRF" at 0..4, format version at 4..8, last_checkpointed_tx_count at
+# 24..32. A patchable constant so a test can play an unrecognised version.
+_GRAPH_HEADER_FORMAT_VERSION = 7
+_GRAPH_HEADER_MAGIC = b"MGRF"
+
+_QUOTED_STRING_PATTERN = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def _graph_stamp(path: str) -> Optional[Tuple[int, Optional[int]]]:
+    """(last_checkpointed_tx_count, WAL size or None) for the graph file, or
+    None when the header is missing, unreadable, or not a v7 header.
+
+    The cross-process half of the lineage cache's validity (#239). Measured on
+    minigraf 2.0.2 and pinned by tests/test_lineage_cache.py: the count
+    advances on every CHECKPOINTED transact or retract, a foreign process's
+    included; a foreign process killed before its drop leaves a non-empty
+    `<graph>.wal` instead; a foreign open/close or read changes neither.
+    """
+    try:
+        with open(path, "rb") as f:
+            header = f.read(32)
+    except OSError:
+        return None
+    if len(header) < 32 or header[:4] != _GRAPH_HEADER_MAGIC:
+        return None
+    version, = struct.unpack_from("<I", header, 4)
+    if version != _GRAPH_HEADER_FORMAT_VERSION:
+        return None
+    tx_count, = struct.unpack_from("<Q", header, 24)
+    wal = path + ".wal"
+    try:
+        wal_size: Optional[int] = os.path.getsize(wal)
+    except OSError:
+        wal_size = None
+    return tx_count, wal_size
+
+
+def _parse_valid_from(ts: str) -> Optional[float]:
+    try:
+        d = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        return None  # how minigraf reads a naive stamp is not modelled here
+    return d.timestamp()
+
+
+class _LineageQueryCache:
+    """Current-time point queries `[<entity> <attr> ?v]` on the four
+    _LINEAGE_CACHE_QUERY_VAR attributes, kept for a whole ingestion run (#239).
+
+    WRITE-THROUGH, and complete because _transact/_retract are the only graph
+    writers in this module: a current transact (no :valid-to, :valid-from not
+    in the future) adds its value to a cached key, a retract removes it
+    (measured: minigraf's retract removes a value even when it was asserted
+    twice), and anything the cache cannot model -- a bounded or future window,
+    a #uuid entity, an escaped string, a value that is neither keyword nor
+    string, a write that raised -- drops the key instead. Dropping only ever
+    costs one refill.
+
+    ATOMIC WITH WRITES. Every operation runs under _db_native_lock, and a read
+    holds it across its query AND its store, as a write holds it across its
+    execute AND its update. Without that, a write landing between a fill's
+    query and its store is a no-op on the not-yet-cached key, and the fill
+    then stores the pre-write result.
+
+    ACROSS HANDLES. Between our 1 -> 0 drop and the next 0 -> 1 open another
+    PROCESS may have written (an auto-memory hook, #366). before_drop()
+    checkpoints explicitly while we still hold the handle -- so minigraf's
+    drop-time checkpoint, which skips when nothing is pending, has nothing
+    left to do and no write can land between the checkpoint and the stamp --
+    then records _graph_stamp(). on_open() compares, and clears on any
+    difference, or when either stamp is missing. Taking the stamp AFTER the
+    drop instead would race a foreign writer that grabs the lock in between.
+
+    ACTIVE ONLY DURING INGESTION (_run_ingestion enables and disables it), so
+    call_tool behaviour and the long-lived server's memory are unchanged.
+
+    Residual, stated not fixed: a fill reflects the clock at fill time, so a
+    fact already in the graph with a FUTURE :valid-from (a commit dated ahead
+    of the clock) that becomes visible during the run is invisible to the
+    cache until the run ends.
+    """
+
+    def __init__(self) -> None:
+        self.active = False
+        self.entries: Dict[Tuple[str, str], set] = {}
+        self._stamp: Optional[Tuple[int, Optional[int]]] = None
+        self.stats = {"hits": 0, "misses": 0, "clears": 0}
+
+    def enable(self) -> None:
+        with _db_native_lock:
+            self.entries.clear()
+            self._stamp = None
+            self.active = _LINEAGE_CACHE_ENABLED
+
+    def disable(self) -> None:
+        with _db_native_lock:
+            self.active = False
+            self.entries.clear()
+            self._stamp = None
+
+    def clear(self) -> None:
+        with _db_native_lock:
+            if self.entries:
+                self.stats["clears"] += 1
+            self.entries.clear()
+            self._stamp = None
+
+    def on_open(self, path: str) -> None:
+        with _db_native_lock:
+            if not self.active:
+                return
+            stamp = _graph_stamp(path)
+            if stamp is None or self._stamp is None or stamp != self._stamp:
+                self.clear()
+            self._stamp = None
+
+    def before_drop(self, handle: Any, path: str) -> None:
+        with _db_native_lock:
+            if not self.active:
+                return
+            try:
+                _db_checkpoint(handle)
+                stamp = _graph_stamp(path)
+            except Exception:
+                stamp = None
+            if stamp is None:
+                self.clear()
+            self._stamp = stamp
+
+    def apply_write(self, kind: str, facts: str, valid_from: Optional[str],
+                    valid_to: Optional[str], failed: bool) -> None:
+        """Maintain the cache for one executed (or failed) write. Caller holds
+        _db_native_lock across the write and this call."""
+        if not self.active or not self.entries:
+            return
+        unquoted = _QUOTED_STRING_PATTERN.sub('""', facts)
+        mentioned = sum(unquoted.count(f" {a} ") for a in _LINEAGE_CACHE_QUERY_VAR)
+        if not mentioned:
+            return
+        current = False
+        if kind == "transact" and valid_to is None and valid_from is not None:
+            vf = _parse_valid_from(valid_from)
+            current = vf is not None and vf <= time.time()
+        seen = 0
+        for match in _FACTS_TRIPLE_PATTERN.finditer(facts):
+            e_raw, attr, v_raw = match.groups()
+            if attr not in _LINEAGE_CACHE_QUERY_VAR:
+                continue
+            seen += 1
+            if not e_raw.startswith(":"):
+                for key in [k for k in self.entries if k[1] == attr]:
+                    del self.entries[key]
+                continue
+            key = (e_raw, attr)
+            values = self.entries.get(key)
+            if values is None:
+                continue
+            if v_raw.startswith(":"):
+                value: Optional[str] = v_raw
+            elif v_raw.startswith('"') and "\\" not in v_raw:
+                value = v_raw[1:-1]
+            else:
+                value = None
+            if failed or value is None:
+                del self.entries[key]
+            elif kind == "retract":
+                values.discard(value)
+            elif current:
+                values.add(value)
+            else:
+                del self.entries[key]
+        if seen < mentioned:
+            # A watched attribute the triple pattern did not parse: nothing
+            # can say which key it touched.
+            self.clear()
+
+
+_lineage_cache = _LineageQueryCache()
+
+
+def _point_query_values(db: Any, entity: str, attr: str) -> List[Any]:
+    """Every current value of `[entity attr ?v]`, sorted -- through the
+    lineage cache for a keyword entity on a cached attribute (#239).
+
+    Sorted rather than in the backend's order so a hit and a miss return the
+    same list: callers that pick one value of a corrupt multi-valued entity
+    (#235) then pick the same one with the cache on or off.
+    """
+    var = _LINEAGE_CACHE_QUERY_VAR.get(attr, "?v")
+    datalog = f"(query [:find {var} :where [{entity} {attr} {var}]])"
+
+    def query() -> set:
+        raw = _db_execute(db, datalog)
+        return {row[0] for row in json.loads(raw).get("results", [])}
+
+    cache = _lineage_cache
+    if not (cache.active and attr in _LINEAGE_CACHE_QUERY_VAR and entity.startswith(":")):
+        return sorted(query(), key=str)
+    key = (entity, attr)
+    with _db_native_lock:
+        cached = cache.entries.get(key)
+        if cached is not None:
+            cache.stats["hits"] += 1
+            if _LINEAGE_CACHE_VERIFY:
+                real = query()
+                if real != cached:
+                    raise AssertionError(
+                        f"lineage cache served {sorted(cached, key=str)} for {key}; "
+                        f"the graph holds {sorted(real, key=str)}"
+                    )
+            return sorted(cached, key=str)
+        cache.stats["misses"] += 1
+        values = query()
+        if cache.active:
+            cache.entries[key] = set(values)
+        return sorted(values, key=str)
 
 
 _ingest_checkpoint_policy: Optional["_CheckpointPolicy"] = None
@@ -4739,7 +5010,14 @@ def _transact(
     opts = f':valid-from "{valid_from}"'
     if valid_to is not None:
         opts += f' :valid-to "{valid_to}"'
-    raw = _db_execute(db, f"(transact {{{opts}}} {datalog_facts})")
+    # One critical section with the lineage cache's write-through (#239).
+    with _db_native_lock:
+        try:
+            raw = _db_execute(db, f"(transact {{{opts}}} {datalog_facts})")
+        except BaseException:
+            _lineage_cache.apply_write("transact", datalog_facts, valid_from, valid_to, failed=True)
+            raise
+        _lineage_cache.apply_write("transact", datalog_facts, valid_from, valid_to, failed=False)
     triples_3 = index_triples if index_triples is not None else _resolved_facts_triples(datalog_facts, db)
     triples_5 = [(e, a, v, valid_from, valid_to) for e, a, v in triples_3]
     _index_write("insert", triples_5, index_con=index_con)
@@ -4762,7 +5040,14 @@ def _retract(
     None, None for the window here unconditionally, since a retract only
     ever means "remove the live assertion."
     """
-    raw = _db_execute(db, f"(retract {datalog_facts})")
+    # One critical section with the lineage cache's write-through (#239).
+    with _db_native_lock:
+        try:
+            raw = _db_execute(db, f"(retract {datalog_facts})")
+        except BaseException:
+            _lineage_cache.apply_write("retract", datalog_facts, None, None, failed=True)
+            raise
+        _lineage_cache.apply_write("retract", datalog_facts, None, None, failed=False)
     triples_3 = index_triples if index_triples is not None else _resolved_facts_triples(datalog_facts, db)
     triples_5 = [(e, a, v, None, None) for e, a, v in triples_3]
     _index_write("delete", triples_5, index_con=index_con)
@@ -8163,8 +8448,7 @@ def _lineage_is_provisional(db: Any, entity_ident: str) -> bool:
     """True iff a :type/lineage-marker companion entity currently exists for
     entity_ident."""
     ident = _lineage_marker_ident(entity_ident)
-    raw = _db_execute(db, f"(query [:find ?e :where [{ident} :entity ?e]])")
-    return bool(json.loads(raw).get("results", []))
+    return bool(_point_query_values(db, ident, ":entity"))
 
 
 _LINEAGE_CONFIRMED_THROUGH_IDENT = ":ingestion/lineage-confirmed-through"
@@ -8350,21 +8634,19 @@ def _entity_ident_is_live(db: Any, entity_ident: str) -> bool:
     Current-time query by design -- an entity live in a CLOSED window is
     exactly the resurrection case this must answer False for.
     """
-    raw = _db_execute(db, f"(query [:find ?i :where [{entity_ident} :ident ?i]])")
-    return bool(json.loads(raw).get("results", []))
+    return bool(_point_query_values(db, entity_ident, ":ident"))
 
 
 def _entity_introduced_by_values_query(db: Any, entity_ident: str) -> List[str]:
-    """Every live :introduced-by value for entity_ident, in the backend's
-    unspecified order; [] if it has none.
+    """Every live :introduced-by value for entity_ident, sorted (so the
+    lineage cache's hits and misses agree, #239); [] if it has none.
 
     A list rather than a single value because an entity CAN hold more than
     one (#235): the forward walk used to mint a second alongside the reverse
     stream's provisional guess. _correction_sweep_apply's repair path needs
     to see all of them to collapse them.
     """
-    raw = _db_execute(db, f"(query [:find ?c :where [{entity_ident} :introduced-by ?c]])")
-    return [row[0] for row in json.loads(raw).get("results", [])]
+    return _point_query_values(db, entity_ident, ":introduced-by")
 
 
 # Max two-value :introduced-by warnings _entity_introduced_by_query writes to
@@ -13956,10 +14238,7 @@ def _correction_sweep_apply(
                 _transact(db, "[" + " ".join(other) + "]", commit_ts_iso, index_con=index_con)
                 for triple in contains:  # one per call: minigraf#287
                     _transact(db, "[" + triple + "]", commit_ts_iso, index_con=index_con)
-                raw_mod = _db_execute(
-                    db, f"(query [:find ?c :where [{ident} :modified-in ?c]])"
-                )
-                if [commit_ident] in json.loads(raw_mod).get("results", []):
+                if commit_ident in _point_query_values(db, ident, ":modified-in"):
                     _retract(db, f"[[{ident} :modified-in {commit_ident}]]", index_con=index_con)
                 continue
 
@@ -13992,8 +14271,7 @@ def _correction_sweep_apply(
                     (only_value,) = introduced_by_values
                     if only_value == commit_ident:
                         continue  # self-introduction guard: no self-:modified-in
-                    raw2 = _db_execute(db, f"(query [:find ?c :where [{ident} :modified-in ?c]])")
-                    modified_in_values = {row[0] for row in json.loads(raw2).get("results", [])}
+                    modified_in_values = set(_point_query_values(db, ident, ":modified-in"))
                     already_has_modified_in = commit_ident in modified_in_values
                     if ident in unchanged_idents:
                         if already_has_modified_in:
@@ -14583,6 +14861,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # existed and never checkpointed", which is the whole content of an
         # all-zeros summary.
         _ingest_checkpoint_policy = _CheckpointPolicy(_checkpoint_duty_from_env())
+        # #239: lineage point queries are cached for this run only. Inside
+        # the try, so the outer finally's disable() covers every exit path.
+        _lineage_cache.enable()
         # Enumerated BEFORE the preload (#238), which needs the positions to
         # bound its queries. Above the DB open too, not merely above the
         # lease release, so the graph file lock is held for no longer than
@@ -15947,6 +16228,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         if _ingest_checkpoint_policy is not None:
             _ingest_progress["checkpoint_summary"] = _ingest_checkpoint_policy.summary()
         _ingest_checkpoint_policy = None
+        _lineage_cache.disable()
         if _ingest_trace is not None:
             _ingest_trace.close()
         _ingest_trace = None

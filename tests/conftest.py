@@ -41,3 +41,27 @@ def _scrub_ambient_minigraf_env(monkeypatch):
     """
     for name in [key for key in os.environ if key.startswith("MINIGRAF_")]:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _verify_every_lineage_cache_hit(monkeypatch):
+    """Make the whole suite an oracle for the #239 lineage point-query cache.
+
+    With ``_LINEAGE_CACHE_VERIFY`` on, every cache HIT also runs the real
+    query and raises on a difference, so each ingestion test re-proves what
+    ``evals/at_scale/probe_lineage_cache_hit_rate.py`` measured once (zero
+    mismatches). A constant, not a variable: mcp_server reads it at call time.
+
+    Imported lazily and tolerated when absent, because a regression test runs
+    pytest in a subprocess against a COPY of this file (#331), where
+    mcp_server may not be importable. Teardown disables the cache so a test
+    that fails mid-ingestion cannot leave it active for its successor.
+    """
+    try:
+        import mcp_server
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(mcp_server, "_LINEAGE_CACHE_VERIFY", True)
+    yield
+    mcp_server._lineage_cache.disable()
