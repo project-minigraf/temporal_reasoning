@@ -30808,6 +30808,149 @@ class TestStageAYieldsTheLock:
             f"dropped (e.g. across the failed commit that emitted no record)"
         )
 
+    @pytest.mark.asyncio
+    async def test_a_polling_hook_lands_mid_stage_a_at_shipped_window_settings(
+        self, tmp_path, monkeypatch
+    ):
+        """A real hook process doing a real handle_minigraf_transact while
+        Stage A is running, with the window at its SHIPPED constants (25
+        commits / 2.0 s / 0.1 s, none monkeypatched here). Every Stage A write
+        is slowed to 0.4 s so Stage A (~4.8 s) outlasts a single window
+        boundary's opening -- the hook can only succeed if that boundary
+        releases the graph for long enough that an ACTIVELY POLLING hook
+        catches it. The positive control requires the write to land BEFORE
+        Stage A ended, so a hook that merely waited for Stage B proves
+        nothing.
+
+        What this proves: the WINDOW's side of the #280 contract at shipped
+        constants -- the graph is genuinely released, for a real interval (not
+        a microsecond release-then-reacquire), within _SWEEP_YIELD_SECONDS.
+
+        What this does NOT prove: that the SHIPPED hook retry schedule
+        (_LOCK_RETRY_MAX=5, _LOCK_RETRY_BASE=0.05 doubling) reliably lands in
+        that interval. It does not, and that is a separate, pre-existing
+        defect on the hook side, not a #280 regression: measured, a hook
+        using its own shipped schedule missed the shipped 0.1 s window in
+        8/8 runs (it sleeps up to 0.4 s between ~0.377 s open-polls, so it can
+        go fully idle for longer than the window stays open), and the SAME
+        hook schedule also failed 0/6 on the pre-#280 per-commit-lease code
+        (which offers no explicit pause at all, only a release-then-reacquire
+        across no `await`) -- so #280 did not make hook access worse, it just
+        did not by itself fix the hook's coarse backoff. This test therefore
+        drives the hook with a finer, deliberately non-shipped retry
+        configuration (continuous polling, no inter-attempt sleep) so it can
+        isolate and pin the window's own guarantee without being gated by
+        that separate defect.
+        """
+        import fact_index
+        import ingest_progress
+        import mcp_server
+        repo, graph = self._prepare(tmp_path, monkeypatch)
+
+        go = tmp_path / "hook_go"
+        ready = tmp_path / "hook_ready"
+        script = (
+            "import json, os, sys, time\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n"
+            "import mcp_server\n"
+            # The SHIPPED hook schedule (_LOCK_RETRY_MAX=5,
+            # _LOCK_RETRY_BASE=0.05 doubling) sleeps up to 0.4 s between
+            # ~0.377 s open-polls and can miss a 0.1 s release entirely --
+            # measured: 8/8 miss at shipped settings, and 0/6 on the
+            # pre-#280 per-commit-lease code too. That is a pre-existing
+            # hook-side gap, tracked separately, not a #280 regression. This
+            # test pins the WINDOW's side of the contract instead: with the
+            # hook polling continuously (no inter-attempt sleep, more
+            # attempts than it could ever need), it must catch a release
+            # that genuinely happens within _SWEEP_YIELD_SECONDS.
+            "mcp_server._LOCK_RETRY_BASE = 0.0\n"
+            "mcp_server._LOCK_RETRY_MAX = 20\n"
+            f"open({str(ready)!r}, 'w').close()\n"
+            f"while not os.path.exists({str(go)!r}):\n"
+            "    time.sleep(0.002)\n"
+            "started = time.time()\n"
+            "try:\n"
+            "    r = mcp_server.handle_minigraf_transact(\n"
+            "        '[[:decision/hook-280 :description \"written mid stage A\"]]', 'hook')\n"
+            "    print(json.dumps({'ok': bool(r.get('ok')), 'err': r.get('error'),\n"
+            "                      'started': started, 'written_at': time.time()}))\n"
+            "except Exception as e:\n"
+            "    print(json.dumps({'ok': False, 'err': repr(e), 'started': started,\n"
+            "                      'written_at': time.time()}))\n"
+            "sys.stdout.flush()\n"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MINIGRAF_")}
+        env["MINIGRAF_GRAPH_PATH"] = str(graph)
+        proc = _subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=_subprocess.PIPE, stderr=_subprocess.PIPE, text=True, env=env,
+        )
+        state = {"stage_a_end": None}
+        try:
+            deadline = time.monotonic() + 60
+            while not ready.exists():
+                assert proc.poll() is None, proc.communicate()
+                assert time.monotonic() < deadline, "the hook process never got ready"
+                await asyncio.sleep(0.01)
+
+            real_fwd = mcp_server._forward_apply
+            real_rev = mcp_server._reverse_apply
+            real_finished = ingest_progress.RunProgress.stage_a_finished
+
+            def slow(real):
+                def spy(*a, **kw):
+                    out = real(*a, **kw)
+                    if not kw.get("lifecycle_only"):
+                        go.touch()
+                        time.sleep(0.4)  # write-executor thread, not the event loop
+                    return out
+                return spy
+
+            def finished_spy(self_, *a, **kw):
+                state["stage_a_end"] = time.time()
+                return real_finished(self_, *a, **kw)
+
+            monkeypatch.setattr(mcp_server, "_forward_apply", slow(real_fwd))
+            monkeypatch.setattr(mcp_server, "_reverse_apply", slow(real_rev))
+            monkeypatch.setattr(ingest_progress.RunProgress, "stage_a_finished", finished_spy)
+            await mcp_server._run_ingestion(str(repo), "master")
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+        assert lines, f"the hook printed no result. stdout={out!r} stderr={err!r}"
+        hook = json.loads(lines[-1])
+        assert mcp_server._ingest_progress.get("status") == "complete", mcp_server._ingest_progress
+        assert hook["ok"], (
+            f"the hook could not write while Stage A ran at shipped window "
+            f"settings: {hook!r}. The window held the graph longer than the "
+            f"hook's acquire budget. stderr tail: {err[-2000:]!r}"
+        )
+        assert state["stage_a_end"] is not None
+        assert hook["written_at"] < state["stage_a_end"], (
+            f"the hook wrote at {hook['written_at']:.3f}, after Stage A ended at "
+            f"{state['stage_a_end']:.3f} -- it did not get in through a Stage A "
+            f"boundary, so this test proved nothing"
+        )
+
+        mcp_server._reset_db_state()
+        with mcp_server.db_lease() as db:
+            graph_rows = json.loads(mcp_server._db_execute(
+                db, '(query [:find ?d :where [:decision/hook-280 :description ?d]])'
+            )).get("results", [])
+        con = fact_index.open_reader(fact_index.index_path_for(str(graph)))
+        try:
+            index_rows = con.execute(
+                "select value from facts_fts where entity = ':decision/hook-280'"
+            ).fetchall()
+        finally:
+            con.close()
+        assert graph_rows, "the hook's fact is not in the graph"
+        assert index_rows, "the hook's fact reached the graph but not the index (#302)"
+
 
 class TestStageBYieldsTheLock:
     """#222 phase 5 item C. Stage B held ONE lease across the whole sweep.
