@@ -16939,6 +16939,11 @@ class TestRunIngestionBatchedIndexWrites:
         import fact_index
 
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
+        # Pin the count below to one Stage A window: the assertion is an
+        # exact tally that assumes 2 commits never cross a window boundary,
+        # and a slow CI runner could otherwise open a second window on the
+        # clock alone.
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
         commit_calls = []
         open_calls = []
         original_open_writer = fact_index.open_writer
@@ -30833,7 +30838,7 @@ class TestStageAYieldsTheLock:
         using its own shipped schedule missed the shipped 0.1 s window in
         8/8 runs (it sleeps up to 0.4 s between ~0.377 s open-polls, so it can
         go fully idle for longer than the window stays open), and the SAME
-        hook schedule also failed 0/6 on the pre-#280 per-commit-lease code
+        hook schedule also landed 0 of 6 on the pre-#280 per-commit-lease code
         (which offers no explicit pause at all, only a release-then-reacquire
         across no `await`) -- so #280 did not make hook access worse, it just
         did not by itself fix the hook's coarse backoff. This test therefore
@@ -30856,8 +30861,8 @@ class TestStageAYieldsTheLock:
             # The SHIPPED hook schedule (_LOCK_RETRY_MAX=5,
             # _LOCK_RETRY_BASE=0.05 doubling) sleeps up to 0.4 s between
             # ~0.377 s open-polls and can miss a 0.1 s release entirely --
-            # measured: 8/8 miss at shipped settings, and 0/6 on the
-            # pre-#280 per-commit-lease code too. That is a pre-existing
+            # measured: missed 8 of 8 at shipped settings, and landed 0 of 6
+            # on the pre-#280 per-commit-lease code too. That is a pre-existing
             # hook-side gap, tracked separately as issue #366, not a #280
             # regression. This
             # test pins the WINDOW's side of the contract instead: with the
@@ -30951,6 +30956,67 @@ class TestStageAYieldsTheLock:
             con.close()
         assert graph_rows, "the hook's fact is not in the graph"
         assert index_rows, "the hook's fact reached the graph but not the index (#302)"
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_during_the_boundary_itself_applies_no_further_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """The shutdown flag can be set DURING maybe_yield's own boundary (its
+        close() drop or its asyncio.sleep pause), not just between boundaries.
+        Without a re-check immediately after `maybe_yield()`, the loop falls
+        through to `window.ensure_open()` and applies one more commit before
+        the next loop head sees the flag. This wraps maybe_yield to set the
+        flag itself, right after a REAL boundary (return value > 0) has
+        already run its close+pause, and records how many Stage A applies had
+        happened by that moment -- the count the fix must not exceed."""
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 2)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
+
+        applied = []
+        applied_at_flag = [None]
+        real_fwd = mcp_server._forward_apply
+        real_rev = mcp_server._reverse_apply
+        real_yield = mcp_server._LeaseWindow.maybe_yield
+
+        def fwd_spy(*a, **kw):
+            if not kw.get("lifecycle_only"):
+                applied.append("fwd")
+            return real_fwd(*a, **kw)
+
+        def rev_spy(*a, **kw):
+            applied.append("rev")
+            return real_rev(*a, **kw)
+
+        async def yield_spy(self_):
+            s = await real_yield(self_)
+            if s > 0 and not mcp_server._shutdown_requested.is_set():
+                applied_at_flag[0] = len(applied)
+                mcp_server._shutdown_requested.set()
+            return s
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", fwd_spy)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)
+        monkeypatch.setattr(mcp_server._LeaseWindow, "maybe_yield", yield_spy)
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+            assert applied_at_flag[0] is not None, (
+                "no real boundary was ever reached -- test proves nothing"
+            )
+            assert len(applied) == applied_at_flag[0], (
+                f"{len(applied)} Stage A applies but the shutdown flag was set "
+                f"after {applied_at_flag[0]} of them -- a commit was applied "
+                f"after shutdown was requested mid-boundary"
+            )
+            assert mcp_server._lease_manager.lease_count == 0, (
+                f"lease_count is {mcp_server._lease_manager.lease_count} after "
+                f"the run -- the Stage A window's lease leaked past the "
+                f"boundary-shutdown break"
+            )
+        finally:
+            mcp_server._shutdown_requested.clear()
+            mcp_server._reset_db_state()
 
 
 class TestStageBYieldsTheLock:
@@ -31752,7 +31818,25 @@ class TestIngestionCommitsTheIndexBeforeReleasingTheGraph:
         where this lease takes the count to 0, after a reverse write. A 2-commit
         window guarantees several of them mid-Stage-A, and the test fails if it
         saw none -- a check that never saw a window close proves nothing
-        about one."""
+        about one.
+
+        In Stage A the per-commit lease (mcp_server.py:15115) is ALSO
+        `_db_lease_async_committing_index`, so its own 2 -> 1 JOIN exit
+        already commits `index_con` unconditionally after every commit --
+        by the time the window's own boundary release runs, there is no
+        open transaction left for it to close. This test therefore guards
+        the PROPERTY (no real Stage A release ever sees an open
+        transaction), not that the window's own commit is load-bearing for
+        it here; belt-and-braces, covering a future change to the
+        per-commit lease rather than anything true of today's code path.
+        The two-step ablation recorded in the "Hold one lease across each
+        Stage A window instead of per commit (#280)" commit is what shows
+        the window's commit ALONE suffices: step 1, the per-commit lease
+        switched to a non-committing `db_lease_async()` -- still GREEN,
+        because the window's own committing lease still covers every real
+        release; step 2, additionally switching the window's own
+        `ensure_open` to non-committing -- FAILS, `in_transaction` true at
+        every real release."""
         import mcp_server
         repo, _graph = self._prepare(tmp_path, monkeypatch)
         monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 2)

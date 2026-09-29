@@ -15033,6 +15033,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         # _trace_t_await so await_s stays pure extraction stall.
                         _trace_yield_s += await window.maybe_yield()
 
+                        # The flag can be set DURING the boundary (its drop or
+                        # its pause); re-check before reopening the graph for
+                        # another commit.
+                        if _shutdown_requested.is_set():
+                            completed_all = False
+                            break
+
                         tag, pos, fut, claim_ident, absorbed_idents = pending.popleft()
                         commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
                         # renamed_pairs (Task 9's 4th _extract_commit return element) is

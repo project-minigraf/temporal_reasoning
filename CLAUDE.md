@@ -1487,7 +1487,11 @@ nothing. `window.maybe_yield()` is called at exactly one place — the dispatch
 loop's HEAD, after the shutdown check and before the next commit's future is
 awaited — and closes the window (a real release) when `count >= max_commits
 or elapsed >= max_seconds`, then pauses `_SWEEP_YIELD_PAUSE_SECONDS` OUTSIDE
-the lease. Because that boundary sits at the loop head and nowhere else,
+the lease. The shutdown flag is re-checked immediately after that call
+(`mcp_server.py:15039`), because it can be set DURING the boundary itself —
+inside `maybe_yield`'s drop or its pause — and without the re-check the loop
+falls through to `window.ensure_open()` and applies one more commit before
+the next head would have seen it. Because that boundary sits at the loop head and nowhere else,
 **the window's lease is held across the NEXT commit's extraction wait
 (`await fut`)** — a window stays open through however long that one
 extraction takes — and since `maybe_yield` checks the clock only there, a
@@ -1526,8 +1530,8 @@ Stage B's own ~845-865 s wall.
 A hook using its OWN shipped retry schedule (`_LOCK_RETRY_MAX=5,
 _LOCK_RETRY_BASE=0.05` doubling) cannot reliably land in the window's
 0.1 s release even though the window itself is genuine: measured 8/8 misses
-at shipped settings on this branch, and the SAME schedule also missed 0/6 on
-the pre-#280 per-commit-lease code (which offered no explicit pause at all).
+at shipped settings on this branch, and the SAME schedule also landed 0 of 6
+on the pre-#280 per-commit-lease code (which offered no explicit pause at all).
 So #280 did not make hook access worse — it did not by itself fix the
 hook's coarse backoff either. That gap is pre-existing and separate from
 this window's own guarantee, and is filed as issue #366; the branch's own

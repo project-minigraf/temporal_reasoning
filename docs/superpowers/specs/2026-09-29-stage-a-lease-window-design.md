@@ -113,7 +113,13 @@ class _LeaseWindow:
   previous one took (written, write failed, or extraction failed). It never
   pays a pause after the last commit, because the head only runs while
   `pending` is non-empty. It never pays a pause on shutdown either, because
-  the shutdown `break` comes first.
+  the shutdown `break` comes first. Shipped: the flag is re-checked a SECOND
+  time, immediately after `await window.maybe_yield()` and before
+  `pending.popleft()`, because it can be set DURING the boundary itself
+  (`maybe_yield`'s own `close()` drop or its `asyncio.sleep` pause) —
+  without that second check the loop would fall through to
+  `window.ensure_open()` and apply one more commit before the next head
+  runs.
 - `await window.ensure_open()` immediately before the existing per-commit
   `async with _db_lease_async_committing_index(...)`, inside the `apply_s`
   span. `apply_s` already documents that it includes lease acquire.
@@ -193,15 +199,27 @@ New class `TestStageAYieldsTheLock`, reusing `TestStageBYieldsTheLock._prepare`:
    fails. That failure is deterministic. Dropping only the pause is not a
    usable ablation, because a hook already blocked in minigraf's polling
    `open()` can still win the bare release instant sometimes.
-4. **No lease leaks on an exceptional exit.** `BrokenProcessPool` injected
-   mid-window → `_lease_manager.lease_count == 0` after `_run_ingestion`
-   returns, and the final checkpoint ran. A shutdown mid-window gives the same
-   result, with no pause paid.
-5. **Every real release commits the index.** The existing
-   `test_no_lease_is_released_with_an_open_index_transaction` already checks
-   `index_con.in_transaction` at each release. It must keep passing, and it
-   must actually observe a window close. The test asserts it saw one, because
-   a check that never saw a window close proves nothing about one.
+4. **No lease leaks on an exceptional exit.** Shipped as a `RuntimeError`
+   injected from the third `RunProgress.retired` call — that call sits
+   outside every per-commit `try`, the same try/finally path a
+   `BrokenProcessPool` takes — asserting `_lease_manager.lease_count == 0`
+   and `status == "error"` after `_run_ingestion` returns
+   (`test_an_exception_mid_window_leaks_no_lease`). A shutdown mid-window
+   gives the same lease-count result with no pause paid
+   (`test_a_shutdown_mid_window_leaks_no_lease_and_pays_no_pause`). A third
+   test, added on the final whole-branch review, covers the flag being set
+   DURING the boundary itself rather than between boundaries — it wraps
+   `_LeaseWindow.maybe_yield`, sets the flag right after a real boundary
+   (return value > 0) has already run, and asserts no further Stage A apply
+   happened and `lease_count == 0`
+   (`test_a_shutdown_during_the_boundary_itself_applies_no_further_commit`).
+5. **Every real release commits the index.** Shipped as
+   `TestIngestionCommitsTheIndexBeforeReleasingTheGraph::
+   test_every_real_stage_a_release_commits_the_index`, which checks
+   `index_con.in_transaction` at each real Stage A release. It must keep
+   passing, and it must actually observe a window close. The test asserts it
+   saw at least two, because a check that never saw a window close proves
+   nothing about one.
 6. **`yield_s`**: its sum over the trace is > 0 on a multi-window run, and
    equals the patched sum of boundary durations.
 
