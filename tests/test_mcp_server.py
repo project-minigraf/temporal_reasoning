@@ -29126,6 +29126,16 @@ class TestIngestTrace:
         assert r["n_functions"] == 4
         assert r["files_by_status"] == {"M": 1}
 
+    def test_record_carries_yield_s_defaulting_to_zero(self, tmp_path):
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        trace.emit(1, "rev", "b", 0.0, 0.0, [], None, yield_s=0.25)
+        trace.close()
+        records = self._read(path)
+        assert [r["yield_s"] for r in records] == [0.0, 0.25]
+
     def test_t_since_start_is_measured_from_construction(self, tmp_path):
         """A fake clock, so this asserts the arithmetic rather than a duration."""
         import mcp_server
@@ -30752,6 +30762,51 @@ class TestStageAYieldsTheLock:
         finally:
             mcp_server._shutdown_requested.clear()
             mcp_server._reset_db_state()
+
+    @pytest.mark.asyncio
+    async def test_the_trace_accounts_for_every_boundary(self, tmp_path, monkeypatch):
+        """#280's lesson is that a drop the trace cannot see gets blamed on
+        nothing. yield_s carries each boundary's drop + pause, accumulated
+        onto the next EMITTED record -- so a boundary before a commit whose
+        write fails (no record) is still counted, on the one after it."""
+        import json
+        import mcp_server
+        repo, _graph = self._prepare(tmp_path, monkeypatch)
+        trace_path = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace_path))
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_COMMITS", 1)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_SECONDS", 10**9)
+        monkeypatch.setattr(mcp_server, "_SWEEP_YIELD_PAUSE_SECONDS", 0.05)
+        real_rev = mcp_server._reverse_apply
+        failed = []
+
+        def rev_spy(*a, **kw):
+            if not failed:
+                failed.append(1)
+                raise RuntimeError("injected write failure (#280 trace test)")
+            return real_rev(*a, **kw)
+
+        spent = []
+        real_yield = mcp_server._LeaseWindow.maybe_yield
+
+        async def yield_spy(self_):
+            s = await real_yield(self_)
+            spent.append(s)
+            return s
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", rev_spy)
+        monkeypatch.setattr(mcp_server._LeaseWindow, "maybe_yield", yield_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        records = [json.loads(l) for l in trace_path.read_text().splitlines() if l.strip()]
+        assert failed, "no write failure was injected -- test proves nothing"
+        assert all("yield_s" in r for r in records)
+        boundaries = [s for s in spent if s > 0]
+        assert len(boundaries) >= 2
+        assert sum(r["yield_s"] for r in records) == pytest.approx(sum(boundaries), abs=1e-9), (
+            f"trace yield_s sums to {sum(r['yield_s'] for r in records):.4f}s but "
+            f"the boundaries took {sum(boundaries):.4f}s -- boundary time was "
+            f"dropped (e.g. across the failed commit that emitted no record)"
+        )
 
 
 class TestStageBYieldsTheLock:

@@ -4084,6 +4084,13 @@ class _IngestTrace:
     Writes only, no locks, no awaits, no DB access -- see this module's
     _db_native_lock invariant comment for why the per-commit loop tolerates
     nothing else.
+
+    `yield_s` (#280) is Stage A lease-window boundary time -- the handle
+    drop (a full O(graph size) checkpoint in minigraf's `Drop for Inner`)
+    plus the pause -- accumulated since the previous EMITTED record, so the
+    sum over a trace equals total boundary time even across commits that
+    emit no record. One drop is outside it: the window's final close after
+    the last record.
     """
 
     def __init__(self, path: str, clock: "Callable[[], float]" = time.monotonic) -> None:
@@ -4103,6 +4110,7 @@ class _IngestTrace:
         apply_s: float,
         extracted_files: Sequence[tuple],
         policy: Optional["_CheckpointPolicy"],
+        yield_s: float = 0.0,
     ) -> None:
         if self._fh is None:
             return
@@ -4121,6 +4129,7 @@ class _IngestTrace:
             "t_since_start": self._clock() - self._started_at,
             "await_s": await_s,
             "apply_s": apply_s,
+            "yield_s": yield_s,
             "ckpt_d_count": d_count,
             "ckpt_d_seconds": d_seconds,
         }
@@ -15001,6 +15010,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     max_seconds=_SWEEP_YIELD_SECONDS,
                     pause_seconds=_SWEEP_YIELD_PAUSE_SECONDS,
                 )
+                _trace_yield_s = 0.0
                 run_progress.stage_a_started()
                 for _ in range(pipeline_depth):
                     if not submit_next():
@@ -15021,7 +15031,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         # head runs only while `pending` is non-empty) and never
                         # on shutdown (checked just above). Before
                         # _trace_t_await so await_s stays pure extraction stall.
-                        await window.maybe_yield()
+                        _trace_yield_s += await window.maybe_yield()
 
                         tag, pos, fut, claim_ident, absorbed_idents = pending.popleft()
                         commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
@@ -15218,7 +15228,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 time.perf_counter() - _trace_t_apply,
                                 extracted_files,
                                 _ingest_checkpoint_policy,
+                                yield_s=_trace_yield_s,
                             )
+                            _trace_yield_s = 0.0
                         run_progress.retired(tag, "written" if _trace_write_ok else "failed", pos)
                         await asyncio.sleep(0)  # yield to event loop
                 finally:
