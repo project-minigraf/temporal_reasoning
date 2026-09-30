@@ -2070,6 +2070,47 @@ shape and were left alone (~2 s); it lacks the guess commit's parse, as its
 own comment says. No `GRAPH_FORMAT_VERSION` bump: existing graphs keep their
 retracted edges in history, which costs file size, not correctness.
 
+**Stage B parses ahead of itself (#372).** After #280/#239/#369 Stage B was
+~66% of wall and untraced. `evals/at_scale/probe_sweep_parse_cost.py` now
+splits it into serial, non-overlapping components with an explicit remainder
+(`results/372-stage-b-attribution.json`, full history at `e89a021`): of
+412.5 s, **327.5 s (79%) was the parent waiting on the re-parse** (#352),
+~57 s window boundaries (pre-drop checkpoint 31, pause 13.6, reopen 12.2),
+17 s policy checkpoints, 9.5 s every Stage B write, 1.2 s unaccounted. The
+wait was serial with the process pool otherwise idle.
+
+`_SweepPrefetch` (mcp_server.py) submits the next `pipeline_depth` positions,
+never past the ceiling, while the current commit's writes run, because
+`_correction_sweep_next` always selects `through + 1`. A result is used only
+when the selected hash matches the submitted one; `_extract_commit` is a pure
+function of (repo, hash, ignore_patterns), so a hit writes what a fresh parse
+would. #352's sidecar stays rejected. `_SWEEP_PREFETCH` is the kill switch —
+a CONSTANT, patched, never an env var — and False is the serial loop exactly.
+
+Two things it rests on, each ablation-proven in
+`TestStageBPrefetchesExtraction`:
+
+  * **`discard()` runs in a `finally` around the whole window loop** and
+    cancels BOTH futures. The concurrent one stops a queued parse from ever
+    starting — cancelling only the asyncio wrapper reaches it a loop tick
+    later, by which time a free worker has started it (measured). The
+    wrapper's cancel silences a failure of a parse nobody took, whether it
+    already landed or lands later. A done-callback retrieving the exception
+    was tried and was DEAD CODE: `Future.cancel()` clears the
+    never-retrieved flag even on a done future, so its ablation stayed green.
+  * **The ordering test spies `ProcessPoolExecutor.submit`**, not
+    `loop.run_in_executor`: every route to the pool ends there, so it sees
+    the old serial loop's single submission too, and the old loop fails it.
+
+Measured (`results/372-sweep-prefetch-ab.json`, `probe_code_ab.py`, master vs
+branch, interleaved A B A B, full history at `e89a021`): **wall 814 s -> 507 s
+median (0.62x)**, both branch runs faster than both master runs (spread 2% /
+1%). Parity identical in all four runs: 40,468 facts, divergence 0, census
+clean, both `:introduced-by` checks 0. The ~307 s saved matches the parse
+wait; DB exec (108 -> 114 s) and drops (223 -> 199 s) barely moved, so Stage
+B's remaining cost is now the window boundary and policy checkpoints. No
+`GRAPH_FORMAT_VERSION` bump: nothing written changes.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.
