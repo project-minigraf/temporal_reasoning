@@ -2010,6 +2010,66 @@ a fact already stored with a FUTURE `:valid-from` (a commit dated ahead of the
 clock) that becomes current mid-run stays invisible to the cache until the run
 ends. No `GRAPH_FORMAT_VERSION` bump: nothing written changes.
 
+**The reverse walk no longer writes a retroactive `:modified-in` it would have
+to take back (#369).** After #239, Stage B's retracts were the largest bucket
+left. `evals/at_scale/probe_sweep_retract_attribution.py` keys every write by
+phase, call site and attribute set, and tracks live facts so each retract
+names the site that WROTE what it removes
+(`results/369-retract-attribution.json`, full history at `daf1b8d`): 232,182
+of Stage B's 239,866 retracts, 545 s of 650 s of write time, were
+`_correction_sweep_apply`'s case-3 unchanged-ident retract, and 230,829 of the
+facts they removed came from `_reverse_apply`'s retroactive
+`[ident :modified-in <superseded guess S>]`. That edge was written on every
+provisional move without asking whether the body changed at S; the sweep then
+reached S, found the ident in S's `unchanged_idents`, and took it back.
+
+`_reverse_apply` now takes a run-scoped `guess_unchanged` map
+(`_run_ingestion`'s `rev_guess_unchanged`), ident -> (current guess, unchanged
+at that guess), and skips the edge only on an exact `(S, True)` entry. Three
+things it rests on, each ablation-proven in
+`TestReverseRetroactiveEdgeSkipsUnchanged`:
+
+  * **The criterion is the sweep's own.** Both sides read
+    `precomputed["unchanged_idents"]` of S from the same extraction, so a
+    skipped edge is exactly one case 3 would retract.
+  * **The map is updated AFTER the retroactive loop**, which reads each
+    ident's PREVIOUS entry; updating first overwrites S with C and the skip
+    never fires. Only idents whose guess this commit asserted or moved are
+    recorded (the provisional batch's return set, which now has a production
+    consumer), and the flag defaults to False, the side that writes the edge.
+  * **Never persisted.** A missing or stale entry -- a resumed run, another
+    interval, a guess moved by anything else -- writes the edge as before, and
+    the sweep still owns it. `_reverse_apply` runs only on `write_executor`'s
+    single worker, so the map needs no lock.
+
+The one permitted difference: an entity the sweep leaves PROVISIONAL (case 2)
+used to keep the unchanged edge, since only case 3 retracts it; it now never
+gets one. It does not occur on this repo: full history under both builds gave
+identical graphs -- 40,163 current facts differing only in
+`:ingestion/last-run-at`, 4,385 `:modified-in` across valid time, identical,
+fact_audit divergence 0 (`results/369-parity.json`).
+
+Measured (`results/369-sweep-retract-ab.json`, `probe_code_ab.py`: master vs
+branch as two source trees, one interpreter, cache on, interleaved A B A B, full history at `daf1b8d`):
+**wall 1627 s -> 796 s median (0.49x)**, both branch runs faster than both
+master runs (spread 4% / 1%); DB exec 668 s -> 108 s; Stage B retracts
+239,866 -> 9,037 (567 s -> 14 s); handle drops 402 s -> 223 s, since the graph
+FILE fell 604 MB -> 339 MB -- 232k assert/retract pairs no longer sit in
+history. Why a retract cost ~2.4 ms: not the entity's history. minigraf
+2.0.2's retract materializes a retraction fact with no lookup, then takes the
+transact path -- one WAL entry, `fdatasync` under the default
+`SyncMode::Full`, and the 1000-entry auto-checkpoint, which counts CALLS, not
+facts (p50 1.33 ms against a 2.35 ms mean; the tail is the checkpoint).
+
+**Retracts collapse under minigraf#287 exactly as transacts do**, measured on
+2.0.2: two retracts of one `(entity, attribute)` in one call leave one of the
+two facts visible until the next checkpoint. Batching retracts is safe only
+across DISTINCT `(entity, attribute)` pairs. The 1,353 edges
+`_forward_reconcile_provisional` writes at a superseded guess are the same
+shape and were left alone (~2 s); it lacks the guess commit's parse, as its
+own comment says. No `GRAPH_FORMAT_VERSION` bump: existing graphs keep their
+retracted edges in history, which costs file size, not correctness.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.
