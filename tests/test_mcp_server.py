@@ -22257,18 +22257,21 @@ class TestReverseRetroactiveEdgeSkipsUnchanged:
     function is offered retroactive edges at c2 and at c1.
     """
 
-    def _repo(self, tmp_path):
+    def _repo(self, tmp_path, commits=3, born_at=0):
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
-        for n in range(3):
-            (repo / "wide.py").write_text(
-                "def same():\n    return 0\n\n\n"
-                f"def moving():\n    return {n}\n"
-            )
-            date = f"2021-03-0{n + 1}T00:00:00+00:00"
+        for n in range(commits):
+            if n < born_at:
+                (repo / "pad.py").write_text(f"PAD = {n}\n")
+            else:
+                (repo / "wide.py").write_text(
+                    "def same():\n    return 0\n\n\n"
+                    f"def moving():\n    return {n}\n"
+                )
+            date = f"2021-03-{n + 1:02d}T00:00:00+00:00"
             env = {**os.environ, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
             _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
             _subprocess.run(["git", "commit", "-m", f"c{n}"], cwd=repo, check=True,
@@ -22349,12 +22352,17 @@ class TestReverseRetroactiveEdgeSkipsUnchanged:
     async def test_ingestion_passes_the_map_and_the_sweep_retracts_nothing(
         self, tmp_path, monkeypatch,
     ):
-        """End to end through _run_ingestion's dispatch, reverse-heavy so the
-        whole history above c0 is reverse territory: the sweep issues no
-        :modified-in retract, and the final graph matches a forward-only
-        ingest of the same history."""
+        """End to end through _run_ingestion's dispatch, reverse-heavy so most
+        of the history is reverse territory: the sweep issues no :modified-in
+        retract, and moving() keeps an edge at every commit after c0."""
         import mcp_server
-        repo = self._repo(tmp_path)
+        # Born at p5 of 10: the forward stream holds only the bottom of the
+        # history, so both functions are first SIGHTED by the reverse stream
+        # at p9 and their guesses walk down to p5 -- the provisional moves
+        # under test. Born at p0 they would be authoritative before the
+        # reverse stream ever saw them, and no retroactive edge is offered.
+        commits, born_at = 10, 5
+        repo = self._repo(tmp_path, commits, born_at)
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
         mcp_server._reset_db_state()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -22367,7 +22375,15 @@ class TestReverseRetroactiveEdgeSkipsUnchanged:
                 retracts.append(facts)
             return real_retract(db_, facts, *a, **k)
 
+        reverse_positions = []
+        real_reverse = mcp_server._reverse_apply
+
+        def reverse_spy(*a, **k):
+            reverse_positions.append(a[4])
+            return real_reverse(*a, **k)
+
         monkeypatch.setattr(mcp_server, "_retract", spy)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", reverse_spy)
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
 
@@ -22375,11 +22391,16 @@ class TestReverseRetroactiveEdgeSkipsUnchanged:
         linearization = [c for c in reversed(_subprocess.run(
             ["git", "rev-list", "master"], cwd=repo, check=True, capture_output=True, text=True,
         ).stdout.split())]
-        c1, c2 = (f":commit/{h[:12]}" for h in linearization[1:])
+        idents = [f":commit/{h[:12]}" for h in linearization]
         same = mcp_server._code_ident("function", "wide.py", "same")
         moving = mcp_server._code_ident("function", "wide.py", "moving")
-        # Positive control: moving() really was modified in reverse territory.
-        assert self._modified_in(db, moving) == {c1, c2}
+        # Positive controls: the reverse stream applied several positions (so
+        # guesses were actually moved), and moving() -- changed at every
+        # commit -- kept an edge at each of them.
+        assert set(range(born_at + 1, commits)) <= set(reverse_positions), (
+            f"reverse applied only {sorted(reverse_positions)}"
+        )
+        assert self._modified_in(db, moving) == set(idents[born_at + 1:])
         assert self._modified_in(db, same) == set()
         assert retracts == [], f"the sweep retracted edges nobody should have written: {retracts}"
         mcp_server._reset_db_state()
