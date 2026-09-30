@@ -44,6 +44,28 @@ def _scrub_ambient_minigraf_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pin_git_default_branch(monkeypatch):
+    """Make a bare ``git init`` produce ``master``, whatever the developer's
+    git config says.
+
+    About a hundred fixtures create repos with a bare ``git init`` and then
+    ingest or query ``master``. Under a global ``init.defaultBranch=main`` the
+    repo had no ``master`` at all and 27 tests failed with ``git log ...
+    master`` exiting 128, while CI, which carries no such config, was green.
+    The same class as #331's ambient ``MINIGRAF_*`` variables.
+
+    Pinned through git's own environment-supplied config, which outranks every
+    config FILE, rather than by editing each fixture: it covers fixtures not
+    yet written and the children tests spawn. Appended after any
+    ``GIT_CONFIG_KEY_<n>`` entries already present rather than replacing them.
+    """
+    count = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)
+    monkeypatch.setenv(f"GIT_CONFIG_KEY_{count}", "init.defaultBranch")
+    monkeypatch.setenv(f"GIT_CONFIG_VALUE_{count}", "master")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", str(count + 1))
+
+
+@pytest.fixture(autouse=True)
 def _verify_every_lineage_cache_hit(monkeypatch):
     """Make the whole suite an oracle for the #239 lineage point-query cache.
 
