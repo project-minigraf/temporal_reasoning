@@ -1,0 +1,156 @@
+{
+  "repo": "temporal_reasoning (this repo, local clone)",
+  "branch": "master @ e89a021 (full history, 1046 commits)",
+  "total_run_s": 630.309,
+  "stage_b_wall_s": 412.497,
+  "stage_b_parse_wall_s": 326.087,
+  "stage_b_parse_share_of_stage_b": 0.7905,
+  "stage_b_parse_share_of_run": 0.5173,
+  "stage_a_extract": {
+    "wall": {
+      "n": 1046,
+      "sum": 1036.084,
+      "mean": 0.99052,
+      "p50": 0.0844869613647461,
+      "p99": 6.095744609832764,
+      "max": 7.134521961212158
+    },
+    "cpu": {
+      "n": 1046,
+      "sum": 955.655,
+      "mean": 0.91363,
+      "p50": 0.06092675000000014,
+      "p99": 5.652810629000001,
+      "max": 6.6591168530000004
+    }
+  },
+  "stage_b_extract": {
+    "wall": {
+      "n": 523,
+      "sum": 326.087,
+      "mean": 0.62349,
+      "p50": 0.028264999389648438,
+      "p99": 2.5496296882629395,
+      "max": 2.639540910720825
+    },
+    "cpu": {
+      "n": 523,
+      "sum": 319.339,
+      "mean": 0.61059,
+      "p50": 0.020949708000003398,
+      "p99": 2.507353319999993,
+      "max": 2.612937950999992
+    }
+  },
+  "stage_b_steps": {
+    "acquire_open": {
+      "n": 136,
+      "sum": 12.157
+    },
+    "intervals_read_extra": {
+      "n": 1,
+      "sum": 0.15
+    },
+    "sweep_next": {
+      "n": 524,
+      "sum": 2.471
+    },
+    "extract_await": {
+      "n": 523,
+      "sum": 328.002
+    },
+    "sweep_apply": {
+      "n": 523,
+      "sum": 5.834
+    },
+    "forward_apply": {
+      "n": 523,
+      "sum": 0.528
+    },
+    "through_update": {
+      "n": 523,
+      "sum": 0.558
+    },
+    "checkpoint_skipped": {
+      "n": 467,
+      "sum": 0.002
+    },
+    "index_commit": {
+      "n": 136,
+      "sum": 0.014
+    },
+    "release_pre_drop_ckpt": {
+      "n": 136,
+      "sum": 31.183
+    },
+    "release_drop": {
+      "n": 136,
+      "sum": 0.015
+    },
+    "pause": {
+      "n": 135,
+      "sum": 13.55
+    },
+    "checkpoint_ran": {
+      "n": 56,
+      "sum": 17.374
+    }
+  },
+  "stage_b_attribution": {
+    "components_s": {
+      "extract_await": 327.496,
+      "release_pre_drop_ckpt": 31.183,
+      "checkpoint_ran": 17.374,
+      "pause": 13.55,
+      "acquire_open": 12.157,
+      "sweep_apply": 5.834,
+      "sweep_next": 2.471,
+      "through_update": 0.558,
+      "forward_apply": 0.528,
+      "intervals_read_extra": 0.15,
+      "release_drop": 0.015,
+      "index_commit": 0.014,
+      "checkpoint_skipped": 0.002
+    },
+    "components_share": {
+      "acquire_open": 0.0295,
+      "intervals_read_extra": 0.0004,
+      "sweep_next": 0.006,
+      "extract_await": 0.7939,
+      "sweep_apply": 0.0141,
+      "forward_apply": 0.0013,
+      "through_update": 0.0014,
+      "checkpoint_skipped": 0.0,
+      "index_commit": 0.0,
+      "release_pre_drop_ckpt": 0.0756,
+      "release_drop": 0.0,
+      "pause": 0.0328,
+      "checkpoint_ran": 0.0421
+    },
+    "accounted_s": 411.331,
+    "unaccounted_s": 1.166,
+    "probe_pickle_subtracted_s": 0.506,
+    "windows": 136
+  },
+  "pickled_bytes_all_commits": {
+    "n": 1046,
+    "sum": 399581359,
+    "mean": 382008.94742,
+    "p50": 35510,
+    "p99": 2138441,
+    "max": 2221664
+  },
+  "pickled_bytes_reverse_region": {
+    "n": 523,
+    "sum": 281297401,
+    "mean": 537853.5392,
+    "p50": 33701,
+    "p99": 2163236,
+    "max": 2221664
+  },
+  "graph_bytes": 342626304,
+  "status": "complete",
+  "sweep_state": "done",
+  "lineage_complete": true,
+  "note": "#372 attribution run on master e89a021, .venv, minigraf 2.0.2, shipped defaults, 8 cores. Components are serial and non-overlapping; unaccounted_s is the remainder."
+}

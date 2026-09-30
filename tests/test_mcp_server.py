@@ -32502,3 +32502,230 @@ class TestApplyDispatchIsKeywordSafe:
             assert {"lifecycle_only", "persist_claim", "linearization", "pos"} <= kwargs.keys()
         for _, _, kwargs in rev:
             assert {"persist_claim", "claim_ident", "absorbed_idents"} <= kwargs.keys()
+
+
+class TestStageBPrefetchesExtraction:
+    """#372. Stage B's re-parse of every reverse-region commit was 327 s of
+    its 412 s on full history (results/372-stage-b-attribution.json), and it
+    ran strictly serially: await one extraction, write it, select the next,
+    extract that. The sweep selects `through + 1` every time, so the
+    positions it will need are known in advance, and _SweepPrefetch submits
+    the next several to the idle process pool while the current commit's
+    writes run. A result is used only when the hash the sweep actually
+    selects matches the one that was prefetched, so what Stage B writes
+    cannot change -- the parity test below holds it to that.
+    """
+
+    _parity = TestMultiStreamParityWithForwardOnly()
+
+    # -- _SweepPrefetch itself, on a thread pool with a fake extractor ------
+
+    def _prefetch(self, loop, executor, linearization, depth, extract):
+        import mcp_server
+        return mcp_server._SweepPrefetch(
+            loop, executor, "/repo", None, linearization, depth, extract=extract,
+        )
+
+    @pytest.mark.asyncio
+    async def test_ahead_submits_the_window_and_take_uses_it(self):
+        calls = []
+
+        def extract(repo, h, ignore):
+            calls.append(h)
+            return (f"parsed-{h}",)
+
+        loop = asyncio.get_running_loop()
+        lin = [f"h{i}" for i in range(10)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            pf = self._prefetch(loop, ex, lin, 3, extract)
+            pf.ahead(2, 9)
+            assert await pf.take("h2") == ("parsed-h2",)
+            pf.ahead(3, 9)
+            assert await pf.take("h3") == ("parsed-h3",)
+            # A hash the window never held is extracted fresh, not refused.
+            assert await pf.take("h8") == ("parsed-h8",)
+            pf.discard()
+        assert (pf.hits, pf.misses) == (2, 1)
+        # Windows [2,4] then [3,5], plus the miss: h2..h5 once each, h8 once.
+        assert sorted(calls) == ["h2", "h3", "h4", "h5", "h8"]
+
+    @pytest.mark.asyncio
+    async def test_the_window_never_passes_the_ceiling(self):
+        calls = []
+        loop = asyncio.get_running_loop()
+        lin = [f"h{i}" for i in range(10)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            pf = self._prefetch(loop, ex, lin, 8,
+                                lambda r, h, i: calls.append(h) or (h,))
+            pf.ahead(6, 7)
+            # What was SUBMITTED, not what ran: discard() may cancel h7.
+            submitted = sorted(pf._pending)
+            await pf.take("h6")
+            pf.discard()
+        assert submitted == ["h6", "h7"]
+
+    @pytest.mark.asyncio
+    async def test_depth_zero_is_the_old_serial_behaviour(self):
+        calls = []
+        loop = asyncio.get_running_loop()
+        lin = [f"h{i}" for i in range(10)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            pf = self._prefetch(loop, ex, lin, 0,
+                                lambda r, h, i: calls.append(h) or (h,))
+            pf.ahead(0, 9)
+            assert calls == []  # nothing submitted ahead
+            assert await pf.take("h0") == ("h0",)
+            pf.discard()
+        assert calls == ["h0"]
+        assert (pf.hits, pf.misses) == (0, 1)
+
+    @pytest.mark.asyncio
+    async def test_discard_silences_an_untaken_failure(self):
+        """A prefetched extraction that is still RUNNING at discard() and
+        fails afterwards must not reach asyncio's 'Future exception was never
+        retrieved' handler: the sweep only ever surfaces failures of the
+        commit it actually took.
+
+        Running is the harder case: the parse cannot be cancelled, so only
+        cancelling the asyncio wrapper -- which then ignores the failure it
+        is handed -- keeps it silent. Deleting that cancel reddens this test.
+        """
+        import gc
+        import threading
+        loop = asyncio.get_running_loop()
+        seen = []
+        loop.set_exception_handler(lambda _l, ctx: seen.append(ctx.get("message")))
+        started, release = threading.Event(), threading.Event()
+
+        def extract(repo, h, ignore):
+            if h == "h1":
+                started.set()
+                release.wait(5)
+                raise RuntimeError("boom")
+            return (h,)
+
+        lin = [f"h{i}" for i in range(2)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            pf = self._prefetch(loop, ex, lin, 2, extract)
+            pf.ahead(0, 1)
+            await pf.take("h0")
+            assert await loop.run_in_executor(None, started.wait, 5)
+            pf.discard()  # h1 is running: its parse cannot be cancelled
+            release.set()
+        for _ in range(3):
+            await asyncio.sleep(0.01)  # let h1's failure reach the loop
+        pf = None
+        gc.collect()
+        await asyncio.sleep(0)
+        assert not [m for m in seen if m and "never retrieved" in m], seen
+
+    @pytest.mark.asyncio
+    async def test_discard_cancels_queued_extractions(self):
+        """An aborted or finished sweep must not leave a queue of parses for
+        the pool's shutdown to wait on."""
+        import threading
+        gate = threading.Event()
+        calls = []
+
+        def extract(repo, h, ignore):
+            calls.append(h)
+            gate.wait(5)
+            return (h,)
+
+        loop = asyncio.get_running_loop()
+        lin = [f"h{i}" for i in range(8)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            pf = self._prefetch(loop, ex, lin, 8, extract)
+            pf.ahead(0, 7)
+            await asyncio.sleep(0.05)  # h0 is running, h1..h7 queued
+            pf.discard()
+            gate.set()
+        assert calls == ["h0"], calls
+
+    # -- end to end ---------------------------------------------------------
+
+    async def _ingest(self, tmp_path, monkeypatch, name, prefetch):
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_SWEEP_PREFETCH", prefetch)
+        graph = tmp_path / f"{name}.graph"
+        instances = []
+        real_cls = mcp_server._SweepPrefetch
+
+        class Recording(real_cls):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                instances.append(self)
+
+        monkeypatch.setattr(mcp_server, "_SweepPrefetch", Recording)
+        await self._parity._ingest(self._repo, graph, monkeypatch, "1:1")
+        monkeypatch.setattr(mcp_server, "_SweepPrefetch", real_cls)
+        return graph, instances
+
+    @pytest.mark.asyncio
+    async def test_prefetched_sweep_writes_the_same_graph(self, tmp_path, monkeypatch):
+        import mcp_server
+        self._repo = self._parity._repo(tmp_path)
+        swept = []
+        real_apply = mcp_server._correction_sweep_apply
+
+        def apply_spy(*a, **kw):
+            swept.append(a[1])
+            return real_apply(*a, **kw)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        on, on_pf = await self._ingest(tmp_path, monkeypatch, "on", True)
+        swept_on = list(swept)
+        swept.clear()
+        off, off_pf = await self._ingest(tmp_path, monkeypatch, "off", False)
+
+        # Positive controls: the sweep ran, and the on-arm really used
+        # prefetched results while the off-arm used none.
+        assert len(swept_on) >= 3, swept_on
+        assert swept == swept_on
+        assert len(on_pf) == 1 and on_pf[0].hits >= len(swept_on) - 1, (
+            on_pf[0].hits, on_pf[0].misses, len(swept_on))
+        assert len(off_pf) == 1 and off_pf[0].hits == 0
+
+        assert self._parity._snapshot(on) == self._parity._snapshot(off)
+        assert self._parity._lineage(on) == self._parity._lineage(off)
+
+    @pytest.mark.asyncio
+    async def test_the_next_extraction_is_submitted_before_the_current_writes(
+        self, tmp_path, monkeypatch
+    ):
+        """The property that saves the time, observed on the real loop: by
+        the time Stage B's first commit is written, the next commit's parse
+        has already been handed to the pool. Serially (the old loop, or
+        _SWEEP_PREFETCH off) exactly one Stage B extraction precedes the
+        first write."""
+        import mcp_server
+        self._repo = self._parity._repo(tmp_path)
+        events = []
+        # Every route to the pool -- loop.run_in_executor included -- ends in
+        # executor.submit, so this sees the old serial loop's extractions too.
+        pool = concurrent.futures.ProcessPoolExecutor
+        real_submit = pool.submit
+
+        def submit_spy(self_, fn, *args, **kwargs):
+            if (fn is mcp_server._extract_commit
+                    and mcp_server._ingest_progress.get("phase") == "sweeping"):
+                events.append(("extract", args[1]))
+            return real_submit(self_, fn, *args, **kwargs)
+
+        real_apply = mcp_server._correction_sweep_apply
+
+        def apply_spy(*a, **kw):
+            events.append(("apply", a[1]))
+            return real_apply(*a, **kw)
+
+        monkeypatch.setattr(pool, "submit", submit_spy)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", apply_spy)
+        await self._ingest(tmp_path, monkeypatch, "g", True)
+
+        applies = [i for i, (k, _) in enumerate(events) if k == "apply"]
+        assert len(applies) >= 3, events
+        before_first = [h for k, h in events[:applies[0]] if k == "extract"]
+        assert len(before_first) >= 2, (
+            f"only {before_first} was submitted before the first Stage B "
+            f"write -- the sweep is still extracting one commit at a time"
+        )
