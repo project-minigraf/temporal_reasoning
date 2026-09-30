@@ -8755,11 +8755,10 @@ def _entity_introduced_by_set_provisional_batch(
     commit on a real repository; retracts cost ~13ms against a transact's
     ~1ms, so the retract batching is the load-bearing half.
 
-    Returns the set of idents whose guess was actually asserted or moved.
-    NO PRODUCTION CONSUMER -- both call sites in _reverse_apply discard it.
-    It is kept because the test suite asserts on it to distinguish "moved" from
-    "left alone", which is otherwise only observable by re-querying every
-    ident. Do not "clean it up" into None without re-pointing those tests.
+    Returns the set of idents whose guess was actually asserted or moved --
+    NOT those already at commit_ident. _reverse_apply records exactly this set
+    in its #369 `guess_unchanged` map, and the test suite asserts on it to
+    distinguish "moved" from "left alone".
 
     Every gate is per-ident and is applied in the same order the per-ident
     function used, because batching must not turn one ident's refusal into
@@ -11958,6 +11957,7 @@ def _reverse_apply(
     persist_claim: bool = True,
     claim_ident: Optional[str] = None,
     absorbed_idents: Optional[List[str]] = None,
+    guess_unchanged: Optional[Dict[str, Tuple[str, bool]]] = None,
 ) -> str:
     """#222 phase 2b: apply one already-claimed, already-extracted commit --
     structural facts, :modified-in edges, and provisional :introduced-by for
@@ -12059,6 +12059,23 @@ def _reverse_apply(
     documented limitation here rather than a bug. Phrased carefully because
     an intermediate draft of 2c's spec dropped the case entirely, leaving it
     briefly owned by nobody (see the 2b review).
+
+    `guess_unchanged` (#369) suppresses the retroactive :modified-in edge a
+    provisional move writes at the SUPERSEDED guess S when this walk already
+    knows the entity's body was unchanged at S. Without it, 230,829 of the
+    232,599 such edges written over this repo's full history were retracted
+    again by _correction_sweep_apply's case 3 (whose criterion is the very
+    same `unchanged_idents` of S), one retract per call -- 545 s of the
+    run's 650 s of write time (evals/at_scale/results/369-retract-
+    attribution.json). The map is ident -> (guess, unchanged at guess),
+    written below for every ident this commit's provisional batches assert
+    or move (an ident already at this commit keeps its entry); an edge is skipped only on an
+    exact (S, True) entry, so a missing or stale entry (resumed run, another
+    interval, a guess moved by anything else) writes the edge as before and
+    the sweep still owns it. None (the default) disables it entirely. The
+    one observable difference: an entity the sweep leaves PROVISIONAL (case
+    2) used to keep the unchanged edge, since only case 3 retracts it; it
+    now never gets one.
 
     Returns the applied commit's hash. Writes for one commit are followed
     by exactly one _db_checkpoint(db) call, after _frontier_persist_claim
@@ -12240,11 +12257,11 @@ def _reverse_apply(
             db, "[" + " ".join(authoritative_modified_triples) + "]", commit_ts_iso, index_con=index_con,
         )
 
-    _entity_introduced_by_set_provisional_batch(
+    guessed_here = _entity_introduced_by_set_provisional_batch(
         db, new_candidates, commit_ident, commit_ts_iso, index_con=index_con,
         pos=pos, pos_by_commit_ident=pos_by_commit_ident,
     )
-    _entity_introduced_by_set_provisional_batch(
+    guessed_here |= _entity_introduced_by_set_provisional_batch(
         db, [ident for ident, _superseded in provisional_moves], commit_ident,
         commit_ts_iso, index_con=index_con,
         pos=pos, pos_by_commit_ident=pos_by_commit_ident,
@@ -12261,6 +12278,10 @@ def _reverse_apply(
     retroactive_by_ts: Dict[str, List[str]] = {}
     for ident, superseded_ident in provisional_moves:
         if superseded_ident is None or superseded_ident == commit_ident:
+            continue
+        # #369: the sweep's case 3 would retract this edge at the superseded
+        # commit, on the same `unchanged_idents` this walk recorded there.
+        if guess_unchanged is not None and guess_unchanged.get(ident) == (superseded_ident, True):
             continue
         superseded_pos = pos_by_commit_ident.get(superseded_ident)
         if superseded_pos is not None and superseded_pos <= pos:
@@ -12285,6 +12306,13 @@ def _reverse_apply(
         )
     for superseded_ts, triples in retroactive_by_ts.items():
         _transact(db, "[" + " ".join(triples) + "]", superseded_ts, index_con=index_con)
+
+    # #369: AFTER the loop above, which reads each ident's PREVIOUS entry.
+    # Only idents whose guess is now this commit are recorded; the flag
+    # defaults to False (changed), the side that writes the edge.
+    if guess_unchanged is not None:
+        for ident in guessed_here:
+            guess_unchanged[ident] = (commit_ident, unchanged_by_ident.get(ident, False))
 
     # #326 (Finding A): `persist_claim=False` withholds the BOOKKEEPING for this
     # position, never the work -- every triple above has already been written.
@@ -14957,6 +14985,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # the extraction pool's own shutdown has already been submitted to it.
         write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
+        # #369: ident -> (its current provisional guess, whether its body was
+        # UNCHANGED at that guess). Read and written only by _reverse_apply,
+        # which runs on write_executor's single worker, so it needs no lock.
+        # Deliberately run-scoped, never persisted: a missing entry makes
+        # _reverse_apply write the edge exactly as before.
+        rev_guess_unchanged: Dict[str, Tuple[str, bool]] = {}
+
         _ingest_trace = _ingest_trace_from_env()
 
         # Single fact-index write connection for the whole ingestion run,
@@ -15574,6 +15609,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                         # docstring.
                                         claim_ident=claim_ident,
                                         absorbed_idents=absorbed_idents,
+                                        # #369: run-scoped; see _reverse_apply.
+                                        guess_unchanged=rev_guess_unchanged,
                                         ),
                                     )
 
