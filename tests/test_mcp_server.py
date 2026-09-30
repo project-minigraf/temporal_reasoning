@@ -18074,6 +18074,67 @@ class TestAmbientMinigrafEnvIsScrubbed:
         )
 
 
+class TestAmbientGitDefaultBranchIsPinned:
+    """tests/conftest.py must make a bare `git init` produce `master`.
+
+    About a hundred fixtures create repos with a bare `git init` and then
+    ingest or query `master`. A developer whose global git config sets
+    `init.defaultBranch=main` got a repo with no `master` at all, and 27
+    tests failed with `git log ... master` exiting 128 -- while CI, which
+    carries no such config, stayed green. The same class as #331: an ambient
+    setting silently changing what a test measures.
+
+    A SUBPROCESS test for the same reason as TestAmbientMinigrafEnvIsScrubbed:
+    in-process, a bare `git init` already yields `master` on CI, so the
+    assertion would pass with the fixture deleted. The child is handed a
+    global git config that says `main`, which is the only form that
+    discriminates everywhere.
+    """
+
+    def _run_child(self, tmp_path, conftest_text):
+        (tmp_path / "conftest.py").write_text(conftest_text, encoding="utf-8")
+        (tmp_path / "test_branch.py").write_text(
+            "import subprocess\n"
+            "def test_bare_git_init_is_master(tmp_path):\n"
+            "    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)\n"
+            "    head = subprocess.run(['git', 'symbolic-ref', '--short', 'HEAD'],\n"
+            "                          cwd=tmp_path, check=True, capture_output=True,\n"
+            "                          text=True).stdout.strip()\n"
+            "    assert head == 'master', head\n",
+            encoding="utf-8",
+        )
+        gitconfig = tmp_path / "gitconfig"
+        gitconfig.write_text("[init]\n\tdefaultBranch = main\n", encoding="utf-8")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG")}
+        env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        return _subprocess.run(
+            [sys.executable, "-m", "pytest", str(tmp_path / "test_branch.py"),
+             "-q", "-p", "no:cacheprovider", "--no-header"],
+            env=env, capture_output=True, text=True, cwd=str(tmp_path), timeout=300,
+        )
+
+    def test_shipped_conftest_pins_master(self, tmp_path):
+        conftest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conftest.py")
+        with open(conftest_path, encoding="utf-8") as handle:
+            conftest_text = handle.read()
+        result = self._run_child(tmp_path, conftest_text)
+        assert result.returncode == 0, (
+            "a bare `git init` under the shipped tests/conftest.py did not "
+            f"produce master\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+    def test_positive_control_without_the_fixture(self, tmp_path):
+        """Ablation: without the fixture the child must see `main`, or the
+        test above proves only that the config never reached the child."""
+        result = self._run_child(tmp_path, '"""No pin fixture."""\n')
+        assert result.returncode != 0, (
+            "ablation did not fail: the child's global config never took "
+            f"effect, so the sibling test is vacuous\nstdout:\n{result.stdout}"
+        )
+        assert "main" in result.stdout, result.stdout
+
+
 class TestMainStartupBackfill:
     @pytest.mark.asyncio
     async def test_kicks_off_backfill_when_needed(self, monkeypatch, tmp_path):
