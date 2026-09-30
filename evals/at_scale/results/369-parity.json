@@ -1,0 +1,43 @@
+{
+  "issue": 369,
+  "ref": "daf1b8d",
+  "arms": {
+    "master": "daf1b8d",
+    "branch": "334103a"
+  },
+  "note": "Full-history ingestion of this repo under each build, PYTHONHASHSEED=0. Graph contents only: timings from this pair were taken under unrelated CPU load and are NOT reported.",
+  "current_facts": {
+    "master": 40163,
+    "branch": 40163,
+    "only_master": [
+      "[\":ingestion/last-run-at\", \":last-run-at\", \"2026-09-30T03:56:48.957Z\"]"
+    ],
+    "only_branch": [
+      "[\":ingestion/last-run-at\", \":last-run-at\", \"2026-09-30T04:21:49.426Z\"]"
+    ]
+  },
+  "modified_in_any_valid_time": {
+    "master": 4385,
+    "branch": 4385,
+    "only_master": 0,
+    "only_branch": 0
+  },
+  "fact_audit": {
+    "master": {
+      "graph_facts": 40163,
+      "index_current_rows": 40163,
+      "divergence": 0,
+      "introduced_by_duplicates": 0,
+      "entities_without_introduced_by": 0,
+      "code_entities_scanned": 4309
+    },
+    "branch": {
+      "graph_facts": 40163,
+      "index_current_rows": 40163,
+      "divergence": 0,
+      "introduced_by_duplicates": 0,
+      "entities_without_introduced_by": 0,
+      "code_entities_scanned": 4309
+    }
+  }
+}

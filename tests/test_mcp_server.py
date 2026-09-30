@@ -22243,6 +22243,169 @@ class TestReverseApplySplit:
         )
 
 
+class TestReverseRetroactiveEdgeSkipsUnchanged:
+    """#369: a provisional move from guess S down to commit C wrote
+    [ident :modified-in S] whether or not the entity's body changed at S, and
+    Stage B's case 3 then retracted every unchanged one again -- 230,829 of
+    232,599 such edges over this repo's full history, one retract per call,
+    545 s of 650 s of write time. _reverse_apply now records, per ident, whether
+    it was unchanged at its current guess and skips the edge on an exact
+    (S, True) entry.
+
+    Fixture: `same()` never changes after c0; `moving()` changes at c1 and c2.
+    Walking c2, c1, c0 in reverse order moves both guesses down twice, so each
+    function is offered retroactive edges at c2 and at c1.
+    """
+
+    def _repo(self, tmp_path, commits=3, born_at=0):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for n in range(commits):
+            if n < born_at:
+                (repo / "pad.py").write_text(f"PAD = {n}\n")
+            else:
+                (repo / "wide.py").write_text(
+                    "def same():\n    return 0\n\n\n"
+                    f"def moving():\n    return {n}\n"
+                )
+            date = f"2021-03-{n + 1:02d}T00:00:00+00:00"
+            env = {**os.environ, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{n}"], cwd=repo, check=True,
+                            capture_output=True, env=env)
+        return repo
+
+    def _modified_in(self, db, ident):
+        import mcp_server
+        raw = mcp_server._db_execute(db, f"(query [:find ?c :where [{ident} :modified-in ?c]])")
+        return {row[0] for row in json.loads(raw)["results"]}
+
+    def _walk(self, db, repo, guess_unchanged):
+        import mcp_server
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        for pos in reversed(range(len(linearization))):
+            file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[pos], ())
+            mcp_server._reverse_apply(
+                db, str(repo), linearization, commit_metadata, pos, file_results,
+                persist_claim=False, guess_unchanged=guess_unchanged,
+            )
+        return [f":commit/{h[:12]}" for h in linearization]
+
+    def test_unchanged_guess_gets_no_retroactive_edge(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo(tmp_path)
+        guess_unchanged = {}
+        c0, c1, c2 = self._walk(real_db, repo, guess_unchanged)
+
+        same = mcp_server._code_ident("function", "wide.py", "same")
+        moving = mcp_server._code_ident("function", "wide.py", "moving")
+        # Positive control: the walk really moved both guesses to c0, so both
+        # were offered edges at c2 and c1 -- and the changed one kept them.
+        assert mcp_server._entity_introduced_by_query(real_db, same) == c0
+        assert self._modified_in(real_db, moving) == {c1, c2}
+        assert self._modified_in(real_db, same) == set(), (
+            "same() is unchanged at c1 and c2; Stage B's case 3 would retract "
+            "both edges, so they must not be written"
+        )
+        assert guess_unchanged[same] == (c0, False)
+
+    def test_without_the_map_the_edges_are_written_as_before(self, real_db, tmp_path):
+        """guess_unchanged=None is the pre-#369 behaviour, and the proof that
+        the fixture exercises the edge at all."""
+        import mcp_server
+        repo = self._repo(tmp_path)
+        _c0, c1, c2 = self._walk(real_db, repo, None)
+        same = mcp_server._code_ident("function", "wide.py", "same")
+        assert self._modified_in(real_db, same) == {c1, c2}
+
+    def test_a_missing_entry_writes_the_edge(self, real_db, tmp_path):
+        """A resumed run starts with an empty map: nothing recorded at S means
+        the edge is written, and the sweep still owns it."""
+        import mcp_server
+        import frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        guess_unchanged = {}
+        for pos in (2, 1, 0):
+            if pos == 1:
+                guess_unchanged.clear()  # a new run resumes below c2
+            file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[pos], ())
+            mcp_server._reverse_apply(
+                real_db, str(repo), linearization, commit_metadata, pos, file_results,
+                persist_claim=False, guess_unchanged=guess_unchanged,
+            )
+        c1, c2 = (f":commit/{h[:12]}" for h in linearization[1:])
+        same = mcp_server._code_ident("function", "wide.py", "same")
+        assert self._modified_in(real_db, same) == {c2}, (
+            "the c2 edge was offered with no entry for c2 and must be written; "
+            "the c1 edge was recorded unchanged by this run and must not be"
+        )
+        assert c1 not in self._modified_in(real_db, same)
+
+    @pytest.mark.asyncio
+    async def test_ingestion_passes_the_map_and_the_sweep_retracts_nothing(
+        self, tmp_path, monkeypatch,
+    ):
+        """End to end through _run_ingestion's dispatch, reverse-heavy so most
+        of the history is reverse territory: the sweep issues no :modified-in
+        retract, and moving() keeps an edge at every commit after c0."""
+        import mcp_server
+        # Born at p5 of 10: the forward stream holds only the bottom of the
+        # history, so both functions are first SIGHTED by the reverse stream
+        # at p9 and their guesses walk down to p5 -- the provisional moves
+        # under test. Born at p0 they would be authoritative before the
+        # reverse stream ever saw them, and no retroactive edge is offered.
+        commits, born_at = 10, 5
+        repo = self._repo(tmp_path, commits, born_at)
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        retracts = []
+        real_retract = mcp_server._retract
+
+        def spy(db_, facts, *a, **k):
+            if mcp_server._ingest_progress.get("phase") == "sweeping" and ":modified-in" in facts:
+                retracts.append(facts)
+            return real_retract(db_, facts, *a, **k)
+
+        reverse_positions = []
+        real_reverse = mcp_server._reverse_apply
+
+        def reverse_spy(*a, **k):
+            reverse_positions.append(a[4])
+            return real_reverse(*a, **k)
+
+        monkeypatch.setattr(mcp_server, "_retract", spy)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", reverse_spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"
+
+        db = mcp_server.get_db()
+        linearization = [c for c in reversed(_subprocess.run(
+            ["git", "rev-list", "master"], cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.split())]
+        idents = [f":commit/{h[:12]}" for h in linearization]
+        same = mcp_server._code_ident("function", "wide.py", "same")
+        moving = mcp_server._code_ident("function", "wide.py", "moving")
+        # Positive controls: the reverse stream applied several positions (so
+        # guesses were actually moved), and moving() -- changed at every
+        # commit -- kept an edge at each of them.
+        assert set(range(born_at + 1, commits)) <= set(reverse_positions), (
+            f"reverse applied only {sorted(reverse_positions)}"
+        )
+        assert self._modified_in(db, moving) == set(idents[born_at + 1:])
+        assert self._modified_in(db, same) == set()
+        assert retracts == [], f"the sweep retracted edges nobody should have written: {retracts}"
+        mcp_server._reset_db_state()
+
+
 class _NoProgressAllocator:
     """Stand-in for a FrontierAllocator whose claim_high() stops making
     progress -- the pre-2b1 behaviour on a grown linearization, where

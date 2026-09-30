@@ -2417,3 +2417,28 @@ repo/walk/graph counts already in the run's log.
 | Code entities with no :introduced-by (#316) | 0 of 3899 code entities |
 | Commits: repo / walk / graph (#317) | 957 / 957 / 957 (ref `master`) |
 | Orphaned commit entities (#222 phase 5) | 0 of 957 (ref `master`) |
+
+## Sweep Retract Churn — 369 (2026-09-30)
+
+Call-site attribution (`probe_sweep_retract_attribution.py`,
+`results/369-retract-attribution.json`, full history at `daf1b8d`): 232,182
+of Stage B's 239,866 retracts (545 s of 650 s write time) removed the reverse
+walk's retroactive `:modified-in` at a superseded guess where the entity was
+unchanged. #369 stops writing those edges (see CLAUDE.md).
+
+Code A/B (`probe_code_ab.py`, `results/369-sweep-retract-ab.json`, master
+`daf1b8d` vs branch as two source trees,
+interleaved A B A B, one interpreter, lineage cache on):
+
+| | master (A) | #369 (B) | B/A |
+|---|---:|---:|---:|
+| wall clock, median | 1627 s | 796 s | 0.49 |
+| wall spread | 4% | 1% | |
+| DB exec | 668 s | 108 s | 0.16 |
+| Stage B retracts | 239,866 (567 s) | 9,037 (14 s) | |
+| handle drops | 402 s | 223 s | 0.55 |
+| graph file | 604 MB | 339 MB | 0.56 |
+
+Parity: identical fingerprints across all four runs, fact_audit divergence 0,
+census clean. A separate kept-graph comparison (`results/369-parity.json`)
+found the two builds' graphs identical apart from `:ingestion/last-run-at`.
