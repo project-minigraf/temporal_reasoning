@@ -1660,6 +1660,24 @@ Four things it rests on:
     agent strategies' prompt simply loses its canonical-ident section, as for
     an empty graph, rather than waiting out the deadline on a query.
 
+**Measured on this repo, full history at `52bdeb3`**
+(`results/379-run-hold-ab.json`, `probe_code_ab.py`, master vs branch
+interleaved A B A B): **wall 289 s -> 254 s median (0.88x)**, both branch runs
+faster than both master runs (spread 7% / 1%); handle drops 126 s -> 0.02 s;
+parity identical in all four runs. **DB exec time DOUBLED (97 s -> 191 s), and
+that is the cost moving, not a new one**: every drop's checkpoint reset
+minigraf's WAL entry counter, so with no drops its 1000-entry auto-checkpoint
+fires more often, inside `execute`. Attributed with `probe_lease_drop_cost.py`
+(`results/379-checkpoint-attribution.json`, one sequential run per tree --
+read its counts, not its wall): checkpoints of every kind went from 83
+explicit (58 of them `before_drop`'s) + 58 drops + 9 auto = ~49 s to 22
+explicit + 0 drops + 26 auto = ~20 s. On a ~0.3 GB graph that is the whole
+win; the issue's 3.8 GB case was not measured. The PROJECTION, arithmetic
+not measurement: drops are paced by the 2 s window clock while auto-checkpoints
+are paced by WAL writes, so as commits slow with graph size the drops per commit
+rise and auto-checkpoints per commit do not -- the saving should grow with
+the graph. The remaining term is #376/#377's to shrink.
+
 Status: `minigraf_ingest_status` reports `handle_drops` (`count`, `seconds`,
 this run, pre-drop checkpoint included) and `hook_spool` (`records`, `facts`,
 `quarantined`). `_DbLeaseManager.drops`/`drop_seconds` are the cumulative
