@@ -9311,7 +9311,7 @@ class TestFrontierLowRetentionCheck:
         return {r[0] for r in json.loads(raw).get("results", [])}
 
     @pytest.mark.asyncio
-    async def test_commit_grafted_inside_frontier_low_is_still_walked(self, tmp_path):
+    async def test_commit_grafted_by_a_foxtrot_fast_forward_is_still_walked(self, tmp_path):
         import mcp_server
         repo = self._repo(tmp_path)
         mcp_server.open_db(str(tmp_path / "g.graph"))
@@ -9328,26 +9328,25 @@ class TestFrontierLowRetentionCheck:
         with mcp_server.db_lease() as db:
             hashes = self._commit_hashes(db)
 
-        # POSITIVE CONTROL, and it is load-bearing -- assert it BEFORE the
-        # real assertion. This test is vacuous unless the grafted commit
-        # actually lands strictly inside frontier-low's retained span: a
-        # graft that lands at the TIP is walked normally by any code, fixed
-        # or not, so `grafted in hashes` would pass without the fix and the
-        # test would guard nothing. Task 1 measured exactly that failure --
-        # the obvious graft recipe put the commit at position 8 of 10.
-        lo_pos, hi_pos = lin.index(bounds[0]), lin.index(bounds[1])
-        grafted_pos = lin.index(grafted)
-        assert lo_pos < grafted_pos < hi_pos, (
-            f"the graft landed at position {grafted_pos}, not strictly inside "
-            f"frontier-low's retained [{lo_pos}, {hi_pos}] -- this test proves "
-            f"nothing in that state, whatever the assertion below does"
+        # #384: on the first-parent timeline this graft is a FOXTROT
+        # fast-forward. master's new first-parent chain is root -> GRAFTED ->
+        # merge, and c1..c7 become side commits of that merge. So
+        # frontier-low's old hi bound no longer resolves and the interval is
+        # discarded -- an insertion strictly INSIDE two resolving bounds is
+        # unconstructible, because a commit's first parent never changes and
+        # the chain below any resolving hi is therefore fixed. That is the
+        # positive control now: if the old bound still resolved, this
+        # construction would no longer be exercising a rewritten chain.
+        assert bounds is not None and bounds[1] not in lin, (
+            f"frontier-low's old hi bound still resolves in {len(lin)} positions "
+            f"-- the graft did not rewrite the first-parent chain"
         )
-
+        grafted_pos = lin.index(grafted)
+        assert lin == [lin[0], grafted, lin[2]], "expected root -> GRAFTED -> merge"
         assert grafted in hashes, (
             f"the grafted commit at position {grafted_pos} of {len(lin)} never "
-            f"reached the graph -- frontier-low was retained over a span it "
-            f"was never claimed under, so the position was excluded from "
-            f"_unclaimed()'s complement and handed to no stream"
+            f"reached the graph -- a rewritten first-parent chain must be "
+            f"re-walked, never covered by an interval from the old chain"
         )
 
 
@@ -10713,7 +10712,7 @@ class TestSkipFastPathInterleavedCommitIsNotSkipped:
         return repo
 
     @pytest.mark.asyncio
-    async def test_a_commit_interleaved_inside_an_archived_region_is_still_ingested(
+    async def test_a_commit_interleaved_by_a_foxtrot_fast_forward_is_still_ingested(
         self, tmp_path, monkeypatch
     ):
         import mcp_server
@@ -10767,16 +10766,18 @@ class TestSkipFastPathInterleavedCommitIsNotSkipped:
             _subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
 
         grown = frontier_registry.build_linearization(str(repo))
-        lo_pos, hi_pos = grown.index(first_high[0]), grown.index(first_high[1])
-        assert grown.index(interleaved) < hi_pos, (
-            "the new commit did not land inside the archived region's position "
-            "range, so this test is not exercising the defect it exists for"
+        # #384: on the first-parent timeline this is a foxtrot fast-forward:
+        # the new chain is original[:2] -> u1 -> merge, and the old mainline
+        # above `base` becomes side commits. The archived region's hi bound
+        # therefore no longer resolves -- an insertion strictly inside two
+        # RESOLVING bounds is unconstructible on a first-parent chain, since
+        # the chain below any resolving hash is fixed. Positive control:
+        # assert the rewrite actually happened.
+        assert first_high[1] not in grown, (
+            "the archived region's hi bound still resolves -- the topology did "
+            "not rewrite the first-parent chain, so this test proves nothing"
         )
-        assert hi_pos - lo_pos + 1 != archived_span, (
-            "the archived region's position span is unchanged, so the stored "
-            "denominator could not discriminate anything here"
-        )
-
+        assert interleaved in grown and archived_span > 0
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
         missing = []
@@ -10791,11 +10792,9 @@ class TestSkipFastPathInterleavedCommitIsNotSkipped:
 
         assert not missing, (
             f"commits {[h[:12] for h in missing]} have no :commit/... entity "
-            f"(the interleaved commit is {interleaved[:12]}). The archived "
-            "region's HASH bounds still map into the linearization, but a new "
-            "commit landed between them, so consuming the region as a closed "
-            "position range skipped a position nothing ever proved complete -- "
-            "and every at-scale detector reads that graph clean"
+            f"(the interleaved commit is {interleaved[:12]}). A rewritten "
+            "first-parent chain must be re-walked, never skipped on the "
+            "strength of a region archived from the old chain"
         )
 
 
@@ -12415,7 +12414,12 @@ class TestGitCommitsTopoOrder:
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo_diamond_clock_skewed), watermark_hash=None)
         subjects = [c[3] for c in commits]
-        assert subjects == ["P", "C2a", "C2b", "C2tip", "C1", "MG"]
+        # #384: first-parent chain by default; C1 is a side commit.
+        assert subjects == ["P", "C2a", "C2b", "C2tip", "MG"]
+        every = mcp_server._git_commits(
+            str(git_repo_diamond_clock_skewed), watermark_hash=None, first_parent=False,
+        )
+        assert [c[3] for c in every] == ["P", "C2a", "C2b", "C2tip", "C1", "MG"]
 
 
 class TestDefaultGitBranch:
@@ -12578,10 +12582,11 @@ class TestGitDiffTreeRaw:
 
 
 class TestGitDiffTreeRawMergeCommits:
-    """See #185: plain `git diff-tree --raw` (no -m/-c/--cc) always emits
-    nothing for a merge commit -- this is documented git behavior. Content
-    authored genuinely at the merge point (e.g. manual conflict-resolution
-    edits) was silently and permanently dropped as a result.
+    """A merge commit diffs against its FIRST parent (#384), like every other
+    position on the first-parent timeline. Plain `git diff-tree --raw` emits
+    nothing for a merge (documented git behavior, #185), so the merge path
+    diffs the two trees explicitly. The merge's rows are the whole side
+    branch's net effect on the mainline, conflict resolution included.
     """
 
     def _init_repo(self, repo):
@@ -12635,10 +12640,10 @@ class TestGitDiffTreeRawMergeCommits:
         content = mcp_server._git_blob_content(str(repo), new_sha)
         assert b"kotlin" in content
 
-    def test_clean_non_conflicting_merge_reports_no_entries(self, tmp_path):
-        """Each side touches its own file only -- every changed byte is already
-        reachable via the individual non-merge commits `_git_commits` walks, so
-        the merge commit itself should contribute nothing new."""
+    def test_clean_merge_reports_the_side_branchs_net_effect(self, tmp_path):
+        """Each side touches its own file only. Against the first parent, the
+        merge is where feature_only.py enters the mainline, so it is an "A"
+        row here -- the side commit that authored it is not a position."""
         import mcp_server
         repo = tmp_path / "repo"
         self._init_repo(repo)
@@ -12669,7 +12674,7 @@ class TestGitDiffTreeRawMergeCommits:
         assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
 
         entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
-        assert entries == []
+        assert [(e[0], e[5]) for e in entries] == [("A", "feature_only.py")]
 
     def test_single_parent_commit_pays_no_extra_parent_hash_lookup(self, git_repo, monkeypatch):
         """The merge-commit branch must not cost the (overwhelming) common
@@ -12693,13 +12698,12 @@ class TestGitDiffTreeRawMergeCommits:
 
         assert call_count["n"] == 0, "expected zero _git_parent_hashes calls for an ordinary non-empty commit"
 
-    def test_content_discarded_entirely_at_merge_is_recovered(self, tmp_path):
-        """See #191: a file added on ONE branch only, never touched on the
-        other, whose content is deliberately dropped while resolving the
-        merge -- the final tree matches the branch that never had the file
-        at all. Neither plain diff-tree nor --cc report anything for this
-        commit (both documented as the residual gap in #185's fix), so
-        without the new supplement this file's facts would never close."""
+    def test_content_discarded_entirely_at_merge_never_reaches_the_mainline(self, tmp_path):
+        """A file added on the side branch only and dropped while resolving
+        the merge was never in any mainline tree, so the first-parent diff
+        reports nothing for it. (#191 used to recover a "D" here, closing an
+        entity the walk had opened from the side commit -- on the
+        first-parent timeline that entity is never opened at all.)"""
         import mcp_server
         repo = tmp_path / "repo"
         self._init_repo(repo)
@@ -12726,18 +12730,12 @@ class TestGitDiffTreeRawMergeCommits:
         assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
 
         entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
-        assert len(entries) == 1
-        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
-        assert path == "dropped.py"
-        assert status == "D"
+        assert entries == []
 
-    def test_deletion_already_handled_by_ordinary_commit_is_not_double_reported(self, tmp_path):
-        """Regression guard: a file that existed before the branches diverged,
-        deleted by an ORDINARY single-parent commit on one lineage and left
-        untouched on the other, is a plain clean merge -- `_git_commits`'
-        walk already visited the deleting commit directly and reported its
-        "D" there. The new per-parent supplement must recognize the path was
-        already absent at the merge-base and NOT report it a second time."""
+    def test_mainline_deletion_is_not_reported_again_at_the_merge(self, tmp_path):
+        """shared.py was deleted by an ordinary mainline commit; the merge
+        diffs against that commit's tree, where it is already gone, so the
+        merge reports only what the side branch brings in."""
         import mcp_server
         repo = tmp_path / "repo"
         self._init_repo(repo)
@@ -12767,7 +12765,7 @@ class TestGitDiffTreeRawMergeCommits:
         assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
 
         entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
-        assert entries == [], "shared.py's removal was already reported by the ordinary deleting commit"
+        assert [(e[0], e[5]) for e in entries] == [("A", "side_only.py")]
 
 
 class TestIsIgnoredPath:
@@ -21723,7 +21721,10 @@ class TestRunIngestionGitlinks:
         Pre-fix, neither plain diff-tree nor --cc ever report this removal,
         so the :pinned-commit fact opened by the add commit stayed open
         forever even though the submodule doesn't exist in the repo from the
-        merge commit onward. Verified against the REAL minigraf backend.
+        merge commit onward. Since #384 the side commit is not a position and
+        the merge diffs against `main`, which never had the submodule, so it
+        is never opened at all; the assertions hold either way. Verified
+        against the REAL minigraf backend.
         """
         import mcp_server
         repo = tmp_path / "repo"
@@ -33212,3 +33213,219 @@ class TestStageBPrefetchesExtraction:
             f"only {before_first} was submitted before the first Stage B "
             f"write -- the sweep is still extracting one commit at a time"
         )
+
+
+class TestFirstParentTimeline:
+    """#384: valid time is the FIRST-PARENT tree. The topo-order walk diffed
+    each file against whatever the interleaved sequence last saw for it, so a
+    sibling-branch commit "removed" what the other branch had added (closed,
+    then reborn at the merge -- inverted when the sibling is dated earlier),
+    and a branch forked before a mainline move resurrected the old path
+    PERMANENTLY. Measured on real history in
+    evals/at_scale/results/384-sibling-branch-exposure.json.
+
+    Every test runs forward-only and at the 1:1 default, so both the forward
+    and the reverse write path are exercised.
+    """
+
+    RATIOS = [f"{10**6}:1", "1:1"]
+
+    def _git(self, repo, *args, date=None):
+        env = dict(os.environ)
+        if date:
+            env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = date
+        return _subprocess.run(["git", *args], cwd=repo, check=True,
+                               capture_output=True, text=True, env=env).stdout.strip()
+
+    def _init(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-b", "master")
+        self._git(repo, "config", "user.email", "t@t.com")
+        self._git(repo, "config", "user.name", "T")
+        return repo
+
+    def _write(self, repo, path, text):
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+
+    async def _ingest(self, repo, graph, monkeypatch, ratio):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph))
+        mcp_server._ingest_progress = {
+            "status": "idle", "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._reset_db_state()
+
+    def _query(self, graph, datalog):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(str(graph))
+        try:
+            return json.loads(mcp_server._db_execute(db, datalog)).get("results", [])
+        finally:
+            db = None
+
+    def _live_idents(self, graph, valid_at=None):
+        clause = f' :valid-at "{valid_at}"' if valid_at else ""
+        rows = self._query(
+            graph, f"(query [:find ?i{clause} :where [?e :ident ?i] [?e :introduced-by ?c]])")
+        return {r[0] for r in rows}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ratio", RATIOS)
+    async def test_sibling_branch_commit_does_not_close_the_other_branchs_entity(
+        self, tmp_path, monkeypatch, ratio,
+    ):
+        """The issue's shape. `feat` adds class Feat to app.py and merges at
+        Jan 4; `sib`, forked at the base, edits app.py at Jan 3 from a tree
+        without Feat and merges at Jan 6. Topo-order places sib's edit after
+        feat's merge, so Feat was closed at Jan 3 -- before its own Jan 4
+        introduction, an inverted window -- and reborn at Jan 6."""
+        repo = self._init(tmp_path)
+        self._write(repo, "app.py", "def run():\n    return 1\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "base", date="2020-01-01T00:00:00")
+        self._git(repo, "checkout", "-b", "sib")
+        self._write(repo, "app.py", "def run():\n    return 1\n\n\ndef helper():\n    return 2\n")
+        self._git(repo, "commit", "-am", "sib edit", date="2020-01-03T00:00:00")
+        self._git(repo, "checkout", "master")
+        self._git(repo, "checkout", "-b", "feat")
+        self._write(repo, "app.py", "def run():\n    return 1\n\n\nclass Feat:\n    pass\n")
+        self._git(repo, "commit", "-am", "add Feat", date="2020-01-02T00:00:00")
+        self._git(repo, "checkout", "master")
+        self._git(repo, "merge", "--no-ff", "-m", "merge feat", "feat", date="2020-01-04T00:00:00")
+        # Both sides appended to app.py's tail: a real conflict, resolved by
+        # keeping both.
+        _subprocess.run(["git", "merge", "--no-ff", "--no-commit", "sib"], cwd=repo,
+                        capture_output=True)
+        self._write(repo, "app.py",
+                    "def run():\n    return 1\n\n\ndef helper():\n    return 2\n\n\nclass Feat:\n    pass\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "merge sib", date="2020-01-06T00:00:00")
+        # Positive control: the topo-order walk really does put sib's edit
+        # after feat's merge, or this repo exercises nothing.
+        topo = self._git(repo, "log", "--topo-order", "--reverse", "--format=%s").splitlines()
+        assert topo.index("sib edit") > topo.index("merge feat"), topo
+
+        graph = tmp_path / "g.graph"
+        await self._ingest(repo, graph, monkeypatch, ratio)
+
+        feat = ":class/app-py--feat"
+        assert feat in self._live_idents(graph), "Feat must be live at HEAD"
+        assert feat in self._live_idents(graph, "2020-01-05T00:00:00Z"), (
+            "Feat was on master from Jan 4; sib's Jan 3 edit never removed it "
+            "from the first-parent tree"
+        )
+        assert feat not in self._live_idents(graph, "2020-01-03T12:00:00Z"), (
+            "Feat entered master at the Jan 4 merge"
+        )
+        intro = self._query(graph, f"(query [:find ?c :where [?e :ident \"{feat}\"] [?e :introduced-by ?c]])")
+        merge_feat = self._git(repo, "log", "--format=%H", "--grep", "^merge feat$")
+        assert [r[0] for r in intro] == [f":commit/{merge_feat[:12]}"], (
+            "attributed to the merge that brought Feat onto the mainline"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ratio", RATIOS)
+    async def test_branch_forked_before_a_move_does_not_resurrect_the_old_path(
+        self, tmp_path, monkeypatch, ratio,
+    ):
+        """flask's ca278a8 shape: master moves pkg/ to src/pkg/; a branch
+        forked earlier edits pkg/app.py and merges (git carries the edit
+        across the rename). The topo-order walk re-introduced pkg/app.py's
+        entities at the side edit and nothing ever closed them."""
+        repo = self._init(tmp_path)
+        self._write(repo, "pkg/app.py", "def run():\n    return 1\n\n\nclass Flask:\n    pass\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "base", date="2020-01-01T00:00:00")
+        self._git(repo, "checkout", "-b", "side")
+        self._write(repo, "pkg/app.py", "def run():\n    return 2\n\n\nclass Flask:\n    pass\n")
+        self._git(repo, "commit", "-am", "side edit", date="2020-01-03T00:00:00")
+        self._git(repo, "checkout", "master")
+        (repo / "src").mkdir()
+        self._git(repo, "mv", "pkg", "src/pkg")
+        self._git(repo, "commit", "-m", "move to src", date="2020-01-02T00:00:00")
+        self._git(repo, "merge", "--no-ff", "-m", "merge side", "side", date="2020-01-04T00:00:00")
+        assert self._git(repo, "ls-tree", "-r", "--name-only", "HEAD") == "src/pkg/app.py"
+
+        graph = tmp_path / "g.graph"
+        await self._ingest(repo, graph, monkeypatch, ratio)
+
+        live = self._live_idents(graph)
+        stale = {i for i in live if "pkg-app-py" in i and not i.split("/", 1)[1].startswith("src-")}
+        assert not stale, f"{sorted(stale)} live at HEAD under a path HEAD does not hold"
+        assert ":function/src-pkg-app-py--run" in live
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ratio", RATIOS)
+    async def test_side_commits_are_metadata_only_commit_entities(
+        self, tmp_path, monkeypatch, ratio,
+    ):
+        """Every commit of the ref is a :type/commit entity. A side commit
+        carries [side :merged-in merge] and its own :parent edges; a
+        mainline commit carries no :merged-in. No code entity cites a side
+        commit."""
+        repo = self._init(tmp_path)
+        self._write(repo, "a.py", "def a():\n    return 1\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "base", date="2020-01-01T00:00:00")
+        self._git(repo, "checkout", "-b", "side")
+        self._write(repo, "b.py", "def b():\n    return 1\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "s1", date="2020-01-02T00:00:00")
+        self._write(repo, "b.py", "def b():\n    return 2\n")
+        self._git(repo, "commit", "-am", "s2", date="2020-01-03T00:00:00")
+        self._git(repo, "checkout", "master")
+        self._write(repo, "a.py", "def a():\n    return 2\n")
+        self._git(repo, "commit", "-am", "m1", date="2020-01-02T12:00:00")
+        self._git(repo, "merge", "--no-ff", "-m", "merge side", "side", date="2020-01-04T00:00:00")
+
+        graph = tmp_path / "g.graph"
+        await self._ingest(repo, graph, monkeypatch, ratio)
+
+        h = {s: self._git(repo, "log", "--all", "--format=%H", "--grep", f"^{s}$")
+             for s in ("base", "s1", "s2", "m1", "merge side")}
+        ident = {s: f":commit/{v[:12]}" for s, v in h.items()}
+        commits = {r[0] for r in self._query(
+            graph, "(query [:find ?h :where [?e :entity-type :type/commit] [?e :hash ?h]])")}
+        assert commits == set(h.values())
+        merged_in = {(r[0], r[1]) for r in self._query(
+            graph, "(query [:find ?i ?m :where [?e :merged-in ?m] [?e :ident ?i]])")}
+        assert merged_in == {(ident["s1"], ident["merge side"]), (ident["s2"], ident["merge side"])}
+        parents = {(r[0], r[1]) for r in self._query(
+            graph, "(query [:find ?i ?p :where [?e :parent ?p] [?e :ident ?i]])")}
+        assert {
+            (ident["s1"], ident["base"]), (ident["s2"], ident["s1"]),
+            (ident["merge side"], ident["m1"]), (ident["merge side"], ident["s2"]),
+        } <= parents
+        cited = {r[0] for r in self._query(
+            graph, "(query [:find ?c :where [?e :introduced-by ?c]])")}
+        cited |= {r[0] for r in self._query(
+            graph, "(query [:find ?c :where [?e :modified-in ?c]])")}
+        assert not cited & {ident["s1"], ident["s2"]}, "side commits have no code effect"
+        b_intro = self._query(
+            graph, '(query [:find ?c :where [?e :ident ":function/b-py--b"] [?e :introduced-by ?c]])')
+        assert [r[0] for r in b_intro] == [ident["merge side"]]
+
+        # The counters read positions, never side commits: `total` and the
+        # graph's commit count (prior_ingested's seed, #317's walk_vs_graph)
+        # are the first-parent chain, and a side commit is not an orphan.
+        import mcp_server
+        from minigraf import MiniGrafDb
+        assert mcp_server._ingest_progress["total"] == 3
+        # The orphan check needs a recorded branch, so only a second run
+        # answers it; None would read as "proved nothing", not as clean.
+        await self._ingest(repo, graph, monkeypatch, ratio)
+        assert mcp_server._ingest_progress["orphaned_commits"] == 0
+        db = MiniGrafDb.open(str(graph))
+        try:
+            assert mcp_server._count_commit_entities(db) == 3
+            assert mcp_server._count_side_commit_entities(db) == 2
+        finally:
+            db = None

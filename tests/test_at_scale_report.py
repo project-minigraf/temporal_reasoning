@@ -1236,3 +1236,23 @@ class TestRuntimeVersionAttribution:
             {"entries": [], "minigraf_version": "9.9.9"}, report_path
         )
         assert "9.9.9" in report_path.read_text()
+
+
+class TestCommitCensusRowSideCommits:
+    """#384: side commits render beside the positional counts, and a metrics
+    file predating them renders without a fabricated 0 / 0."""
+
+    def _census(self, **extra):
+        base = dict(repo_commits=3, walk_claimed=3, graph_commit_entities=3,
+                    ok=True, proved_nothing=False, census_error=None, ref="master")
+        base.update(extra)
+        return {"commit_census": base}
+
+    def test_side_counts_are_rendered(self):
+        from evals.at_scale.report import _commit_census_row
+        row = _commit_census_row(self._census(repo_side_commits=2, graph_side_commit_entities=2))
+        assert "3 / 3 / 3; side 2 / 2" in row
+
+    def test_a_pre_384_census_renders_no_side_counts(self):
+        from evals.at_scale.report import _commit_census_row
+        assert "side" not in _commit_census_row(self._census())

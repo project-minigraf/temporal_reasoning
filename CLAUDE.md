@@ -293,14 +293,14 @@ repo's 1053-commit graph has 0, because no entity there has been closed twice.
 No gate sees it. Tracked as #383 and deferred to minigraf#435 (a `close`
 primitive); the public tool got the restore step in #380, ingestion did not.
 minigraf also stores an empty or inverted window without complaint, so the
-handler refuses `valid_at <= valid-from` itself. Ingestion DOES write inverted
-windows, and NOT from date skew, as this paragraph first said: when two
-branches touch one file concurrently, the linearized walk diffs against its
-running `state.file_entities` rather than the commit's own parent, so a
-sibling-branch commit "removes" what the other branch added, and the entity is
-reborn at the merge (#384; 2 entities on this repo, the inverted ones being
-those where the sibling commit is dated earlier). Every such spurious cycle is
-one more life for #383 to wipe.
+handler refuses `valid_at <= valid-from` itself. Ingestion USED TO write
+inverted windows, and NOT from date skew, as this paragraph first said: when
+two branches touched one file concurrently, the topo-order walk diffed against
+its running `state.file_entities` rather than the commit's own parent, so a
+sibling-branch commit "removed" what the other branch added, and the entity
+was reborn at the merge. #384 removed the cause by walking the first-parent
+chain (see "The timeline is the first-parent chain" below); every such
+spurious cycle had been one more life for #383 to wipe.
 
 **The same scan also answers a graph-only question: #287's two-value
 `:introduced-by`.** `fact_audit`'s full `[:find ?e ?a ?v]` scan is already in
@@ -382,7 +382,8 @@ and `_exit_code`'s `graph_facts == 0` clause only fires when the graph reads
 back COMPLETELY empty — one commit in 847 is not zero facts. So
 `evals/at_scale/commit_census.py` compares THREE numbers, not one delta, and
 is wired beside the audit rather than inside it (it needs a repo handle
-`fact_audit` deliberately does not take): `git rev-list --count <branch>`,
+`fact_audit` deliberately does not take): `git rev-list --first-parent --count <branch>`
+(since #384; plain `--count` before it),
 `walk_claimed_from_progress(_ingest_progress)`, and `_count_commit_entities`. **`walk_vs_graph`
 catches a commit walked and then lost; `repo_vs_walk` catches one NEVER
 WALKED** — the case no in-process counter can see, because the counter and the
@@ -392,7 +393,11 @@ The clean difference **is** zero, which was the open question: **847 = 847 =
 847** on the 847-commit at-scale graph (`results/317-commit-census.json`), so
 the gate is zero-tolerance. Predicted from the code, then confirmed — shipping
 it as zero without measuring would have repeated the `:type/external-dependency`
-trap. The five hazards the issue required measuring all resolved clean: merges
+trap. **#384 split the census in two**: `repo_commits` is the first-parent
+count (positions), and side commits -- metadata-only entities written at their
+merge -- get `side_repo_vs_graph`, gated on a completed run, with ident
+collisions counted over EVERY commit. Before #384, the five hazards the issue
+required measuring all resolved clean: merges
 count on both sides (`build_linearization` and `rev-list` are the same set, and
 both apply functions write the `:type/commit` triple FIRST, before any file is
 looked at, so path-ignore changes nothing either); an extraction-skipped commit
@@ -500,6 +505,60 @@ is a property of a PAIR, and the pair to fear is a new entity against an OLD one
 a bounded collection sees only new-vs-new and reports clean while missing the case it
 exists for. A red census step in the nightly is **not** a harness failure — it means
 history produced two entities sharing one ident, and #263's rule choice is reopened.
+
+**The timeline is the first-parent chain (#384, user decision 2026-10-01).**
+"Live at t" means "in the branch tip's tree at t". `build_linearization` and
+`_git_commits` both list `--first-parent`, and every position diffs against its
+first parent -- a merge tree-to-tree (`_git_diff_tree_raw`), so its rows are the
+side branch's whole net effect, conflict resolution included. That replaced
+#185's `--cc` path and #191's missed-removal supplement, which only ever
+approximated this diff. Spec:
+`docs/superpowers/specs/2026-10-01-first-parent-timeline-design.md`.
+
+The topo-order walk it replaced diffed a file against whatever the
+INTERLEAVED sequence last saw for it, and that was wrong two ways. A sibling
+commit "removed" what the other branch had added (closed, reborn at the merge,
+inverted when the sibling was dated earlier). Worse, and not in the issue: a
+branch forked before a mainline delete or move, editing the old path, was
+linearized AFTER the delete and RESURRECTED the old path's entities, which
+nothing ever closed -- the merge's absence of the path matched its first
+parent, so `--cc` and #191 both read it as old news. That one is wrong AT HEAD,
+not just in history. Measured with
+`evals/at_scale/probe_sibling_branch_closes.py` (git + real extractor, no
+graph; positive control = the issue's 2 inverted entities here, exactly):
+spurious closes / inverted / stale-live-at-HEAD were 2/2/0 here, 82/3/0 nedb,
+82/41/0 minigraf and 955/132/**1020** on pallets/flask; all 0 after
+(`results/384-sibling-branch-exposure.json`). Per-commit diffs against the
+commit's own parent, the issue's first option, would have fixed the closes
+and NOT the resurrection -- the side edit genuinely modifies a file that
+exists on its branch.
+
+Merged code is attributed to the MERGE (`:introduced-by`/`:modified-in`),
+consistent with its valid-from. Side commits are still `:type/commit`
+entities: `_write_side_commits` writes each one (`git log <P2..> ^<P1>`) at its
+merge position, with the seven commit triples, its `:parent` edges and
+`[side :merged-in merge]`, at its own date, from BOTH apply paths and before the
+claim persists -- so it rides the position's completion witness and a #313
+re-walk collapses onto identical triples. In `_forward_apply` it sits OUTSIDE
+the `:parent` loop's best-effort `try`: a lost side commit would be counted by
+nothing, so a failure fails the position. `:merged-in` is registered under the
+`commit` schema type, for the audit. Three readers had to learn the
+difference, each ablation-proven in `TestFirstParentTimeline`:
+`_count_commit_entities` counts MAINLINE commits only (`not-join` on
+`:merged-in` -- a plain `not` with an unbound `?m` is rejected, INT-018) because
+it seeds `prior_ingested` and #317's `walk_vs_graph`; `total` is
+`rev-list --first-parent --count`; and `_orphaned_commit_count` compares against
+the ref's FULL `rev-list`, or every side commit reads as an orphan.
+
+Side effects worth knowing. Positions roughly halve (1060 -> 431 here, 5557 ->
+2276 on flask), while each merge position carries its branch's aggregated
+diff. A foxtrot merge (feature branch as first parent) makes the mainline
+zig-zag -- git's own `--first-parent` convention, accepted. And a rewritten
+chain can no longer hide an insertion inside resolving frontier bounds (see the
+#326 `:pos-count` section). `GRAPH_FORMAT_VERSION` went 1 -> 2; old graphs are
+rebuilt, never migrated. #383 (a second close wipes the first life) is NOT
+fixed -- it loses most of its exposure, since spurious lives were its main
+source.
 
 **Graph format version — there is no migration, by design.** `GRAPH_FORMAT_VERSION`
 (mcp_server.py) is stamped as `:ingestion/format-version` and ingestion refuses to
@@ -908,6 +967,19 @@ earlier draft made, and it overstates what a checksum can do. A per-position
 marker (approach B in the design spec) is what would close it, at the cost of
 one fact per commit on the write path this issue exists to make cheaper.
 
+**#384 closed this residual, and the reasoning is structural, not measured.**
+The linearization is now the first-parent chain, and a commit's first parent
+never changes. So when both bounds resolve, the positions between them are
+`hi`'s own first-parent ancestry down to `lo` -- the identical commit set the
+interval was claimed over, whatever the tip has done since. An insertion
+strictly inside two resolving bounds is unconstructible; the only way to put
+a new commit below an old position is to rewrite the chain (a foxtrot
+fast-forward or a force-push), which takes the old `hi` OUT of the chain and
+sends the interval down the unresolvable-bounds discard path. `:pos-count`
+stays, and still discards on a mismatch, but on a first-parent chain it can
+no longer disagree when both bounds resolve. The "CHECKSUM, not a proof of set
+identity" warnings below describe the topo-order walk and are kept as history.
+
 **The end-of-walk flush's hi bound is the highest SKIPPED position, never the
 highest reverse position claimed.** `_frontier_persist_span` moves `:hi-hash`
 UP, which `_frontier_persist_claim` never does for the high interval. A reverse
@@ -1157,8 +1229,9 @@ the interval is now RETAINED rather than discarded-and-immediately-
 re-skipped, which matters for the count-check safety property above, not
 for the ordinary-resume cost that #326 had already fixed.
 
-**The `:pos-count` residual is unchanged: it is a CHECKSUM, not a proof of
-set identity — do not upgrade that language to "sound."** Equal count does
+**The `:pos-count` residual was unchanged by #325: it is a CHECKSUM, not a
+proof of set identity — #384's first-parent chain is what later made
+resolving bounds sound (see the #326 section).** Equal count does
 not imply the same member set; the undemonstrated (not measured) residual
 described in the #326 section above still applies verbatim to every
 interval #325 retains, extras included.
@@ -1259,8 +1332,8 @@ archive case was different: archiving and loading ran in the SAME run
 against the SAME linearization, so the count always agreed. **Accepted
 cost:** merging is coarser, so a later commit landing inside what used to be
 the upper component now discards the whole union rather than that component
-alone — a bigger re-walk, never a loss. The `:pos-count` residual is
-unchanged: it stays a CHECKSUM, not a proof of set identity.
+alone — a bigger re-walk, never a loss. The `:pos-count` residual was
+unchanged by #329; #384's first-parent chain closed it (see the #326 section).
 
 **The post-condition's two violations have deliberately different
 consequences.** `_frontier_check_load_invariants` RAISES on an adjacent or
@@ -1404,6 +1477,15 @@ test would have passed WITHOUT the fix. It now asserts containment
 (`lo_pos < grafted_pos < hi_pos`) as a positive control, ordered strictly
 before the defect-naming assertion, so a mis-placed graft fails as "this test
 proves nothing" rather than passing green.
+
+**After #384 that construction no longer inserts anything inside the
+interval.** On the first-parent timeline it is a foxtrot fast-forward: the
+new chain is root -> GRAFTED -> merge, the old mainline becomes side commits,
+and frontier-low's old `hi` no longer resolves, so the interval is discarded
+and the chain re-walked. The test (and its #326 twin,
+`TestSkipFastPathInterleavedCommitIsNotSkipped`) now asserts THAT as its
+positive control -- the old `hi` is gone from the chain -- before asserting
+the grafted commit reached the graph.
 
 **The same change closes a fact leak the plan did not name.** When a watermark
 hash does not resolve in the linearization, `_frontier_seed_from_watermark`

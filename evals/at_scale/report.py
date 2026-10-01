@@ -297,6 +297,14 @@ def _commit_census_row(metrics: dict[str, Any]) -> str:
         f"{census.get('repo_commits')} / {census.get('walk_claimed')} / "
         f"{census.get('graph_commit_entities')}"
     )
+    # #384: side commits (metadata-only, written at their merge) as repo /
+    # graph. Absent from a metrics file written before the first-parent
+    # timeline, and then simply not rendered -- never rendered as 0 / 0.
+    if "repo_side_commits" in census:
+        counts += (
+            f"; side {census['repo_side_commits']} / "
+            f"{census.get('graph_side_commit_entities')}"
+        )
     if census.get("proved_nothing"):
         # Both halves are 0. Reported as a non-result rather than a pass, on
         # the same terms as the orphan row: the census ran and found nothing

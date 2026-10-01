@@ -97,14 +97,20 @@ def coalesce_intervals(
 
 
 def build_linearization(repo_path: str, branch: str = "HEAD") -> List[str]:
-    """Full C0..branch commit hash list in fixed topological order (oldest first).
+    """C0..branch FIRST-PARENT chain, oldest first (#384).
 
-    --topo-order guarantees parent-before-child even when committer dates are
-    non-monotonic (clock skew, rebases) -- plain chronological `git log`
-    order does not.
+    Ingestion's timeline is the branch tip's own history: a side branch's
+    commits are not positions, and its changes enter at the merge, which
+    diffs against its first parent (mcp_server._git_diff_tree_raw). Walking
+    every branch interleaved (plain --topo-order) let a sibling-branch commit
+    "remove" what the other branch had added, and let a branch forked before
+    a mainline deletion resurrect the deleted path permanently.
+
+    --topo-order is kept so the order never depends on committer dates
+    (clock skew, rebases); on a first-parent chain it is the chain order.
     """
     result = subprocess.run(
-        ["git", "log", "--topo-order", "--reverse", "--format=%H", branch],
+        ["git", "log", "--first-parent", "--topo-order", "--reverse", "--format=%H", branch],
         cwd=repo_path, capture_output=True, text=True, check=True,
     )
     return [line for line in result.stdout.strip().splitlines() if line.strip()]

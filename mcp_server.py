@@ -5857,11 +5857,20 @@ def _git_commits(
     repo_path: str,
     watermark_hash: Optional[str],
     branch: str = "HEAD",
+    *,
+    first_parent: bool = True,
 ) -> List[tuple]:
-    """Return list of (hash, ts_iso, author_email, subject) in topological order."""
+    """Return list of (hash, ts_iso, author_email, subject), oldest first.
+
+    first_parent (default) lists the first-parent chain only -- ingestion's
+    timeline (#384), positionally aligned with
+    frontier_registry.build_linearization. False lists every commit in
+    topological order, for callers that census all of history.
+    """
     range_spec = f"{watermark_hash}..{branch}" if watermark_hash else branch
+    fp = ["--first-parent"] if first_parent else []
     result = _subprocess.run(
-        ["git", "log", "--topo-order", "--reverse", "--format=%H %at %ae %s", range_spec],
+        ["git", "log", *fp, "--topo-order", "--reverse", "--format=%H %at %ae %s", range_spec],
         cwd=repo_path, capture_output=True, text=True, check=True,
     )
     commits = []
@@ -5901,32 +5910,34 @@ def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
     --raw already carries file mode (needed to spot submodule paths, mode
     160000) in the same subprocess invocation _extract_commit already makes.
 
-    Merge commits (#185): plain `git diff-tree --raw` (no -m/-c/--cc) is
-    documented git behavior to emit NOTHING for a commit with more than one
-    parent, even when real content was authored at the merge point itself
-    (most commonly, manual conflict-resolution edits). Ordinary clean merges
-    don't need special handling here -- every underlying change is already
-    reachable via the individual non-merge commits `_git_commits`' plain
-    `git log` walk visits regardless.
-
-    Rather than checking parent count up front (an extra `git log -1`
-    subprocess call on every single commit, working against this function's
-    single-subprocess-call design goal for the overwhelmingly common
-    single-parent case), the plain diff-tree call always runs first; a
-    parent-count check (and the _git_diff_tree_combined_raw fallback it
-    guards) only happens on the rare path where it comes back empty -- which
-    is exactly the signal ("root or single-parent commit truly touched
-    nothing" vs. "this is a merge commit, plain diff-tree always returns
-    nothing regardless of content") this needs to distinguish.
-
-    On that merge path, _git_diff_tree_merge_missed_removals additionally
-    supplements --cc's own output with content genuinely discarded at the
-    merge (#191) -- present on exactly one parent's side and dropped
-    entirely during conflict resolution, which --cc's combined-diff
-    semantics can never surface (see that function's docstring).
+    Every commit diffs against its FIRST parent (#384): ingestion's timeline
+    is the first-parent chain, so a merge's rows are the side branch's whole
+    net effect on the mainline, conflict-resolution edits included, and
+    content that lived only on the side branch never appears. Plain
+    `git diff-tree --raw` emits NOTHING for a commit with more than one
+    parent (documented git behaviour, #185), so a merge is diffed tree to
+    tree against parent 1. The parent-count check runs only when the plain
+    call comes back empty -- the one signal that distinguishes "a root or
+    single-parent commit that touched nothing" from "a merge" -- so the
+    common single-parent case pays no extra subprocess. This replaced #185's
+    `--cc` path and #191's missed-removal supplement, which approximated
+    exactly this diff for the topo-order walk and could not see a side
+    commit that re-touched a path mainline had already removed.
     """
+    entries = _git_diff_tree_raw_run(
+        repo_path, ["--root", commit_hash],
+    )
+    if not entries:
+        parent_hashes = _git_parent_hashes(repo_path, commit_hash)
+        if len(parent_hashes) > 1:
+            return _git_diff_tree_raw_run(repo_path, [parent_hashes[0], commit_hash])
+    return entries
+
+
+def _git_diff_tree_raw_run(repo_path: str, revs: List[str]) -> List[tuple]:
+    """Run `git diff-tree -r -M --raw <revs>` and parse it; see _git_diff_tree_raw."""
     result = _subprocess.run(
-        ["git", "diff-tree", "--no-commit-id", "-r", "-M", "--raw", "--root", commit_hash],
+        ["git", "diff-tree", "--no-commit-id", "-r", "-M", "--raw", *revs],
         cwd=repo_path, capture_output=True, text=True, check=True,
     )
     entries = []
@@ -5947,170 +5958,6 @@ def _git_diff_tree_raw(repo_path: str, commit_hash: str) -> List[tuple]:
         else:
             old_path, path = "", rest
         entries.append((status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity))
-    if not entries:
-        parent_hashes = _git_parent_hashes(repo_path, commit_hash)
-        if len(parent_hashes) > 1:
-            cc_entries = _git_diff_tree_combined_raw(repo_path, commit_hash)
-            cc_paths = {e[5] for e in cc_entries}
-            missed_removals = _git_diff_tree_merge_missed_removals(
-                repo_path, commit_hash, parent_hashes, cc_paths
-            )
-            return cc_entries + missed_removals
-    return entries
-
-
-def _git_diff_tree_combined_raw(repo_path: str, commit_hash: str) -> List[tuple]:
-    """Combined-diff (`--cc`) raw parse, used only for merge commits (#185).
-
-    `--cc`'s combined-diff format already restricts its output to paths whose
-    content differs from EVERY parent -- exactly the "genuinely authored at
-    the merge point" set this exists to recover. A file that matches at
-    least one parent unchanged never appears here, which is what keeps this
-    safe for the common "both sides touched different files" clean-merge
-    case (reports nothing) and the "both sides touched the same file in
-    non-overlapping, auto-merged hunks" case (reports the file, since its
-    merged content differs from both individual parents, same as a manual
-    conflict resolution would).
-
-    Combined raw lines carry one leading ':' and one mode/sha per parent
-    (plus one more of each for the merge result itself), e.g. for an
-    ordinary 2-parent merge:
-    "::100644 100644 100644 <sha1> <sha2> <sha_new> MM\tpath". Rename/copy
-    detection doesn't apply in combined-diff mode, so there is always
-    exactly one tab-separated path field -- old_path is always "" and
-    similarity is always None, matching _git_diff_tree_raw's non-rename rows.
-
-    status is derived from the mode columns rather than the trailing status
-    letters (which are one char per parent, e.g. "MM", and don't collapse
-    cleanly to _git_diff_tree_raw's single-char contract): new_mode all
-    zeros means "D"; every old_mode all zeros means "A" (the path exists in
-    none of the parents); otherwise "M". old_mode/old_sha are taken from the
-    first parent only -- combined diff has no single unambiguous "old" side
-    for a merge, and the exact old-side content only feeds this codebase's
-    best-effort rename-matching heuristic (_extract_commit's
-    old_entity_nodes), not the fact-extraction this issue is about.
-
-    Residual gap (--cc only reports a path when it differs from EVERY
-    parent, so content that exists on exactly one parent's side and is
-    discarded entirely at the merge -- final tree matches the OTHER parent,
-    which never had it -- never appears here) is covered by a separate
-    supplement, `_git_diff_tree_merge_missed_removals`, called from
-    `_git_diff_tree_raw` right after this function for every merge commit.
-    See #191 and that function's docstring.
-    """
-    result = _subprocess.run(
-        ["git", "diff-tree", "--cc", "--no-commit-id", "-r", "--raw", "--root", commit_hash],
-        cwd=repo_path, capture_output=True, text=True, check=True,
-    )
-    entries = []
-    for line in result.stdout.strip().splitlines():
-        if not line.startswith(":"):
-            continue
-        meta, sep, path = line.partition("\t")
-        if not sep:
-            continue
-        n_parents = len(meta) - len(meta.lstrip(":"))
-        fields = meta[n_parents:].split(" ")
-        if len(fields) != 2 * n_parents + 3:
-            continue
-        old_modes = fields[:n_parents]
-        new_mode = fields[n_parents]
-        old_shas = fields[n_parents + 1: 2 * n_parents + 1]
-        new_sha = fields[2 * n_parents + 1]
-        zero_mode = "0" * len(new_mode)
-        if new_mode == zero_mode:
-            status = "D"
-        elif all(m == zero_mode for m in old_modes):
-            status = "A"
-        else:
-            status = "M"
-        entries.append((status, old_modes[0], new_mode, old_shas[0], new_sha, path, "", None))
-    return entries
-
-
-def _git_diff_tree_merge_missed_removals(
-    repo_path: str, commit_hash: str, parent_hashes: List[str], already_reported_paths: Set[str],
-) -> List[tuple]:
-    """Recover paths whose content was discarded entirely while resolving a
-    merge (#191) -- present on exactly one parent's side, absent from the
-    merge's own final tree, and therefore invisible to both the plain
-    diff-tree call (always empty for any merge commit) and `--cc`'s combined
-    diff (which only reports a path when it differs from EVERY parent -- a
-    path absent from the final tree AND absent from some other parent
-    matches that other parent trivially, so --cc excludes it too; see
-    _git_diff_tree_combined_raw's docstring).
-
-    Only ever called as a supplement to _git_diff_tree_combined_raw's output
-    for a merge commit, with that output's paths passed in as
-    already_reported_paths so a path --cc already reported (e.g. a genuine
-    full removal, differing from every parent) is never double-counted.
-
-    For each parent Pi, diffing the merge commit directly against Pi's own
-    tree (mirroring what `-m` reports for that parent) surfaces every path
-    Pi had that the merge's final tree lacks, as an ordinary "D" row. Most of
-    these are NOT this issue's bug: the overwhelmingly common case is a path
-    that already existed back at the merge-base too, and was deleted by an
-    ordinary single-parent commit on some OTHER parent's own lineage --
-    `_git_commits`' plain walk already visited that commit directly and
-    reported the same "D" there, so re-reporting it here would double-close
-    an already-closed fact. The distinguishing test: was this path already
-    absent at the merge-base between Pi and every other parent? If so, the
-    removal is old news, already handled by that ordinary commit -- skip it.
-    Only a path that did NOT exist at any other-parent merge-base (i.e. it
-    was born strictly after the branches diverged, entirely on Pi's side,
-    and the merge simply never incorporated it) is the
-    never-recorded-elsewhere case #191 is about.
-
-    An octopus merge (>2 parents) is handled the same way, checking each
-    candidate path's history against every OTHER parent individually -- a
-    path only counts as genuinely new if it's absent at the merge-base with
-    ALL of them, not just one.
-    """
-    entries: List[tuple] = []
-    seen = set(already_reported_paths)
-    for i, parent in enumerate(parent_hashes):
-        other_parents = [p for j, p in enumerate(parent_hashes) if j != i]
-        if not other_parents:
-            continue
-        result = _subprocess.run(
-            ["git", "diff-tree", "--no-commit-id", "-r", "-M", "--raw", parent, commit_hash],
-            cwd=repo_path, capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            continue
-        for line in result.stdout.strip().splitlines():
-            if not line.startswith(":"):
-                continue
-            meta, sep, path = line.partition("\t")
-            if not sep:
-                continue
-            fields = meta[1:].split(" ")
-            if len(fields) < 5:
-                continue
-            old_mode, new_mode, old_sha, new_sha, status_field = fields[0], fields[1], fields[2], fields[3], fields[4]
-            if status_field[0] != "D" or path in seen:
-                continue
-            existed_elsewhere_at_divergence = False
-            for other in other_parents:
-                mb = _subprocess.run(
-                    ["git", "merge-base", parent, other],
-                    cwd=repo_path, capture_output=True, text=True,
-                )
-                base = mb.stdout.strip() if mb.returncode == 0 else ""
-                if not base:
-                    existed_elsewhere_at_divergence = True  # no common ancestor -- be conservative
-                    break
-                check = _subprocess.run(
-                    ["git", "cat-file", "-e", f"{base}:{path}"],
-                    cwd=repo_path, capture_output=True,
-                )
-                if check.returncode == 0:
-                    existed_elsewhere_at_divergence = True
-                    break
-            if existed_elsewhere_at_divergence:
-                continue
-            seen.add(path)
-            entries.append(("D", old_mode, new_mode, old_sha, new_sha, path, "", None))
     return entries
 
 
@@ -6349,6 +6196,68 @@ def _git_parent_hashes(repo_path: str, commit_hash: str) -> List[str]:
     )
     raw = result.stdout.strip()
     return raw.split() if raw else []
+
+
+def _git_side_commits(
+    repo_path: str, parent_hashes: List[str],
+) -> List[Tuple[str, str, str, str, List[str]]]:
+    """The side commits a merge brings onto the first-parent timeline (#384).
+
+    Every commit reachable from the merge's non-first parents and not from its
+    first parent, as (hash, ts_iso, author_email, subject, parent_hashes),
+    oldest first. Each belongs to exactly one mainline merge: the first one
+    whose first parent does not already reach it. Empty for a non-merge.
+    """
+    if len(parent_hashes) < 2:
+        return []
+    result = _subprocess.run(
+        ["git", "log", "--topo-order", "--reverse", "--format=%H%x00%at%x00%ae%x00%P%x00%s",
+         *parent_hashes[1:], f"^{parent_hashes[0]}"],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    out = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        hash_, ts_unix, author, parents, subject = line.split("\x00", 4)
+        ts_iso = datetime.datetime.fromtimestamp(
+            int(ts_unix), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out.append((hash_, ts_iso, author, subject, parents.split()))
+    return out
+
+
+def _write_side_commits(
+    db: Any, repo_path: str, commit_ident: str, parent_hashes: List[str], index_con: Any,
+) -> None:
+    """Write a merge's side commits as metadata-only :type/commit entities (#384).
+
+    Same seven commit triples a position gets, plus [side :merged-in merge],
+    at the side commit's own date, and one :parent edge per call (a merge
+    side commit's two parents share (entity, attribute, valid_from) --
+    minigraf#287). No parse, no diff, no code effect: on the first-parent
+    timeline a side commit's changes enter at the merge, which owns them.
+
+    Called from both apply paths BEFORE the position's claim persists, so the
+    writes sit inside its completion witness; a #313 re-walk re-transacts
+    identical triples at identical valid-from and they collapse.
+    """
+    for hash_, ts_iso, author, subject, parents in _git_side_commits(repo_path, parent_hashes):
+        side_ident = f":commit/{hash_[:12]}"
+        _transact(db, "[" + " ".join([
+            f"[{side_ident} :entity-type :type/commit]",
+            f'[{side_ident} :ident "{side_ident}"]',
+            f'[{side_ident} :description "{_edn_escape(subject[:120])}"]',
+            f'[{side_ident} :hash "{hash_}"]',
+            f'[{side_ident} :author "{_edn_escape(author)}"]',
+            f'[{side_ident} :subject "{_edn_escape(subject[:200])}"]',
+            f'[{side_ident} :date "{ts_iso}"]',
+            f"[{side_ident} :merged-in {commit_ident}]",
+        ]) + "]", ts_iso, index_con=index_con)
+        for parent_hash in parents:
+            _transact(
+                db, f"[[{side_ident} :parent :commit/{parent_hash[:12]}]]",
+                ts_iso, index_con=index_con,
+            )
 
 
 def _git_tags(repo_path: str) -> List[tuple]:
@@ -6740,7 +6649,13 @@ def _total_ingested_query(db: Any) -> int:
 
 
 def _count_commit_entities(db: Any) -> int:
-    """Return the true number of durably persisted :type/commit entities.
+    """Return the true number of durably persisted MAINLINE :type/commit entities.
+
+    Mainline = positions of the first-parent chain (#384): a side commit
+    carries :merged-in and is counted by _count_side_commit_entities instead.
+    Every reader of this number compares it with positions walked
+    (prior_ingested, #317's walk_vs_graph) or reports it as commits ingested,
+    so a side commit counted here would read as a lost walk.
 
     Unlike _total_ingested_query, this reflects reality even after a run was
     interrupted before it could write its completion watermark.
@@ -6771,7 +6686,23 @@ def _count_commit_entities(db: Any) -> int:
     genuinely lost commit and read clean on a graph that lost history -- the
     precise failure that census exists to catch.
     """
-    raw = _db_execute(db, "(query [:find (count-distinct ?e) :where [?e :entity-type :type/commit]])")
+    raw = _db_execute(
+        db,
+        "(query [:find (count-distinct ?e) :where [?e :entity-type :type/commit]"
+        " (not-join [?e] [?e :merged-in ?m])])",
+    )
+    results = json.loads(raw).get("results", [])
+    return int(results[0][0]) if results else 0
+
+
+def _count_side_commit_entities(db: Any) -> int:
+    """Durably persisted SIDE :type/commit entities (#384) -- those carrying
+    :merged-in. count-distinct for the same reason as _count_commit_entities."""
+    raw = _db_execute(
+        db,
+        "(query [:find (count-distinct ?e) :where [?e :entity-type :type/commit]"
+        " [?e :merged-in ?m]])",
+    )
     results = json.loads(raw).get("results", [])
     return int(results[0][0]) if results else 0
 
@@ -6949,10 +6880,13 @@ def _frontier_span_count(
 # since ingestion recomputes every ident from scratch rather than reading it
 # back, so an old-rule graph read by new-rule code silently FORKS every entity
 # instead of erroring. Version 1 is the R3 rule; a graph with no stamp at all
-# predates it. There is deliberately NO migration -- see
+# predates it. Version 2 is the first-parent timeline (#384): positions,
+# frontier hashes and every entity's valid-time window mean something
+# different, and side commits gain :merged-in. There is deliberately NO
+# migration -- see
 # docs/superpowers/specs/2026-08-14-ident-rule-r3-and-format-version-design.md:
 # the supported recovery is a rebuild into a fresh graph path.
-GRAPH_FORMAT_VERSION = 1
+GRAPH_FORMAT_VERSION = 2
 _FORMAT_VERSION_IDENT = ":ingestion/format-version"
 
 
@@ -9344,8 +9278,19 @@ def _ingestion_branch_write(
         _transact(db, "[" + " ".join(to_transact) + "]", run_ts_iso, index_con=index_con)
 
 
+def _git_history_hashes(repo_path: str, ref: str) -> Optional[Set[str]]:
+    """Every commit hash reachable from ref, side commits included, or None
+    when git cannot answer (an unborn branch has no history to list)."""
+    result = _subprocess.run(
+        ["git", "rev-list", ref], cwd=repo_path, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return set(result.stdout.split())
+
+
 def _orphaned_commit_count(
-    db: Any, linearization: List[str], recorded_branch: Optional[str], ref: str
+    db: Any, history_hashes: Optional[Set[str]], recorded_branch: Optional[str], ref: str
 ) -> Optional[int]:
     """How many live :type/commit entities hold a hash this ref's history no
     longer contains, or None when that question cannot be answered.
@@ -9354,8 +9299,14 @@ def _orphaned_commit_count(
     commits may belong to another ingested branch, and reporting a count would
     invite a reader to treat real history as garbage. Detection only -- nothing
     here retracts anything.
+
+    history_hashes is EVERY commit of the ref, side commits included (#384):
+    the linearization is the first-parent chain only, and a side commit's
+    entity is real history, not an orphan. None (git could not list it) makes
+    the question unanswerable: comparing against an empty set would report
+    every commit entity as an orphan.
     """
-    if recorded_branch is None or recorded_branch != ref:
+    if history_hashes is None or recorded_branch is None or recorded_branch != ref:
         return None
     raw = _db_execute(
         db, "(query [:find ?h :where [?e :entity-type :type/commit] [?e :hash ?h]])"
@@ -9363,7 +9314,7 @@ def _orphaned_commit_count(
     graph_hashes = {r[0] for r in json.loads(raw).get("results", []) if r}
     if not graph_hashes:
         return None
-    return len(graph_hashes - set(linearization))
+    return len(graph_hashes - history_hashes)
 
 
 # System attributes written by _transact_extracted_facts alongside domain attributes.
@@ -9456,6 +9407,8 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
             ":hash": str, ":author": str, ":subject": str, ":date": str, ":alias": str,
             # parent commit reference (keyword-valued edge, stored as string)
             ":parent": str,
+            # #384: a side commit's mainline merge (keyword-valued edge)
+            ":merged-in": str,
         },
     },
 }
@@ -12469,11 +12422,13 @@ def _reverse_apply(
     # descends to it (or when the forward stream covers it, for parents
     # below frontier-high's floor): temporarily dangling, and convergent --
     # the same shape as the lineage facts around it.
-    for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+    parent_hashes = _git_parent_hashes(repo_path, commit_hash)
+    for parent_hash in parent_hashes:
         _transact(
             db, f"[[{commit_ident} :parent :commit/{parent_hash[:12]}]]",
             commit_ts_iso, index_con=index_con,
         )
+    _write_side_commits(db, repo_path, commit_ident, parent_hashes, index_con)
 
     # Third of the three write paths the monotonicity invariant covers
     # (#222 phase 2b1), and the one the 2b review did not list: an entity
@@ -14020,8 +13975,9 @@ def _forward_apply(
     # edges (and its :type/commit entity, skipped at the top of this
     # function) for every commit in frontier-high's territory.
     if not lifecycle_only:
+        parent_hashes = _git_parent_hashes(repo_path, commit_hash)
         try:
-            for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+            for parent_hash in parent_hashes:
                 parent_ident = f":commit/{parent_hash[:12]}"
                 _transact(
                     db,
@@ -14033,6 +13989,9 @@ def _forward_apply(
                 )
         except Exception:
             pass  # non-fatal; parent edges are best-effort
+        # NOT best-effort (#384): a side commit lost here would be counted by
+        # nothing, so a failure must fail the position and get it re-walked.
+        _write_side_commits(db, repo_path, commit_ident, parent_hashes, index_con)
 
     # lifecycle_only: Stage B tracks its own progress through
     # :ingestion/correction-sweep-through (written by _correction_sweep_apply),
@@ -15289,8 +15248,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # the checkout sits on a feature branch. Found while building #317's
         # commit census, which compares this same count against the graph and
         # would have inherited the wrong ref.
+        # --first-parent (#384): positions are the first-parent chain; side
+        # commits are written at their merge but are not walked.
         repo_total_result = _subprocess.run(
-            ["git", "rev-list", "--count", branch],
+            ["git", "rev-list", "--first-parent", "--count", branch],
             cwd=repo_path, capture_output=True, text=True,
         )
         repo_total = int(repo_total_result.stdout.strip()) if repo_total_result.returncode == 0 else len(commit_metadata)
@@ -15405,7 +15366,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # commits from another ingested branch are indistinguishable from
             # a rewrite's leftovers. A 0 there would read as "verified clean".
             _ingest_progress["orphaned_commits"] = await loop.run_in_executor(
-                write_executor, _orphaned_commit_count, db, linearization, prior_branch, branch,
+                write_executor, _orphaned_commit_count, db,
+                _git_history_hashes(repo_path, branch), prior_branch, branch,
             )
             allocator = await loop.run_in_executor(
                 write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,

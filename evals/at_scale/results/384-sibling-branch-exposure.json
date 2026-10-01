@@ -1,0 +1,727 @@
+{
+  "self": {
+    "repo": "temporal_reasoning",
+    "branch": "master",
+    "counts": {
+      "commits": 1059,
+      "merges": 99,
+      "file_changes": 1367,
+      "diverged": 2,
+      "diverged_M": 2,
+      "diverged_at_merge": 1,
+      "late_intros": 2,
+      "spurious_closes": 2,
+      "missed_closes": 0,
+      "inverted": 2
+    },
+    "entities_spuriously_closed": 2,
+    "entities_spuriously_closed_twice_or_more": 0,
+    "inverted_entities": 2,
+    "head_stale_live": 0,
+    "head_missing_live": 0,
+    "head_stale_sample": [],
+    "head_missing_sample": [],
+    "inverted_sample": [
+      ":class/tests-test_mcp_server-py--testambientgitdefaultbranchispinned",
+      ":function/tests-test_mcp_server-py--test_shipped_conftest_pins_master"
+    ],
+    "samples": [
+      {
+        "pos": 1049,
+        "commit": "f1b06f8d5c0f",
+        "merge": false,
+        "path": "tests/test_mcp_server.py",
+        "status": "M",
+        "spurious": [
+          ":class/tests-test_mcp_server-py--testambientgitdefaultbranchispinned",
+          ":function/tests-test_mcp_server-py--test_shipped_conftest_pins_master"
+        ]
+      }
+    ],
+    "seconds": 136.4
+  },
+  "nedb": {
+    "repo": "nedb",
+    "branch": "master",
+    "counts": {
+      "commits": 681,
+      "merges": 33,
+      "file_changes": 757,
+      "diverged": 18,
+      "diverged_M": 18,
+      "diverged_at_merge": 8,
+      "late_intros": 11,
+      "spurious_closes": 82,
+      "missed_closes": 73,
+      "inverted": 3
+    },
+    "entities_spuriously_closed": 82,
+    "entities_spuriously_closed_twice_or_more": 0,
+    "inverted_entities": 3,
+    "head_stale_live": 0,
+    "head_missing_live": 0,
+    "head_stale_sample": [],
+    "head_missing_sample": [],
+    "inverted_sample": [
+      ":variable/lib-datastore-js--cursor",
+      ":variable/test-model-test-js--datastore",
+      ":variable/test-model-test-js--fs"
+    ],
+    "samples": [
+      {
+        "pos": 494,
+        "commit": "6e41c82dfd17",
+        "merge": false,
+        "path": "test/model.test.js",
+        "status": "M",
+        "spurious": [
+          ":variable/test-model-test-js--datastore",
+          ":variable/test-model-test-js--fs"
+        ]
+      },
+      {
+        "pos": 568,
+        "commit": "b3c69f67aa1b",
+        "merge": false,
+        "path": "lib/datastore.js",
+        "status": "M",
+        "spurious": [
+          ":variable/lib-datastore-js--cursor"
+        ]
+      },
+      {
+        "pos": 628,
+        "commit": "26d6ec2bfd56",
+        "merge": false,
+        "path": "browser-version/out/nedb.js",
+        "status": "M",
+        "spurious": [
+          ":function/browser-version-out-nedb-js--_deepequal",
+          ":function/browser-version-out-nedb-js--_getvalue",
+          ":function/browser-version-out-nedb-js--_throws",
+          ":function/browser-version-out-nedb-js--_walk",
+          ":function/browser-version-out-nedb-js--aggregate"
+        ]
+      },
+      {
+        "pos": 632,
+        "commit": "c5591bd03937",
+        "merge": false,
+        "path": "lib/model.js",
+        "status": "M",
+        "spurious": [
+          ":function/lib-model-js--_djb2",
+          ":function/lib-model-js--_getvalue",
+          ":function/lib-model-js--_sortobject",
+          ":function/lib-model-js--_walk",
+          ":function/lib-model-js--aggregate"
+        ]
+      }
+    ],
+    "seconds": 10.1
+  },
+  "minigraf": {
+    "repo": "project-minigraf/minigraf",
+    "branch": "main",
+    "counts": {
+      "commits": 1103,
+      "merges": 141,
+      "file_changes": 1199,
+      "diverged": 49,
+      "diverged_A": 10,
+      "diverged_at_merge": 9,
+      "stale_add": 10,
+      "stale_add_entities": 9,
+      "diverged_M": 36,
+      "late_intros": 41,
+      "spurious_closes": 82,
+      "missed_closes": 7,
+      "diverged_D": 3,
+      "inverted": 41
+    },
+    "entities_spuriously_closed": 82,
+    "entities_spuriously_closed_twice_or_more": 0,
+    "inverted_entities": 41,
+    "head_stale_live": 0,
+    "head_missing_live": 0,
+    "head_stale_sample": [],
+    "head_missing_sample": [],
+    "inverted_sample": [
+      ":field/src-query-datalog-executor-rs--datalogexecutor-indexes",
+      ":field/src-storage-mod-rs--fileheader-header_checksum",
+      ":function/src-db-rs--test_begin_write_flag_not_leaked_on_lock_failure",
+      ":function/src-query-datalog-executor-rs--test_agg_count_empty_bindings_returns_zero",
+      ":function/src-query-datalog-executor-rs--test_agg_max_on_floats",
+      ":function/src-query-datalog-executor-rs--test_agg_min_max_on_all_null_group_skips_row",
+      ":function/src-query-datalog-executor-rs--test_agg_min_on_strings",
+      ":function/src-query-datalog-executor-rs--test_agg_sum_distinct_float_values",
+      ":function/src-query-datalog-executor-rs--test_agg_sum_empty_no_grouping_returns_zero",
+      ":function/src-query-datalog-executor-rs--test_eval_float_div_by_zero_is_err",
+      ":function/src-query-datalog-executor-rs--test_eval_float_div_succeeds",
+      ":function/src-query-datalog-executor-rs--test_eval_float_mul",
+      ":function/src-query-datalog-executor-rs--test_eval_float_sub",
+      ":function/src-query-datalog-executor-rs--test_evaluate_branch_empty_incoming_returns_empty",
+      ":function/src-query-datalog-executor-rs--test_evaluate_branch_empty_patterns_passes_incoming_through",
+      ":function/src-query-datalog-executor-rs--test_evaluate_branch_no_match_patterns_empty_bindings_returns_empty",
+      ":function/src-query-datalog-executor-rs--test_evaluate_branch_not_filter_excludes_matching",
+      ":function/src-query-datalog-executor-rs--test_evaluate_branch_not_join_excludes_matching",
+      ":function/src-query-datalog-executor-rs--test_evaluate_branch_or_clause_produces_empty_bindings",
+      ":function/src-query-datalog-executor-rs--test_not_body_expr_only_filters_binding"
+    ],
+    "samples": [
+      {
+        "pos": 414,
+        "commit": "4485e9bd5d36",
+        "merge": false,
+        "path": "src/query/datalog/executor.rs",
+        "status": "M",
+        "spurious": [
+          ":function/src-query-datalog-executor-rs--test_agg_count_empty_bindings_returns_zero",
+          ":function/src-query-datalog-executor-rs--test_agg_max_on_floats",
+          ":function/src-query-datalog-executor-rs--test_agg_min_max_on_all_null_group_skips_row",
+          ":function/src-query-datalog-executor-rs--test_agg_min_on_strings",
+          ":function/src-query-datalog-executor-rs--test_agg_sum_distinct_float_values"
+        ]
+      },
+      {
+        "pos": 441,
+        "commit": "a5b161f61b44",
+        "merge": false,
+        "path": "src/query/datalog/types.rs",
+        "status": "M",
+        "spurious": [
+          ":function/src-query-datalog-types-rs--from_keyword",
+          ":function/src-query-datalog-types-rs--is_per_fact",
+          ":function/src-query-datalog-types-rs--pseudo",
+          ":function/src-query-datalog-types-rs--real",
+          ":function/src-query-datalog-types-rs--test_attribute_spec_pseudo_variant"
+        ]
+      },
+      {
+        "pos": 459,
+        "commit": "a5b8c8c0cd44",
+        "merge": false,
+        "path": "src/storage/mod.rs",
+        "status": "M",
+        "spurious": [
+          ":field/src-storage-mod-rs--fileheader-header_checksum",
+          ":function/src-storage-mod-rs--test_file_header_roundtrip_v7",
+          ":function/src-storage-mod-rs--test_file_header_serialization_v7",
+          ":function/src-storage-mod-rs--test_file_header_v6_reads_header_checksum_zero",
+          ":function/src-storage-mod-rs--test_file_header_v7_byte_layout_all_fields"
+        ]
+      },
+      {
+        "pos": 459,
+        "commit": "a5b8c8c0cd44",
+        "merge": false,
+        "path": "src/storage/persistent_facts.rs",
+        "status": "M",
+        "spurious": [
+          ":function/src-storage-persistent_facts-rs--compute_header_checksum",
+          ":function/src-storage-persistent_facts-rs--compute_header_checksum_from_bytes",
+          ":function/src-storage-persistent_facts-rs--test_header_checksum_computation",
+          ":function/src-storage-persistent_facts-rs--test_header_checksum_corruption_detection"
+        ]
+      },
+      {
+        "pos": 473,
+        "commit": "7141173eb1e0",
+        "merge": true,
+        "path": "src/storage/mod.rs",
+        "status": "M",
+        "spurious": [
+          ":function/src-storage-mod-rs--test_file_header_byte_layout_all_fields",
+          ":function/src-storage-mod-rs--test_file_header_roundtrip_v6",
+          ":function/src-storage-mod-rs--test_file_header_serialization_v6",
+          ":function/src-storage-mod-rs--test_file_header_v5_reads_fact_page_count_zero",
+          ":function/src-storage-mod-rs--test_file_header_v6_byte_layout_all_fields"
+        ]
+      },
+      {
+        "pos": 512,
+        "commit": "255dbd029a6b",
+        "merge": false,
+        "path": "src/query/datalog/executor.rs",
+        "status": "M",
+        "spurious": [
+          ":field/src-query-datalog-executor-rs--datalogexecutor-indexes"
+        ]
+      },
+      {
+        "pos": 512,
+        "commit": "255dbd029a6b",
+        "merge": false,
+        "path": "src/query/datalog/types.rs",
+        "status": "M",
+        "spurious": [
+          ":function/src-query-datalog-types-rs--eq",
+          ":function/src-query-datalog-types-rs--hash"
+        ]
+      },
+      {
+        "pos": 516,
+        "commit": "63d81b5cbba2",
+        "merge": false,
+        "path": "src/query/datalog/parser.rs",
+        "status": "M",
+        "spurious": [
+          ":function/src-query-datalog-parser-rs--test_tokenize_keyword_length_limit",
+          ":function/src-query-datalog-parser-rs--test_tokenize_string_length_limit",
+          ":function/src-query-datalog-parser-rs--test_tokenize_symbol_length_limit",
+          ":function/src-query-datalog-parser-rs--test_tokenize_tagged_literal_length_limit",
+          ":variable/src-query-datalog-parser-rs--max_keyword_length"
+        ]
+      },
+      {
+        "pos": 518,
+        "commit": "6bc1c8bfc628",
+        "merge": false,
+        "path": "src/query/datalog/evaluator.rs",
+        "status": "M",
+        "spurious": [
+          ":field/src-query-datalog-evaluator-rs--recursiveevaluator-max_derived_facts",
+          ":field/src-query-datalog-evaluator-rs--recursiveevaluator-max_results",
+          ":field/src-query-datalog-evaluator-rs--stratifiedevaluator-max_derived_facts",
+          ":field/src-query-datalog-evaluator-rs--stratifiedevaluator-max_results",
+          ":function/src-query-datalog-evaluator-rs--test_stratified_max_derived_facts_limit"
+        ]
+      },
+      {
+        "pos": 527,
+        "commit": "2188e348faa8",
+        "merge": true,
+        "path": "src/query/datalog/evaluator.rs",
+        "status": "M",
+        "spurious": [
+          ":function/src-query-datalog-evaluator-rs--contains_fact"
+        ]
+      },
+      {
+        "pos": 572,
+        "commit": "a71019b173b1",
+        "merge": false,
+        "path": "src/db.rs",
+        "status": "M",
+        "spurious": [
+          ":function/src-db-rs--test_begin_write_flag_not_leaked_on_lock_failure"
+        ]
+      }
+    ],
+    "seconds": 19.4
+  },
+  "flask": {
+    "repo": "pallets/flask",
+    "branch": "main",
+    "counts": {
+      "commits": 5557,
+      "merges": 1732,
+      "file_changes": 4666,
+      "diverged": 693,
+      "diverged_M": 687,
+      "diverged_at_merge": 260,
+      "late_intros": 1943,
+      "spurious_closes": 955,
+      "missed_closes": 75,
+      "inverted": 149,
+      "diverged_D": 4,
+      "diverged_R": 2,
+      "head_files_diverged": 26
+    },
+    "entities_spuriously_closed": 520,
+    "entities_spuriously_closed_twice_or_more": 206,
+    "inverted_entities": 132,
+    "head_stale_live": 1020,
+    "head_missing_live": 0,
+    "head_stale_sample": [
+      ":class/flask-_compat-py--_mgr",
+      ":class/flask-_compat-py--metaclass",
+      ":class/flask-app-py--flask",
+      ":class/flask-blueprints-py--blueprint",
+      ":class/flask-blueprints-py--blueprintsetupstate",
+      ":class/flask-cli-py--appgroup",
+      ":class/flask-cli-py--certparamtype",
+      ":class/flask-cli-py--dispatchingapp",
+      ":class/flask-cli-py--flaskgroup",
+      ":class/flask-cli-py--noappexception"
+    ],
+    "head_missing_sample": [],
+    "inverted_sample": [
+      ":class/flask-cli-py--certparamtype",
+      ":class/flask-py--_packageboundobject",
+      ":class/flask-py--config",
+      ":class/flask-testsuite-config-py--loader",
+      ":class/flask-testsuite-helpers-py--pystringio",
+      ":class/flask-testsuite-helpers-py--staticfileapp",
+      ":class/tests-flask_tests-py--base",
+      ":class/tests-flask_tests-py--moduletestcase",
+      ":class/tests-flask_tests-py--test",
+      ":class/tests-test_cli-py--mockctx",
+      ":class/tests-test_cli-py--module",
+      ":field/flask-app-py--flask-cli",
+      ":field/flask-app-py--flask-config_class",
+      ":field/flask-app-py--flask-import_name",
+      ":field/flask-app-py--flask-request_globals_class",
+      ":field/flask-app-py--flask-root_path",
+      ":field/flask-app-py--flask-send_file_max_age_default",
+      ":field/flask-app-py--flask-shell_context_processors",
+      ":field/flask-app-py--flask-template_folder",
+      ":field/flask-app-py--flask-url_build_error_handlers"
+    ],
+    "samples": [
+      {
+        "pos": 148,
+        "commit": "a862ead5f22f",
+        "merge": false,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":class/flask-py--_modulesetupstate",
+          ":class/flask-py--_packageboundobject",
+          ":class/flask-py--module",
+          ":field/flask-py--_modulesetupstate-app",
+          ":field/flask-py--_modulesetupstate-url_prefix"
+        ]
+      },
+      {
+        "pos": 148,
+        "commit": "a862ead5f22f",
+        "merge": false,
+        "path": "tests/flask_tests.py",
+        "status": "M",
+        "spurious": [
+          ":class/tests-flask_tests-py--moduletestcase",
+          ":function/tests-flask_tests-py--after_admin_request",
+          ":function/tests-flask_tests-py--before_admin_request",
+          ":function/tests-flask_tests-py--login",
+          ":function/tests-flask_tests-py--logout"
+        ]
+      },
+      {
+        "pos": 150,
+        "commit": "5144d3b65a56",
+        "merge": true,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":field/flask-py--flask-package_name",
+          ":field/flask-py--flask-root_path",
+          ":function/flask-py--match_request"
+        ]
+      },
+      {
+        "pos": 156,
+        "commit": "a9bb965b6dcd",
+        "merge": false,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":class/flask-py--_modulesetupstate",
+          ":class/flask-py--_packageboundobject",
+          ":class/flask-py--module",
+          ":field/flask-py--_modulesetupstate-app",
+          ":field/flask-py--_modulesetupstate-url_prefix"
+        ]
+      },
+      {
+        "pos": 156,
+        "commit": "a9bb965b6dcd",
+        "merge": false,
+        "path": "tests/flask_tests.py",
+        "status": "M",
+        "spurious": [
+          ":class/tests-flask_tests-py--moduletestcase",
+          ":function/tests-flask_tests-py--after_admin_request",
+          ":function/tests-flask_tests-py--before_admin_request",
+          ":function/tests-flask_tests-py--login",
+          ":function/tests-flask_tests-py--logout"
+        ]
+      },
+      {
+        "pos": 159,
+        "commit": "36e24299e35c",
+        "merge": true,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":field/flask-py--flask-package_name",
+          ":field/flask-py--flask-root_path",
+          ":function/flask-py--match_request"
+        ]
+      },
+      {
+        "pos": 168,
+        "commit": "36717b02731a",
+        "merge": false,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":class/flask-py--_modulesetupstate",
+          ":class/flask-py--_packageboundobject",
+          ":class/flask-py--module",
+          ":field/flask-py--_modulesetupstate-app",
+          ":field/flask-py--_modulesetupstate-url_prefix"
+        ]
+      },
+      {
+        "pos": 168,
+        "commit": "36717b02731a",
+        "merge": false,
+        "path": "tests/flask_tests.py",
+        "status": "M",
+        "spurious": [
+          ":class/tests-flask_tests-py--moduletestcase",
+          ":function/tests-flask_tests-py--after_admin_request",
+          ":function/tests-flask_tests-py--before_admin_request",
+          ":function/tests-flask_tests-py--login",
+          ":function/tests-flask_tests-py--logout"
+        ]
+      },
+      {
+        "pos": 174,
+        "commit": "eeb0e9495187",
+        "merge": true,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":field/flask-py--flask-package_name",
+          ":field/flask-py--flask-root_path",
+          ":function/flask-py--match_request"
+        ]
+      },
+      {
+        "pos": 176,
+        "commit": "75461c1467bb",
+        "merge": false,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":class/flask-py--_modulesetupstate",
+          ":class/flask-py--_packageboundobject",
+          ":class/flask-py--module",
+          ":field/flask-py--_modulesetupstate-app",
+          ":field/flask-py--_modulesetupstate-url_prefix"
+        ]
+      },
+      {
+        "pos": 176,
+        "commit": "75461c1467bb",
+        "merge": false,
+        "path": "tests/flask_tests.py",
+        "status": "M",
+        "spurious": [
+          ":class/tests-flask_tests-py--moduletestcase",
+          ":function/tests-flask_tests-py--after_admin_request",
+          ":function/tests-flask_tests-py--before_admin_request",
+          ":function/tests-flask_tests-py--login",
+          ":function/tests-flask_tests-py--logout"
+        ]
+      },
+      {
+        "pos": 177,
+        "commit": "36f659b82b90",
+        "merge": true,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":field/flask-py--flask-package_name",
+          ":field/flask-py--flask-root_path",
+          ":function/flask-py--match_request"
+        ]
+      },
+      {
+        "pos": 179,
+        "commit": "9248a7baca5b",
+        "merge": false,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":class/flask-py--_modulesetupstate",
+          ":class/flask-py--_packageboundobject",
+          ":class/flask-py--module",
+          ":field/flask-py--_modulesetupstate-app",
+          ":field/flask-py--_modulesetupstate-url_prefix"
+        ]
+      },
+      {
+        "pos": 180,
+        "commit": "ce53d1023627",
+        "merge": true,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":field/flask-py--flask-package_name",
+          ":field/flask-py--flask-root_path",
+          ":function/flask-py--match_request"
+        ]
+      },
+      {
+        "pos": 181,
+        "commit": "dffb3d091c0e",
+        "merge": false,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":class/flask-py--_modulesetupstate",
+          ":class/flask-py--_packageboundobject",
+          ":class/flask-py--module",
+          ":field/flask-py--_modulesetupstate-app",
+          ":field/flask-py--_modulesetupstate-url_prefix"
+        ]
+      },
+      {
+        "pos": 181,
+        "commit": "dffb3d091c0e",
+        "merge": false,
+        "path": "tests/flask_tests.py",
+        "status": "M",
+        "spurious": [
+          ":class/tests-flask_tests-py--moduletestcase",
+          ":function/tests-flask_tests-py--after_admin_request",
+          ":function/tests-flask_tests-py--before_admin_request",
+          ":function/tests-flask_tests-py--login",
+          ":function/tests-flask_tests-py--logout"
+        ]
+      },
+      {
+        "pos": 183,
+        "commit": "9da5795d7919",
+        "merge": true,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":field/flask-py--flask-package_name",
+          ":field/flask-py--flask-root_path",
+          ":function/flask-py--match_request"
+        ]
+      },
+      {
+        "pos": 184,
+        "commit": "67fc46526234",
+        "merge": false,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":class/flask-py--_modulesetupstate",
+          ":class/flask-py--_packageboundobject",
+          ":class/flask-py--module",
+          ":field/flask-py--_modulesetupstate-app",
+          ":field/flask-py--_modulesetupstate-url_prefix"
+        ]
+      },
+      {
+        "pos": 184,
+        "commit": "67fc46526234",
+        "merge": false,
+        "path": "tests/flask_tests.py",
+        "status": "M",
+        "spurious": [
+          ":class/tests-flask_tests-py--moduletestcase",
+          ":function/tests-flask_tests-py--after_admin_request",
+          ":function/tests-flask_tests-py--before_admin_request",
+          ":function/tests-flask_tests-py--login",
+          ":function/tests-flask_tests-py--logout"
+        ]
+      },
+      {
+        "pos": 185,
+        "commit": "720bede150d8",
+        "merge": true,
+        "path": "flask.py",
+        "status": "M",
+        "spurious": [
+          ":field/flask-py--flask-package_name",
+          ":field/flask-py--flask-root_path",
+          ":function/flask-py--match_request"
+        ]
+      }
+    ],
+    "seconds": 57.3
+  },
+  "_meta": {
+    "probe": "evals/at_scale/probe_sibling_branch_closes.py",
+    "temporal_reasoning_head": "bc19c56",
+    "flask_head": "d73fa1cd",
+    "real_ingest_confirmation": "synthetic move-on-master + edit-on-side + merge: pkg/app.py module/function/class closed at the move, reborn by the side edit, live at HEAD in both 10**6:1 and 1:1 ingestion",
+    "before": "sections self/nedb/minigraf/flask: topo-order walk, measured at 3bfaa22 (pre-fix code)",
+    "after": "after_first_parent: same probe replaying the shipped first-parent walk (#384); every count 0, HEAD end state exact"
+  },
+  "after_first_parent": {
+    "self": {
+      "repo": "temporal_reasoning",
+      "branch": "master",
+      "counts": {
+        "commits": 430,
+        "merges": 99,
+        "file_changes": 745
+      },
+      "entities_spuriously_closed": 0,
+      "entities_spuriously_closed_twice_or_more": 0,
+      "inverted_entities": 0,
+      "head_stale_live": 0,
+      "head_missing_live": 0,
+      "head_stale_sample": [],
+      "head_missing_sample": [],
+      "inverted_sample": [],
+      "samples": [],
+      "seconds": 51.5
+    },
+    "nedb": {
+      "repo": "nedb",
+      "branch": "master",
+      "counts": {
+        "commits": 561,
+        "merges": 27,
+        "file_changes": 679
+      },
+      "entities_spuriously_closed": 0,
+      "entities_spuriously_closed_twice_or_more": 0,
+      "inverted_entities": 0,
+      "head_stale_live": 0,
+      "head_missing_live": 0,
+      "head_stale_sample": [],
+      "head_missing_sample": [],
+      "inverted_sample": [],
+      "samples": [],
+      "seconds": 8.9
+    },
+    "minigraf": {
+      "repo": "project-minigraf/minigraf",
+      "branch": "main",
+      "counts": {
+        "commits": 569,
+        "merges": 105,
+        "file_changes": 807
+      },
+      "entities_spuriously_closed": 0,
+      "entities_spuriously_closed_twice_or_more": 0,
+      "inverted_entities": 0,
+      "head_stale_live": 0,
+      "head_missing_live": 0,
+      "head_stale_sample": [],
+      "head_missing_sample": [],
+      "inverted_sample": [],
+      "samples": [],
+      "seconds": 11.9
+    },
+    "flask": {
+      "repo": "pallets/flask",
+      "branch": "main",
+      "counts": {
+        "commits": 2276,
+        "merges": 1027,
+        "file_changes": 3236
+      },
+      "entities_spuriously_closed": 0,
+      "entities_spuriously_closed_twice_or_more": 0,
+      "inverted_entities": 0,
+      "head_stale_live": 0,
+      "head_missing_live": 0,
+      "head_stale_sample": [],
+      "head_missing_sample": [],
+      "inverted_sample": [],
+      "samples": [],
+      "seconds": 26.5
+    }
+  }
+}
