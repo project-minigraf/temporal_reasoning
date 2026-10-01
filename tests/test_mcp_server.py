@@ -33210,3 +33210,219 @@ class TestStageBPrefetchesExtraction:
             f"only {before_first} was submitted before the first Stage B "
             f"write -- the sweep is still extracting one commit at a time"
         )
+
+
+class TestFirstParentTimeline:
+    """#384: valid time is the FIRST-PARENT tree. The topo-order walk diffed
+    each file against whatever the interleaved sequence last saw for it, so a
+    sibling-branch commit "removed" what the other branch had added (closed,
+    then reborn at the merge -- inverted when the sibling is dated earlier),
+    and a branch forked before a mainline move resurrected the old path
+    PERMANENTLY. Measured on real history in
+    evals/at_scale/results/384-sibling-branch-exposure.json.
+
+    Every test runs forward-only and at the 1:1 default, so both the forward
+    and the reverse write path are exercised.
+    """
+
+    RATIOS = [f"{10**6}:1", "1:1"]
+
+    def _git(self, repo, *args, date=None):
+        env = dict(os.environ)
+        if date:
+            env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = date
+        return _subprocess.run(["git", *args], cwd=repo, check=True,
+                               capture_output=True, text=True, env=env).stdout.strip()
+
+    def _init(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-b", "master")
+        self._git(repo, "config", "user.email", "t@t.com")
+        self._git(repo, "config", "user.name", "T")
+        return repo
+
+    def _write(self, repo, path, text):
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+
+    async def _ingest(self, repo, graph, monkeypatch, ratio):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph))
+        mcp_server._ingest_progress = {
+            "status": "idle", "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._reset_db_state()
+
+    def _query(self, graph, datalog):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(str(graph))
+        try:
+            return json.loads(mcp_server._db_execute(db, datalog)).get("results", [])
+        finally:
+            db = None
+
+    def _live_idents(self, graph, valid_at=None):
+        clause = f' :valid-at "{valid_at}"' if valid_at else ""
+        rows = self._query(
+            graph, f"(query [:find ?i{clause} :where [?e :ident ?i] [?e :introduced-by ?c]])")
+        return {r[0] for r in rows}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ratio", RATIOS)
+    async def test_sibling_branch_commit_does_not_close_the_other_branchs_entity(
+        self, tmp_path, monkeypatch, ratio,
+    ):
+        """The issue's shape. `feat` adds class Feat to app.py and merges at
+        Jan 4; `sib`, forked at the base, edits app.py at Jan 3 from a tree
+        without Feat and merges at Jan 6. Topo-order places sib's edit after
+        feat's merge, so Feat was closed at Jan 3 -- before its own Jan 4
+        introduction, an inverted window -- and reborn at Jan 6."""
+        repo = self._init(tmp_path)
+        self._write(repo, "app.py", "def run():\n    return 1\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "base", date="2020-01-01T00:00:00")
+        self._git(repo, "checkout", "-b", "sib")
+        self._write(repo, "app.py", "def run():\n    return 1\n\n\ndef helper():\n    return 2\n")
+        self._git(repo, "commit", "-am", "sib edit", date="2020-01-03T00:00:00")
+        self._git(repo, "checkout", "master")
+        self._git(repo, "checkout", "-b", "feat")
+        self._write(repo, "app.py", "def run():\n    return 1\n\n\nclass Feat:\n    pass\n")
+        self._git(repo, "commit", "-am", "add Feat", date="2020-01-02T00:00:00")
+        self._git(repo, "checkout", "master")
+        self._git(repo, "merge", "--no-ff", "-m", "merge feat", "feat", date="2020-01-04T00:00:00")
+        # Both sides appended to app.py's tail: a real conflict, resolved by
+        # keeping both.
+        _subprocess.run(["git", "merge", "--no-ff", "--no-commit", "sib"], cwd=repo,
+                        capture_output=True)
+        self._write(repo, "app.py",
+                    "def run():\n    return 1\n\n\ndef helper():\n    return 2\n\n\nclass Feat:\n    pass\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "merge sib", date="2020-01-06T00:00:00")
+        # Positive control: the topo-order walk really does put sib's edit
+        # after feat's merge, or this repo exercises nothing.
+        topo = self._git(repo, "log", "--topo-order", "--reverse", "--format=%s").splitlines()
+        assert topo.index("sib edit") > topo.index("merge feat"), topo
+
+        graph = tmp_path / "g.graph"
+        await self._ingest(repo, graph, monkeypatch, ratio)
+
+        feat = ":class/app-py--feat"
+        assert feat in self._live_idents(graph), "Feat must be live at HEAD"
+        assert feat in self._live_idents(graph, "2020-01-05T00:00:00Z"), (
+            "Feat was on master from Jan 4; sib's Jan 3 edit never removed it "
+            "from the first-parent tree"
+        )
+        assert feat not in self._live_idents(graph, "2020-01-03T12:00:00Z"), (
+            "Feat entered master at the Jan 4 merge"
+        )
+        intro = self._query(graph, f"(query [:find ?c :where [?e :ident \"{feat}\"] [?e :introduced-by ?c]])")
+        merge_feat = self._git(repo, "log", "--format=%H", "--grep", "^merge feat$")
+        assert [r[0] for r in intro] == [f":commit/{merge_feat[:12]}"], (
+            "attributed to the merge that brought Feat onto the mainline"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ratio", RATIOS)
+    async def test_branch_forked_before_a_move_does_not_resurrect_the_old_path(
+        self, tmp_path, monkeypatch, ratio,
+    ):
+        """flask's ca278a8 shape: master moves pkg/ to src/pkg/; a branch
+        forked earlier edits pkg/app.py and merges (git carries the edit
+        across the rename). The topo-order walk re-introduced pkg/app.py's
+        entities at the side edit and nothing ever closed them."""
+        repo = self._init(tmp_path)
+        self._write(repo, "pkg/app.py", "def run():\n    return 1\n\n\nclass Flask:\n    pass\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "base", date="2020-01-01T00:00:00")
+        self._git(repo, "checkout", "-b", "side")
+        self._write(repo, "pkg/app.py", "def run():\n    return 2\n\n\nclass Flask:\n    pass\n")
+        self._git(repo, "commit", "-am", "side edit", date="2020-01-03T00:00:00")
+        self._git(repo, "checkout", "master")
+        (repo / "src").mkdir()
+        self._git(repo, "mv", "pkg", "src/pkg")
+        self._git(repo, "commit", "-m", "move to src", date="2020-01-02T00:00:00")
+        self._git(repo, "merge", "--no-ff", "-m", "merge side", "side", date="2020-01-04T00:00:00")
+        assert self._git(repo, "ls-tree", "-r", "--name-only", "HEAD") == "src/pkg/app.py"
+
+        graph = tmp_path / "g.graph"
+        await self._ingest(repo, graph, monkeypatch, ratio)
+
+        live = self._live_idents(graph)
+        stale = {i for i in live if "pkg-app-py" in i and not i.split("/", 1)[1].startswith("src-")}
+        assert not stale, f"{sorted(stale)} live at HEAD under a path HEAD does not hold"
+        assert ":function/src-pkg-app-py--run" in live
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ratio", RATIOS)
+    async def test_side_commits_are_metadata_only_commit_entities(
+        self, tmp_path, monkeypatch, ratio,
+    ):
+        """Every commit of the ref is a :type/commit entity. A side commit
+        carries [side :merged-in merge] and its own :parent edges; a
+        mainline commit carries no :merged-in. No code entity cites a side
+        commit."""
+        repo = self._init(tmp_path)
+        self._write(repo, "a.py", "def a():\n    return 1\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "base", date="2020-01-01T00:00:00")
+        self._git(repo, "checkout", "-b", "side")
+        self._write(repo, "b.py", "def b():\n    return 1\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "s1", date="2020-01-02T00:00:00")
+        self._write(repo, "b.py", "def b():\n    return 2\n")
+        self._git(repo, "commit", "-am", "s2", date="2020-01-03T00:00:00")
+        self._git(repo, "checkout", "master")
+        self._write(repo, "a.py", "def a():\n    return 2\n")
+        self._git(repo, "commit", "-am", "m1", date="2020-01-02T12:00:00")
+        self._git(repo, "merge", "--no-ff", "-m", "merge side", "side", date="2020-01-04T00:00:00")
+
+        graph = tmp_path / "g.graph"
+        await self._ingest(repo, graph, monkeypatch, ratio)
+
+        h = {s: self._git(repo, "log", "--all", "--format=%H", "--grep", f"^{s}$")
+             for s in ("base", "s1", "s2", "m1", "merge side")}
+        ident = {s: f":commit/{v[:12]}" for s, v in h.items()}
+        commits = {r[0] for r in self._query(
+            graph, "(query [:find ?h :where [?e :entity-type :type/commit] [?e :hash ?h]])")}
+        assert commits == set(h.values())
+        merged_in = {(r[0], r[1]) for r in self._query(
+            graph, "(query [:find ?i ?m :where [?e :merged-in ?m] [?e :ident ?i]])")}
+        assert merged_in == {(ident["s1"], ident["merge side"]), (ident["s2"], ident["merge side"])}
+        parents = {(r[0], r[1]) for r in self._query(
+            graph, "(query [:find ?i ?p :where [?e :parent ?p] [?e :ident ?i]])")}
+        assert {
+            (ident["s1"], ident["base"]), (ident["s2"], ident["s1"]),
+            (ident["merge side"], ident["m1"]), (ident["merge side"], ident["s2"]),
+        } <= parents
+        cited = {r[0] for r in self._query(
+            graph, "(query [:find ?c :where [?e :introduced-by ?c]])")}
+        cited |= {r[0] for r in self._query(
+            graph, "(query [:find ?c :where [?e :modified-in ?c]])")}
+        assert not cited & {ident["s1"], ident["s2"]}, "side commits have no code effect"
+        b_intro = self._query(
+            graph, '(query [:find ?c :where [?e :ident ":function/b-py--b"] [?e :introduced-by ?c]])')
+        assert [r[0] for r in b_intro] == [ident["merge side"]]
+
+        # The counters read positions, never side commits: `total` and the
+        # graph's commit count (prior_ingested's seed, #317's walk_vs_graph)
+        # are the first-parent chain, and a side commit is not an orphan.
+        import mcp_server
+        from minigraf import MiniGrafDb
+        assert mcp_server._ingest_progress["total"] == 3
+        # The orphan check needs a recorded branch, so only a second run
+        # answers it; None would read as "proved nothing", not as clean.
+        await self._ingest(repo, graph, monkeypatch, ratio)
+        assert mcp_server._ingest_progress["orphaned_commits"] == 0
+        db = MiniGrafDb.open(str(graph))
+        try:
+            assert mcp_server._count_commit_entities(db) == 3
+            assert mcp_server._count_side_commit_entities(db) == 2
+        finally:
+            db = None

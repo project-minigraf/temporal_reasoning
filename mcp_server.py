@@ -6198,6 +6198,68 @@ def _git_parent_hashes(repo_path: str, commit_hash: str) -> List[str]:
     return raw.split() if raw else []
 
 
+def _git_side_commits(
+    repo_path: str, parent_hashes: List[str],
+) -> List[Tuple[str, str, str, str, List[str]]]:
+    """The side commits a merge brings onto the first-parent timeline (#384).
+
+    Every commit reachable from the merge's non-first parents and not from its
+    first parent, as (hash, ts_iso, author_email, subject, parent_hashes),
+    oldest first. Each belongs to exactly one mainline merge: the first one
+    whose first parent does not already reach it. Empty for a non-merge.
+    """
+    if len(parent_hashes) < 2:
+        return []
+    result = _subprocess.run(
+        ["git", "log", "--topo-order", "--reverse", "--format=%H%x00%at%x00%ae%x00%P%x00%s",
+         *parent_hashes[1:], f"^{parent_hashes[0]}"],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    out = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        hash_, ts_unix, author, parents, subject = line.split("\x00", 4)
+        ts_iso = datetime.datetime.fromtimestamp(
+            int(ts_unix), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out.append((hash_, ts_iso, author, subject, parents.split()))
+    return out
+
+
+def _write_side_commits(
+    db: Any, repo_path: str, commit_ident: str, parent_hashes: List[str], index_con: Any,
+) -> None:
+    """Write a merge's side commits as metadata-only :type/commit entities (#384).
+
+    Same seven commit triples a position gets, plus [side :merged-in merge],
+    at the side commit's own date, and one :parent edge per call (a merge
+    side commit's two parents share (entity, attribute, valid_from) --
+    minigraf#287). No parse, no diff, no code effect: on the first-parent
+    timeline a side commit's changes enter at the merge, which owns them.
+
+    Called from both apply paths BEFORE the position's claim persists, so the
+    writes sit inside its completion witness; a #313 re-walk re-transacts
+    identical triples at identical valid-from and they collapse.
+    """
+    for hash_, ts_iso, author, subject, parents in _git_side_commits(repo_path, parent_hashes):
+        side_ident = f":commit/{hash_[:12]}"
+        _transact(db, "[" + " ".join([
+            f"[{side_ident} :entity-type :type/commit]",
+            f'[{side_ident} :ident "{side_ident}"]',
+            f'[{side_ident} :description "{_edn_escape(subject[:120])}"]',
+            f'[{side_ident} :hash "{hash_}"]',
+            f'[{side_ident} :author "{_edn_escape(author)}"]',
+            f'[{side_ident} :subject "{_edn_escape(subject[:200])}"]',
+            f'[{side_ident} :date "{ts_iso}"]',
+            f"[{side_ident} :merged-in {commit_ident}]",
+        ]) + "]", ts_iso, index_con=index_con)
+        for parent_hash in parents:
+            _transact(
+                db, f"[[{side_ident} :parent :commit/{parent_hash[:12]}]]",
+                ts_iso, index_con=index_con,
+            )
+
+
 def _git_tags(repo_path: str) -> List[tuple]:
     """Return list of (tag_name, commit_hash, date_iso) for all tags in the repo.
 
@@ -6587,7 +6649,13 @@ def _total_ingested_query(db: Any) -> int:
 
 
 def _count_commit_entities(db: Any) -> int:
-    """Return the true number of durably persisted :type/commit entities.
+    """Return the true number of durably persisted MAINLINE :type/commit entities.
+
+    Mainline = positions of the first-parent chain (#384): a side commit
+    carries :merged-in and is counted by _count_side_commit_entities instead.
+    Every reader of this number compares it with positions walked
+    (prior_ingested, #317's walk_vs_graph) or reports it as commits ingested,
+    so a side commit counted here would read as a lost walk.
 
     Unlike _total_ingested_query, this reflects reality even after a run was
     interrupted before it could write its completion watermark.
@@ -6618,7 +6686,23 @@ def _count_commit_entities(db: Any) -> int:
     genuinely lost commit and read clean on a graph that lost history -- the
     precise failure that census exists to catch.
     """
-    raw = _db_execute(db, "(query [:find (count-distinct ?e) :where [?e :entity-type :type/commit]])")
+    raw = _db_execute(
+        db,
+        "(query [:find (count-distinct ?e) :where [?e :entity-type :type/commit]"
+        " (not-join [?e] [?e :merged-in ?m])])",
+    )
+    results = json.loads(raw).get("results", [])
+    return int(results[0][0]) if results else 0
+
+
+def _count_side_commit_entities(db: Any) -> int:
+    """Durably persisted SIDE :type/commit entities (#384) -- those carrying
+    :merged-in. count-distinct for the same reason as _count_commit_entities."""
+    raw = _db_execute(
+        db,
+        "(query [:find (count-distinct ?e) :where [?e :entity-type :type/commit]"
+        " [?e :merged-in ?m]])",
+    )
     results = json.loads(raw).get("results", [])
     return int(results[0][0]) if results else 0
 
@@ -6796,10 +6880,13 @@ def _frontier_span_count(
 # since ingestion recomputes every ident from scratch rather than reading it
 # back, so an old-rule graph read by new-rule code silently FORKS every entity
 # instead of erroring. Version 1 is the R3 rule; a graph with no stamp at all
-# predates it. There is deliberately NO migration -- see
+# predates it. Version 2 is the first-parent timeline (#384): positions,
+# frontier hashes and every entity's valid-time window mean something
+# different, and side commits gain :merged-in. There is deliberately NO
+# migration -- see
 # docs/superpowers/specs/2026-08-14-ident-rule-r3-and-format-version-design.md:
 # the supported recovery is a rebuild into a fresh graph path.
-GRAPH_FORMAT_VERSION = 1
+GRAPH_FORMAT_VERSION = 2
 _FORMAT_VERSION_IDENT = ":ingestion/format-version"
 
 
@@ -9192,7 +9279,7 @@ def _ingestion_branch_write(
 
 
 def _orphaned_commit_count(
-    db: Any, linearization: List[str], recorded_branch: Optional[str], ref: str
+    db: Any, history_hashes: Set[str], recorded_branch: Optional[str], ref: str
 ) -> Optional[int]:
     """How many live :type/commit entities hold a hash this ref's history no
     longer contains, or None when that question cannot be answered.
@@ -9201,6 +9288,10 @@ def _orphaned_commit_count(
     commits may belong to another ingested branch, and reporting a count would
     invite a reader to treat real history as garbage. Detection only -- nothing
     here retracts anything.
+
+    history_hashes is EVERY commit of the ref, side commits included (#384):
+    the linearization is the first-parent chain only, and a side commit's
+    entity is real history, not an orphan.
     """
     if recorded_branch is None or recorded_branch != ref:
         return None
@@ -9210,7 +9301,7 @@ def _orphaned_commit_count(
     graph_hashes = {r[0] for r in json.loads(raw).get("results", []) if r}
     if not graph_hashes:
         return None
-    return len(graph_hashes - set(linearization))
+    return len(graph_hashes - history_hashes)
 
 
 # System attributes written by _transact_extracted_facts alongside domain attributes.
@@ -9303,6 +9394,8 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
             ":hash": str, ":author": str, ":subject": str, ":date": str, ":alias": str,
             # parent commit reference (keyword-valued edge, stored as string)
             ":parent": str,
+            # #384: a side commit's mainline merge (keyword-valued edge)
+            ":merged-in": str,
         },
     },
 }
@@ -12316,11 +12409,13 @@ def _reverse_apply(
     # descends to it (or when the forward stream covers it, for parents
     # below frontier-high's floor): temporarily dangling, and convergent --
     # the same shape as the lineage facts around it.
-    for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+    parent_hashes = _git_parent_hashes(repo_path, commit_hash)
+    for parent_hash in parent_hashes:
         _transact(
             db, f"[[{commit_ident} :parent :commit/{parent_hash[:12]}]]",
             commit_ts_iso, index_con=index_con,
         )
+    _write_side_commits(db, repo_path, commit_ident, parent_hashes, index_con)
 
     # Third of the three write paths the monotonicity invariant covers
     # (#222 phase 2b1), and the one the 2b review did not list: an entity
@@ -13867,8 +13962,9 @@ def _forward_apply(
     # edges (and its :type/commit entity, skipped at the top of this
     # function) for every commit in frontier-high's territory.
     if not lifecycle_only:
+        parent_hashes = _git_parent_hashes(repo_path, commit_hash)
         try:
-            for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+            for parent_hash in parent_hashes:
                 parent_ident = f":commit/{parent_hash[:12]}"
                 _transact(
                     db,
@@ -13880,6 +13976,9 @@ def _forward_apply(
                 )
         except Exception:
             pass  # non-fatal; parent edges are best-effort
+        # NOT best-effort (#384): a side commit lost here would be counted by
+        # nothing, so a failure must fail the position and get it re-walked.
+        _write_side_commits(db, repo_path, commit_ident, parent_hashes, index_con)
 
     # lifecycle_only: Stage B tracks its own progress through
     # :ingestion/correction-sweep-through (written by _correction_sweep_apply),
@@ -15136,8 +15235,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # the checkout sits on a feature branch. Found while building #317's
         # commit census, which compares this same count against the graph and
         # would have inherited the wrong ref.
+        # --first-parent (#384): positions are the first-parent chain; side
+        # commits are written at their merge but are not walked.
         repo_total_result = _subprocess.run(
-            ["git", "rev-list", "--count", branch],
+            ["git", "rev-list", "--first-parent", "--count", branch],
             cwd=repo_path, capture_output=True, text=True,
         )
         repo_total = int(repo_total_result.stdout.strip()) if repo_total_result.returncode == 0 else len(commit_metadata)
@@ -15252,7 +15353,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # commits from another ingested branch are indistinguishable from
             # a rewrite's leftovers. A 0 there would read as "verified clean".
             _ingest_progress["orphaned_commits"] = await loop.run_in_executor(
-                write_executor, _orphaned_commit_count, db, linearization, prior_branch, branch,
+                write_executor, _orphaned_commit_count, db,
+                set(_subprocess.run(
+                    ["git", "rev-list", branch], cwd=repo_path,
+                    capture_output=True, text=True, check=True,
+                ).stdout.split()),
+                prior_branch, branch,
             )
             allocator = await loop.run_in_executor(
                 write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
