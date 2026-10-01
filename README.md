@@ -277,8 +277,8 @@ When running under Claude Code with the hook configuration in `hooks/claude-code
 ## Tools
 
 - **minigraf_query** — Query memory with Datalog
-- **minigraf_transact** — Store facts (reason required)
-- **minigraf_retract** — Retract facts (original stays in history)
+- **minigraf_transact** — Store facts (reason required; optional `valid_at` backdates when they became true)
+- **minigraf_retract** — Retract facts (original stays in history; optional `valid_at` closes their window at the real end date)
 - **minigraf_rule** — Register a Datalog rule for the server session (recursive traversal)
 - **minigraf_report_issue** — File GitHub issues
 - **memory_prepare_turn** — Retrieve relevant context for the current user message

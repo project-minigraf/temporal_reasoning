@@ -5086,17 +5086,112 @@ def _ensure_memory_idents(db: Any, facts_str: str, valid_from: str) -> None:
             print(f"[fact_index] auto-ident write failed for {entity}: {e}", file=sys.stderr)
 
 
-def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
+def _normalize_write_valid_at(text: str) -> Tuple[Optional[str], Optional[int]]:
+    """Strictly parse a caller-supplied valid time for a public write (#375).
+
+    Returns (valid_time, epoch_ms), or (None, None) if text is not one of
+    _VALID_AT_DATE_FORMATS. A plain date stays a plain date; a datetime is
+    rendered in UTC with a Z suffix, because minigraf refuses offsets outright
+    (temporal.rs parse_timestamp) and a naive datetime is read as UTC, which
+    is what minigraf would do with it.
+
+    Deliberately NOT _parse_valid_at_hint, which normalizes everything to a
+    date and defaults an unreadable hint to now (#182). That leniency suits
+    model output on the auto-memory path; on a public write it would store a
+    date the caller did not ask for behind ok:True.
+    """
+    for fmt in _VALID_AT_DATE_FORMATS:
+        try:
+            parsed = datetime.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if fmt == "%Y-%m-%d":
+            valid_time = parsed.strftime("%Y-%m-%d")
+        else:
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(datetime.timezone.utc)
+            valid_time = parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return valid_time, _iso_to_epoch_ms(valid_time)
+    return None, None
+
+
+def _resolve_write_valid_at(
+    facts: str, valid_at: Optional[str]
+) -> Tuple[Optional[str], str, Optional[str]]:
+    """Resolve the valid time a public transact/retract asked for (#375).
+
+    Two channels name it: the `valid_at` tool argument and a `; valid-at:
+    <date>` line inside facts -- the hint the auto-memory path already reads,
+    which minigraf otherwise accepts as an EDN comment and silently ignores.
+    Hint lines are stripped from the returned facts either way.
+
+    Returns (valid_time, cleaned_facts, error). valid_time is None when
+    neither channel names one. Refused, with an error: an unparseable value,
+    two values naming different instants (compared as instants, so
+    "2026-08-18" and "2026-08-18T00:00:00Z" agree), and a time in the future
+    -- recording when something became or stopped being true is the use
+    case; a future window would also sit in the fact index as a live or
+    historical row that is neither.
+    """
+    named: List[Tuple[str, str]] = []
+    # Blank is absent: some MCP clients send "" for an unused optional field.
+    if valid_at is not None and valid_at.strip():
+        named.append(("valid_at", valid_at.strip()))
+    kept = []
+    for line in facts.splitlines():
+        match = _VALID_AT_LINE_RE.match(line.strip())
+        if match:
+            named.append(("; valid-at:", line.strip()[match.end():].strip()))
+        else:
+            kept.append(line)
+    cleaned = "\n".join(kept).strip()
+    if not named:
+        return None, cleaned, None
+
+    resolved: Optional[Tuple[str, int]] = None
+    for source, text in named:
+        valid_time, ms = _normalize_write_valid_at(text)
+        if valid_time is None:
+            return None, cleaned, (
+                f"invalid valid time {text!r} from {source}: expected YYYY-MM-DD "
+                "or an ISO 8601 datetime (YYYY-MM-DDTHH:MM:SS, optionally with Z "
+                "or a UTC offset)"
+            )
+        if resolved is not None and resolved[1] != ms:
+            return None, cleaned, (
+                f"conflicting valid times: {resolved[0]!r} and {valid_time!r} -- "
+                "give one, via the valid_at argument or a single '; valid-at:' line"
+            )
+        resolved = resolved or (valid_time, ms)
+    assert resolved is not None
+    if resolved[1] > _iso_to_epoch_ms(_now_utc_ms()):
+        return None, cleaned, (
+            f"valid time {resolved[0]!r} is in the future; only past or present "
+            "valid times can be recorded"
+        )
+    return resolved[0], cleaned, None
+
+
+def handle_minigraf_transact(
+    facts: str, reason: str, valid_at: Optional[str] = None
+) -> Dict[str, Any]:
     """Transact facts into the graph. reason is required.
 
-    :valid-at is set to the current UTC ms timestamp so every agent-initiated
-    write has a recorded valid time, enabling correct bi-temporal queries.
+    The facts' valid time starts at valid_at, or at a `; valid-at:` line in
+    facts, when either is given (#375; see _resolve_write_valid_at), and at
+    the current UTC ms timestamp otherwise -- so every agent-initiated write
+    has a recorded valid time, enabling correct bi-temporal queries. A
+    requested valid time is echoed back as `valid_from`.
     On success, also ensures any memory-category entity (fact_index.
     _MEMORY_PREFIXES) created by this call has a resolvable :ident fact --
-    see _ensure_memory_idents (#194).
+    see _ensure_memory_idents (#194). That :ident shares the facts' valid
+    time, so a point-in-time read that finds the fact also finds its ident.
     """
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for all writes"}
+    requested_valid_from, facts, valid_at_error = _resolve_write_valid_at(facts, valid_at)
+    if valid_at_error:
+        return {"ok": False, "error": valid_at_error}
     # #306: refuse the whole block, before the graph is touched. minigraf
     # accepts a nil-valued triple, so nothing downstream would stop it, and
     # the fact index cannot hold one -- see _has_nil_valued_triple.
@@ -5117,7 +5212,7 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
         if violations:
             return {"ok": False, "error": f"schema violations: {'; '.join(violations)}"}
     with db_lease() as db:
-        valid_from = _now_utc_ms()
+        valid_from = requested_valid_from or _now_utc_ms()
         try:
             raw = _transact(db, facts, valid_from)
         except MiniGrafError as e:
@@ -5125,15 +5220,129 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
         result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
+            if requested_valid_from:
+                result["valid_from"] = requested_valid_from
             _ensure_memory_idents(db, facts, valid_from)
         _checkpoint_after_write(db, "minigraf_transact", result)
         return result
 
 
-def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
-    """Retract facts from the graph. reason is required."""
+def _asserted_windows_ms(db: Any, triple: str, entity: str) -> List[Tuple[int, int]]:
+    """Every asserted valid window [valid-from, valid-to) of one literal
+    [e a v] triple, as epoch ms, across all valid time.
+
+    :any-valid-time is what lets the pseudo-attributes bind at all. They bind
+    to the EAV clause on `entity` immediately before them -- the triple
+    itself, so another attribute's window cannot leak in. A retracted
+    assertion is not returned; an earlier lifecycle's bounded window is,
+    because it is still an asserted fact.
+    """
+    raw = _db_execute(
+        db,
+        f"(query [:find ?vf ?vt :any-valid-time :where {triple} "
+        f"[{entity} :db/valid-from ?vf] [{entity} :db/valid-to ?vt]])",
+    )
+    return sorted((row[0], row[1]) for row in json.loads(raw).get("results", []))
+
+
+def _retract_closing_at(db: Any, facts: str, valid_to: str) -> Dict[str, Any]:
+    """Close each [e a v] triple's live window at valid_to (#375).
+
+    retract takes no temporal options, so this is _ingest_close's idiom on a
+    public write: retract the live assertion, then re-transact it bounded
+    [its own valid-from, valid_to). Live means open-ended and already
+    started; the earliest such valid-from wins, since a value re-asserted at
+    a later valid-from (#156) has been true continuously since the first.
+
+    minigraf's retract removes EVERY asserted window of the triple, not only
+    the live one (measured on 2.0.2: an earlier lifecycle's bounded window
+    reads empty at its own :valid-at afterwards). So every other window read
+    back beforehand is re-transacted verbatim too, graph-only -- the fact
+    index already holds those rows, and _retract only deletes live ones.
+
+    Every triple is checked before anything is written -- parseable, live,
+    and starting strictly before valid_to, since minigraf stores an empty or
+    inverted window without complaint (measured) -- so a refusal leaves the
+    graph untouched. Each window is written in its own call: two values of
+    one (entity, attribute) can share a valid-from, and batching them
+    collapses to the last until the next checkpoint (minigraf#287).
+    """
+    matches = list(_FACTS_TRIPLE_PATTERN.finditer(facts))
+    leftover = _FACTS_TRIPLE_PATTERN.sub("", facts)
+    if not matches or leftover.strip("[], \t\r\n"):
+        return {
+            "ok": False,
+            "error": "a retract with a valid time takes only literal [entity "
+                     "attribute value] triples, e.g. [[:decision/x :description \"y\"]]",
+        }
+    valid_to_ms = _iso_to_epoch_ms(valid_to)
+    now_ms = _iso_to_epoch_ms(_now_utc_ms())
+    closes: List[Tuple[str, str, List[Tuple[int, int]]]] = []
+    for m in matches:
+        triple = m.group(0)
+        if any(triple == t for t, _, _ in closes):
+            continue
+        windows = _asserted_windows_ms(db, triple, m.group(1))
+        live = [vf for vf, vt in windows if vt == _VALID_TIME_FOREVER_MS and vf <= now_ms]
+        if not live:
+            return {"ok": False, "error": f"no live fact matches {triple}"}
+        vf_iso = _epoch_ms_to_iso(min(live))
+        if valid_to_ms <= min(live):
+            return {
+                "ok": False,
+                "error": f"valid time {valid_to!r} is not after {triple}'s "
+                         f"valid-from {vf_iso}; a window must end after it starts",
+            }
+        others = [
+            (vf, vt) for vf, vt in windows
+            if not (vt == _VALID_TIME_FOREVER_MS and vf <= now_ms)
+        ]
+        closes.append((triple, vf_iso, others))
+    raw = ""
+    for triple, vf_iso, others in closes:
+        _retract(db, f"[{triple}]")
+        for vf, vt in others:
+            _transact(
+                db, f"[{triple}]", _epoch_ms_to_iso(vf),
+                valid_to=None if vt == _VALID_TIME_FOREVER_MS else _epoch_ms_to_iso(vt),
+                index_triples=[],
+            )
+        raw = _transact(db, f"[{triple}]", vf_iso, valid_to=valid_to)
+    result = _parse_tx_result(raw)
+    if result["ok"]:
+        result["valid_to"] = valid_to
+        result["closed"] = [
+            {"fact": triple, "valid_from": vf_iso, "valid_to": valid_to}
+            for triple, vf_iso, _ in closes
+        ]
+    return result
+
+
+def handle_minigraf_retract(
+    facts: str, reason: str, valid_at: Optional[str] = None
+) -> Dict[str, Any]:
+    """Retract facts from the graph. reason is required.
+
+    With a valid time -- valid_at, or a `; valid-at:` line in facts (#375) --
+    each fact's window is closed at that time instead of simply removed from
+    the live view, so :valid-at queries can still see when it applied. See
+    _retract_closing_at.
+    """
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for retract"}
+    requested_valid_to, facts, valid_at_error = _resolve_write_valid_at(facts, valid_at)
+    if valid_at_error:
+        return {"ok": False, "error": valid_at_error}
+    if requested_valid_to:
+        with db_lease() as db:
+            try:
+                result = _retract_closing_at(db, facts, requested_valid_to)
+            except MiniGrafError as e:
+                return {"ok": False, "error": str(e)}
+            if result["ok"]:
+                result["reason"] = reason
+            _checkpoint_after_write(db, "minigraf_retract", result)
+            return result
     with db_lease() as db:
         try:
             raw = _retract(db, facts)
@@ -16610,6 +16819,16 @@ _TOOLS: List[Tool] = [
                         "Forces you to justify writes — only store facts worth remembering."
                     ),
                 },
+                "valid_at": {
+                    "type": "string",
+                    "description": (
+                        "Optional. When the fact became true in the world, if not now -- "
+                        "e.g. \"2026-08-18\" for a decision made then. YYYY-MM-DD or an "
+                        "ISO 8601 datetime; past or present only. Omit to use now. A "
+                        "'; valid-at: <date>' line in facts is read the same way; an "
+                        "unparseable or conflicting value is refused, never defaulted."
+                    ),
+                },
             },
             "required": ["facts", "reason"],
         },
@@ -16630,6 +16849,17 @@ _TOOLS: List[Tool] = [
                 "reason": {
                     "type": "string",
                     "description": "Why this fact is being retracted. Forces you to justify the removal.",
+                },
+                "valid_at": {
+                    "type": "string",
+                    "description": (
+                        "Optional. When the fact stopped being true in the world, if not now "
+                        "-- e.g. the date a decision was superseded. Closes each fact's valid "
+                        "window at that time instead of removing it, so :valid-at queries "
+                        "still see when it applied. YYYY-MM-DD or an ISO 8601 datetime; past "
+                        "or present, after the fact's own valid-from; literal [e a v] triples "
+                        "only. A '; valid-at: <date>' line in facts is read the same way."
+                    ),
                 },
             },
             "required": ["facts", "reason"],
@@ -16842,11 +17072,15 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_transact":
-            result = handle_minigraf_transact(arguments["facts"], arguments["reason"])
+            result = handle_minigraf_transact(
+                arguments["facts"], arguments["reason"], valid_at=arguments.get("valid_at"),
+            )
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_retract":
-            result = handle_minigraf_retract(arguments["facts"], arguments["reason"])
+            result = handle_minigraf_retract(
+                arguments["facts"], arguments["reason"], valid_at=arguments.get("valid_at"),
+            )
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_rule":
