@@ -21721,7 +21721,10 @@ class TestRunIngestionGitlinks:
         Pre-fix, neither plain diff-tree nor --cc ever report this removal,
         so the :pinned-commit fact opened by the add commit stayed open
         forever even though the submodule doesn't exist in the repo from the
-        merge commit onward. Verified against the REAL minigraf backend.
+        merge commit onward. Since #384 the side commit is not a position and
+        the merge diffs against `main`, which never had the submodule, so it
+        is never opened at all; the assertions hold either way. Verified
+        against the REAL minigraf backend.
         """
         import mcp_server
         repo = tmp_path / "repo"

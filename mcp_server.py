@@ -9278,8 +9278,19 @@ def _ingestion_branch_write(
         _transact(db, "[" + " ".join(to_transact) + "]", run_ts_iso, index_con=index_con)
 
 
+def _git_history_hashes(repo_path: str, ref: str) -> Optional[Set[str]]:
+    """Every commit hash reachable from ref, side commits included, or None
+    when git cannot answer (an unborn branch has no history to list)."""
+    result = _subprocess.run(
+        ["git", "rev-list", ref], cwd=repo_path, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return set(result.stdout.split())
+
+
 def _orphaned_commit_count(
-    db: Any, history_hashes: Set[str], recorded_branch: Optional[str], ref: str
+    db: Any, history_hashes: Optional[Set[str]], recorded_branch: Optional[str], ref: str
 ) -> Optional[int]:
     """How many live :type/commit entities hold a hash this ref's history no
     longer contains, or None when that question cannot be answered.
@@ -9291,9 +9302,11 @@ def _orphaned_commit_count(
 
     history_hashes is EVERY commit of the ref, side commits included (#384):
     the linearization is the first-parent chain only, and a side commit's
-    entity is real history, not an orphan.
+    entity is real history, not an orphan. None (git could not list it) makes
+    the question unanswerable: comparing against an empty set would report
+    every commit entity as an orphan.
     """
-    if recorded_branch is None or recorded_branch != ref:
+    if history_hashes is None or recorded_branch is None or recorded_branch != ref:
         return None
     raw = _db_execute(
         db, "(query [:find ?h :where [?e :entity-type :type/commit] [?e :hash ?h]])"
@@ -15354,11 +15367,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # a rewrite's leftovers. A 0 there would read as "verified clean".
             _ingest_progress["orphaned_commits"] = await loop.run_in_executor(
                 write_executor, _orphaned_commit_count, db,
-                set(_subprocess.run(
-                    ["git", "rev-list", branch], cwd=repo_path,
-                    capture_output=True, text=True, check=True,
-                ).stdout.split()),
-                prior_branch, branch,
+                _git_history_hashes(repo_path, branch), prior_branch, branch,
             )
             allocator = await loop.run_in_executor(
                 write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,

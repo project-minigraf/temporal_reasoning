@@ -355,6 +355,8 @@ Do not write to `:ingestion/watermark` or any `:ingestion/` entity directly.
 
 **Graph format version.** Ingestion stamps `:ingestion/format-version` on a new graph and refuses to run against a graph stamped at a different version — including a graph with no stamp at all, which means it predates the stamp. The check runs before any write, so a refused run leaves the graph untouched.
 
+The current version is **2** (first-parent timeline, #384): a version-1 graph was built by walking every branch interleaved, so its validity windows mean something different, and it is refused the same way.
+
 There is **no migration**. Entity idents are recomputed from `(entity type, file path, name)` on every run rather than read back, so ingesting an old-rule graph with new-rule code would create a second, forked entity for everything already stored, silently and with no error. The supported recovery is to re-ingest into a **fresh graph path**: point `MINIGRAF_GRAPH_PATH` at a new file, or delete the existing graph along with its `.fts.sqlite3` index. Re-running ingestion over the existing file does not repair it.
 
 **Index damage.** Before any other read, ingestion checks that the graph's two indexes agree: it lists entities through the attribute index and re-reads the ingestion-state entities plus a random sample of the rest by entity. If one index has lost an entity the other still lists, the run fails with `status: error` and a message naming project-minigraf/minigraf#370. That is what a process killed mid-save can leave behind: the graph opens cleanly, every count and scan looks healthy, and lookups by ident silently return nothing — so without the check a run would read its own watermark as missing and re-walk, or adopt a mature graph as new. Nothing repairs it in place; re-running ingestion does not. The only recovery is re-ingesting into a **fresh graph path**, as above. `minigraf_ingest_status` reports what the check covered as `index_cross_check` (`population`, `probed`, `control_probed`); `population: 0` means the graph had nothing to check, not that it was verified.
@@ -427,7 +429,9 @@ removed that PID from the text.
 
 ### Git-Ingested Data Schema
 
-`minigraf_ingest_git` writes the following entity types. All relationship attributes (`:parent`, `:introduced-by`, `:modified-in`, `:contains`, `:depends-on`, `:tagged-commit`, `:resolves-to`) are stored as keyword entity references — they bypass string-value schema validation by design and are directly traversable in queries.
+**Timeline: the branch's first-parent history.** Valid time follows the branch tip's own tree — "live at t" means "present on the branch at t". A feature branch's code enters at the merge that brings it in: its entities' `:valid-from`, `:introduced-by` and `:modified-in` are the **merge commit**, not the side commit that authored them. Side commits are still recorded as `:type/commit` entities (metadata and `:parent` only, plus `:merged-in`), so `ancestor` traverses the whole DAG and "which merge brought commit X in" is one hop. To find who authored a merged change, follow the merge's second `:parent`, or the side commits whose `:merged-in` is that merge.
+
+`minigraf_ingest_git` writes the following entity types. All relationship attributes (`:parent`, `:merged-in`, `:introduced-by`, `:modified-in`, `:contains`, `:depends-on`, `:tagged-commit`, `:resolves-to`) are stored as keyword entity references — they bypass string-value schema validation by design and are directly traversable in queries.
 
 **Ident slugging:** characters outside `[a-z0-9_-]` in paths and names are replaced with hyphens; underscores are kept and hyphen runs are **not** collapsed. Examples: `src/auth.py` → `:module/src-auth-py`; function `login` in `src/auth.py` → `:function/src-auth-py--login` (the `::` join survives as `--`); `mcp_server.py` → `:module/mcp_server-py`.
 
@@ -435,6 +439,8 @@ Both rules exist to keep distinct entities apart (#263): folding `_` into `-` ma
 
 #### `:type/commit` — one per git commit
 Ident: `:commit/<first-12-chars-of-hash>`
+
+Every commit of the branch gets one. Commits on the first-parent chain carry the code edits; side commits (reached only through a merge's second parent) are metadata-only and carry `:merged-in`. No code entity cites a side commit.
 
 | Attribute | Notes |
 |---|---|
@@ -444,6 +450,7 @@ Ident: `:commit/<first-12-chars-of-hash>`
 | `:subject` | commit subject (truncated to 200 chars) |
 | `:date` | ISO 8601 UTC timestamp, e.g. `"2026-05-26T14:32:00Z"` |
 | `:parent` (keyword ref) | parent commit(s); merge commits have two |
+| `:merged-in` (keyword ref) | side commits only: the first-parent merge that brought this commit onto the branch. Absent on first-parent commits |
 
 #### `:type/module` — one per source file, written on the commit that introduces it
 Ident: `:module/<slugified-file-path>`
