@@ -110,8 +110,19 @@ def commit_census(
     distinct_commit_idents: int,
     final_status: str,
     census_error: Optional[str] = None,
+    *,
+    repo_side_commits: int = 0,
+    graph_side_commit_entities: int = 0,
 ) -> dict[str, Any]:
     """Compare the three counts and return the gate's verdict.
+
+    #384: `repo_commits` is the FIRST-PARENT count -- ingestion's positions --
+    and side commits, written as metadata-only entities at their merge, are
+    censused separately: `side_repo_vs_graph` is `repo_side_commits -
+    graph_side_commit_entities`, gated on a completed run (an interrupted one
+    has not reached every merge). `distinct_commit_idents` counts 12-char
+    prefixes over EVERY commit, side ones included, because a side commit is
+    an entity and collides exactly as a mainline one does.
 
     PURE. It compares integers somebody else collected, so it can be tested
     without a repo or a graph -- and so the collection half can fail loudly
@@ -156,7 +167,8 @@ def commit_census(
         "walk_vs_graph": walk_claimed - graph_commit_entities,
         "repo_vs_graph": repo_commits - graph_commit_entities,
     }
-    ident_collisions = repo_commits - distinct_commit_idents
+    deltas["side_repo_vs_graph"] = repo_side_commits - graph_side_commit_entities
+    ident_collisions = repo_commits + repo_side_commits - distinct_commit_idents
     complete = final_status == "complete"
     proved_nothing = census_error is None and repo_commits == 0
 
@@ -195,6 +207,14 @@ def commit_census(
             f"No in-process counter can see this: the counter and the walk "
             f"share the bug."
         )
+    elif complete and deltas["side_repo_vs_graph"]:
+        ok = False
+        interpretation = (
+            f"the repo holds {repo_side_commits} side commits but the graph "
+            f"holds {graph_side_commit_entities} -- "
+            f"{deltas['side_repo_vs_graph']} side commits a merge position "
+            f"should have written are missing (or extra, if negative)."
+        )
     else:
         ok = True
         interpretation = (
@@ -213,6 +233,8 @@ def commit_census(
         "walk_claimed": walk_claimed,
         "graph_commit_entities": graph_commit_entities,
         "distinct_commit_idents": distinct_commit_idents,
+        "repo_side_commits": repo_side_commits,
+        "graph_side_commit_entities": graph_side_commit_entities,
         **deltas,
         "ident_collisions": ident_collisions,
         "final_status": final_status,
@@ -279,8 +301,11 @@ def orphaned_commits(
     }
 
 
-def repo_commit_counts(repo_path: str, ref: str) -> tuple[int, int]:
-    """`(rev-list --count <ref>, distinct 12-char hash prefixes)`.
+def repo_commit_counts(repo_path: str, ref: str) -> tuple[int, int, int]:
+    """`(rev-list --first-parent --count <ref>, side commits, distinct 12-char
+    hash prefixes over every commit)` (#384).
+
+    Side commits are the full count minus the first-parent count.
 
     TWO SUBPROCESSES, NOT ONE. The count could be derived from the hash list,
     but `--count` is the number `_run_ingestion` itself uses for
@@ -292,19 +317,17 @@ def repo_commit_counts(repo_path: str, ref: str) -> tuple[int, int]:
     count of 0 (see collect_commit_census).
     """
     count = subprocess.run(
-        ["git", "rev-list", "--count", ref],
+        ["git", "rev-list", "--first-parent", "--count", ref],
         cwd=repo_path, capture_output=True, text=True, check=True,
     )
     hashes = subprocess.run(
         ["git", "rev-list", ref],
         cwd=repo_path, capture_output=True, text=True, check=True,
     )
-    prefixes = {
-        line[:COMMIT_IDENT_PREFIX_LEN]
-        for line in hashes.stdout.split()
-        if line
-    }
-    return int(count.stdout.strip()), len(prefixes)
+    every = [line for line in hashes.stdout.split() if line]
+    prefixes = {line[:COMMIT_IDENT_PREFIX_LEN] for line in every}
+    first_parent = int(count.stdout.strip())
+    return first_parent, len(every) - first_parent, len(prefixes)
 
 
 def repo_commit_hashes(repo_path: str, ref: str) -> set[str]:
@@ -375,15 +398,19 @@ def collect_commit_census(
     single-handle invariant applies to this census like everywhere else.
     """
     repo_commits = 0
+    repo_side = 0
     distinct = 0
     graph_count = 0
+    graph_side = 0
     repo_hashes: set[str] = set()
     graph_hashes: set[str] = set()
     recorded_branch: Optional[str] = None
     error: Optional[str] = None
     try:
-        repo_commits, distinct = repo_commit_counts(repo_path, ref)
+        repo_commits, repo_side, distinct = repo_commit_counts(repo_path, ref)
         graph_count = graph_commit_entities(db)
+        import mcp_server
+        graph_side = mcp_server._count_side_commit_entities(db)
         repo_hashes = repo_commit_hashes(repo_path, ref)
         graph_hashes = graph_commit_hashes(db)
         recorded_branch = _recorded_branch(db)
@@ -397,6 +424,8 @@ def collect_commit_census(
         distinct_commit_idents=distinct,
         final_status=final_status,
         census_error=error,
+        repo_side_commits=repo_side,
+        graph_side_commit_entities=graph_side,
     )
     result["ref"] = ref
     # Reported under its own key and NOT folded into `ok`'s deltas: an orphan

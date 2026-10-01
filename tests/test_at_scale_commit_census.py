@@ -289,3 +289,38 @@ class TestWalkClaimedFromProgress:
         from evals.at_scale.commit_census import walk_claimed_from_progress
         assert walk_claimed_from_progress({"prior_ingested": 0, "_run": None}) == 0
         assert walk_claimed_from_progress({"status": "error"}) == 0
+
+
+class TestSideCommitCensus:
+    """#384: positions are the first-parent chain, and side commits are
+    written as metadata-only entities at their merge. They get their own
+    census: `repo_commits` stays the walk's denominator, and a side commit
+    the graph lacks is a loss no other count would show."""
+
+    def test_matching_side_counts_pass(self):
+        result = _clean(repo_side_commits=40, graph_side_commit_entities=40,
+                        distinct_commit_idents=887)
+        assert result["ok"] is True
+        assert result["side_repo_vs_graph"] == 0
+
+    def test_a_missing_side_commit_fails_a_complete_run(self):
+        result = _clean(repo_side_commits=40, graph_side_commit_entities=39,
+                        distinct_commit_idents=887)
+        assert result["ok"] is False
+        assert result["side_repo_vs_graph"] == 1
+        assert "side" in result["interpretation"]
+
+    def test_an_incomplete_run_is_not_failed_for_fewer_side_commits(self):
+        result = _clean(repo_side_commits=40, graph_side_commit_entities=10,
+                        distinct_commit_idents=887, final_status="stopped",
+                        walk_claimed=500, graph_commit_entities=500)
+        assert result["ok"] is True
+        assert result["side_repo_vs_graph"] == 30
+
+    def test_ident_collisions_count_every_commit_not_only_positions(self):
+        """A side commit is an entity too, so a prefix it shares with a
+        mainline commit collapses them exactly as two mainline ones would."""
+        result = _clean(repo_side_commits=40, graph_side_commit_entities=40,
+                        distinct_commit_idents=886)
+        assert result["ident_collisions"] == 1
+        assert result["ok"] is False
