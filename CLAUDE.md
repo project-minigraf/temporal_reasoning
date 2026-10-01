@@ -252,6 +252,37 @@ is unguarded, and deliberately so — ingestion emits no `nil`, and if it ever
 did, a red gate is then the correct signal rather than a misattribution.
 Existing graphs are not repaired either way.
 
+**Public writes can carry their real valid time (#375).** `minigraf_transact`
+and `minigraf_retract` take an optional `valid_at`, and read a `; valid-at:`
+line in `facts` the same way (minigraf otherwise accepts that line as an EDN
+comment and silently ignores it). `_resolve_write_valid_at` is STRICT where
+`_parse_valid_at_hint` (#182, auto-memory) is lenient: an unparseable, future
+or conflicting value is refused, never defaulted to now, because a public
+caller asked for a date and would otherwise get a different one behind
+`ok:True`. The `:ident` `_ensure_memory_idents` writes shares the facts'
+valid time.
+
+A retract with a valid time closes the window rather than removing the fact
+(`_retract_closing_at`, `_ingest_close`'s idiom), and it rests on a measured
+minigraf behaviour worth knowing everywhere: **`retract` removes EVERY asserted
+window of an `[e a v]`, not only the live one.** An earlier lifecycle's bounded
+window reads empty at its own `:valid-at` afterwards. So the close reads every
+window back first and re-transacts the non-live ones verbatim, graph-only (the
+index already holds them). The plain retract path and `_ingest_close` do NOT do
+this, and for `_ingest_close` the loss is MEASURED: an entity closed a second
+time loses its first life from `:valid-at` view in both forward-only and 1:1
+ingestion — every fact whose value repeats across lives (`:ident`,
+`:entity-type`, `:path`, `:contains`, ...) keeps only the latest window, and only
+`:introduced-by` survives. All 10 multi-life entities of
+`TestRebirthInsideReverseRegion`'s fixture lose it (that test compares 1:1
+against forward-only, which are wrong identically, so it stays green); this
+repo's 1053-commit graph has 0, because no entity there has been closed twice.
+No gate sees it. Deferred to minigraf#435 (a `close` primitive) rather than
+patched with a restore step — see #380. minigraf also stores an empty or
+inverted window without complaint, so the handler refuses `valid_at <=
+valid-from` itself; ingestion already produces inverted `:introduced-by`
+windows from author/committer date skew (2 entities on this repo).
+
 **The same scan also answers a graph-only question: #287's two-value
 `:introduced-by`.** `fact_audit`'s full `[:find ?e ?a ?v]` scan is already in
 memory, so `evals/at_scale/introduced_by_audit.py` reads #235's corruption off

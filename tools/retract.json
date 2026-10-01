@@ -11,6 +11,10 @@
       "reason": {
         "type": "string",
         "description": "Why this fact is being retracted. Forces you to justify the removal."
+      },
+      "valid_at": {
+        "type": "string",
+        "description": "Optional. When the fact stopped being true in the world, if not now -- e.g. the date a decision was superseded. Closes each fact's valid window at that time instead of removing it, so :valid-at queries still see when it applied. YYYY-MM-DD or an ISO 8601 datetime; past or present, after the fact's own valid-from; literal [e a v] triples only. A '; valid-at: <date>' line in facts is read the same way."
       }
     },
     "required": [

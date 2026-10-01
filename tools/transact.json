@@ -11,6 +11,10 @@
       "reason": {
         "type": "string",
         "description": "Why this fact deserves long-term storage. Forces you to justify writes — only store facts worth remembering."
+      },
+      "valid_at": {
+        "type": "string",
+        "description": "Optional. When the fact became true in the world, if not now -- e.g. \"2026-08-18\" for a decision made then. YYYY-MM-DD or an ISO 8601 datetime; past or present only. Omit to use now. A '; valid-at: <date>' line in facts is read the same way; an unparseable or conflicting value is refused, never defaulted."
       }
     },
     "required": [

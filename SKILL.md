@@ -234,6 +234,26 @@ minigraf_transact(
 
 Both arguments are required; a write with an empty `reason` is rejected.
 
+**Recording something that became true earlier.** By default a fact is valid
+from the moment it is written. When you record a decision, constraint or
+preference that was made on an earlier date — importing history, or writing
+up a decision days after it was taken — pass `valid_at` so `:valid-at`
+queries find it on the day it actually applied:
+
+```python
+minigraf_transact(
+    facts='[[:decision/cache :description "use Redis for session caching"]]',
+    reason="Decision taken in the 2026-08-18 design review",
+    valid_at="2026-08-18")
+```
+
+`valid_at` takes `YYYY-MM-DD` or an ISO 8601 datetime (UTC, or with an offset,
+which is converted). A `; valid-at: 2026-08-18` line at the top of `facts` is
+read the same way. Past or present only. An unparseable date, a future date,
+or two different dates (argument and hint line) are refused with `ok: false`
+— nothing is written, and the write is never silently stamped with "now"
+instead. A successful backdated write echoes the stored `valid_from`.
+
 ### minigraf_query
 ```python
 # All facts for a known entity
@@ -255,6 +275,23 @@ minigraf_query(datalog="[:find ?a ?v :as-of 5 :where [:decision/postgres ?a ?v]]
 minigraf_retract(facts='[[:dependency/old-service :description "obsolete"]]',
                  reason="Service decommissioned")
 ```
+
+**Recording when something stopped being true.** A plain retract ends the
+fact now. Pass `valid_at` to close its validity window at the date it really
+stopped applying instead — `:valid-at` queries inside the window still see it,
+queries after it do not, and it leaves the current view either way:
+
+```python
+minigraf_retract(facts='[[:decision/cache :description "use Redis for session caching"]]',
+                 reason="Superseded by the 2026-09-01 move to Memcached",
+                 valid_at="2026-09-01")
+```
+
+Same date rules as `minigraf_transact`, plus: every fact must be a literal
+`[entity attribute value]` triple that is currently live, and `valid_at` must
+fall after the fact's own valid-from. If any fact in the block fails a check,
+the whole block is refused and nothing changes. The response lists each
+closed window under `closed`.
 
 ### minigraf_rule
 
@@ -941,6 +978,12 @@ minigraf_transact(
 minigraf_query(datalog="[:find ?desc :as-of 3 :where [:decision/db :description ?desc]]")
 # → "PostgreSQL 15 — primary database"
 ```
+
+If the switch happened on a known earlier date, pass the same `valid_at` to
+step 2's `minigraf_retract` and step 3's `minigraf_transact`: the old decision's
+window then ends, and the new one's begins, on that date — so
+`[:find ?desc :valid-at "<date>" ...]` answers "which database had we chosen
+on that day?" correctly, not just "what had we written down by then?".
 
 This is the key difference from a simple key-value store: changing your mind doesn't erase the record. The agent can always reconstruct what was decided and when.
 

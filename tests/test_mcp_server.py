@@ -2523,6 +2523,350 @@ class TestParseFactsBlock:
         ]
 
 
+def _q(db, datalog):
+    return json.loads(db.execute(f"(query {datalog})"))["results"]
+
+
+def _index_rows(entity):
+    """Every fact-index row for entity, current and historical, as
+    (attribute, value, valid_from, valid_to) -- read straight from SQLite so
+    the assertion sees the stored window, not a ranking."""
+    import fact_index
+    import mcp_server
+    path = fact_index.index_path_for(mcp_server._graph_path_current())
+    if not os.path.exists(path):
+        return []
+    con = sqlite3.connect(path)
+    try:
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE name = 'facts_fts'").fetchall():
+            return []
+        return sorted(con.execute(
+            "SELECT attribute, value, valid_from, valid_to FROM facts_fts "
+            "WHERE entity = ?", (entity,)
+        ).fetchall())
+    finally:
+        con.close()
+
+
+class TestTransactValidAt:
+    """#375: a public write can carry its real valid time.
+
+    Before this, handle_minigraf_transact stamped every fact with now, and a
+    `; valid-at:` line in the facts was silently ignored -- minigraf accepts
+    it as an EDN comment -- so an agent recording a decision made weeks ago
+    got a fact :valid-at could not find on the day it was made. Unlike the
+    auto-memory path, which defaults an unreadable hint to now (#182), the
+    public handler REFUSES one: the caller asked for a date and would
+    otherwise get a different one with ok:True.
+    """
+
+    def test_valid_at_argument_backdates_the_fact(self, real_db):
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="import",
+            valid_at="2026-08-18",
+        )
+        assert result["ok"] is True
+        assert result["valid_from"] == "2026-08-18"
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-18T12:00:00Z" '
+                           ':where [:decision/cache :description ?d]]') == [["use Redis"]]
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-17T23:59:59Z" '
+                           ':where [:decision/cache :description ?d]]') == []
+
+    def test_without_valid_at_the_fact_starts_now(self, real_db):
+        """The default is unchanged: no valid time requested, valid from now."""
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="t",
+        )
+        assert result["ok"] is True
+        assert "valid_from" not in result
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-18" '
+                           ':where [:decision/cache :description ?d]]') == []
+        assert _q(real_db, '[:find ?d :where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+    def test_hint_line_backdates_the_fact(self, real_db):
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            '; valid-at: 2026-08-18\n[[:decision/cache :description "use Redis"]]',
+            reason="import",
+        )
+        assert result["ok"] is True
+        assert result["valid_from"] == "2026-08-18"
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-18T12:00:00Z" '
+                           ':where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+    def test_index_row_carries_the_requested_valid_from(self, real_db):
+        """The fact index is #302's independent witness; it must record the
+        same window the graph does, not the wall clock."""
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="t",
+            valid_at="2026-08-18",
+        )
+        assert (":description", "use Redis", "2026-08-18", None) in _index_rows(":decision/cache")
+
+    def test_memory_ident_is_backdated_with_the_fact(self, real_db):
+        """The auto-written :ident must be resolvable at the fact's own valid
+        time, or a point-in-time read finds the fact but not its ident."""
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="t",
+            valid_at="2026-08-18",
+        )
+        assert _q(real_db, '[:find ?i :valid-at "2026-08-18T12:00:00Z" '
+                           ':where [:decision/cache :ident ?i]]') == [[":decision/cache"]]
+
+    def test_datetime_with_offset_is_stored_in_utc(self, real_db):
+        """minigraf refuses offsets outright; the handler converts instead."""
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="t",
+            valid_at="2026-08-18T02:00:00+05:00",
+        )
+        assert result["ok"] is True
+        assert result["valid_from"] == "2026-08-17T21:00:00Z"
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-17T21:00:00Z" '
+                           ':where [:decision/cache :description ?d]]') == [["use Redis"]]
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-17T20:59:59Z" '
+                           ':where [:decision/cache :description ?d]]') == []
+
+    @pytest.mark.parametrize("kwargs, facts", [
+        ({"valid_at": "2026-13-45"}, '[[:decision/cache :description "x"]]'),
+        ({"valid_at": "last tuesday"}, '[[:decision/cache :description "x"]]'),
+        ({}, '; valid-at: 2026-13-45\n[[:decision/cache :description "x"]]'),
+        ({}, '; valid-at: 2026-08-18\n; valid-at: 2026-08-19\n[[:decision/cache :description "x"]]'),
+        ({"valid_at": "2026-08-19"}, '; valid-at: 2026-08-18\n[[:decision/cache :description "x"]]'),
+        ({"valid_at": "2999-01-01"}, '[[:decision/cache :description "x"]]'),
+    ], ids=["bad-calendar-arg", "bad-text-arg", "bad-hint", "two-hints-disagree",
+            "arg-and-hint-disagree", "future"])
+    def test_refused_requests_write_nothing(self, real_db, kwargs, facts):
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(facts, reason="t", **kwargs)
+        assert result["ok"] is False
+        assert "valid" in result["error"].lower()
+        assert _q(real_db, '[:find ?d :any-valid-time '
+                           ':where [:decision/cache :description ?d]]') == []
+        assert _index_rows(":decision/cache") == []
+
+    def test_blank_valid_at_means_now(self, real_db):
+        """Some MCP clients send "" for an optional field they did not set."""
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/cache :description "use Redis"]]', reason="t", valid_at="  ",
+        )
+        assert result["ok"] is True
+        assert "valid_from" not in result
+
+    def test_arg_and_hint_naming_the_same_instant_agree(self, real_db):
+        """Agreement is compared as an instant, not as text."""
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            '; valid-at: 2026-08-18T00:00:00Z\n[[:decision/cache :description "x"]]',
+            reason="t", valid_at="2026-08-18",
+        )
+        assert result["ok"] is True
+
+    def test_call_tool_passes_valid_at(self, real_db):
+        import asyncio
+        import mcp_server
+        out = asyncio.run(mcp_server.call_tool("minigraf_transact", {
+            "facts": '[[:decision/cache :description "use Redis"]]',
+            "reason": "t", "valid_at": "2026-08-18",
+        }))
+        assert json.loads(out[0].text)["ok"] is True
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-18T12:00:00Z" '
+                           ':where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+
+class TestRetractValidAt:
+    """#375, retract half: close a fact's window at the date it actually
+    stopped applying, not at the moment of the call.
+
+    minigraf's retract takes no temporal options, so this is _ingest_close's
+    idiom applied to a public write: retract the live assertion, then
+    re-transact it bounded [its own valid-from, valid_at). The valid-from is
+    read back from the graph, never assumed.
+    """
+
+    def _seed(self, mcp_server, facts='[[:decision/cache :description "use Redis"]]',
+              valid_at="2026-08-18"):
+        assert mcp_server.handle_minigraf_transact(facts, reason="seed", valid_at=valid_at)["ok"]
+
+    def test_window_closes_at_valid_at(self, real_db):
+        import mcp_server
+        self._seed(mcp_server)
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/cache :description "use Redis"]]', reason="superseded",
+            valid_at="2026-09-01",
+        )
+        assert result["ok"] is True, result
+        assert result["valid_to"] == "2026-09-01"
+        desc = ':where [:decision/cache :description ?d]]'
+        assert _q(real_db, '[:find ?d ' + desc) == []
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-20" ' + desc) == [["use Redis"]]
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-31T23:59:59Z" ' + desc) == [["use Redis"]]
+        assert _q(real_db, '[:find ?d :valid-at "2026-09-01" ' + desc) == []
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-17" ' + desc) == []
+
+    def test_index_moves_the_row_to_history_with_its_window(self, real_db):
+        import mcp_server
+        self._seed(mcp_server)
+        mcp_server.handle_minigraf_retract(
+            '[[:decision/cache :description "use Redis"]]', reason="superseded",
+            valid_at="2026-09-01",
+        )
+        rows = [r for r in _index_rows(":decision/cache") if r[0] == ":description"]
+        assert rows == [(":description", "use Redis", "2026-08-18T00:00:00.000Z", "2026-09-01")]
+
+    def test_hint_line_closes_the_window(self, real_db):
+        import mcp_server
+        self._seed(mcp_server)
+        result = mcp_server.handle_minigraf_retract(
+            '; valid-at: 2026-09-01\n[[:decision/cache :description "use Redis"]]',
+            reason="superseded",
+        )
+        assert result["ok"] is True, result
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-20" '
+                           ':where [:decision/cache :description ?d]]') == [["use Redis"]]
+        assert _q(real_db, '[:find ?d :where [:decision/cache :description ?d]]') == []
+
+    def test_window_starts_at_the_live_assertion_not_an_earlier_closed_one(self, real_db):
+        """A fact whose window was closed, then asserted again: only the live
+        assertion's valid-from bounds the new window. The earlier window is
+        still an ASSERTED (bounded) fact, so a read-back without the
+        open-ended valid-to filter binds it too and opens the new window on
+        2026-08-01, merging the gap away. And minigraf's retract removes that
+        earlier window along with the live one (measured), so it must be put
+        back or 2026-08-03 reads empty."""
+        import mcp_server
+        self._seed(mcp_server, valid_at="2026-08-01")
+        assert mcp_server.handle_minigraf_retract(
+            '[[:decision/cache :description "use Redis"]]', reason="t",
+            valid_at="2026-08-05")["ok"]
+        self._seed(mcp_server, valid_at="2026-08-10")
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/cache :description "use Redis"]]', reason="t",
+            valid_at="2026-08-20",
+        )
+        assert result["ok"] is True, result
+        assert result["closed"][0]["valid_from"] == "2026-08-10T00:00:00.000Z"
+        desc = ':where [:decision/cache :description ?d]]'
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-03" ' + desc) == [["use Redis"]]
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-07" ' + desc) == []
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-12" ' + desc) == [["use Redis"]]
+        assert _q(real_db, '[:find ?d ' + desc) == []
+        # The restored earlier window is graph-only: the index already held it,
+        # and re-indexing would add a second row for it in another spelling.
+        assert [r[2:] for r in _index_rows(":decision/cache") if r[0] == ":description"] == [
+            ("2026-08-01T00:00:00.000Z", "2026-08-05"),
+            ("2026-08-10T00:00:00.000Z", "2026-08-20"),
+        ]
+
+    def test_window_starts_at_the_earliest_of_two_live_assertions(self, real_db):
+        """The same value asserted twice at different valid-froms is two live
+        facts (#156); retract removes both, so the re-transacted window must
+        start at the earlier one or 2026-08-01..08-10 is lost."""
+        import mcp_server
+        self._seed(mcp_server, valid_at="2026-08-01")
+        self._seed(mcp_server, valid_at="2026-08-10")
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/cache :description "use Redis"]]', reason="t",
+            valid_at="2026-08-20",
+        )
+        assert result["ok"] is True, result
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-05" '
+                           ':where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+    def test_valid_at_not_after_valid_from_is_refused(self, real_db):
+        """minigraf accepts an empty or inverted window without complaint
+        (measured), so the handler must refuse it."""
+        import mcp_server
+        self._seed(mcp_server)
+        for when in ("2026-08-18", "2026-08-10"):
+            result = mcp_server.handle_minigraf_retract(
+                '[[:decision/cache :description "use Redis"]]', reason="t", valid_at=when,
+            )
+            assert result["ok"] is False
+            assert "valid-from" in result["error"]
+        assert _q(real_db, '[:find ?d :where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+    def test_no_live_fact_is_refused(self, real_db):
+        import mcp_server
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/cache :description "never written"]]', reason="t",
+            valid_at="2026-09-01",
+        )
+        assert result["ok"] is False
+        assert "no live fact" in result["error"]
+
+    def test_refusal_is_all_or_nothing(self, real_db):
+        """One unclosable triple refuses the whole block: the closable one
+        stays live rather than being half-applied behind ok:False."""
+        import mcp_server
+        self._seed(mcp_server)
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/cache :description "use Redis"] '
+            '[:decision/cache :rationale "never written"]]',
+            reason="t", valid_at="2026-09-01",
+        )
+        assert result["ok"] is False
+        assert _q(real_db, '[:find ?d :where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+    def test_non_triple_content_is_refused(self, real_db):
+        import mcp_server
+        self._seed(mcp_server)
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/cache :description "use Redis"] {:x 1}]', reason="t",
+            valid_at="2026-09-01",
+        )
+        assert result["ok"] is False
+        assert _q(real_db, '[:find ?d :where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+    def test_two_values_of_one_attribute_close_independently(self, real_db):
+        """Two :alias values of one entity share (entity, attribute,
+        valid-from); batching them into one transact would keep only the last
+        until the next checkpoint (minigraf#287). Each must survive. The seed
+        writes them one per call for the same reason: batched, the public
+        transact itself would lose one before the retract ever ran."""
+        import mcp_server
+        self._seed(mcp_server, facts='[[:decision/cache :description "use Redis"] '
+                                     '[:decision/cache :alias "a1"]]')
+        self._seed(mcp_server, facts='[[:decision/cache :description "use Redis"] '
+                                     '[:decision/cache :alias "a2"]]')
+        assert sorted(_q(real_db, '[:find ?a :where [:decision/cache :alias ?a]]')) == [["a1"], ["a2"]]
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/cache :alias "a1"] [:decision/cache :alias "a2"]]',
+            reason="t", valid_at="2026-09-01",
+        )
+        assert result["ok"] is True, result
+        assert sorted(_q(real_db, '[:find ?a :valid-at "2026-08-20" '
+                                  ':where [:decision/cache :alias ?a]]')) == [["a1"], ["a2"]]
+        assert _q(real_db, '[:find ?a :where [:decision/cache :alias ?a]]') == []
+
+    def test_refused_valid_at_is_refused_on_retract_too(self, real_db):
+        import mcp_server
+        self._seed(mcp_server)
+        for kwargs in ({"valid_at": "2026-13-45"}, {"valid_at": "2999-01-01"}):
+            result = mcp_server.handle_minigraf_retract(
+                '[[:decision/cache :description "use Redis"]]', reason="t", **kwargs,
+            )
+            assert result["ok"] is False
+        assert _q(real_db, '[:find ?d :where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+    def test_call_tool_passes_valid_at(self, real_db):
+        import asyncio
+        import mcp_server
+        self._seed(mcp_server)
+        out = asyncio.run(mcp_server.call_tool("minigraf_retract", {
+            "facts": '[[:decision/cache :description "use Redis"]]',
+            "reason": "t", "valid_at": "2026-09-01",
+        }))
+        assert json.loads(out[0].text)["ok"] is True
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-20" '
+                           ':where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+
 class TestTransactRetractChokePoint:
     def test_transact_writes_to_index(self, real_db, tmp_path):
         import mcp_server
