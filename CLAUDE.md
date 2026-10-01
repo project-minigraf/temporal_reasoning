@@ -262,6 +262,19 @@ caller asked for a date and would otherwise get a different one behind
 `ok:True`. The `:ident` `_ensure_memory_idents` writes shares the facts'
 valid time.
 
+**`minigraf_retract` CLOSES by default, and only `mode="correct"` retracts
+(#380).** minigraf's `retract` means "this assertion was wrong" — a
+transaction-time withdrawal that cancels the triple across ALL valid time —
+while agents call `minigraf_retract` when something STOPPED being true. Before
+#380 the tool passed straight through, so superseding a decision erased it
+from `:valid-at` history and left it reachable only by `:as-of`. Now the
+default ends the live window at now (or `valid_at`), and `mode="correct"` keeps
+minigraf's meaning for facts recorded in error and refuses a valid time. The
+close refuses a fact that is not live — the old pass-through returned `ok:True`
+for a retract that matched nothing. Upstream `retract` keeps its meaning;
+minigraf#435 asks for a separate `close`, and this whole path moves onto it
+when it ships.
+
 A retract with a valid time closes the window rather than removing the fact
 (`_retract_closing_at`, `_ingest_close`'s idiom), and it rests on a measured
 minigraf behaviour worth knowing everywhere: **`retract` removes EVERY asserted

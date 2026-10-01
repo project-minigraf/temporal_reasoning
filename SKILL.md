@@ -72,12 +72,12 @@ Say "Let me check memory..." before querying. Then:
 
 ## When to Retract (minigraf_retract)
 
-Retract when:
-- The user explicitly says "remove", "delete", "retract", "forget", "that's no longer true"
-- A fact has been superseded by a newer decision
-- A fact was stored incorrectly
+`minigraf_retract` has two modes, and picking the right one matters:
 
-After retraction, say: "I've removed that from memory (the original is preserved in history)."
+- **Default (`mode` omitted, i.e. `"close"`) — the fact stopped being true.** The user says "that's no longer true", "we dropped X", or a newer decision supersedes it. The fact leaves the current view, but `:valid-at` queries for the time it applied still return it. Pass `valid_at` if it stopped on a known earlier date.
+- **`mode="correct"` — the fact was never true.** It was stored by mistake (wrong value, wrong entity, a misunderstanding). This erases it from valid-time history; only `:as-of` still shows that it was once written. Use it when the user says "that was wrong", "I never said that", or asks you to "forget"/"delete" something rather than to record a change.
+
+After a default retract, say: "I've recorded that this no longer applies (its history is kept)." After `mode="correct"`, say: "I've removed that from memory as recorded in error."
 
 ## What NOT to Store
 
@@ -276,10 +276,10 @@ minigraf_retract(facts='[[:dependency/old-service :description "obsolete"]]',
                  reason="Service decommissioned")
 ```
 
-**Recording when something stopped being true.** A plain retract ends the
-fact now. Pass `valid_at` to close its validity window at the date it really
-stopped applying instead — `:valid-at` queries inside the window still see it,
-queries after it do not, and it leaves the current view either way:
+**Recording when something stopped being true.** A plain retract closes the
+fact's validity window at now: it leaves the current view, and `:valid-at`
+queries for any time it applied still see it. Pass `valid_at` to close the
+window at the date it really stopped applying instead:
 
 ```python
 minigraf_retract(facts='[[:decision/cache :description "use Redis for session caching"]]',
@@ -292,6 +292,16 @@ Same date rules as `minigraf_transact`, plus: every fact must be a literal
 fall after the fact's own valid-from. If any fact in the block fails a check,
 the whole block is refused and nothing changes. The response lists each
 closed window under `closed`.
+
+**Withdrawing a fact recorded in error.** `mode="correct"` withdraws the fact
+outright, across all valid time — use it only when the fact was never true.
+It takes no `valid_at`, and does not require the fact to be live:
+
+```python
+minigraf_retract(facts='[[:decision/cache :description "use Redsi"]]',
+                 reason="Typo in the stored value",
+                 mode="correct")
+```
 
 ### minigraf_rule
 
@@ -962,7 +972,8 @@ User: "We're dropping PostgreSQL, switching to CockroachDB for geo-distribution.
 result = minigraf_query(datalog="[:find ?a ?v :where [:decision/db ?a ?v]]")
 # → :description "PostgreSQL 15 — primary database", :rationale "ACID + JSON support"
 
-# 2. Retract the old facts (they stay in history — still queryable with :as-of)
+# 2. Close the old facts (the default mode) — they leave the current view, but
+#    :valid-at queries for while they applied still return them
 minigraf_retract(
     facts="""[[:decision/db :description "PostgreSQL 15 — primary database"]
               [:decision/db :rationale "ACID + JSON support"]]""",
@@ -974,7 +985,10 @@ minigraf_transact(
               [:decision/db :rationale "geo-distribution requirement"]]""",
     reason="Switching to CockroachDB for geo-distribution")
 
-# 4. Old decision is still in history — what did we know at transaction 3?
+# 4. Old decision is still in history — what was the database last month?
+minigraf_query(datalog='[:find ?desc :valid-at "2026-08-01" :where [:decision/db :description ?desc]]')
+# → "PostgreSQL 15 — primary database"
+# ...and what had we written down as of transaction 3?
 minigraf_query(datalog="[:find ?desc :as-of 3 :where [:decision/db :description ?desc]]")
 # → "PostgreSQL 15 — primary database"
 ```
@@ -994,6 +1008,7 @@ All tools return `{"ok": bool, ...}`. Common errors:
 - `No graph file at <path>` — call `minigraf_transact` first
 - `as_of requires :as-of clause` — include `:as-of N` in query
 - `reason is required for all writes` — provide non-empty reason
+- `no live fact matches [...]` (retract) — the default mode closes only facts that are currently live; check the exact value with `minigraf_query`, or use `mode="correct"` for a fact that is not live
 
 `minigraf_transact`/`minigraf_retract` may return `{"ok": true, ..., "warning": "..."}` if the write itself succeeded but a subsequent internal checkpoint failed (e.g. a disk/permissions error). The fact is durably written — do not retry, since a retry uses a fresh timestamp and creates a duplicate.
 
