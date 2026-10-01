@@ -9311,7 +9311,7 @@ class TestFrontierLowRetentionCheck:
         return {r[0] for r in json.loads(raw).get("results", [])}
 
     @pytest.mark.asyncio
-    async def test_commit_grafted_inside_frontier_low_is_still_walked(self, tmp_path):
+    async def test_commit_grafted_by_a_foxtrot_fast_forward_is_still_walked(self, tmp_path):
         import mcp_server
         repo = self._repo(tmp_path)
         mcp_server.open_db(str(tmp_path / "g.graph"))
@@ -9328,26 +9328,25 @@ class TestFrontierLowRetentionCheck:
         with mcp_server.db_lease() as db:
             hashes = self._commit_hashes(db)
 
-        # POSITIVE CONTROL, and it is load-bearing -- assert it BEFORE the
-        # real assertion. This test is vacuous unless the grafted commit
-        # actually lands strictly inside frontier-low's retained span: a
-        # graft that lands at the TIP is walked normally by any code, fixed
-        # or not, so `grafted in hashes` would pass without the fix and the
-        # test would guard nothing. Task 1 measured exactly that failure --
-        # the obvious graft recipe put the commit at position 8 of 10.
-        lo_pos, hi_pos = lin.index(bounds[0]), lin.index(bounds[1])
-        grafted_pos = lin.index(grafted)
-        assert lo_pos < grafted_pos < hi_pos, (
-            f"the graft landed at position {grafted_pos}, not strictly inside "
-            f"frontier-low's retained [{lo_pos}, {hi_pos}] -- this test proves "
-            f"nothing in that state, whatever the assertion below does"
+        # #384: on the first-parent timeline this graft is a FOXTROT
+        # fast-forward. master's new first-parent chain is root -> GRAFTED ->
+        # merge, and c1..c7 become side commits of that merge. So
+        # frontier-low's old hi bound no longer resolves and the interval is
+        # discarded -- an insertion strictly INSIDE two resolving bounds is
+        # unconstructible, because a commit's first parent never changes and
+        # the chain below any resolving hi is therefore fixed. That is the
+        # positive control now: if the old bound still resolved, this
+        # construction would no longer be exercising a rewritten chain.
+        assert bounds is not None and bounds[1] not in lin, (
+            f"frontier-low's old hi bound still resolves in {len(lin)} positions "
+            f"-- the graft did not rewrite the first-parent chain"
         )
-
+        grafted_pos = lin.index(grafted)
+        assert lin == [lin[0], grafted, lin[2]], "expected root -> GRAFTED -> merge"
         assert grafted in hashes, (
             f"the grafted commit at position {grafted_pos} of {len(lin)} never "
-            f"reached the graph -- frontier-low was retained over a span it "
-            f"was never claimed under, so the position was excluded from "
-            f"_unclaimed()'s complement and handed to no stream"
+            f"reached the graph -- a rewritten first-parent chain must be "
+            f"re-walked, never covered by an interval from the old chain"
         )
 
 
@@ -10713,7 +10712,7 @@ class TestSkipFastPathInterleavedCommitIsNotSkipped:
         return repo
 
     @pytest.mark.asyncio
-    async def test_a_commit_interleaved_inside_an_archived_region_is_still_ingested(
+    async def test_a_commit_interleaved_by_a_foxtrot_fast_forward_is_still_ingested(
         self, tmp_path, monkeypatch
     ):
         import mcp_server
@@ -10767,16 +10766,18 @@ class TestSkipFastPathInterleavedCommitIsNotSkipped:
             _subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
 
         grown = frontier_registry.build_linearization(str(repo))
-        lo_pos, hi_pos = grown.index(first_high[0]), grown.index(first_high[1])
-        assert grown.index(interleaved) < hi_pos, (
-            "the new commit did not land inside the archived region's position "
-            "range, so this test is not exercising the defect it exists for"
+        # #384: on the first-parent timeline this is a foxtrot fast-forward:
+        # the new chain is original[:2] -> u1 -> merge, and the old mainline
+        # above `base` becomes side commits. The archived region's hi bound
+        # therefore no longer resolves -- an insertion strictly inside two
+        # RESOLVING bounds is unconstructible on a first-parent chain, since
+        # the chain below any resolving hash is fixed. Positive control:
+        # assert the rewrite actually happened.
+        assert first_high[1] not in grown, (
+            "the archived region's hi bound still resolves -- the topology did "
+            "not rewrite the first-parent chain, so this test proves nothing"
         )
-        assert hi_pos - lo_pos + 1 != archived_span, (
-            "the archived region's position span is unchanged, so the stored "
-            "denominator could not discriminate anything here"
-        )
-
+        assert interleaved in grown and archived_span > 0
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
         missing = []
@@ -10791,11 +10792,9 @@ class TestSkipFastPathInterleavedCommitIsNotSkipped:
 
         assert not missing, (
             f"commits {[h[:12] for h in missing]} have no :commit/... entity "
-            f"(the interleaved commit is {interleaved[:12]}). The archived "
-            "region's HASH bounds still map into the linearization, but a new "
-            "commit landed between them, so consuming the region as a closed "
-            "position range skipped a position nothing ever proved complete -- "
-            "and every at-scale detector reads that graph clean"
+            f"(the interleaved commit is {interleaved[:12]}). A rewritten "
+            "first-parent chain must be re-walked, never skipped on the "
+            "strength of a region archived from the old chain"
         )
 
 
@@ -12415,7 +12414,12 @@ class TestGitCommitsTopoOrder:
         import mcp_server
         commits = mcp_server._git_commits(str(git_repo_diamond_clock_skewed), watermark_hash=None)
         subjects = [c[3] for c in commits]
-        assert subjects == ["P", "C2a", "C2b", "C2tip", "C1", "MG"]
+        # #384: first-parent chain by default; C1 is a side commit.
+        assert subjects == ["P", "C2a", "C2b", "C2tip", "MG"]
+        every = mcp_server._git_commits(
+            str(git_repo_diamond_clock_skewed), watermark_hash=None, first_parent=False,
+        )
+        assert [c[3] for c in every] == ["P", "C2a", "C2b", "C2tip", "C1", "MG"]
 
 
 class TestDefaultGitBranch:
@@ -12578,10 +12582,11 @@ class TestGitDiffTreeRaw:
 
 
 class TestGitDiffTreeRawMergeCommits:
-    """See #185: plain `git diff-tree --raw` (no -m/-c/--cc) always emits
-    nothing for a merge commit -- this is documented git behavior. Content
-    authored genuinely at the merge point (e.g. manual conflict-resolution
-    edits) was silently and permanently dropped as a result.
+    """A merge commit diffs against its FIRST parent (#384), like every other
+    position on the first-parent timeline. Plain `git diff-tree --raw` emits
+    nothing for a merge (documented git behavior, #185), so the merge path
+    diffs the two trees explicitly. The merge's rows are the whole side
+    branch's net effect on the mainline, conflict resolution included.
     """
 
     def _init_repo(self, repo):
@@ -12635,10 +12640,10 @@ class TestGitDiffTreeRawMergeCommits:
         content = mcp_server._git_blob_content(str(repo), new_sha)
         assert b"kotlin" in content
 
-    def test_clean_non_conflicting_merge_reports_no_entries(self, tmp_path):
-        """Each side touches its own file only -- every changed byte is already
-        reachable via the individual non-merge commits `_git_commits` walks, so
-        the merge commit itself should contribute nothing new."""
+    def test_clean_merge_reports_the_side_branchs_net_effect(self, tmp_path):
+        """Each side touches its own file only. Against the first parent, the
+        merge is where feature_only.py enters the mainline, so it is an "A"
+        row here -- the side commit that authored it is not a position."""
         import mcp_server
         repo = tmp_path / "repo"
         self._init_repo(repo)
@@ -12669,7 +12674,7 @@ class TestGitDiffTreeRawMergeCommits:
         assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
 
         entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
-        assert entries == []
+        assert [(e[0], e[5]) for e in entries] == [("A", "feature_only.py")]
 
     def test_single_parent_commit_pays_no_extra_parent_hash_lookup(self, git_repo, monkeypatch):
         """The merge-commit branch must not cost the (overwhelming) common
@@ -12693,13 +12698,12 @@ class TestGitDiffTreeRawMergeCommits:
 
         assert call_count["n"] == 0, "expected zero _git_parent_hashes calls for an ordinary non-empty commit"
 
-    def test_content_discarded_entirely_at_merge_is_recovered(self, tmp_path):
-        """See #191: a file added on ONE branch only, never touched on the
-        other, whose content is deliberately dropped while resolving the
-        merge -- the final tree matches the branch that never had the file
-        at all. Neither plain diff-tree nor --cc report anything for this
-        commit (both documented as the residual gap in #185's fix), so
-        without the new supplement this file's facts would never close."""
+    def test_content_discarded_entirely_at_merge_never_reaches_the_mainline(self, tmp_path):
+        """A file added on the side branch only and dropped while resolving
+        the merge was never in any mainline tree, so the first-parent diff
+        reports nothing for it. (#191 used to recover a "D" here, closing an
+        entity the walk had opened from the side commit -- on the
+        first-parent timeline that entity is never opened at all.)"""
         import mcp_server
         repo = tmp_path / "repo"
         self._init_repo(repo)
@@ -12726,18 +12730,12 @@ class TestGitDiffTreeRawMergeCommits:
         assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
 
         entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
-        assert len(entries) == 1
-        status, old_mode, new_mode, old_sha, new_sha, path, old_path, similarity = entries[0]
-        assert path == "dropped.py"
-        assert status == "D"
+        assert entries == []
 
-    def test_deletion_already_handled_by_ordinary_commit_is_not_double_reported(self, tmp_path):
-        """Regression guard: a file that existed before the branches diverged,
-        deleted by an ORDINARY single-parent commit on one lineage and left
-        untouched on the other, is a plain clean merge -- `_git_commits`'
-        walk already visited the deleting commit directly and reported its
-        "D" there. The new per-parent supplement must recognize the path was
-        already absent at the merge-base and NOT report it a second time."""
+    def test_mainline_deletion_is_not_reported_again_at_the_merge(self, tmp_path):
+        """shared.py was deleted by an ordinary mainline commit; the merge
+        diffs against that commit's tree, where it is already gone, so the
+        merge reports only what the side branch brings in."""
         import mcp_server
         repo = tmp_path / "repo"
         self._init_repo(repo)
@@ -12767,7 +12765,7 @@ class TestGitDiffTreeRawMergeCommits:
         assert len(mcp_server._git_parent_hashes(str(repo), merge_hash)) == 2
 
         entries = mcp_server._git_diff_tree_raw(str(repo), merge_hash)
-        assert entries == [], "shared.py's removal was already reported by the ordinary deleting commit"
+        assert [(e[0], e[5]) for e in entries] == [("A", "side_only.py")]
 
 
 class TestIsIgnoredPath:

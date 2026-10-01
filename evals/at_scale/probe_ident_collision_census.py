@@ -558,7 +558,7 @@ def collect_inputs(
     """
     resolved_branch = branch or mcp_server._default_git_branch(repo_path)
     ignore_patterns = mcp_server._load_ignore_patterns(repo_path)
-    commits = mcp_server._git_commits(repo_path, None, resolved_branch)
+    commits = mcp_server._git_commits(repo_path, None, resolved_branch, first_parent=False)
     # _git_commits walks --topo-order --reverse, so hashes[-1] is the branch
     # tip. Taken from the walked list, not a separate rev-parse, so the
     # reported head cannot disagree with what was actually measured.

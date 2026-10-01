@@ -90,13 +90,15 @@ class TestBuildLinearizationTopoOrder:
     def test_topo_order_survives_clock_skew(self, git_repo_diamond_clock_skewed):
         linearization = frontier_registry.build_linearization(str(git_repo_diamond_clock_skewed))
         log_result = _subprocess.run(
-            ["git", "log", "--topo-order", "--reverse", "--format=%H %s"],
+            ["git", "log", "--first-parent", "--reverse", "--format=%H %s"],
             cwd=git_repo_diamond_clock_skewed, capture_output=True, text=True, check=True,
         )
         lines = log_result.stdout.strip().splitlines()
         expected_hashes = [line.split(" ", 1)[0] for line in lines]
         expected_subjects = [line.split(" ", 1)[1] for line in lines]
-        assert expected_subjects == ["P", "C2a", "C2b", "C2tip", "C1", "MG"]
+        # #384: the first-parent chain. C1 (branch1, merged into branch2 by
+        # MG) is a side commit, not a position.
+        assert expected_subjects == ["P", "C2a", "C2b", "C2tip", "MG"]
         assert linearization == expected_hashes
 
 
