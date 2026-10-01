@@ -12,6 +12,12 @@ justifying `_SWEEP_YIELD_COMMITS` (25) and `_SWEEP_YIELD_PAUSE_SECONDS` (0.1)
 came from here, so it lives in the repo rather than in a scratchpad. Precedent:
 `probe_lease_drop_cost.py` and its siblings (#281).
 
+HISTORICAL since #379: ingestion now holds the graph for the whole run, so a
+window boundary drops nothing and `_SWEEP_YIELD_PAUSE_SECONDS` no longer
+exists (`--pause-seconds` sets an attribute nothing reads). Run against
+current code it measures boundary drains, not drops; its recorded numbers
+describe the pre-#379 design.
+
 WHY NOT `probe_per_commit_cost.py`. It cannot see Stage B at all. `#260`'s
 trace has exactly one `_ingest_trace.emit` call site, inside Stage A's pipeline
 loop immediately before `run_progress.stage_a_finished`, so
@@ -182,7 +188,7 @@ def main(argv=None) -> int:
         "n_commits": args.commits,
         "yield_commits": args.yield_commits,
         "yield_seconds": args.yield_seconds,
-        "pause_s": mcp_server._SWEEP_YIELD_PAUSE_SECONDS,
+        "pause_s": getattr(mcp_server, "_SWEEP_YIELD_PAUSE_SECONDS", None),
         "swept": stats["swept"],
         # One window == one refcount 1->0 drop == one Drop for Inner
         # checkpoint. Boundaries are windows - 1.

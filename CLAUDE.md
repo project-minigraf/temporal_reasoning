@@ -777,8 +777,11 @@ processes — `finalize_hook.py` takes a lease to write each turn's facts. Their
 acquire budget is bounded — **`_HOOK_LOCK_DEADLINE_SECONDS` (5 s)** since #366,
 see below — and both hooks swallow failures (`except Exception: pass`). So
 lengthening how long ingestion holds a lease does not block queries — it
-**silently discards auto-memory writes**. Do not "just hold one lease for the
-whole run".
+**silently discards auto-memory writes** -- unless the hooks have somewhere
+else to put them. Since #379 they do: ingestion DOES hold one lease for the
+whole run, and the finalize hook spools while it does (see "Ingestion holds
+the graph for its whole run" below). Do not lengthen any OTHER long-lived
+holder's lease without the same escape hatch.
 
 **Locking is in the kernel; there is no PID sidecar to read.** As of minigraf
 2.0.0 the lock is `File::try_lock` on the `.graph` file itself (`flock` on Unix,
@@ -1609,6 +1612,78 @@ never derived from graph queries at poll time, which contends on
 is not: without that, a run that failed or was declined before reaching the assignment
 left the PREVIOUS run's value in the status response, misattributed to a run
 that never happened.
+
+**Ingestion holds the graph for its whole run, and hooks SPOOL instead of
+waiting for it (#379).** Every window boundary used to release the lease, and
+at refcount 1 -> 0 the handle drops -- on minigraf 2.x a full O(graph size)
+checkpoint, outside `_CheckpointPolicy`. Measured on an ArangoDB ingest at
+3.8 GB: ~7.5 s of drop per 2 s window, ~80% of the write path, ~26 GB/min of
+disk writes for ~2 MB/min of growth, and ingestion rate falling as 1/graph
+size. Worse, 2 s + 7.5 s already exceeded the hooks' 5 s deadline, so the
+windows no longer protected the writes they existed for. The suppression
+switch (`OpenOptions::wal_checkpoint_threshold = usize::MAX`) is not exposed
+over FFI (minigraf#322), and minigraf 2.0.2 is tagged the final planned 2.x,
+so it will not arrive under our `<3.0.0` cap.
+
+`_run_ingestion` now takes a **run hold** -- one `db_lease_async(extended=True)`
+from the start of the walk to after the final checkpoint -- so every lease
+inside it (both stages' windows, per-commit leases, fold, tags, final
+checkpoint) is a join whose exit drops nothing. `_SWEEP_YIELD_PAUSE_SECONDS`
+is deleted; `_SWEEP_YIELD_COMMITS`/`_SECONDS` keep their names but now bound
+how long a SPOOLED fact waits, not how long a hook is locked out.
+
+The hook side (`hook_spool.py`, `_finalize_lease_or_spool`): a HOOK process
+(`use_hook_lease_deadline`) spools when another process's fresh ownership
+hint says `purpose: ingestion` -- without touching the graph -- or when the
+lease deadline passes anyway (a hint-less holder, or a run that started after
+the hint was read). Each record is one JSON file in `<graph>.spool/`, written
+tmp-then-`os.replace` (atomic everywhere, no file locking), carrying the
+extracted facts and the valid time they were extracted at. The drain
+(`_drain_hook_spool`) applies records through `_apply_extracted_facts` --
+the same closed-world validation as the direct path -- at every window
+boundary of both stages and once more before the final checkpoint, on the
+write executor with ingestion's batched `index_con`. A hook that DOES get the
+lease drains stranded records first (one spooled after a run's final drain).
+
+Four things it rests on:
+
+  * **At-least-once, and that is safe.** A record is removed only after it is
+    applied; a crash in between re-applies it at its own valid time, which
+    minigraf collapses and the index's UNIQUE constraint ignores (tested: one
+    row in each).
+  * **The server process never spools and never drains.** In-process
+    ingestion holds the fact index's write transaction on its own connection;
+    a drain on any other connection would block on it (#347's shape).
+  * **The spooled valid time is the extraction time**, so a fact drained a
+    window later is stored when it was learned.
+  * **`_query_canonical_entities` returns "" while spooling** -- the llm and
+    agent strategies' prompt simply loses its canonical-ident section, as for
+    an empty graph, rather than waiting out the deadline on a query.
+
+Status: `minigraf_ingest_status` reports `handle_drops` (`count`, `seconds`,
+this run, pre-drop checkpoint included) and `hook_spool` (`records`, `facts`,
+`quarantined`). `_DbLeaseManager.drops`/`drop_seconds` are the cumulative
+counters behind it. `TestRunHold` asserts zero drops between Stage A start and
+sweep end.
+
+Residuals, stated not fixed: another process's `call_tool` (a second MCP
+session's `minigraf_query`) is locked out for the whole run and fails after
+~2.6 s -- it effectively was before (its gapped retries missed 0.1 s
+pauses); `prepare_hook`'s rare backfill lease (index missing) cannot run
+mid-ingestion; a spooled fact is invisible to retrieval until the next
+boundary drains it; minigraf's own 1000-WAL-entry auto-checkpoint is still
+O(graph size) and is now the dominant checkpoint term during a run (#376/#377
+reduce its frequency). When the cap moves to 3.x and minigraf#322 lands, the
+run hold could be replaced by opening with the threshold suppressed -- but
+nothing about the spool depends on that.
+
+**SUPERSEDED IN PART by #379 (the next paragraph and the window/yield
+paragraphs after it, down to `probe_sweep_window_cost.py`, are kept as
+history).** Ingestion no longer releases the graph at window boundaries, there
+is no pause, and the hooks no longer land in a release -- they spool. What
+still holds from those paragraphs: boundaries fall only between fully-swept
+commits, every committing lease commits `index_con` before its exit, and the
+count/clock disjunction (now bounding spool-drain latency).
 
 **Stage B now yields its lease on a bounded window, and the whole-sweep hold
 it replaced was silently discarding auto-memory writes (#222 phase 5, item
