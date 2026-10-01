@@ -69,6 +69,60 @@ def _keep_rightmost_leaf(graph_path, root_offset):
         f.write(header)
 
 
+def _keep_last_leaf_containing(graph_path, root_offset, needle):
+    """_keep_rightmost_leaf, but keeping the LAST leaf whose bytes contain
+    `needle` (an entity's 16 UUID bytes) instead of the rightmost one.
+
+    Which leaf an entity's entries land in is not a property of the graph's
+    content: minigraf 2.0.2's save() copies untouched leaves and repacks only
+    those receiving new entries (#315), so leaf boundaries depend on how many
+    checkpoints the writes were split across. Ingestion's checkpoints are
+    clock-gated (_CheckpointPolicy), and since #379 a run no longer
+    checkpoints on every lease drop, so a slow runner can leave
+    :ingestion/last-run-at -- the one entity sorting above the watermark --
+    alone in the rightmost leaf. Measured: forcing the duty to ~0 reproduced
+    it every time locally, as CI saw on 4 of 5 interpreters. Walks the leaf
+    chain from the leftmost leaf (first child at offset 12 of an internal
+    page, next_leaf at offset 4 of a leaf); the caller's precondition
+    assertions remain the positive control.
+    """
+    with open(graph_path, "r+b") as f:
+        header = bytearray(f.read(_HEADER_LEN))
+        assert bytes(header[:4]) == b"MGRF"
+        assert struct.unpack_from("<I", header, 4)[0] == 7, (
+            "minigraf header layout changed; re-derive _keep_last_leaf_containing"
+        )
+        page_id = struct.unpack_from("<Q", header, root_offset)[0]
+        f.seek(page_id * _PAGE_SIZE)
+        page = f.read(_PAGE_SIZE)
+        assert page[0] == _PAGE_TYPE_INTERNAL, (
+            "index root is already a leaf: the graph is too small to damage"
+        )
+        while page[0] == _PAGE_TYPE_INTERNAL:
+            page_id = struct.unpack_from("<Q", page, 12)[0]  # first child
+            f.seek(page_id * _PAGE_SIZE)
+            page = f.read(_PAGE_SIZE)
+        chosen = None
+        while True:
+            assert page[0] == _PAGE_TYPE_LEAF
+            if needle in page:
+                chosen = page_id
+            nxt = struct.unpack_from("<Q", page, 4)[0]  # next_leaf, 0 = last
+            if nxt == 0:
+                break
+            page_id = nxt
+            f.seek(page_id * _PAGE_SIZE)
+            page = f.read(_PAGE_SIZE)
+        assert chosen is not None, "no leaf holds the needle -- re-derive the layout"
+        struct.pack_into("<Q", header, root_offset, chosen)
+        struct.pack_into(
+            "<I", header, _HEADER_CHECKSUM_OFFSET,
+            zlib.crc32(bytes(header[:_HEADER_CHECKSUM_OFFSET])),
+        )
+        f.seek(0)
+        f.write(header)
+
+
 def _entity_uuid(ident):
     """The entity id minigraf derives from a keyword ident."""
     return uuid.uuid5(uuid.NAMESPACE_OID, ident)
@@ -509,7 +563,7 @@ class TestIndexCrossCheckAtRunStart:
         _write_facts(
             graph, _filler_facts(_filler_idents(400, keep=lambda u: u < watermark))
         )
-        _keep_rightmost_leaf(graph, _EAVT_ROOT_OFFSET)
+        _keep_last_leaf_containing(graph, _EAVT_ROOT_OFFSET, watermark.bytes)
         # Precondition: stamp lost, watermark kept -- the shape in which
         # _graph_format_version_verify raises GraphFormatVersionError.
         db = MiniGrafDb.open(str(graph))
