@@ -5260,7 +5260,10 @@ def _retract_closing_at(db: Any, facts: str, valid_to: Optional[str]) -> Dict[st
     reads empty at its own :valid-at afterwards). So every other window read
     back beforehand is re-transacted verbatim too, graph-only -- the fact
     index already holds those rows, and _retract only deletes live ones.
-    This whole dance is a workaround until minigraf#435 ships `close`.
+    The closing window is written LAST: minigraf#435 (v3.0.0) makes the
+    latest assertion of an [e a v] its one current window, so this whole
+    dance becomes one transact with :valid-to, and the restore goes, when
+    the minigraf cap moves to 3.x. _ingest_close does the same (#383).
 
     Every triple is checked before anything is written -- parseable, live,
     and starting strictly before a caller-chosen valid_to, since minigraf
@@ -6539,14 +6542,47 @@ def _ingest_close(
     Triples are retracted one-by-one to avoid EAVT collision on :contains edges
     (Minigraf's pending index omits value bytes, so batching multiple
     [module :contains fn] retracts could collide).
+
+    minigraf's retract cancels EVERY asserted window of an [e a v], not only
+    the live one, so step 1 alone wiped an earlier life's bounded window of
+    every fact whose value repeats across lives (:ident, :entity-type,
+    :path, :contains, ...) the second time an entity was closed (#383). So
+    each triple's bounded windows are read back first and re-transacted
+    verbatim after its retract, graph-only -- the fact index already holds
+    those rows, and _retract only deletes live ones -- exactly as the public
+    close path does (_retract_closing_at, #380). Open windows are the life
+    being closed and are not restored; nor is a window identical to the one
+    step 2 writes, which a re-walk (#313) would otherwise assert twice.
+
+    The restores are written BEFORE step 2 on purpose. minigraf#435 (v3.0.0)
+    makes the latest assertion of an [e a v] its one current window, so the
+    closing window must be the last one asserted. Under that model the
+    restore step is wasted work -- earlier lives are reachable only through
+    :as-of -- and this whole function becomes one transact with :valid-to
+    when the minigraf cap moves to 3.x.
     """
     if not triples:
         return
     for triple in triples:
+        m = _FACTS_TRIPLE_PATTERN.fullmatch(triple)
+        restore = []
+        if m is not None:
+            restore = [
+                (vf, vt)
+                for vf, vt in _asserted_windows_ms(db, triple, m.group(1))
+                if vt != _VALID_TIME_FOREVER_MS
+                and (vf, vt) != (_iso_to_epoch_ms(original_ts_iso),
+                                 _iso_to_epoch_ms(commit_ts_iso))
+            ]
         try:
             _retract(db, f"[{triple}]", index_con=index_con)
         except Exception:
             pass  # best-effort: original may not exist if preload was incomplete
+        for vf, vt in restore:
+            _transact(
+                db, f"[{triple}]", _epoch_ms_to_iso(vf),
+                valid_to=_epoch_ms_to_iso(vt), index_triples=[],
+            )
     facts_str = "[" + " ".join(triples) + "]"
     _transact(
         db, facts_str, original_ts_iso, valid_to=commit_ts_iso, index_con=index_con,
