@@ -290,11 +290,17 @@ ingestion — every fact whose value repeats across lives (`:ident`,
 `TestRebirthInsideReverseRegion`'s fixture lose it (that test compares 1:1
 against forward-only, which are wrong identically, so it stays green); this
 repo's 1053-commit graph has 0, because no entity there has been closed twice.
-No gate sees it. Deferred to minigraf#435 (a `close` primitive) rather than
-patched with a restore step — see #380. minigraf also stores an empty or
-inverted window without complaint, so the handler refuses `valid_at <=
-valid-from` itself; ingestion already produces inverted `:introduced-by`
-windows from author/committer date skew (2 entities on this repo).
+No gate sees it. Tracked as #383 and deferred to minigraf#435 (a `close`
+primitive); the public tool got the restore step in #380, ingestion did not.
+minigraf also stores an empty or inverted window without complaint, so the
+handler refuses `valid_at <= valid-from` itself. Ingestion DOES write inverted
+windows, and NOT from date skew, as this paragraph first said: when two
+branches touch one file concurrently, the linearized walk diffs against its
+running `state.file_entities` rather than the commit's own parent, so a
+sibling-branch commit "removes" what the other branch added, and the entity is
+reborn at the merge (#384; 2 entities on this repo, the inverted ones being
+those where the sibling commit is dated earlier). Every such spurious cycle is
+one more life for #383 to wipe.
 
 **The same scan also answers a graph-only question: #287's two-value
 `:introduced-by`.** `fact_audit`'s full `[:find ?e ?a ?v]` scan is already in
