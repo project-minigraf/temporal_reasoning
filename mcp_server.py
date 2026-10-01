@@ -5245,8 +5245,9 @@ def _asserted_windows_ms(db: Any, triple: str, entity: str) -> List[Tuple[int, i
     return sorted((row[0], row[1]) for row in json.loads(raw).get("results", []))
 
 
-def _retract_closing_at(db: Any, facts: str, valid_to: str) -> Dict[str, Any]:
-    """Close each [e a v] triple's live window at valid_to (#375).
+def _retract_closing_at(db: Any, facts: str, valid_to: Optional[str]) -> Dict[str, Any]:
+    """Close each [e a v] triple's live window at valid_to, or at now when
+    valid_to is None (#375, #380).
 
     retract takes no temporal options, so this is _ingest_close's idiom on a
     public write: retract the live assertion, then re-transact it bounded
@@ -5259,47 +5260,58 @@ def _retract_closing_at(db: Any, facts: str, valid_to: str) -> Dict[str, Any]:
     reads empty at its own :valid-at afterwards). So every other window read
     back beforehand is re-transacted verbatim too, graph-only -- the fact
     index already holds those rows, and _retract only deletes live ones.
+    This whole dance is a workaround until minigraf#435 ships `close`.
 
     Every triple is checked before anything is written -- parseable, live,
-    and starting strictly before valid_to, since minigraf stores an empty or
-    inverted window without complaint (measured) -- so a refusal leaves the
-    graph untouched. Each window is written in its own call: two values of
-    one (entity, attribute) can share a valid-from, and batching them
-    collapses to the last until the next checkpoint (minigraf#287).
+    and starting strictly before a caller-chosen valid_to, since minigraf
+    stores an empty or inverted window without complaint (measured) -- so a
+    refusal leaves the graph untouched. When the end defaults to now, a fact
+    whose valid-from IS now (same millisecond) gets a one-millisecond window
+    rather than a refusal or an empty one: it was true, briefly, and the
+    caller asked for nothing it could have got wrong. Each window is written
+    in its own call: two values of one (entity, attribute) can share a
+    valid-from, and batching them collapses to the last until the next
+    checkpoint (minigraf#287).
     """
     matches = list(_FACTS_TRIPLE_PATTERN.finditer(facts))
     leftover = _FACTS_TRIPLE_PATTERN.sub("", facts)
     if not matches or leftover.strip("[], \t\r\n"):
         return {
             "ok": False,
-            "error": "a retract with a valid time takes only literal [entity "
-                     "attribute value] triples, e.g. [[:decision/x :description \"y\"]]",
+            "error": "closing a fact's window takes only literal [entity "
+                     "attribute value] triples, e.g. [[:decision/x :description \"y\"]]; "
+                     "use mode \"correct\" for anything else",
         }
-    valid_to_ms = _iso_to_epoch_ms(valid_to)
-    now_ms = _iso_to_epoch_ms(_now_utc_ms())
-    closes: List[Tuple[str, str, List[Tuple[int, int]]]] = []
+    now_iso = _now_utc_ms()
+    now_ms = _iso_to_epoch_ms(now_iso)
+    closes: List[Tuple[str, str, str, List[Tuple[int, int]]]] = []
     for m in matches:
         triple = m.group(0)
-        if any(triple == t for t, _, _ in closes):
+        if any(triple == c[0] for c in closes):
             continue
         windows = _asserted_windows_ms(db, triple, m.group(1))
         live = [vf for vf, vt in windows if vt == _VALID_TIME_FOREVER_MS and vf <= now_ms]
         if not live:
             return {"ok": False, "error": f"no live fact matches {triple}"}
-        vf_iso = _epoch_ms_to_iso(min(live))
-        if valid_to_ms <= min(live):
+        vf_ms = min(live)
+        vf_iso = _epoch_ms_to_iso(vf_ms)
+        if valid_to is None:
+            vt_iso = now_iso if now_ms > vf_ms else _epoch_ms_to_iso(vf_ms + 1)
+        elif _iso_to_epoch_ms(valid_to) <= vf_ms:
             return {
                 "ok": False,
                 "error": f"valid time {valid_to!r} is not after {triple}'s "
                          f"valid-from {vf_iso}; a window must end after it starts",
             }
+        else:
+            vt_iso = valid_to
         others = [
             (vf, vt) for vf, vt in windows
             if not (vt == _VALID_TIME_FOREVER_MS and vf <= now_ms)
         ]
-        closes.append((triple, vf_iso, others))
+        closes.append((triple, vf_iso, vt_iso, others))
     raw = ""
-    for triple, vf_iso, others in closes:
+    for triple, vf_iso, vt_iso, others in closes:
         _retract(db, f"[{triple}]")
         for vf, vt in others:
             _transact(
@@ -5307,48 +5319,73 @@ def _retract_closing_at(db: Any, facts: str, valid_to: str) -> Dict[str, Any]:
                 valid_to=None if vt == _VALID_TIME_FOREVER_MS else _epoch_ms_to_iso(vt),
                 index_triples=[],
             )
-        raw = _transact(db, f"[{triple}]", vf_iso, valid_to=valid_to)
+        raw = _transact(db, f"[{triple}]", vf_iso, valid_to=vt_iso)
     result = _parse_tx_result(raw)
     if result["ok"]:
-        result["valid_to"] = valid_to
+        result["valid_to"] = valid_to or now_iso
         result["closed"] = [
-            {"fact": triple, "valid_from": vf_iso, "valid_to": valid_to}
-            for triple, vf_iso, _ in closes
+            {"fact": triple, "valid_from": vf_iso, "valid_to": vt_iso}
+            for triple, vf_iso, vt_iso, _ in closes
         ]
     return result
 
 
-def handle_minigraf_retract(
-    facts: str, reason: str, valid_at: Optional[str] = None
-) -> Dict[str, Any]:
-    """Retract facts from the graph. reason is required.
+_RETRACT_MODES = ("close", "correct")
 
-    With a valid time -- valid_at, or a `; valid-at:` line in facts (#375) --
-    each fact's window is closed at that time instead of simply removed from
-    the live view, so :valid-at queries can still see when it applied. See
-    _retract_closing_at.
+
+def handle_minigraf_retract(
+    facts: str,
+    reason: str,
+    valid_at: Optional[str] = None,
+    mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record that facts no longer hold, or withdraw them. reason is required.
+
+    mode "close" (the default, #380) ends each fact's valid window -- at
+    valid_at, or a `; valid-at:` line in facts (#375), or now -- so :valid-at
+    queries inside the window still see it. See _retract_closing_at.
+
+    mode "correct" is minigraf's own retract: a transaction-time withdrawal
+    meaning "this was recorded in error". It cancels every assertion of the
+    triple across ALL valid time, so the fact vanishes from :valid-at history
+    and survives only under :as-of. That is exactly why it is not the default:
+    agents retract when something stopped being true, and before #380 doing
+    so erased it. A correction has no end date, so a valid time is refused.
     """
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for retract"}
+    mode = mode or "close"
+    if mode not in _RETRACT_MODES:
+        return {
+            "ok": False,
+            "error": f"unknown mode {mode!r}: expected one of {list(_RETRACT_MODES)}",
+        }
     requested_valid_to, facts, valid_at_error = _resolve_write_valid_at(facts, valid_at)
     if valid_at_error:
         return {"ok": False, "error": valid_at_error}
-    if requested_valid_to:
+    if mode == "correct":
+        if requested_valid_to:
+            return {
+                "ok": False,
+                "error": "mode \"correct\" withdraws a fact recorded in error and "
+                         "takes no valid time; to record when a fact stopped being "
+                         "true, use the default mode \"close\"",
+            }
         with db_lease() as db:
             try:
-                result = _retract_closing_at(db, facts, requested_valid_to)
+                raw = _retract(db, facts)
             except MiniGrafError as e:
                 return {"ok": False, "error": str(e)}
+            result = _parse_tx_result(raw)
             if result["ok"]:
                 result["reason"] = reason
             _checkpoint_after_write(db, "minigraf_retract", result)
             return result
     with db_lease() as db:
         try:
-            raw = _retract(db, facts)
+            result = _retract_closing_at(db, facts, requested_valid_to)
         except MiniGrafError as e:
             return {"ok": False, "error": str(e)}
-        result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
         _checkpoint_after_write(db, "minigraf_retract", result)
@@ -16836,8 +16873,11 @@ _TOOLS: List[Tool] = [
     Tool(
         name="minigraf_retract",
         description=(
-            "Retract a fact from Minigraf's graph memory. Retraction records a new fact with "
-            "asserted=false — the original stays in history for bi-temporal auditing."
+            "Record that a fact in Minigraf's graph memory is no longer true. By default this "
+            "closes the fact's valid window at now (or at valid_at): it leaves the current view, "
+            "and :valid-at queries inside the window still see it. Use mode \"correct\" only "
+            "for a fact that was recorded in error — that erases it from valid-time history, "
+            "leaving it visible only to :as-of."
         ),
         inputSchema={
             "type": "object",
@@ -16854,11 +16894,20 @@ _TOOLS: List[Tool] = [
                     "type": "string",
                     "description": (
                         "Optional. When the fact stopped being true in the world, if not now "
-                        "-- e.g. the date a decision was superseded. Closes each fact's valid "
-                        "window at that time instead of removing it, so :valid-at queries "
-                        "still see when it applied. YYYY-MM-DD or an ISO 8601 datetime; past "
-                        "or present, after the fact's own valid-from; literal [e a v] triples "
-                        "only. A '; valid-at: <date>' line in facts is read the same way."
+                        "-- e.g. the date a decision was superseded. YYYY-MM-DD or an ISO 8601 "
+                        "datetime; past or present, after the fact's own valid-from. A "
+                        "'; valid-at: <date>' line in facts is read the same way. Not "
+                        "allowed with mode \"correct\"."
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["close", "correct"],
+                    "description": (
+                        "Optional, default \"close\": the fact stopped being true; end its "
+                        "valid window and keep its history. Each fact must be a literal "
+                        "[entity attribute value] triple that is currently live. "
+                        "\"correct\": the fact was recorded in error; withdraw it outright."
                     ),
                 },
             },
@@ -17079,7 +17128,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
 
         if name == "minigraf_retract":
             result = handle_minigraf_retract(
-                arguments["facts"], arguments["reason"], valid_at=arguments.get("valid_at"),
+                arguments["facts"], arguments["reason"],
+                valid_at=arguments.get("valid_at"), mode=arguments.get("mode"),
             )
             return [TextContent(type="text", text=json.dumps(result))]
 

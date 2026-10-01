@@ -2069,8 +2069,7 @@ class TestMinigrafRetract:
             '[[:service/use-redis :description "use redis for caching"]]', reason="test"
         )
         mcp_server.handle_minigraf_retract(
-            '[[:service/use-redis :description "use redis for caching"]]', reason="cleanup"
-        )
+            '[[:service/use-redis :description "use redis for caching"]]', reason="cleanup", mode="correct")
         index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
@@ -2092,8 +2091,7 @@ class TestMinigrafRetract:
         )
 
         result = mcp_server.handle_minigraf_retract(
-            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="cleanup"
-        )
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="cleanup", mode="correct")
         assert result["ok"] is True
 
         index_path = fact_index.index_path_for(mcp_server._graph_path_current())
@@ -2256,8 +2254,7 @@ class TestUuidIdentBoostResolution:
         )
 
         result = mcp_server.handle_minigraf_retract(
-            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="cleanup"
-        )
+            f'[[#uuid "{entity_uuid}" :status "reviewed"]]', reason="cleanup", mode="correct")
         assert result["ok"] is True
 
         index_path = fact_index.index_path_for(mcp_server._graph_path_current())
@@ -2865,6 +2862,149 @@ class TestRetractValidAt:
         assert json.loads(out[0].text)["ok"] is True
         assert _q(real_db, '[:find ?d :valid-at "2026-08-20" '
                            ':where [:decision/cache :description ?d]]') == [["use Redis"]]
+
+
+class TestRetractClosesByDefault:
+    """#380: minigraf's retract means "this assertion was wrong" -- it cancels
+    every assertion of the triple across all valid time -- but agents call
+    minigraf_retract when something STOPPED being true. So superseding a
+    decision erased it from :valid-at history (measured), which is the
+    opposite of what SKILL.md promised. A plain minigraf_retract now closes
+    the fact's window at now; mode="correct" is the old transaction-time
+    retraction, for facts recorded in error.
+    """
+
+    def _seed(self, mcp_server, valid_at="2026-08-18"):
+        assert mcp_server.handle_minigraf_transact(
+            '[[:decision/db :description "PostgreSQL"]]', reason="seed", valid_at=valid_at,
+        )["ok"]
+
+    def test_plain_retract_keeps_the_fact_in_valid_time_history(self, real_db):
+        import mcp_server
+        self._seed(mcp_server)
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/db :description "PostgreSQL"]]', reason="switched to CockroachDB",
+        )
+        assert result["ok"] is True, result
+        desc = ':where [:decision/db :description ?d]]'
+        assert _q(real_db, '[:find ?d ' + desc) == []
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-20" ' + desc) == [["PostgreSQL"]]
+        assert result["closed"][0]["valid_from"] == "2026-08-18T00:00:00.000Z"
+        assert result["valid_to"] == result["closed"][0]["valid_to"]
+
+    def test_plain_retract_ends_the_window_at_now(self, real_db):
+        import mcp_server
+        self._seed(mcp_server)
+        before = mcp_server._iso_to_epoch_ms(mcp_server._now_utc_ms())
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/db :description "PostgreSQL"]]', reason="t",
+        )
+        after = mcp_server._iso_to_epoch_ms(mcp_server._now_utc_ms())
+        assert before <= mcp_server._iso_to_epoch_ms(result["valid_to"]) <= after
+
+    def test_plain_retract_leaves_a_historical_index_row(self, real_db):
+        """Retrieval still finds a superseded decision, labelled as history."""
+        import mcp_server
+        self._seed(mcp_server)
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/db :description "PostgreSQL"]]', reason="t",
+        )
+        assert [r[2:] for r in _index_rows(":decision/db") if r[0] == ":description"] == [
+            ("2026-08-18T00:00:00.000Z", result["valid_to"]),
+        ]
+
+    def test_correct_mode_erases_the_fact_from_valid_time(self, real_db):
+        """The old meaning, kept for facts recorded in error."""
+        import mcp_server
+        self._seed(mcp_server)
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/db :description "PostgreSQL"]]', reason="recorded in error",
+            mode="correct",
+        )
+        assert result["ok"] is True, result
+        desc = ':where [:decision/db :description ?d]]'
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-20" ' + desc) == []
+        assert [r for r in _index_rows(":decision/db") if r[0] == ":description"] == []
+
+    def test_correct_mode_refuses_a_valid_time(self, real_db):
+        """A correction says the fact was never true; it has no end date."""
+        import mcp_server
+        self._seed(mcp_server)
+        for kwargs, facts in (
+            ({"valid_at": "2026-09-01"}, '[[:decision/db :description "PostgreSQL"]]'),
+            ({}, '; valid-at: 2026-09-01\n[[:decision/db :description "PostgreSQL"]]'),
+        ):
+            result = mcp_server.handle_minigraf_retract(facts, reason="t", mode="correct", **kwargs)
+            assert result["ok"] is False
+            assert "correct" in result["error"]
+        assert _q(real_db, '[:find ?d :where [:decision/db :description ?d]]') == [["PostgreSQL"]]
+
+    def test_unknown_mode_is_refused(self, real_db):
+        import mcp_server
+        self._seed(mcp_server)
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/db :description "PostgreSQL"]]', reason="t", mode="delete",
+        )
+        assert result["ok"] is False
+        assert _q(real_db, '[:find ?d :where [:decision/db :description ?d]]') == [["PostgreSQL"]]
+
+    def test_plain_retract_of_a_fact_that_is_not_live_is_refused(self, real_db):
+        """Closing nothing is an error, not a silent ok -- the caller named a
+        fact the graph does not hold, usually a typo in the value."""
+        import mcp_server
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/db :description "MySQL"]]', reason="t",
+        )
+        assert result["ok"] is False
+        assert "no live fact" in result["error"]
+
+    def test_a_fact_written_this_millisecond_can_still_be_closed(self, real_db, monkeypatch):
+        """With the end defaulted to now, a fact whose valid-from IS now would
+        get an empty window. It gets a one-millisecond window instead: it was
+        true, briefly, and an empty window would say it never was."""
+        import mcp_server
+        frozen = "2026-09-30T12:00:00.000Z"
+        monkeypatch.setattr(mcp_server, "_now_utc_ms", lambda: frozen)
+        assert mcp_server.handle_minigraf_transact(
+            '[[:decision/db :description "PostgreSQL"]]', reason="seed")["ok"]
+        result = mcp_server.handle_minigraf_retract(
+            '[[:decision/db :description "PostgreSQL"]]', reason="t",
+        )
+        assert result["ok"] is True, result
+        assert result["closed"][0]["valid_to"] == "2026-09-30T12:00:00.001Z"
+        assert _q(real_db, '[:find ?d :valid-at "2026-09-30T12:00:00.000Z" '
+                           ':where [:decision/db :description ?d]]') == [["PostgreSQL"]]
+
+    def test_uuid_tagged_fact_closes_under_its_resolved_ident(self, real_db):
+        """#177/#194 on the close path: a #uuid-tagged triple is read back,
+        retracted and re-asserted through the same literal, and its index rows
+        land under the entity's resolved :ident -- the live row removed, a
+        historical one written."""
+        import mcp_server
+        self._seed(mcp_server)
+        uuid = mcp_server.handle_minigraf_query(
+            '[:find ?e :where [?e :description "PostgreSQL"]]')["results"][0][0]
+        result = mcp_server.handle_minigraf_retract(
+            f'[[#uuid "{uuid}" :description "PostgreSQL"]]', reason="t",
+        )
+        assert result["ok"] is True, result
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-20" '
+                           ':where [:decision/db :description ?d]]') == [["PostgreSQL"]]
+        assert [r[2:] for r in _index_rows(":decision/db") if r[0] == ":description"] == [
+            ("2026-08-18T00:00:00.000Z", result["valid_to"]),
+        ]
+
+    def test_call_tool_passes_mode(self, real_db):
+        import asyncio
+        import mcp_server
+        self._seed(mcp_server)
+        out = asyncio.run(mcp_server.call_tool("minigraf_retract", {
+            "facts": '[[:decision/db :description "PostgreSQL"]]',
+            "reason": "t", "mode": "correct",
+        }))
+        assert json.loads(out[0].text)["ok"] is True
+        assert _q(real_db, '[:find ?d :valid-at "2026-08-20" '
+                           ':where [:decision/db :description ?d]]') == []
 
 
 class TestTransactRetractChokePoint:
@@ -19193,8 +19333,7 @@ class TestIndexCacheInvalidation:
         # New behavior: retract removes from the fact index directly (not via cache invalidation)
         real_db.execute('(transact {} [[:decision/test :description "test"]])')
         mcp_server.handle_minigraf_retract(
-            '[[:decision/test :description "test"]]', reason="cleanup"
-        )
+            '[[:decision/test :description "test"]]', reason="cleanup", mode="correct")
         index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "test", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
