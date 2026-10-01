@@ -642,6 +642,86 @@
     "probe": "evals/at_scale/probe_sibling_branch_closes.py",
     "temporal_reasoning_head": "bc19c56",
     "flask_head": "d73fa1cd",
-    "real_ingest_confirmation": "synthetic move-on-master + edit-on-side + merge: pkg/app.py module/function/class closed at the move, reborn by the side edit, live at HEAD in both 10**6:1 and 1:1 ingestion"
+    "real_ingest_confirmation": "synthetic move-on-master + edit-on-side + merge: pkg/app.py module/function/class closed at the move, reborn by the side edit, live at HEAD in both 10**6:1 and 1:1 ingestion",
+    "before": "sections self/nedb/minigraf/flask: topo-order walk, measured at 3bfaa22 (pre-fix code)",
+    "after": "after_first_parent: same probe replaying the shipped first-parent walk (#384); every count 0, HEAD end state exact"
+  },
+  "after_first_parent": {
+    "self": {
+      "repo": "temporal_reasoning",
+      "branch": "master",
+      "counts": {
+        "commits": 430,
+        "merges": 99,
+        "file_changes": 745
+      },
+      "entities_spuriously_closed": 0,
+      "entities_spuriously_closed_twice_or_more": 0,
+      "inverted_entities": 0,
+      "head_stale_live": 0,
+      "head_missing_live": 0,
+      "head_stale_sample": [],
+      "head_missing_sample": [],
+      "inverted_sample": [],
+      "samples": [],
+      "seconds": 51.5
+    },
+    "nedb": {
+      "repo": "nedb",
+      "branch": "master",
+      "counts": {
+        "commits": 561,
+        "merges": 27,
+        "file_changes": 679
+      },
+      "entities_spuriously_closed": 0,
+      "entities_spuriously_closed_twice_or_more": 0,
+      "inverted_entities": 0,
+      "head_stale_live": 0,
+      "head_missing_live": 0,
+      "head_stale_sample": [],
+      "head_missing_sample": [],
+      "inverted_sample": [],
+      "samples": [],
+      "seconds": 8.9
+    },
+    "minigraf": {
+      "repo": "project-minigraf/minigraf",
+      "branch": "main",
+      "counts": {
+        "commits": 569,
+        "merges": 105,
+        "file_changes": 807
+      },
+      "entities_spuriously_closed": 0,
+      "entities_spuriously_closed_twice_or_more": 0,
+      "inverted_entities": 0,
+      "head_stale_live": 0,
+      "head_missing_live": 0,
+      "head_stale_sample": [],
+      "head_missing_sample": [],
+      "inverted_sample": [],
+      "samples": [],
+      "seconds": 11.9
+    },
+    "flask": {
+      "repo": "pallets/flask",
+      "branch": "main",
+      "counts": {
+        "commits": 2276,
+        "merges": 1027,
+        "file_changes": 3236
+      },
+      "entities_spuriously_closed": 0,
+      "entities_spuriously_closed_twice_or_more": 0,
+      "inverted_entities": 0,
+      "head_stale_live": 0,
+      "head_missing_live": 0,
+      "head_stale_sample": [],
+      "head_missing_sample": [],
+      "inverted_sample": [],
+      "samples": [],
+      "seconds": 26.5
+    }
   }
 }

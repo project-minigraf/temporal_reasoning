@@ -32,6 +32,16 @@ for "A", so the stale entities stay live); in-file renames
 closes are therefore an UPPER bound only in that last respect, and the rename
 exclusion applies to genuine renames, which are rare among spurious ones.
 
+AFTER #384 THIS PROBE REPLAYS THE SHIPPED WALK. It calls the live
+`build_linearization` and `_git_diff_tree_raw`, which are now the
+first-parent chain and a first-parent diff for merges. The topo-order
+numbers in results/384-sibling-branch-exposure.json were measured at 3bfaa22,
+before the fix; `after_first_parent` in the same file is this probe on the
+shipped code -- 0 on every count, every repo, HEAD end state included. On a
+first-parent chain `walk_prev == true_prev` holds by construction for every
+path, so the zeros are the expected result, and the end-state comparison
+against HEAD's tree is the part that could still have caught a defect.
+
 Run: .venv/bin/python -m evals.at_scale.probe_sibling_branch_closes REPO [--branch B] [--json OUT]
 """
 from __future__ import annotations
