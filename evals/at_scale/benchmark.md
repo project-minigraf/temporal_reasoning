@@ -2471,3 +2471,32 @@ found the two builds' graphs identical apart from `:ingestion/last-run-at`.
 | Code entities with no :introduced-by (#316) | 0 of 4462 code entities |
 | Commits: repo / walk / graph (#317) | 437 / 437 / 437; side 629 / 629 (ref `384-sibling-branch-closes`) |
 | Orphaned commit entities (#222 phase 5) | 0 of 1066 (ref `384-sibling-branch-closes`) |
+
+## Ingestion Run — 20261001T094426Z
+
+- Repo: `.` @ `master`
+- minigraf: `2.0.2`
+- Metrics JSON: `results/ingestion-20261001T094426Z.json`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 431 |
+| Final status | complete |
+| Wall-clock | 159.73s |
+| Throughput | 161.9 commits/min |
+| Peak RSS | 761744 KB |
+| Graph size | 236724224 bytes |
+| Fact-index size | 33521664 bytes |
+| Status-query latency (min/p50/p99/max) | 0.2ms / 0.4ms / 33.9ms / 35.8ms |
+| Graph-query latency (min/p50/p99/max) | 0.4ms / 73.4ms / 422.7ms / 459.7ms |
+| Poll duty cycle (#242) | 8.24% over 122 polls |
+| Checkpoint duty cycle (#241) | 4.65% over 21 checkpoints (7.37s total, 626 suppressed) |
+| Stderr tee (#256) | active (wall-clock and latencies measured with an fd-level tee in place) |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+| Fact-index divergence (#302) | 0 (40435 facts cross-checked) |
+| Duplicate :introduced-by (#287) | 0 |
+| Code entities with no :introduced-by (#316) | 0 of 4462 code entities |
+| Commits: repo / walk / graph (#317) | 431 / 431 / 431; side 637 / 637 (ref `master`) |
+| Orphaned commit entities (#222 phase 5) | 0 of 1068 (ref `master`) |
