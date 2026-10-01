@@ -27448,6 +27448,42 @@ class TestRebirthInsideReverseRegion:
         # that matched nothing on every day would not pass as agreement.
         assert saw_live and saw_dead
 
+    @pytest.mark.asyncio
+    async def test_every_life_survives_a_later_close(self, tmp_path, monkeypatch):
+        """#383: the parity test above cannot see a defect both modes share,
+        and a second _ingest_close used to be one. minigraf's retract cancels
+        EVERY asserted window of an [e a v], so closing the second life wiped
+        the first life's bounded window of every fact whose value repeats
+        across lives (:ident among them) -- in both graphs identically. So
+        this asserts each entity's liveness against the fixture's own plan,
+        per day, in each graph on its own."""
+        h, multi, forward_only = await self._ingest_both(tmp_path, monkeypatch)
+        import mcp_server
+
+        group_r = {
+            mcp_server._code_ident("module", "gamma.py"),
+            mcp_server._code_ident("function", "gamma.py", "g"),
+            mcp_server._code_ident("class", "gamma.py", "K"),
+            mcp_server._code_ident("function", "auth.py", "ghost"),
+        }
+        assert group_r < self._reborn()
+        # Days 2..13 (p1 .. p11, then after the tip); see _repo's plan.
+        expected = {
+            "R": ".....L.LL.LL",
+            "F": ".LLLLL.LL.LL",
+        }
+        for name, graph in (("1:1", multi), ("forward-only", forward_only)):
+            for ident in sorted(self._reborn()):
+                seen = "".join(
+                    "L" if h._raw_query(graph, (
+                        f'(query [:find ?i :valid-at "2021-03-{day:02d}T12:00:00Z" '
+                        f':where [{ident} :ident ?i]])'
+                    )) else "."
+                    for day in range(2, 14)
+                )
+                want = expected["R" if ident in group_r else "F"]
+                assert seen == want, f"{name}: {ident} lives {seen}, expected {want}"
+
 
 class TestDuplicateNameInOneFile:
     """#351: one file defining one name twice -- a method name shared by

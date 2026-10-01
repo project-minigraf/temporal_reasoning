@@ -271,9 +271,19 @@ from `:valid-at` history and left it reachable only by `:as-of`. Now the
 default ends the live window at now (or `valid_at`), and `mode="correct"` keeps
 minigraf's meaning for facts recorded in error and refuses a valid time. The
 close refuses a fact that is not live — the old pass-through returned `ok:True`
-for a retract that matched nothing. Upstream `retract` keeps its meaning;
-minigraf#435 asks for a separate `close`, and this whole path moves onto it
-when it ships.
+for a retract that matched nothing. Upstream `retract` keeps its meaning.
+
+**minigraf#435 was reframed, and it no longer asks for a `close` command.**
+Its model (v3.0.0): each `[e a v]` has exactly ONE current valid-time window at
+a given transaction time — the latest assertion wins, and earlier windows stay
+reachable only through `:as-of`. Closing is then a plain `transact` with
+`:valid-to`. On minigraf 2.x every window newer than the last retraction stays
+live, which is what the restore step below relies on. **When the minigraf cap
+moves to 3.x, both close paths (`_retract_closing_at`, `_ingest_close`) are
+redone as one `transact` with `:valid-to` and the restore step is deleted** —
+under v3 a triple true over two separate periods is no longer two live
+windows, by design. Until then both paths write the closing window LAST, so
+the data already reads correctly under v3's latest-assertion rule.
 
 A retract with a valid time closes the window rather than removing the fact
 (`_retract_closing_at`, `_ingest_close`'s idiom), and it rests on a measured
@@ -281,17 +291,21 @@ minigraf behaviour worth knowing everywhere: **`retract` removes EVERY asserted
 window of an `[e a v]`, not only the live one.** An earlier lifecycle's bounded
 window reads empty at its own `:valid-at` afterwards. So the close reads every
 window back first and re-transacts the non-live ones verbatim, graph-only (the
-index already holds them). The plain retract path and `_ingest_close` do NOT do
-this, and for `_ingest_close` the loss is MEASURED: an entity closed a second
-time loses its first life from `:valid-at` view in both forward-only and 1:1
-ingestion — every fact whose value repeats across lives (`:ident`,
-`:entity-type`, `:path`, `:contains`, ...) keeps only the latest window, and only
-`:introduced-by` survives. All 10 multi-life entities of
-`TestRebirthInsideReverseRegion`'s fixture lose it (that test compares 1:1
-against forward-only, which are wrong identically, so it stays green); this
-repo's 1053-commit graph has 0, because no entity there has been closed twice.
-No gate sees it. Tracked as #383 and deferred to minigraf#435 (a `close`
-primitive); the public tool got the restore step in #380, ingestion did not.
+index already holds them). `_ingest_close` does the same since #383, and
+before it the loss was MEASURED: an entity closed a second time lost its first
+life from `:valid-at` view in both forward-only and 1:1 ingestion — every fact
+whose value repeats across lives (`:ident`, `:entity-type`, `:path`,
+`:contains`, ...) kept only the latest window, and only `:introduced-by`
+survived. All 10 multi-life entities of `TestRebirthInsideReverseRegion`'s
+fixture lost it, and its parity tests stayed green because 1:1 and
+forward-only were wrong identically; `test_every_life_survives_a_later_close`
+now checks each graph against the fixture's own life plan instead. This repo's
+1053-commit graph had 0, because no entity there had been closed twice. No gate
+saw it. The ingestion restore skips open windows (the life being closed) and a
+window identical to the one being written (a #313 re-walk). Existing graphs
+are not repaired — the lost windows survive only under `:as-of` — so an
+affected graph is rebuilt. The plain retract path (`mode="correct"`) still
+cancels every window, which is its meaning.
 minigraf also stores an empty or inverted window without complaint, so the
 handler refuses `valid_at <= valid-from` itself. Ingestion USED TO write
 inverted windows, and NOT from date skew, as this paragraph first said: when
@@ -556,9 +570,9 @@ diff. A foxtrot merge (feature branch as first parent) makes the mainline
 zig-zag -- git's own `--first-parent` convention, accepted. And a rewritten
 chain can no longer hide an insertion inside resolving frontier bounds (see the
 #326 `:pos-count` section). `GRAPH_FORMAT_VERSION` went 1 -> 2; old graphs are
-rebuilt, never migrated. #383 (a second close wipes the first life) is NOT
-fixed -- it loses most of its exposure, since spurious lives were its main
-source.
+rebuilt, never migrated. #383 (a second close wiped the first life) lost
+most of its exposure here, since spurious lives were its main source, and was
+then fixed separately with a restore step in `_ingest_close`.
 
 **Graph format version — there is no migration, by design.** `GRAPH_FORMAT_VERSION`
 (mcp_server.py) is stamped as `:ingestion/format-version` and ingestion refuses to
