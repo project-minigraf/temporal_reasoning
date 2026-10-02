@@ -495,6 +495,28 @@ A harness that SIGKILLs ingestion must kill the **process group**, not the PID.
 blocked forever on a queue whose write end they hold open themselves. They do
 not exit on their own; 34 trials of that exhausts 15 GB.
 
+**A guess and its lineage marker go down in ONE transact (#390).**
+`_entity_introduced_by_set_provisional_batch` used to write the
+`:introduced-by` batch and then the markers, so a kill between them left an
+unmarked guess — which every reader takes for authoritative. On the parity
+fixture the consequence was worse than a guess that never moves: Stage B's
+rename pass declined to reconcile it and minted a SECOND introduction, leaving
+duplicate live structural facts. The retract of a moved guess stays a separate
+call (minigraf has no mixed write) and is safe: only an already-marked guess
+is ever moved, so that window leaves #313's torn shape, which the resume
+repairs. `TestProvisionalGuessAndMarkerAreOneWrite` aims its kill at "the write
+carrying the marker", so it runs unchanged against either shape.
+
+Found by killing a real 1:1 ingest at EVERY graph write and comparing the
+resumed graph to a forward-only one. That sweep also found three
+non-atomic sequences #390 does not fix, all pre-existing:
+the forward markers' retract-then-transact (#391; a kill between, or inside p0
+before any watermark exists, leaves no watermark, and the resume's
+`watermark_pos=None` preload is UNBOUNDED, so p0's replay loses `:contains`
+and writes self-`:modified-in`); `_ingest_close` retracting `:ident` first
+(#392; a kill after it leaves the remaining facts live forever); and a Stage B kill
+whose re-walk duplicates `:depends-on` rows (#393).
+
 **R3's zero ident collisions is MEASURED, never proven — and #267 is what keeps
 measuring it.** `_canonical_ident`'s rule (keep `_`, drop the hyphen-run
 collapse) was chosen over R4's hash suffix in full knowledge that a contrived
