@@ -510,12 +510,31 @@ carrying the marker", so it runs unchanged against either shape.
 Found by killing a real 1:1 ingest at EVERY graph write and comparing the
 resumed graph to a forward-only one. That sweep also found three
 non-atomic sequences #390 does not fix, all pre-existing:
-the forward markers' retract-then-transact (#391; a kill between, or inside p0
-before any watermark exists, leaves no watermark, and the resume's
-`watermark_pos=None` preload is UNBOUNDED, so p0's replay loses `:contains`
-and writes self-`:modified-in`); `_ingest_close` retracting `:ident` first
+the forward markers' retract-then-transact (#391, fixed -- below);
+`_ingest_close` retracting `:ident` first
 (#392; a kill after it leaves the remaining facts live forever); and a Stage B kill
 whose re-walk duplicates `:depends-on` rows (#393).
+
+**No watermark AND no frontier-low means a FRESH preload, not an unbounded one
+(#391).** A kill inside p0 before its first marker write, or between the
+retract and the transact of a later forward position's marker rewrite,
+leaves facts in the graph and neither marker. The forward walk then restarts
+at C0, and `_load_ingestion_preload_state` used to read the absent watermark
+as "fresh graph" and run the UNBOUNDED pre-#222 query -- every entity already
+written read as known, so the replay took no introduction, lost
+`[module :contains fn]` and wrote `:modified-in` at each entity's own
+introducing commit. It now returns what an empty graph would (position -1:
+no known entity, the ls-files seed kept, no deps/pins/stubs). The replay's
+forward writes land at identical valid-from and collapse; reverse-stream
+entities reconcile per ident through `_lineage_is_provisional`, as when both
+streams start on an empty graph. A watermark that EXISTS but does not resolve
+(a rewritten history) is a different None and keeps the unbounded read, so
+the old chain's live entities can still be closed. The kill sweep went 18/125
+-> 8/125 (1:1) and 23/141 -> 15/141 (1:3); every kill point it fixed was a
+#391 point, none regressed, and what remains is #392's and #393's.
+`TestAbsentWatermarkReplaysFromAFreshPreload` kills at p0's marker write and
+at p1's transact half, with a positive control that the kill left facts and
+no marker; both are red without the fix.
 
 **R3's zero ident collisions is MEASURED, never proven — and #267 is what keeps
 measuring it.** `_canonical_ident`'s rule (keep `_`, drop the hyphen-run
