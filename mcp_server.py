@@ -6749,7 +6749,33 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
     duplicate row whose value trivially matches desired is left alone, same
     bounded/self-healing-by-omission scoping as _ingest_tags' own #156 fix.
     """
-    current_raw = _db_execute(db, "(query [:find ?a ?v :where [:ingestion/watermark ?a ?v]])")
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    _ingestion_marker_delta(
+        db, ":ingestion/watermark", "git ingestion watermark", commit_hash,
+        to_retract, to_transact,
+    )
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
+def _ingestion_marker_delta(
+    db: Any,
+    ident: str,
+    description: str,
+    commit_hash: str,
+    to_retract: List[str],
+    to_transact: List[str],
+) -> None:
+    """Append the moves that point the :type/ingestion marker `ident` at
+    `commit_hash` onto an in-progress write -- the shared body of
+    _watermark_update and _lineage_confirmed_through_update, split out so
+    _forward_apply can batch both with frontier-low's claim into one retract
+    and one transact (#377). The constants are written only when they differ
+    from the live value (#156); :hash always moves.
+    """
+    current_raw = _db_execute(db, f"(query [:find ?a ?v :where [{ident} ?a ?v]])")
     current: Dict[str, str] = dict(json.loads(current_raw).get("results", []))
 
     def _edn(attr: str, value: str) -> str:
@@ -6757,26 +6783,20 @@ def _watermark_update(db: Any, commit_hash: str, commit_ts_iso: str, reason: str
 
     constants = {
         ":entity-type": ":type/ingestion",
-        ":ident": ":ingestion/watermark",
-        ":description": "git ingestion watermark",
+        ":ident": ident,
+        ":description": description,
     }
 
-    to_retract: List[str] = []
-    to_transact: List[str] = []
     for attr, value in constants.items():
         if current.get(attr) == value:
             continue  # already correct -- skip to avoid creating a duplicate live fact (#156)
         if attr in current:
-            to_retract.append(f"[:ingestion/watermark {attr} {_edn(attr, current[attr])}]")
-        to_transact.append(f"[:ingestion/watermark {attr} {_edn(attr, value)}]")
+            to_retract.append(f"[{ident} {attr} {_edn(attr, current[attr])}]")
+        to_transact.append(f"[{ident} {attr} {_edn(attr, value)}]")
 
     if ":hash" in current:
-        to_retract.append(f"[:ingestion/watermark :hash {_edn(':hash', current[':hash'])}]")
-    to_transact.append(f"[:ingestion/watermark :hash {_edn(':hash', commit_hash)}]")
-
-    if to_retract:
-        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
-    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+        to_retract.append(f"[{ident} :hash {_edn(':hash', current[':hash'])}]")
+    to_transact.append(f"[{ident} :hash {_edn(':hash', commit_hash)}]")
 
 
 _FRONTIER_LOW_IDENT = ":ingestion/frontier-low"
@@ -8329,6 +8349,35 @@ def _frontier_persist_claim(
     entity whose `:entity-type` and `:ident` are already gone -- silently,
     since `_intervals_read_extra` can never surface it again to notice.
     """
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    _frontier_claim_delta(
+        db, linearization, pos, from_low, to_retract, to_transact,
+        index_con=index_con, ident=ident, absorbed_idents=absorbed_idents,
+    )
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
+def _frontier_claim_delta(
+    db: Any,
+    linearization: List[str],
+    pos: int,
+    from_low: bool,
+    to_retract: List[str],
+    to_transact: List[str],
+    index_con: Optional[Any] = None,
+    ident: Optional[str] = None,
+    absorbed_idents: Optional[List[str]] = None,
+) -> None:
+    """Append _frontier_persist_claim's bound and :pos-count moves onto an
+    in-progress write instead of issuing them (#377), so _forward_apply can
+    carry frontier-low's claim in the same retract and transact as the two
+    watermarks. Absorbed intervals are still DISCARDED here, by their own
+    writes, before anything is appended -- the ordering
+    _frontier_persist_claim's docstring requires.
+    """
     if ident is None:
         ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
     tag = ":authoritative" if from_low else ":provisional"
@@ -8350,8 +8399,6 @@ def _frontier_persist_claim(
     moved_hash = linearization[pos]
     existing = _frontier_read_bounds(db, ident)
 
-    to_retract: List[str] = []
-    to_transact: List[str] = []
     # #325 review round 2: branch on `absorbed_idents` (what the CALLER says
     # merged), never on `absorbed_bounds_list` (what survived the phantom
     # filter above). A merge whose absorbed interval was minted and coalesced
@@ -8431,10 +8478,6 @@ def _frontier_persist_claim(
     # time always agrees with the span it was computed from and discriminates
     # nothing.
     _frontier_pos_count_delta(db, ident, new_count, to_retract, to_transact)
-
-    if to_retract:
-        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
-    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
 
 
 def _frontier_pos_count_delta(
@@ -8680,33 +8723,12 @@ def _lineage_confirmed_through_update(
     watermark already uses -- so this entity carries the same required
     :description constant _watermark_update's own entity does.
     """
-    current_raw = _db_execute(
-        db, f"(query [:find ?a ?v :where [{_LINEAGE_CONFIRMED_THROUGH_IDENT} ?a ?v]])"
-    )
-    current: Dict[str, str] = dict(json.loads(current_raw).get("results", []))
-
-    def _edn(attr: str, value: str) -> str:
-        return value if attr == ":entity-type" else f'"{_edn_escape(value)}"'
-
-    constants = {
-        ":entity-type": ":type/ingestion",
-        ":ident": _LINEAGE_CONFIRMED_THROUGH_IDENT,
-        ":description": "lineage confirmed-through watermark",
-    }
-
     to_retract: List[str] = []
     to_transact: List[str] = []
-    for attr, value in constants.items():
-        if current.get(attr) == value:
-            continue
-        if attr in current:
-            to_retract.append(f"[{_LINEAGE_CONFIRMED_THROUGH_IDENT} {attr} {_edn(attr, current[attr])}]")
-        to_transact.append(f"[{_LINEAGE_CONFIRMED_THROUGH_IDENT} {attr} {_edn(attr, value)}]")
-
-    if ":hash" in current:
-        to_retract.append(f"[{_LINEAGE_CONFIRMED_THROUGH_IDENT} :hash {_edn(':hash', current[':hash'])}]")
-    to_transact.append(f"[{_LINEAGE_CONFIRMED_THROUGH_IDENT} :hash {_edn(':hash', commit_hash)}]")
-
+    _ingestion_marker_delta(
+        db, _LINEAGE_CONFIRMED_THROUGH_IDENT, "lineage confirmed-through watermark",
+        commit_hash, to_retract, to_transact,
+    )
     if to_retract:
         _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
@@ -14143,18 +14165,35 @@ def _forward_apply(
     # for a position above one whose write FAILED, silently declares that
     # failed position complete. The work above has already happened; only the
     # claim to have completed it is refused.
+    #
+    # #377: all three go down in ONE retract and ONE transact rather than a
+    # pair each. minigraf's auto-checkpoint counts calls, and these six were
+    # 12% of Stage A's write calls on full history (b6fb093). Three distinct
+    # entities, so minigraf#287 cannot collapse them, and "together or not at
+    # all" is now atomic rather than merely adjacent.
     if not lifecycle_only and persist_claim:
-        _watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
+        to_retract: List[str] = []
+        to_transact: List[str] = []
+        _ingestion_marker_delta(
+            db, ":ingestion/watermark", "git ingestion watermark", commit_hash,
+            to_retract, to_transact,
+        )
         if linearization is not None and pos is not None:
-            _frontier_persist_claim(
-                db, linearization, pos, from_low=True,
-                commit_ts_iso=commit_ts_iso, index_con=index_con,
+            _frontier_claim_delta(
+                db, linearization, pos, True, to_retract, to_transact,
+                index_con=index_con,
             )
         # The virgin positions this walk claims are authoritative on first write,
         # so lineage is confirmed contiguously from C0 through here. The sweep
         # folds its own region in later (Task 9); this watermark must not be
         # advanced past the forward frontier before that happens.
-        _lineage_confirmed_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
+        _ingestion_marker_delta(
+            db, _LINEAGE_CONFIRMED_THROUGH_IDENT, "lineage confirmed-through watermark",
+            commit_hash, to_retract, to_transact,
+        )
+        if to_retract:
+            _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+        _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
     # Stage B's lifecycle pass is followed immediately by
     # _correction_sweep_through_update and a checkpoint in _run_ingestion's
     # sweep loop, so checkpointing here would be a pure duplicate -- and it

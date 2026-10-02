@@ -17308,16 +17308,20 @@ class TestRunIngestionCommitFaultIsolation:
         import mcp_server
         import fact_index
 
-        real_watermark_update = mcp_server._watermark_update
+        # #377: the forward walk builds the watermark's write with
+        # _ingestion_marker_delta and batches it, so that is where the
+        # write phase is broken now (_watermark_update has no caller there).
+        real_marker_delta = mcp_server._ingestion_marker_delta
         calls = []
 
-        def failing_once_watermark_update(db, commit_hash, commit_ts_iso, reason, index_con=None):
-            calls.append(commit_hash)
-            if len(calls) == 1:
-                raise RuntimeError("simulated write failure")
-            return real_watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
+        def failing_once_marker_delta(db, ident, description, commit_hash, *rest):
+            if ident == ":ingestion/watermark":
+                calls.append(commit_hash)
+                if len(calls) == 1:
+                    raise RuntimeError("simulated write failure")
+            return real_marker_delta(db, ident, description, commit_hash, *rest)
 
-        monkeypatch.setattr(mcp_server, "_watermark_update", failing_once_watermark_update)
+        monkeypatch.setattr(mcp_server, "_ingestion_marker_delta", failing_once_marker_delta)
         mcp_server._ingest_progress = {
             "status": "idle", "total": 0,
             "current_commit": "", "error": None,
@@ -32171,6 +32175,113 @@ class TestApplyDispatchIsKeywordSafe:
             assert {"lifecycle_only", "persist_claim", "linearization", "pos"} <= kwargs.keys()
         for _, _, kwargs in rev:
             assert {"persist_claim", "claim_ident", "absorbed_idents"} <= kwargs.keys()
+
+
+class TestForwardBookkeepingIsOneWrite:
+    """#377. A forward position used to persist its three "contiguous from
+    C0" markers -- :ingestion/watermark, frontier-low's moved bound and
+    :ingestion/lineage-confirmed-through -- as three retract+transact pairs,
+    six WAL entries. minigraf's 1000-entry auto-checkpoint counts CALLS, and
+    measured on full history those six were 12% of Stage A's write calls
+    (b6fb093). They are three different entities, so minigraf#287 (a batch
+    sharing (entity, attribute, valid_from) keeps only the last) cannot reach
+    them, and one retract plus one transact carries all three. They also
+    already move together or not at all (#342), which one transact now makes
+    atomic rather than merely adjacent.
+    """
+
+    _IDENTS = (":ingestion/watermark", ":ingestion/frontier-low",
+               ":ingestion/lineage-confirmed-through")
+
+    def test_a_forward_position_writes_its_bookkeeping_in_one_retract_and_one_transact(
+        self, tmp_path, monkeypatch,
+    ):
+        import threading
+        import mcp_server
+
+        tls = threading.local()
+        real_forward = mcp_server._forward_apply
+        real_transact = mcp_server._transact
+        real_retract = mcp_server._retract
+        per_position = []  # one list of (kind, idents touched) per Stage A forward call
+
+        def forward_spy(*args, **kwargs):
+            if kwargs.get("lifecycle_only"):
+                return real_forward(*args, **kwargs)
+            tls.calls = []
+            try:
+                return real_forward(*args, **kwargs)
+            finally:
+                per_position.append(tls.calls)
+                tls.calls = None
+
+        def record(kind, facts):
+            calls = getattr(tls, "calls", None)
+            if calls is not None:
+                touched = frozenset(i for i in self._IDENTS if f"[{i} " in facts)
+                if touched:
+                    calls.append((kind, touched))
+
+        def transact_spy(db, facts, *args, **kwargs):
+            record("transact", facts)
+            return real_transact(db, facts, *args, **kwargs)
+
+        def retract_spy(db, facts, *args, **kwargs):
+            record("retract", facts)
+            return real_retract(db, facts, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", forward_spy)
+        monkeypatch.setattr(mcp_server, "_transact", transact_spy)
+        monkeypatch.setattr(mcp_server, "_retract", retract_spy)
+        # Forward-only, so every position takes the path under test.
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1000000:1")
+        repo = _phase4_linear_repo(tmp_path, 6)
+        status, graph_commits = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        assert status["status"] == "complete"
+        assert graph_commits == 6
+
+        # Positive control: the spy saw forward positions at all, and every
+        # one of them wrote bookkeeping -- otherwise "at most one call" holds
+        # vacuously.
+        assert len(per_position) == 6, per_position
+        everything = frozenset(self._IDENTS)
+        for i, calls in enumerate(per_position):
+            transacts = [t for k, t in calls if k == "transact"]
+            retracts = [t for k, t in calls if k == "retract"]
+            assert transacts == [everything], (
+                f"position {i}: bookkeeping transacts {transacts}, expected one "
+                f"carrying all three markers"
+            )
+            # The first position has nothing to retract; every later one moves
+            # all three, so it retracts all three in one call.
+            assert retracts == ([] if i == 0 else [everything]), (
+                f"position {i}: bookkeeping retracts {retracts}"
+            )
+
+    def test_the_three_markers_land_where_sequential_writes_left_them(
+        self, tmp_path, monkeypatch,
+    ):
+        """Batching changes the call count, never the stored state."""
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1000000:1")
+        repo = _phase4_linear_repo(tmp_path, 6)
+        status, _ = _phase4_run(repo, tmp_path / "g.graph", monkeypatch)
+        assert status["status"] == "complete"
+        lin = _subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "--first-parent", "--reverse", "master"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+        with mcp_server.db_lease() as db:
+            assert mcp_server._watermark_query(db) == lin[-1]
+            assert mcp_server._lineage_confirmed_through_query(db) == lin[-1]
+            assert mcp_server._frontier_read_bounds(db, ":ingestion/frontier-low") == (lin[0], lin[-1])
+            assert mcp_server._frontier_read_pos_count(db, ":ingestion/frontier-low") == 6
+            # One live value each: a batched retract that missed would leave two.
+            for ident in (":ingestion/watermark", ":ingestion/lineage-confirmed-through"):
+                rows = json.loads(mcp_server._db_execute(
+                    db, f"(query [:find ?h :where [{ident} :hash ?h]])"))["results"]
+                assert rows == [[lin[-1]]], (ident, rows)
+        mcp_server._reset_db_state()
 
 
 class TestStageBPrefetchesExtraction:
