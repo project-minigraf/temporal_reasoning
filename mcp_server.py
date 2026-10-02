@@ -8647,6 +8647,15 @@ def _lineage_mark_provisional_batch(
     Collision-free: each marker is its own :lineage/... companion entity, so
     no two facts in the batch share (entity, attribute, valid_from).
     """
+    facts = _lineage_marker_facts(db, entity_idents)
+    if facts:
+        _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
+
+
+def _lineage_marker_facts(db: Any, entity_idents: Sequence[str]) -> List[str]:
+    """The marker triples _lineage_mark_provisional_batch would write, for a
+    caller that must put them in the SAME transact as the facts they qualify
+    (#390). Idents already marked contribute nothing."""
     facts: List[str] = []
     for entity_ident in entity_idents:
         if _lineage_is_provisional(db, entity_ident):
@@ -8657,8 +8666,7 @@ def _lineage_mark_provisional_batch(
             f"[{ident} :entity {entity_ident}]",
             f"[{ident} :status :provisional]",
         ])
-    if facts:
-        _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
+    return facts
 
 
 def _lineage_confirm_batch(
@@ -8978,8 +8986,9 @@ def _entity_introduced_by_set_provisional_batch(
     pos_by_commit_ident: Optional[Dict[str, int]] = None,
 ) -> Set[str]:
     """Assert or move a PROVISIONAL :introduced-by to commit_ident for many
-    entities at once (#233), in one _retract and at most two _transact
-    calls instead of two writes per ident. _reverse_apply's two loops were
+    entities at once (#233), in one _retract and at most one _transact --
+    the guesses and their lineage markers together (#390) -- instead of two
+    writes per ident. _reverse_apply's two loops were
     the only production callers of the per-ident form, at ~1,265 idents per
     commit on a real repository; retracts cost ~13ms against a transact's
     ~1ms, so the retract batching is the load-bearing half.
@@ -9047,11 +9056,19 @@ def _entity_introduced_by_set_provisional_batch(
         to_mark.append(entity_ident)
         moved.add(entity_ident)
 
+    # #390: the guess and its marker go down in ONE transact. Written apart,
+    # a kill between them left a guess with no marker, which every reader
+    # takes for an authoritative introduction -- permanently. Both are at
+    # commit_ts_iso on different entities, so minigraf#287 cannot collapse
+    # them. The retract stays separate (minigraf has no mixed write), and
+    # that window is safe: only an already-MARKED guess is ever moved, so a
+    # kill there leaves a marked entity with no :introduced-by, which the
+    # resumed walk re-guesses as #313's torn shape.
+    to_transact.extend(_lineage_marker_facts(db, to_mark))
     if to_retract:
         _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
     if to_transact:
         _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
-    _lineage_mark_provisional_batch(db, to_mark, commit_ts_iso, index_con=index_con)
     return moved
 
 

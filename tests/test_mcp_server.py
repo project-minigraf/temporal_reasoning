@@ -23087,6 +23087,126 @@ class TestReverseApplyTornWriteResume:
         )
 
 
+class _HardKill(BaseException):
+    """A kill that _run_ingestion's per-commit `except Exception` cannot
+    absorb. _SimulatedKill is enough when _reverse_apply is driven directly;
+    through the real run, an ordinary exception is logged as a failed write
+    and the walk CONTINUES, which is not what a SIGKILL does."""
+
+
+class TestProvisionalGuessAndMarkerAreOneWrite:
+    """#390: a reverse-stream guess and its lineage marker used to be two
+    transacts -- the :introduced-by batch, then _lineage_mark_provisional_batch.
+    A kill between them left the guess with NO marker, which every reader takes
+    for an authoritative introduction: the resumed walk never moves it, the
+    sweep's case 3 skips it, and nothing reconciles it.
+
+    The kill is aimed at "the write that carries the marker", not at a named
+    function, so the same test runs against both shapes: on the old code that
+    write comes AFTER the guess, and the guess survives it unmarked; with the
+    two in one transact, the kill takes both and leaves #313's torn shape,
+    which the resumed walk already repairs.
+    """
+
+    @staticmethod
+    def _kill_at_marker_write(monkeypatch, must_mention):
+        """Patch _transact/_retract so the first transact carrying a lineage
+        marker for `must_mention` dies, and every graph write after it dies
+        too -- a killed process writes nothing more. Returns the fired flag."""
+        import mcp_server
+
+        real_t, real_r = mcp_server._transact, mcp_server._retract
+        state = {"fired": False}
+
+        def transact(db, facts, *a, **kw):
+            if state["fired"]:
+                raise _HardKill()
+            if ":type/lineage-marker" in facts and must_mention in facts:
+                state["fired"] = True
+                raise _HardKill()
+            return real_t(db, facts, *a, **kw)
+
+        def retract(*a, **kw):
+            if state["fired"]:
+                raise _HardKill()
+            return real_r(*a, **kw)
+
+        monkeypatch.setattr(mcp_server, "_transact", transact)
+        monkeypatch.setattr(mcp_server, "_retract", retract)
+        return state
+
+    def test_no_guess_survives_a_kill_without_its_marker(
+        self, real_db, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        import frontier_registry
+
+        repo = TestReverseApplyTornWriteResume._repo_with_one_commit(tmp_path)
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[0], ())
+        commit_ident = f":commit/{linearization[0][:12]}"
+
+        with monkeypatch.context() as mp:
+            fired = self._kill_at_marker_write(mp, fn_ident)
+            with pytest.raises(_HardKill):
+                mcp_server._reverse_apply(
+                    real_db, str(repo), linearization, commit_metadata, 0, file_results,
+                )
+        # Positive control: the kill landed on the marker write. Without it the
+        # resume below is an uninterrupted second walk and passes vacuously.
+        assert fired["fired"], "the kill never reached a write carrying the marker"
+
+        assert not (
+            mcp_server._entity_introduced_by_values_query(real_db, fn_ident)
+            and not mcp_server._lineage_is_provisional(real_db, fn_ident)
+        ), (
+            f"{fn_ident} holds a guessed :introduced-by with no lineage marker after "
+            "the kill -- every reader now takes the guess for authoritative (#390)"
+        )
+
+        mcp_server._reverse_apply(
+            real_db, str(repo), linearization, commit_metadata, 0, file_results,
+        )
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn_ident) == [commit_ident]
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident), (
+            f"{fn_ident}'s :introduced-by is a reverse-stream guess and must still be "
+            "provisional after the resumed walk (#390)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resumed_ingest_matches_forward_only(self, tmp_path, monkeypatch):
+        """End to end, through the real run. On the parity fixture the
+        unmarked guesses are the renamed module's entities, guessed at p8:
+        Stage B's rename pass then reads them as authoritative, declines to
+        reconcile, and mints a SECOND introduction at p7 -- duplicate live
+        structural facts that no resume repairs."""
+        import mcp_server
+
+        h = TestMultiStreamParityWithForwardOnly()
+        repo = h._repo(tmp_path)
+        forward_only = tmp_path / "fwd.graph"
+        multi = tmp_path / "multi.graph"
+        await h._ingest(repo, forward_only, monkeypatch, f"{10**6}:1")
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(multi))
+        h._reset_progress()
+        with monkeypatch.context() as mp:
+            fired = self._kill_at_marker_write(
+                mp, mcp_server._code_ident("module", "helpers/util.py"),
+            )
+            with pytest.raises(_HardKill):
+                await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._reset_db_state()
+        assert fired["fired"], "the kill never reached a write carrying the marker"
+
+        await h._ingest(repo, multi, monkeypatch, "1:1")
+        h._assert_parity(multi, forward_only)
+
+
 class TestSkipFastPathDoesNotSkipTornWrites:
     """#326 acceptance test 2, and the one that matters. A fast path whose
     predicate quietly matched nothing would pass the skip test by doing no
