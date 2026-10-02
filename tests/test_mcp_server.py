@@ -23285,6 +23285,172 @@ class TestAbsentWatermarkReplaysFromAFreshPreload:
         h._assert_parity(multi, forward_only)
 
 
+class TestIngestCloseLeavesNoPartiallyLiveEntity:
+    """#392: _ingest_close used to retract a closing entity's facts one per
+    call, :ident first. A kill after that first retract left the entity with
+    no live :ident while :entity-type, :file, :contains, :introduced-by and
+    the rest stayed live and unbounded -- and the resume never re-closed it,
+    because the preload only rediscovers an entity whose :entity-type,
+    :ident, :path/:file, :description and :introduced-by are ALL live. So the
+    leftovers stayed live forever.
+
+    The retract is now one call, so a kill anywhere in a close leaves the
+    triples all live (the resume re-closes them) or none live.
+    """
+
+    _ORIG = "2025-01-01T00:00:00Z"
+    _CLOSE = "2025-03-01T00:00:00Z"
+
+    @staticmethod
+    def _close_triples(i):
+        import mcp_server
+
+        ident = f":function/m-py--f{i}"
+        return mcp_server._build_close_triples(
+            ident, f"f{i}", ":module/m-py",
+            close_entity_type=True, file_value="m.py",
+            introduced_by=":commit/aaaaaaaaaaaa",
+        )
+
+    def _seed(self, db, triples):
+        import mcp_server
+
+        for t in triples:  # one per call: :contains, minigraf#287
+            mcp_server._ingest_transact(db, [t], self._ORIG, "seed")
+
+    @staticmethod
+    def _live(db, triples):
+        import mcp_server
+
+        live = []
+        for t in triples:
+            m = mcp_server._FACTS_TRIPLE_PATTERN.fullmatch(t)
+            windows = mcp_server._asserted_windows_ms(db, t, m.group(1))
+            if any(vt == mcp_server._VALID_TIME_FOREVER_MS for _vf, vt in windows):
+                live.append(t)
+        return live
+
+    def test_a_kill_at_any_write_leaves_all_or_none_live(self, real_db, monkeypatch):
+        import mcp_server
+
+        real_t, real_r = mcp_server._transact, mcp_server._retract
+        state = {"n": 0, "k": None}
+
+        def counting(real):
+            def f(*a, **kw):
+                state["n"] += 1
+                if state["n"] == state["k"]:
+                    raise _HardKill()
+                return real(*a, **kw)
+            return f
+
+        monkeypatch.setattr(mcp_server, "_transact", counting(real_t))
+        monkeypatch.setattr(mcp_server, "_retract", counting(real_r))
+
+        # Count the writes of one clean close, so every kill point is covered.
+        probe = self._close_triples(0)
+        self._seed(real_db, probe)
+        state.update(n=0, k=None)
+        mcp_server._ingest_close(real_db, probe, self._ORIG, self._CLOSE, "r")
+        writes = state["n"]
+        assert self._live(real_db, probe) == []
+        # Positive control: a close carries several triples, so one-per-call
+        # retracting would have several kill points between them.
+        assert len(probe) >= 5
+
+        partial = {}
+        for k in range(1, writes + 1):
+            triples = self._close_triples(k)
+            self._seed(real_db, triples)
+            assert self._live(real_db, triples) == triples
+            state.update(n=0, k=k)
+            with pytest.raises(_HardKill):
+                mcp_server._ingest_close(real_db, triples, self._ORIG, self._CLOSE, "r")
+            live = self._live(real_db, triples)
+            if live and live != triples:
+                partial[k] = sorted(set(triples) - set(live))
+        assert partial == {}, (
+            f"a kill at these write numbers (of {writes}) left the close "
+            f"partially applied -- retracted: {partial}"
+        )
+
+    def test_a_shared_entity_attribute_pair_falls_back_to_one_retract_each(self, real_db):
+        """Two triples sharing (entity, attribute) in one retract collapse
+        under minigraf#287: one stays visible until the next checkpoint. No
+        close site produces that shape today, so the batch must not either."""
+        import mcp_server
+
+        triples = [
+            "[:module/m-py :contains :function/m-py--a]",
+            "[:module/m-py :contains :function/m-py--b]",
+        ]
+        self._seed(real_db, triples)
+        assert self._live(real_db, triples) == triples
+        mcp_server._ingest_close(real_db, triples, self._ORIG, self._CLOSE, "r")
+        assert self._live(real_db, triples) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("nth", [1, 2])
+    async def test_resumed_ingest_matches_forward_only(self, tmp_path, monkeypatch, nth):
+        """End to end on the parity fixture: kill at the nth graph write of
+        the first close of a legacy.py entity, resume, compare to forward-only.
+        That close makes two writes now: nth=1 kills its one retract (nothing
+        landed, the resume re-closes), nth=2 its closing transact (nothing
+        live). Before #392, nth=2 was the :description retract right after
+        :ident's, and only nth=2 was red."""
+        import mcp_server
+
+        h = TestMultiStreamParityWithForwardOnly()
+        repo = h._repo(tmp_path)
+        forward_only = tmp_path / "fwd.graph"
+        multi = tmp_path / "multi.graph"
+        await h._ingest(repo, forward_only, monkeypatch, f"{10**6}:1")
+
+        real_t, real_r, real_c = (
+            mcp_server._transact, mcp_server._retract, mcp_server._ingest_close,
+        )
+        state = {"target": False, "done": False, "seen": 0, "fired": False}
+
+        def close(db, triples, *a, **kw):
+            hit = not state["done"] and any("legacy-py" in t for t in triples)
+            if hit:
+                state["target"], state["done"] = True, True
+            try:
+                return real_c(db, triples, *a, **kw)
+            finally:
+                state["target"] = False
+
+        def counting(real):
+            def f(*a, **kw):
+                if state["fired"]:
+                    raise _HardKill()
+                if state["target"]:
+                    state["seen"] += 1
+                    if state["seen"] == nth:
+                        state["fired"] = True
+                        raise _HardKill()
+                return real(*a, **kw)
+            return f
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(multi))
+        h._reset_progress()
+        with monkeypatch.context() as mp:
+            mp.setattr(mcp_server, "_ingest_close", close)
+            mp.setattr(mcp_server, "_transact", counting(real_t))
+            mp.setattr(mcp_server, "_retract", counting(real_r))
+            with pytest.raises(_HardKill):
+                await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._reset_db_state()
+        # Positive control: the kill landed inside a legacy.py close, after
+        # at least one of its writes -- not before the close, not elsewhere.
+        assert state["fired"], "the kill never reached a legacy.py close"
+
+        await h._ingest(repo, multi, monkeypatch, "1:1")
+        h._assert_parity(multi, forward_only)
+
+
 class TestSkipFastPathDoesNotSkipTornWrites:
     """#326 acceptance test 2, and the one that matters. A fast path whose
     predicate quietly matched nothing would pass the skip test by doing no

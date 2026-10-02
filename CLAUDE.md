@@ -512,7 +512,7 @@ resumed graph to a forward-only one. That sweep also found three
 non-atomic sequences #390 does not fix, all pre-existing:
 the forward markers' retract-then-transact (#391, fixed -- below);
 `_ingest_close` retracting `:ident` first
-(#392; a kill after it leaves the remaining facts live forever); and a Stage B kill
+(#392, fixed -- below); and a Stage B kill
 whose re-walk duplicates `:depends-on` rows (#393).
 
 **No watermark AND no frontier-low means a FRESH preload, not an unbounded one
@@ -535,6 +535,27 @@ the old chain's live entities can still be closed. The kill sweep went 18/125
 `TestAbsentWatermarkReplaysFromAFreshPreload` kills at p0's marker write and
 at p1's transact half, with a positive control that the kill left facts and
 no marker; both are red without the fix.
+
+**A close retracts in ONE call (#392).** `_ingest_close` retracted one
+triple per call, `:ident` first, so a kill after that first retract left
+`:entity-type`, `:file`, `:contains`, `:introduced-by` and the rest live and
+unbounded on an entity with no live `:ident` -- forever, because the preload
+only rediscovers an entity whose `:entity-type`, `:ident`, `:path`/`:file`,
+`:description` and `:introduced-by` are ALL live, so the resume never
+re-closed it. Retracting `:ident` LAST, the issue's first proposal, would not
+have fixed it for the same reason: any earlier retract already takes the
+entity out of the preload's join. One call leaves the close's triples all
+live (re-closed on resume) or none. The residual is history, not liveness: a
+kill between the retract and the closing transact loses the closing window
+and any restored earlier lives, and no ordering of separate calls avoids it,
+since the retract cancels every window asserted before it. Batching is safe
+under minigraf#287 only across distinct `(entity, attribute)` pairs, which
+every close site produces today; a close sharing a pair falls back to one
+retract per triple (ablation-proven). The kill sweep went 8/125 -> 0/102 (1:1)
+and 15/141 -> 7/118 (1:3); the 7 left are all #393's `:depends-on`, none new.
+`TestIngestCloseLeavesNoPartiallyLiveEntity` kills a close at every one of its
+writes, and end to end inside a `legacy.py` close; both are red without the
+fix. The public close (`_retract_closing_at`) still retracts per triple.
 
 **R3's zero ident collisions is MEASURED, never proven — and #267 is what keeps
 measuring it.** `_canonical_ident`'s rule (keep `_`, drop the hyphen-run

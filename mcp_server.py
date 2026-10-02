@@ -6530,9 +6530,25 @@ def _ingest_close(
        entity's facts recoverable through the fact index as a labeled entry
        point into history, instead of just vanishing.
 
-    Triples are retracted one-by-one to avoid EAVT collision on :contains edges
-    (Minigraf's pending index omits value bytes, so batching multiple
-    [module :contains fn] retracts could collide).
+    The retract is ONE call for the whole close (#392). It used to be one per
+    triple, :ident first, and a kill after the first left the entity with no
+    live :ident while every other fact stayed live and unbounded -- forever,
+    because the resume's preload only rediscovers an entity whose
+    :entity-type, :ident, :path/:file, :description and :introduced-by are
+    ALL live, so nothing re-closed it. One call leaves the triples all live
+    (the resume re-closes them) or none live. What a kill between that call
+    and step 2 still costs is history: the closing window and any restored
+    earlier lives are never written. Nothing stays live, and no ordering of
+    separate calls avoids it -- step 2 must follow the retract, which cancels
+    whatever came before it.
+
+    Batching is safe under minigraf#287 only across DISTINCT (entity,
+    attribute) pairs, and every close today is that: _build_close_triples
+    writes one value per attribute of the entity plus one :contains per
+    distinct parent, and every other close site passes a single triple. A
+    close that ever carries two triples sharing a pair (two
+    [module :contains fn] for one module) falls back to one retract per
+    triple, and gives up the property above for it.
 
     minigraf's retract cancels EVERY asserted window of an [e a v], not only
     the live one, so step 1 alone wiped an earlier life's bounded window of
@@ -6554,22 +6570,32 @@ def _ingest_close(
     """
     if not triples:
         return
+    closing_window = (
+        _iso_to_epoch_ms(original_ts_iso), _iso_to_epoch_ms(commit_ts_iso),
+    )
+    restores = []
+    pairs = []
     for triple in triples:
         m = _FACTS_TRIPLE_PATTERN.fullmatch(triple)
-        restore = []
-        if m is not None:
-            restore = [
-                (vf, vt)
-                for vf, vt in _asserted_windows_ms(db, triple, m.group(1))
-                if vt != _VALID_TIME_FOREVER_MS
-                and (vf, vt) != (_iso_to_epoch_ms(original_ts_iso),
-                                 _iso_to_epoch_ms(commit_ts_iso))
-            ]
+        if m is None:
+            pairs.append(None)
+            continue
+        pairs.append((m.group(1), m.group(2)))
+        restores.extend(
+            (triple, vf, vt)
+            for vf, vt in _asserted_windows_ms(db, triple, m.group(1))
+            if vt != _VALID_TIME_FOREVER_MS and (vf, vt) != closing_window
+        )
+    if None in pairs or len(set(pairs)) != len(pairs):
+        retract_calls = [[t] for t in triples]
+    else:
+        retract_calls = [triples]
+    for batch in retract_calls:
         try:
-            _retract(db, f"[{triple}]", index_con=index_con)
+            _retract(db, "[" + " ".join(batch) + "]", index_con=index_con)
         except Exception:
             pass  # best-effort: original may not exist if preload was incomplete
-        for vf, vt in restore:
+    for triple, vf, vt in restores:
             _transact(
                 db, f"[{triple}]", _epoch_ms_to_iso(vf),
                 valid_to=_epoch_ms_to_iso(vt), index_triples=[],
