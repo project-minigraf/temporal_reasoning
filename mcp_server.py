@@ -6962,13 +6962,24 @@ def _frontier_span_count(
 GRAPH_FORMAT_VERSION = 2
 _FORMAT_VERSION_IDENT = ":ingestion/format-version"
 
+# What each version changed, so a refusal names the change that actually
+# separates the graph from this build instead of always blaming #263. A bump
+# adds its entry here; tests/test_mcp_server.py requires one per version.
+_FORMAT_VERSION_CHANGES = {
+    1: "the entity ident rule changed (#263), so ingesting would fork every "
+    "entity already in the graph",
+    2: "the commit timeline became the first-parent chain (#384), so positions, "
+    "frontier bounds and entity validity windows no longer mean the same thing",
+}
+
 
 class GraphFormatVersionError(RuntimeError):
     """Raised when a graph's format version does not match GRAPH_FORMAT_VERSION.
 
     Deliberately a hard failure rather than a warning: continuing would write
-    new-rule idents alongside old-rule ones for the same entities, which
-    produces no error anywhere downstream and corrupts the graph silently.
+    facts under the current format alongside facts under the old one for the
+    same entities, which produces no error anywhere downstream and corrupts
+    the graph silently.
     """
 
 
@@ -7022,15 +7033,40 @@ def _graph_format_version_verify(db: Any) -> None:
         return
     if stamped is None and not _graph_has_ingestion_state(db):
         return  # genuinely new -- _graph_format_version_stamp_if_new adopts it
-    found = "no version stamp (pre-#263)" if stamped is None else f"version {stamped}"
-    raise GraphFormatVersionError(
+    raise GraphFormatVersionError(_graph_format_version_refusal(stamped))
+
+
+def _graph_format_version_refusal(stamped: Optional[int]) -> str:
+    """The refusal text for a graph stamped `stamped` (None: no stamp at all,
+    -1: an unreadable one). Names the changes between the graph's version and
+    this build's, so the reason given is the one that actually applies."""
+    rebuild = (
+        "There is no migration: re-ingest into a FRESH graph path (set "
+        "MINIGRAF_GRAPH_PATH to a new file, or delete the existing graph and "
+        "its .fts.sqlite3 index first)."
+    )
+    if stamped is not None and stamped > GRAPH_FORMAT_VERSION:
+        return (
+            f"This graph is at graph format version {stamped}, newer than this "
+            f"build's version {GRAPH_FORMAT_VERSION}. Upgrade temporal-reasoning "
+            "to ingest into it."
+        )
+    if stamped is not None and stamped < 0:
+        return (
+            "This graph's format version stamp is unreadable, so this build "
+            f"(graph format version {GRAPH_FORMAT_VERSION}) cannot tell whether "
+            f"ingesting into it is safe. {rebuild}"
+        )
+    found = "no version stamp (it predates version 1)" if stamped is None else f"version {stamped}"
+    since = stamped or 0
+    changes = [
+        _FORMAT_VERSION_CHANGES.get(v, f"the graph format changed (version {v})")
+        for v in range(since + 1, GRAPH_FORMAT_VERSION + 1)
+    ]
+    return (
         f"This graph has {found}, but this build ingests at graph format "
-        f"version {GRAPH_FORMAT_VERSION}. The entity ident rule changed "
-        "(#263), and ingesting would silently create a second, forked "
-        "entity for everything already in the graph. There is no "
-        "migration: re-ingest into a FRESH graph path (set "
-        "MINIGRAF_GRAPH_PATH to a new file, or delete the existing graph "
-        "and its .fts.sqlite3 index first)."
+        f"version {GRAPH_FORMAT_VERSION}. Since then: " + "; ".join(changes) + ". "
+        + rebuild
     )
 
 
