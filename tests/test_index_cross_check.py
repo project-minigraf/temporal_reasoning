@@ -69,6 +69,82 @@ def _keep_rightmost_leaf(graph_path, root_offset):
         f.write(header)
 
 
+def _eavt_leaf_chain(graph_path, root_offset):
+    """Page ids of one index's leaves, left to right: first child (offset 12
+    of an internal page) down to the leftmost leaf, then next_leaf (offset 4
+    of a leaf, 0 = last)."""
+    with open(graph_path, "rb") as f:
+        header = f.read(_HEADER_LEN)
+        assert bytes(header[:4]) == b"MGRF"
+        assert struct.unpack_from("<I", header, 4)[0] == 7, (
+            "minigraf header layout changed; re-derive _eavt_leaf_chain"
+        )
+        page_id = struct.unpack_from("<Q", header, root_offset)[0]
+        f.seek(page_id * _PAGE_SIZE)
+        page = f.read(_PAGE_SIZE)
+        assert page[0] == _PAGE_TYPE_INTERNAL, (
+            "index root is already a leaf: the graph is too small to damage"
+        )
+        while page[0] == _PAGE_TYPE_INTERNAL:
+            page_id = struct.unpack_from("<Q", page, 12)[0]
+            f.seek(page_id * _PAGE_SIZE)
+            page = f.read(_PAGE_SIZE)
+        chain = []
+        while True:
+            assert page[0] == _PAGE_TYPE_LEAF
+            chain.append(page_id)
+            page_id = struct.unpack_from("<Q", page, 4)[0]
+            if page_id == 0:
+                return chain
+            f.seek(page_id * _PAGE_SIZE)
+            page = f.read(_PAGE_SIZE)
+
+
+def _point_root_at(graph_path, root_offset, page_id):
+    with open(graph_path, "r+b") as f:
+        header = bytearray(f.read(_HEADER_LEN))
+        struct.pack_into("<Q", header, root_offset, page_id)
+        struct.pack_into(
+            "<I", header, _HEADER_CHECKSUM_OFFSET,
+            zlib.crc32(bytes(header[:_HEADER_CHECKSUM_OFFSET])),
+        )
+        f.seek(0)
+        f.write(header)
+
+
+def _keep_the_leaf_where(graph_path, root_offset, shape_holds):
+    """_keep_rightmost_leaf, but keeping the rightmost leaf whose single-leaf
+    index makes `shape_holds(db)` true, found by trying each leaf on a copy.
+
+    Which leaf an entity's entries land in is not a property of the graph's
+    content: minigraf 2.0.2's save() copies untouched leaves and repacks only
+    those receiving new entries (#315), so leaf boundaries depend on how many
+    checkpoints the writes were split across -- and ingestion's checkpoints
+    are clock-gated (_CheckpointPolicy). Since #379 a run no longer
+    checkpoints on every lease drop, and slower CI runners produced layouts
+    where the rightmost leaf held only :ingestion/last-run-at, then (choosing
+    the last leaf holding the watermark's UUID) one holding the watermark's
+    other attributes but not :hash. Searching for the shape the caller needs
+    removes the layout assumption entirely; the caller still asserts that
+    shape, as its positive control.
+    """
+    import shutil
+    probe = str(graph_path) + ".leafprobe"
+    for page_id in reversed(_eavt_leaf_chain(graph_path, root_offset)):
+        shutil.copyfile(graph_path, probe)
+        _point_root_at(probe, root_offset, page_id)
+        db = MiniGrafDb.open(probe)
+        try:
+            ok = shape_holds(db)
+        finally:
+            del db
+        os.remove(probe)
+        if ok:
+            _point_root_at(graph_path, root_offset, page_id)
+            return
+    raise AssertionError("no single EAVT leaf yields the requested shape")
+
+
 def _entity_uuid(ident):
     """The entity id minigraf derives from a keyword ident."""
     return uuid.uuid5(uuid.NAMESPACE_OID, ident)
@@ -509,7 +585,11 @@ class TestIndexCrossCheckAtRunStart:
         _write_facts(
             graph, _filler_facts(_filler_idents(400, keep=lambda u: u < watermark))
         )
-        _keep_rightmost_leaf(graph, _EAVT_ROOT_OFFSET)
+        _keep_the_leaf_where(
+            graph, _EAVT_ROOT_OFFSET,
+            lambda db: mcp_server._watermark_query(db) is not None
+            and mcp_server._graph_format_version_read(db) is None,
+        )
         # Precondition: stamp lost, watermark kept -- the shape in which
         # _graph_format_version_verify raises GraphFormatVersionError.
         db = MiniGrafDb.open(str(graph))

@@ -40,6 +40,7 @@ from mcp.server.stdio import stdio_server
 from minigraf import MiniGrafDb, MiniGrafError
 import fact_index
 import frontier_registry
+import hook_spool
 import ingest_progress
 
 # ---------------------------------------------------------------------------
@@ -137,27 +138,31 @@ _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
 # use_hook_lease_deadline(), so nothing in the server process changes.
 #
 # The _LOCK_RETRY_* schedule has DEAD GAPS: it is listening only while an
-# open() is polling, and sleeps up to 0.4 s between attempts. Ingestion's
-# lease windows release the graph for _SWEEP_YIELD_PAUSE_SECONDS (0.1 s), so a
-# release inside a gap is missed deterministically -- measured 0 of 8 landed
-# at shipped window settings (0 of 6 on the pre-#280 per-commit leases), and
-# both hooks swallow the failure, so the turn's memory write is silently
-# lost. Here the hook retries back to back until a wall-clock deadline;
-# open() already polls internally at 5-50 ms, so there is no gap for a 0.1 s
-# release to fall into. The poll sleep is only a floor against a hot spin
-# should open() ever fail fast instead of polling.
+# open() is polling, and sleeps up to 0.4 s between attempts. Here the hook
+# retries back to back until a wall-clock deadline; open() already polls
+# internally at 5-50 ms, so there is no gap. The poll sleep is only a floor
+# against a hot spin should open() ever fail fast instead of polling.
 #
-# The deadline must outlast one ingestion window (_SWEEP_YIELD_SECONDS, 2 s,
-# checked only between commits, so one slow commit stretches it -- ~0.3 s in
-# Stage A and ~0.8 s per swept commit in Stage B on this repo's full history)
-# and stay inside the hooks' own timeouts: 30 s / 60 s in
-# hooks/claude-code.json, but 5 s / 10 s in codex.toml and hermes.yaml. A
-# hook killed at its timeout while still polling holds nothing, so 5 s costs
-# at worst the write it would have lost anyway. It is paid only while
-# something else holds the graph.
+# Since #379 ingestion holds the graph for its whole run, so a hook no longer
+# waits for a window release at all: while ingestion's ownership hint is fresh
+# finalize spools without trying, and if the deadline passes anyway (a run
+# that started after the hint was read, a holder publishing no hint) it spools
+# then -- see _finalize_lease_or_spool. The deadline is what the hook pays
+# before falling back, against a holder that may let go: an interactive
+# call_tool lease, or another hook. It stays inside the hooks' own timeouts:
+# 30 s / 60 s in hooks/claude-code.json, but 5 s / 10 s in codex.toml and
+# hermes.yaml.
 _HOOK_LOCK_DEADLINE_SECONDS = 5.0
 _HOOK_LOCK_POLL_SECONDS = 0.005
 _hook_lease_deadline: Optional[float] = None  # set by use_hook_lease_deadline()
+
+
+# #379. Set by handle_memory_finalize_turn, in a hook process only, to the
+# graph path whose spool _transact_extracted_facts writes to instead of the
+# graph. A module global, not a ContextVar: the llm strategy runs its write on
+# a run_in_executor thread, which does not inherit the caller's context. A hook
+# process makes exactly one finalize call, so nothing else can observe it.
+_spool_target: Optional[str] = None
 
 
 def use_hook_lease_deadline(seconds: float = _HOOK_LOCK_DEADLINE_SECONDS) -> None:
@@ -219,89 +224,40 @@ try:
 except ValueError:
     _OWNER_HINT_TTL = 30.0
 
-# #222 phase 5 item C, extended to Stage A by #280. Stage B releases its lease
-# every _SWEEP_YIELD_COMMITS swept commits or _SWEEP_YIELD_SECONDS, whichever
-# comes first, and Stage A's _LeaseWindow applies the same bounds -- so the
-# out-of-process auto-memory hooks can win the graph file lock. The constants
-# bound hook lockout, not anything specific to the sweep, which is why both
-# stages share them.
+# #222 phase 5 item C, extended to Stage A by #280, reworked by #379. Both
+# stages group their commits into windows of at most _SWEEP_YIELD_COMMITS
+# commits or _SWEEP_YIELD_SECONDS, and each boundary drains the hook spool
+# (hook_spool) -- so these bound how long a fact an auto-memory hook spooled
+# mid-run waits to reach the graph and the fact index.
 #
-# Stage B used to hold ONE lease across its whole sweep. A lease is cheap
-# in-process (at count > 0 try_acquire joins and returns the same handle, so a
-# concurrent call_tool never blocks) but EXCLUSIVE out-of-process, and BOTH
-# auto-memory hooks (hooks/claude-code.json) are `command` hooks in separate
-# processes -- finalize_hook.py takes a lease to write each turn's facts. Their
-# acquire budget is bounded (_HOOK_LOCK_DEADLINE_SECONDS since #366; ~2.6 s of
-# _LOCK_RETRY_* before it) and both swallow failures with
-# `except Exception: pass`. So the whole-sweep hold
-# did not block queries; it SILENTLY DISCARDED every auto-memory write for the
-# sweep's duration, which on a large repo is a large fraction of the ingest.
+# History, because the names still say "yield". The windows were built so
+# ingestion would RELEASE the graph at each boundary and the out-of-process
+# hooks (finalize_hook.py writes each turn's facts) could take the kernel
+# lock: a lease is cheap in-process but exclusive out-of-process, and the
+# hooks swallow a failed acquire, so a whole-run hold silently discarded every
+# auto-memory write. But every release at refcount 1 -> 0 drops the handle,
+# and minigraf 2.x's `Drop for Inner` runs a full O(graph size) checkpoint,
+# outside _CheckpointPolicy's duty gate -- #280 measured it at 47.3% of
+# Stage A's write time, and at 3.8 GB (#379, ArangoDB) each 2 s window paid
+# ~7.5 s of drop, ~80% of the write path, ~26 GB/min written for ~2 MB/min of
+# growth. Worse, 2 s + 7.5 s already exceeded the hooks' 5 s deadline, so
+# the windows no longer even protected the writes they existed for.
+# OpenOptions' threshold that would suppress the drop checkpoint is not
+# exposed over FFI (minigraf#322), and 2.0.2 is the final planned 2.x.
 #
-# Yielding only makes the hook's write SUCCEED if the fact index is committed
-# before every release -- which is why each window goes through
-# _db_lease_async_committing_index. A window released with the batched
-# index_con's SQLite write transaction still open is a lock-order inversion:
-# the hook takes the graph lock then blocks on SQLite (5 s busy timeout)
-# holding it, ingestion holds SQLite and cannot get the graph back (~2.6 s
-# then; since #366 it waits on the extended budget instead), the run ended
-# `status: error`, and the hook's index insert is swallowed -- fact in graph,
-# missing from index (#302). Measured, not supposed: see
-# CLAUDE.md, "The fact index must be COMMITTED". Every other index-writing
-# lease in _run_ingestion goes through the same wrapper since #347.
-#
-# NOT a per-commit release: _DbLeaseManager.release() at refcount 1 -> 0 drops
-# the handle, and minigraf's `Drop for Inner` then runs a full O(graph size)
-# checkpoint -- #280, measured at 47.3% of Stage A's write time and growing
-# 3.47x within a 220-commit run, outside _CheckpointPolicy's duty gate and
-# invisible to the trace's ckpt_d_seconds. A window amortises that over N
-# commits.
-#
-# _SWEEP_YIELD_SECONDS is sized against the hooks' own acquire budget
-# (_HOOK_LOCK_DEADLINE_SECONDS): the lock must come free often enough that a
-# hook already retrying can win it. It is the SECOND trigger, not the first -- on a large graph one
-# window's worth of commits can take far longer than the clock bound, and
-# without it the hooks' window would be set by graph size rather than by
-# anything anyone chose.
-#
-# _DbLeaseManager exposes no waiter or contention signal, so "release only when
-# something is actually waiting" is not available without building one. The
-# trigger has to be a counter or a clock; it is both.
-#
-# When upstream minigraf#322 exposes OpenOptions (wal_checkpoint_threshold =
-# usize::MAX suppresses the Drop checkpoint), N can safely go to 1 -- which is
-# why this is a constant to lower rather than a structure to rewrite. #280
-# itself landed as this window, which amortises the drop checkpoint but does
-# not remove it.
+# So since #379 _run_ingestion holds ONE lease for the whole walk and sweep
+# (its run hold), every window lease is a join, and hooks spool instead of
+# waiting. The window structure stays because its boundaries are the right
+# place to drain: between fully-applied commits, with the index committed.
 #
 # Read at import, so the conftest MINIGRAF_* scrub cannot reach it: a test that
 # depends on a value must patch the CONSTANT, not the variable.
 _SWEEP_YIELD_COMMITS = int(os.environ.get("MINIGRAF_SWEEP_YIELD_COMMITS", "25"))
 _SWEEP_YIELD_SECONDS = float(os.environ.get("MINIGRAF_SWEEP_YIELD_SECONDS", "2.0"))
 
-# How long the boundary leaves the graph ACTUALLY unlocked.
-#
-# Without this the window is worthless in practice, and the reason is worth
-# stating exactly. Releasing the lease and re-acquiring it costs no awaits --
-# `window_started = ...`, `window_count = 0`, `try_acquire` -- so the graph is
-# free for MICROSECONDS. That is a free instant, not a free interval, and no
-# hook -- however it polls -- can reliably land in it. The boundary creates the right PLACE to yield; this constant is what
-# makes the yield real.
-#
-# Why 0.1 s. Under minigraf 2.0.0 `open()` does not fail fast: it blocks for
-# ~375 ms, adaptively polling 5->50 ms, and returns as soon as the lock frees.
-# So a hook ALREADY blocked in open() acquires within ~5-50 ms of the lock
-# becoming free, and 100 ms clears that comfortably while costing ~5% of a 2 s
-# window. That holds only for a hook that is IN open() when the release comes:
-# the old _LOCK_RETRY_* hook schedule slept up to 0.4 s between opens and
-# missed this pause 8 of 8 times, which is why the hooks poll back to back
-# under _HOOK_LOCK_DEADLINE_SECONDS since #366. A hook that has not started yet gains nothing from any PARTICULAR
-# boundary -- it simply blocks and wins at the next one.
-#
-# Paid only between windows, never after the last one (the sweep sets
-# sweep_done first), so a sweep that fits in one window pays nothing at all.
-_SWEEP_YIELD_PAUSE_SECONDS = float(
-    os.environ.get("MINIGRAF_SWEEP_YIELD_PAUSE_SECONDS", "0.1")
-)
+# _SWEEP_YIELD_PAUSE_SECONDS (0.1 s) is gone (#379). It held the graph
+# unlocked at each boundary so a hook could land; ingestion no longer releases
+# the graph mid-run, so there is nothing to hold open.
 
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
@@ -3539,6 +3495,11 @@ class _DbLeaseManager:
         # the #255 interleaving ablation). Defaults to strict; flipping the
         # default would quietly turn the always-on detector into a test-only one.
         self.strict_leak_detection: bool = True
+        # #379: cumulative handle drops and their wall time (each drop runs a
+        # full O(graph size) checkpoint on minigraf 2.x). Never reset;
+        # readers take deltas.
+        self.drops: int = 0
+        self.drop_seconds: float = 0.0
 
     @property
     def lease_count(self) -> int:
@@ -3643,6 +3604,7 @@ class _DbLeaseManager:
                 )
             self._count -= 1
             if self._count == 0:
+                drop_started = time.perf_counter()
                 if self._handle is not None:
                     # Checkpoint and stamp WHILE the handle -- and so the
                     # kernel lock -- is still ours; see
@@ -3670,6 +3632,11 @@ class _DbLeaseManager:
                     # count actually reaches zero before anyone can observe the
                     # lock as free. Do not "simplify" this away.
                     del handle
+                    # #379: what the drop cost, pre-drop checkpoint included,
+                    # so a run can report its own drops instead of leaving
+                    # them to external sampling.
+                    self.drops += 1
+                    self.drop_seconds += time.perf_counter() - drop_started
 
     def reset(self) -> None:
         """Force the manager back to its initial state.
@@ -3940,47 +3907,75 @@ async def _db_lease_async_committing_index(loop, write_executor, index_con):
             await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
 
 
+async def _drain_hook_spool_async(loop, write_executor, index_con) -> None:
+    """Drain the hook spool inside an ingestion run (#379), and publish this
+    run's spool and handle-drop counters.
+
+    Takes a committing lease -- a JOIN of the run's own hold, so nothing is
+    dropped -- and applies the records on write_executor with the run's
+    batched index_con (see _apply_extracted_facts). A failure is
+    logged and leaves the records spooled for the next drain; it never fails
+    the run.
+    """
+    try:
+        async with _db_lease_async_committing_index(loop, write_executor, index_con) as db:
+            got = await loop.run_in_executor(write_executor, _drain_hook_spool, db, index_con)
+    except Exception as e:
+        print(f"[hook_spool] drain failed: {e}", file=sys.stderr)
+        got = None
+    totals = _ingest_progress.get("hook_spool")
+    if got is not None and isinstance(totals, dict):
+        for k, v in got.items():
+            totals[k] = totals.get(k, 0) + v
+    _publish_run_handle_drops()
+
+
+def _publish_run_handle_drops() -> None:
+    start = _ingest_progress.get("_drops_at_start")
+    if start is None:
+        return
+    _ingest_progress["handle_drops"] = {
+        "count": _lease_manager.drops - start[0],
+        "seconds": _lease_manager.drop_seconds - start[1],
+    }
+
+
 class _LeaseWindow:
-    """#280. One graph lease held across several Stage A commits.
+    """#280, reworked by #379. Stage A's per-commit leases, grouped into
+    windows whose boundaries are where the hook spool is drained.
 
-    Stage A used to take a lease per commit. Its two streams essentially
-    never overlap their leases, so the refcount hit 0 after every commit and
-    _DbLeaseManager.release() dropped the handle -- and minigraf's `Drop for
-    Inner` runs a full O(graph size) checkpoint, outside _CheckpointPolicy's
-    duty gate and invisible to the trace's ckpt_d_seconds. Measured at 110 s
-    of a 277 s Stage A over 600 commits (minigraf 2.0.2), i.e. ~1 drop per
-    commit.
+    #280 introduced the window to amortise handle drops: every release at
+    refcount 1 -> 0 drops the handle, and minigraf 2.x's `Drop for Inner`
+    runs a full O(graph size) checkpoint. The window released for real at
+    each boundary and paused so an out-of-process auto-memory hook could take
+    the graph lock. At 3.8 GB that release cost ~7.5 s per 2 s window (#379),
+    and the hook's 5 s deadline no longer covered it anyway.
 
-    The window holds its OWN lease; Stage A's per-commit lease then JOINS it
-    at refcount 1 -> 2 and its exit is 2 -> 1, which drops nothing. The
-    window releases for real only at a boundary (maybe_yield), then sleeps
-    OUTSIDE any lease so an out-of-process auto-memory hook -- which polls
-    for only _HOOK_LOCK_DEADLINE_SECONDS and then silently discards its
-    write (#366) -- can take the graph file lock. Holding one lease for all of Stage A
-    instead would discard every hook write for its duration (#280's own
-    correction comment).
+    Since #379 _run_ingestion holds the graph for the whole walk (its run
+    hold), so the window's lease and every per-commit lease below it are
+    JOINS and their exits drop nothing. Hooks spool instead of waiting
+    (hook_spool), and a boundary drains that spool -- so the _SWEEP_YIELD_*
+    bounds now set how long a spooled fact waits to reach the graph and the
+    fact index, not how long a hook is locked out.
 
-    The window's lease is _db_lease_async_committing_index, so every REAL
-    release commits index_con first (#347) by construction, not by call-site
-    care.
+    The window's lease is _db_lease_async_committing_index, so each boundary
+    still commits index_con (#347) -- harmless now, and it keeps a spooled
+    fact's index row from sitting in an open transaction.
 
     Lazy: nothing is opened until ensure_open(), so a Stage A that never
     reaches write dispatch (empty, or every extraction failed) takes no
     lease, as before.
 
-    Stage B keeps its own inline window loop (#222 phase 5 item C). Both use
-    the same _SWEEP_YIELD_* constants, which bound hook lockout, not sweep
-    behaviour.
+    Stage B keeps its own inline window loop with the same constants.
     """
 
     def __init__(self, loop, write_executor, index_con, *,
-                 max_commits: int, max_seconds: float, pause_seconds: float) -> None:
+                 max_commits: int, max_seconds: float) -> None:
         self._loop = loop
         self._write_executor = write_executor
         self._index_con = index_con
         self._max_commits = max_commits
         self._max_seconds = max_seconds
-        self._pause_seconds = pause_seconds
         self._stack: Optional[contextlib.AsyncExitStack] = None
         self._opened_at = 0.0
         self._count = 0
@@ -4009,15 +4004,12 @@ class _LeaseWindow:
             self._count += 1
 
     async def maybe_yield(self) -> float:
-        """At a boundary, release for real and pause; return seconds spent.
+        """At a boundary, close the window and drain the hook spool; return
+        seconds spent.
 
-        A boundary is `count >= max_commits or elapsed >= max_seconds`. The
-        COUNT bounds how many drop-checkpoints the releases cost; the CLOCK
-        bounds how long a hook is locked out when one window's commits are
-        individually slow, which on a large graph they are. Neither is
-        redundant. The pause is what makes the release usable: a bare
-        release-then-reacquire leaves the lock free for microseconds, not an
-        interval (see _SWEEP_YIELD_PAUSE_SECONDS).
+        A boundary is `count >= max_commits or elapsed >= max_seconds`: the
+        COUNT bounds the drain latency in commits, the CLOCK bounds it in time
+        when one window's commits are individually slow.
         """
         if self._stack is None:
             return 0.0
@@ -4028,12 +4020,11 @@ class _LeaseWindow:
             return 0.0
         started = time.perf_counter()
         await self.close()
-        # asyncio.sleep, never time.sleep: this runs on the event loop (#99).
-        await asyncio.sleep(self._pause_seconds)
+        await _drain_hook_spool_async(self._loop, self._write_executor, self._index_con)
         return time.perf_counter() - started
 
     async def close(self) -> None:
-        """Release the window's lease, with no pause. Idempotent."""
+        """Release the window's lease. Idempotent."""
         stack, self._stack = self._stack, None
         if stack is not None:
             await stack.aclose()
@@ -9563,6 +9554,11 @@ def _query_canonical_entities() -> str:
     This returns proper keyword idents (e.g. :decision/redis) rather than the
     internal UUIDs that join-variable queries would return for ?e.
     """
+    if _spool_target is not None:
+        # #379: ingestion owns the graph, and a query would wait out the hook
+        # deadline only to fail. The prompt simply omits the section, as it
+        # does for an empty graph.
+        return ""
     try:
         ident_result = handle_minigraf_query("[:find ?id :where [?e :ident ?id]]")
         ident_rows = ident_result.get("results", [])
@@ -9945,6 +9941,36 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
     -- :alias, :rationale, :date -- whenever it arrived as its own triple
     rather than bundled into the same dict as :description.)
     """
+    if _spool_target is not None:
+        # #379: ingestion owns the graph. Spool the batch, unvalidated -- the
+        # drain applies it through _apply_extracted_facts, which validates it
+        # exactly as below -- and stamp the valid time NOW, so a fact drained
+        # minutes later still carries the time it was learned.
+        if not facts:
+            return 0
+        hook_spool.write_record(_spool_target, facts, valid_from or _now_utc_ms())
+        return len(facts)
+    with db_lease() as db:
+        stored = _apply_extracted_facts(db, facts, valid_from)
+        if stored:
+            _db_checkpoint(db)
+    return stored
+
+
+def _apply_extracted_facts(
+    db: Any,
+    facts: List[Dict[str, str]],
+    valid_from: Optional[str],
+    index_con: Optional[Any] = None,
+) -> int:
+    """_transact_extracted_facts' write, against a db the caller already
+    leases, with no checkpoint. Shared with the spool drain (#379), which runs
+    inside ingestion's lease and passes ingestion's batched index_con so the
+    run keeps one SQLite writer. Not load-bearing today -- every drain site
+    runs just after that connection committed, so a separate writer would not
+    block (ablation-checked) -- but a drain placed where the run holds an open
+    index transaction would block on a second writer (#347's shape).
+    """
     stored = 0
 
     entity_groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -9954,42 +9980,39 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
         entity for entity, group in entity_groups.items() if _validate_facts(group)
     }
 
-    with db_lease() as db:
-        for fact in facts:
-            entity = fact["entity"]
-            entity_type = fact.get("entity_type", "")
-            attribute = fact["attribute"]
-            value = fact["value"]
-            # Schema validation — closed-world: skip facts belonging to any entity
-            # whose full fact group (across this batch) has violations.
-            if entity in invalid_entities:
-                continue
-            now_z = valid_from or _now_utc_ms()
-            try:
-                # Combine main fact, :entity-type tag, and :ident into one transact so
-                # all triples are written atomically — a single (transact [...]) is one
-                # transaction. :ident stores the keyword ident as a string value so that
-                # handle_minigraf_audit and _query_canonical_entities can surface it for
-                # display without knowing the UUID (audits retract via #uuid "..." syntax).
-                escaped_value = _edn_escape(value)
-                if entity_type:
-                    triples = (
-                        f'[{entity} {attribute} "{escaped_value}"]'
-                        f' [{entity} :entity-type :type/{entity_type}]'
-                        f' [{entity} :ident "{entity}"]'
-                    )
-                else:
-                    triples = f'[{entity} {attribute} "{escaped_value}"]'
-                _transact(db, "[" + triples + "]", now_z)
-                stored += 1
-            except MiniGrafError as e:
-                print(
-                    f"[_transact_extracted_facts] dropped fact for {entity} {attribute}: {e}",
-                    file=sys.stderr,
+    for fact in facts:
+        entity = fact["entity"]
+        entity_type = fact.get("entity_type", "")
+        attribute = fact["attribute"]
+        value = fact["value"]
+        # Schema validation — closed-world: skip facts belonging to any entity
+        # whose full fact group (across this batch) has violations.
+        if entity in invalid_entities:
+            continue
+        now_z = valid_from or _now_utc_ms()
+        try:
+            # Combine main fact, :entity-type tag, and :ident into one transact so
+            # all triples are written atomically — a single (transact [...]) is one
+            # transaction. :ident stores the keyword ident as a string value so that
+            # handle_minigraf_audit and _query_canonical_entities can surface it for
+            # display without knowing the UUID (audits retract via #uuid "..." syntax).
+            escaped_value = _edn_escape(value)
+            if entity_type:
+                triples = (
+                    f'[{entity} {attribute} "{escaped_value}"]'
+                    f' [{entity} :entity-type :type/{entity_type}]'
+                    f' [{entity} :ident "{entity}"]'
                 )
-                continue
-        if stored:
-            _db_checkpoint(db)
+            else:
+                triples = f'[{entity} {attribute} "{escaped_value}"]'
+            _transact(db, "[" + triples + "]", now_z, index_con=index_con)
+            stored += 1
+        except MiniGrafError as e:
+            print(
+                f"[_transact_extracted_facts] dropped fact for {entity} {attribute}: {e}",
+                file=sys.stderr,
+            )
+            continue
     return stored
 
 
@@ -10291,15 +10314,93 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
 # memory_finalize_turn — dispatcher
 # ---------------------------------------------------------------------------
 
+def _clear_spool_target() -> None:
+    global _spool_target
+    _spool_target = None
+
+
+def _ingestion_owns_graph(graph_path: str) -> bool:
+    """Another process's fresh ingestion ownership hint is published (#379)."""
+    hint = _graph_owner_hint(graph_path)
+    return hint is not None and hint.get("purpose") == "ingestion"
+
+
+async def _finalize_lease_or_spool(stack: contextlib.AsyncExitStack) -> Optional[str]:
+    """Take the finalize lease on `stack`, or return the graph path to spool to.
+
+    Only a HOOK process (use_hook_lease_deadline) spools (#379). Ingestion
+    holds the graph for its whole run, so while its ownership hint is fresh
+    the hook does not wait at all; and if the lease still cannot be had -- a
+    run that started after the hint was read, or a holder that publishes no
+    hint -- the facts are spooled rather than lost, which is what the hooks'
+    `except Exception: pass` used to do with them.
+
+    A hook that DOES get the lease first drains whatever is spooled: a record
+    written just after a run's final drain would otherwise wait for the next
+    run. Never in the server process, where ingestion may be running in this
+    same process and holds the fact index's write transaction open on its own
+    connection -- a drain here would open a second SQLite writer and block on
+    it (#347's lock-order shape).
+    """
+    if _hook_lease_deadline is None:
+        await stack.enter_async_context(db_lease_async())
+        return None
+    path = _graph_path_current()
+    if _ingestion_owns_graph(path):
+        return path
+    try:
+        db = await stack.enter_async_context(db_lease_async())
+    except RuntimeError:
+        return path
+    try:
+        _drain_hook_spool(db)
+    except Exception as e:
+        # A failed drain leaves its records spooled for the next one; it must
+        # not cost this turn its own write.
+        print(f"[hook_spool] drain failed: {e}", file=sys.stderr)
+    return None
+
+
+def _drain_hook_spool(db: Any, index_con: Optional[Any] = None) -> Dict[str, int]:
+    """Apply every spooled record to the leased `db`, oldest first (#379).
+
+    `index_con` is ingestion's batched index connection when called from a run
+    (the caller commits it), None from a hook (each write opens its own).
+    No checkpoint: in a run _CheckpointPolicy and the final checkpoint own
+    that; from a hook, _transact_extracted_facts' own checkpoint follows.
+
+    A record is removed only AFTER it is applied. A crash in between
+    re-applies it at its own valid time, which writes nothing new -- see
+    hook_spool. An unreadable record is quarantined, never retried forever.
+    """
+    path = _graph_path_current()
+    drained = quarantined = facts_stored = 0
+    for record_path, parsed in hook_spool.pending(path):
+        if parsed is None:
+            hook_spool.quarantine(record_path)
+            quarantined += 1
+            print(f"[hook_spool] quarantined unreadable record {record_path}", file=sys.stderr)
+            continue
+        facts, valid_from = parsed
+        facts_stored += _apply_extracted_facts(db, facts, valid_from, index_con)
+        hook_spool.remove(record_path)
+        drained += 1
+    return {"records": drained, "facts": facts_stored, "quarantined": quarantined}
+
+
 async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]:
     """
     Extract facts from conversation_delta and transact them.
     Strategy selected via MINIGRAF_EXTRACTION_STRATEGY env var (default: heuristic).
     """
     strategy = os.environ.get("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
+    global _spool_target
     async with contextlib.AsyncExitStack() as stack:
         if strategy in ("heuristic", "llm", "agent"):
-            await stack.enter_async_context(db_lease_async())
+            spool_to = await _finalize_lease_or_spool(stack)
+            if spool_to is not None:
+                _spool_target = spool_to
+                stack.callback(_clear_spool_target)
 
         if strategy == "heuristic":
             facts = heuristic_extract(conversation_delta)
@@ -15181,6 +15282,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # runs, so a run refused or failing before that point never echoes a
     # previous run's orphan count under a run that never computed one.
     _ingest_progress["orphaned_commits"] = None
+    # #379: this run's spool drains and handle drops, live. Set here, not in
+    # the initializers, for index_cross_check's reason above.
+    _ingest_progress["hook_spool"] = {"records": 0, "facts": 0, "quarantined": 0}
+    _ingest_progress["handle_drops"] = {"count": 0, "seconds": 0.0}
+    _ingest_progress["_drops_at_start"] = (_lease_manager.drops, _lease_manager.drop_seconds)
     # Bound BEFORE the try so the outermost finally can shut it down no matter
     # where a failure lands, including the two awaited calls
     # (_open_index_writer_safe, _frontier_load) that sit above the inner try
@@ -15451,7 +15557,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             executor = concurrent.futures.ProcessPoolExecutor(
                 max_workers=max_workers, mp_context=mp_context
             )
+            # #379: the RUN HOLD. One lease across the whole walk and sweep, so
+            # every lease below -- Stage A's window and per-commit leases,
+            # Stage B's windows, the fold, the tags write, the final
+            # checkpoint -- is a join whose exit drops nothing. On minigraf
+            # 2.x a drop is a full O(graph size) checkpoint, and at 3.8 GB
+            # the windows' drops were ~80% of Stage A's write path. Hooks
+            # cannot take the graph meanwhile; they spool (hook_spool) and
+            # the window boundaries drain it. Released in the finally below,
+            # after the final drain and checkpoint.
+            run_hold = contextlib.AsyncExitStack()
             try:
+                await run_hold.enter_async_context(db_lease_async(extended=True))
                 pending: Any = deque()
 
                 # #326: the end-of-walk flush's bounds. A run of skips is
@@ -15762,7 +15879,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     loop, write_executor, index_con,
                     max_commits=_SWEEP_YIELD_COMMITS,
                     max_seconds=_SWEEP_YIELD_SECONDS,
-                    pause_seconds=_SWEEP_YIELD_PAUSE_SECONDS,
                 )
                 _trace_yield_s = 0.0
                 run_progress.stage_a_started()
@@ -16417,25 +16533,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             # condition so the first window is still entered above.
                             if _shutdown_requested.is_set():
                                 break
-                            # Hold the graph genuinely unlocked for a moment. This
-                            # sleep is OUTSIDE the lease by construction -- the
-                            # `async with` above has exited and the next window's
-                            # has not been entered -- which is the whole point: a
-                            # sleep inside the lease would accomplish nothing but
-                            # slow the sweep down. See _SWEEP_YIELD_PAUSE_SECONDS
-                            # for why the gap has to be an interval rather than the
-                            # instant a bare release leaves behind.
-                            #
-                            # asyncio.sleep, never time.sleep: this runs on the
-                            # event loop, so a blocking sleep would freeze every
-                            # concurrent call_tool for the duration (#99) -- and
-                            # tests/_forbid_blocking_sleep_on_event_loop fires on
-                            # exactly that.
-                            #
-                            # Skipped when the sweep is already finished, so the
-                            # last window never pays it.
+                            # #379: the window's exit was a JOIN of the run hold,
+                            # so nothing was released; the boundary is where
+                            # spooled hook facts reach the graph. Skipped when the
+                            # sweep is already finished -- the run's final drain
+                            # covers that.
                             if not sweep_done:
-                                await asyncio.sleep(_SWEEP_YIELD_PAUSE_SECONDS)
+                                await _drain_hook_spool_async(loop, write_executor, index_con)
                     finally:
                         sweep_prefetch.discard()
                     if _shutdown_requested.is_set():
@@ -16503,11 +16607,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # before falling into this finally -- removed, since this
                 # one already covers it; see the comment left at its old
                 # call site.)
+                #
+                # #379: drain the hook spool first, so facts spooled during
+                # the run's last window are compacted with everything else.
+                await _drain_hook_spool_async(loop, write_executor, index_con)
                 try:
                     async with db_lease_async(extended=True) as final_db:
                         await loop.run_in_executor(write_executor, _db_checkpoint, final_db)
                 except Exception as e:
                     print(f"[_run_ingestion] final checkpoint failed: {e}", file=sys.stderr)
+                # Release the run hold: the run's one real drop, after the
+                # checkpoint above, so it has nothing left to compact.
+                try:
+                    await run_hold.aclose()
+                except Exception as e:
+                    print(f"[_run_ingestion] releasing the run hold failed: {e}", file=sys.stderr)
+                _publish_run_handle_drops()
                 # ProcessPoolExecutor.shutdown(wait=True) blocks joining the
                 # worker OS processes — measured ~90ms even for a pool that
                 # never did any real work, entirely from process-exit

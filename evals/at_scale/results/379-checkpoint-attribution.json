@@ -1,0 +1,145 @@
+{
+ "issue": 379,
+ "date": "2026-10-01",
+ "ref": "52bdeb3 (full first-parent history of this repo)",
+ "command": "PROBE_CODE_DIR=<tree> PYTHONHASHSEED=0 .venv/bin/python evals/at_scale/probe_lease_drop_cost.py --repo . --ref 52bdeb3, master (52bdeb3) then branch (07d1bf1), sequential, one run each",
+ "note": "Single runs: read COUNTS, not wall. Wall is measured by results/379-run-hold-ab.json. explicit_ckpt includes _lineage_cache.before_drop's pre-drop checkpoint, which is why master's count is higher.",
+ "runs": {
+  "master": {
+   "issue": 260,
+   "wall_s": 160.5702987270197,
+   "commits_traced": 432,
+   "handle_opens": 59,
+   "handle_drops": 59,
+   "opens_per_commit": 0.13657407407407407,
+   "apply_total_s": 56.06289233465213,
+   "apply_share_of_wall": 0.34914858338753435,
+   "explicit_ckpt_total_s": 4.220475222973619,
+   "explicit_ckpt_share_of_apply": 0.07528108249893073,
+   "drop_total_s": 19.06522102979943,
+   "drop_share_of_wall": 0.11873441838836951,
+   "drop_share_of_apply": 0.3400684523373286,
+   "drop_thirds": {
+    "first_mean_s": 0.17826454953204743,
+    "middle_mean_s": 0.3684931826765502,
+    "last_mean_s": 0.413182100849337,
+    "growth": 2.3178029615756968
+   },
+   "per_phase": {
+    "other": {
+     "opens": 1,
+     "opens_s": 0.000943402003031224,
+     "explicit_ckpt": 1,
+     "explicit_ckpt_s": 1.1127965990453959e-05,
+     "drops": 1,
+     "drops_s": 8.016003994271159e-05
+    },
+    "converging": {
+     "opens": 32,
+     "opens_s": 1.596983772877138,
+     "wal_writes": 14265,
+     "wal_writes_s": 27.86455260962248,
+     "explicit_ckpt": 50,
+     "explicit_ckpt_s": 12.855274181056302,
+     "explicit_ckpt_wal_shrank": 43,
+     "drops": 32,
+     "drops_s": 8.645952492952347,
+     "auto_ckpt": 3,
+     "auto_ckpt_s": 0.31445304199587554
+    },
+    "sweeping": {
+     "opens": 26,
+     "opens_s": 3.9009879148798063,
+     "wal_writes": 20537,
+     "wal_writes_s": 13.81235766079044,
+     "explicit_ckpt": 33,
+     "explicit_ckpt_s": 13.655505851726048,
+     "explicit_ckpt_wal_shrank": 27,
+     "drops": 26,
+     "drops_s": 10.419188376807142,
+     "auto_ckpt": 6,
+     "auto_ckpt_s": 3.1854723139549606
+    }
+   },
+   "code_dir": "/home/aditya/.cache/ab/master379",
+   "phase_wall_s": {
+    "other": 0.050802882004063576,
+    "converging": 87.224741435959,
+    "sweeping": 73.2784676970332
+   },
+   "audit": {
+    "divergence": 0,
+    "audit_error": null,
+    "graph_facts": 40473
+   },
+   "commit_entities": 432
+  },
+  "branch": {
+   "issue": 260,
+   "wall_s": 156.3534773089923,
+   "commits_traced": 432,
+   "handle_opens": 3,
+   "handle_drops": 3,
+   "opens_per_commit": 0.006944444444444444,
+   "apply_total_s": 58.99706978176255,
+   "apply_share_of_wall": 0.377331357109315,
+   "explicit_ckpt_total_s": 3.7758193829795346,
+   "explicit_ckpt_share_of_apply": 0.06400011724220808,
+   "drop_total_s": 0.0010121259838342667,
+   "drop_share_of_wall": 6.473319309899714e-06,
+   "drop_share_of_apply": 1.7155529716615516e-05,
+   "drop_thirds": {
+    "first_mean_s": 7.917801849544048e-05,
+    "middle_mean_s": 0.0002079779515042901,
+    "last_mean_s": 0.0007249700138345361,
+    "growth": 9.156203042341657
+   },
+   "per_phase": {
+    "other": {
+     "opens": 1,
+     "opens_s": 0.0007602529949508607,
+     "explicit_ckpt": 1,
+     "explicit_ckpt_s": 1.0190997272729874e-05,
+     "drops": 1,
+     "drops_s": 7.917801849544048e-05
+    },
+    "converging": {
+     "opens": 2,
+     "opens_s": 0.0009304229752160609,
+     "wal_writes": 14265,
+     "wal_writes_s": 31.533487827226054,
+     "explicit_ckpt": 13,
+     "explicit_ckpt_s": 3.7752851060358807,
+     "explicit_ckpt_wal_shrank": 13,
+     "drops": 1,
+     "drops_s": 0.0002079779515042901,
+     "auto_ckpt": 8,
+     "auto_ckpt_s": 2.6404995128395967
+    },
+    "sweeping": {
+     "wal_writes": 20537,
+     "wal_writes_s": 20.630649761820678,
+     "auto_ckpt": 18,
+     "auto_ckpt_s": 9.981175968132447,
+     "explicit_ckpt": 9,
+     "explicit_ckpt_s": 3.648262029979378,
+     "explicit_ckpt_wal_shrank": 8,
+     "drops": 1,
+     "drops_s": 0.0007249700138345361
+    }
+   },
+   "code_dir": "/home/aditya/.cache/ab/branch379",
+   "phase_wall_s": {
+    "other": 0.05033904197625816,
+    "converging": 84.93288522097282,
+    "sweeping": 71.35828312300146
+   },
+   "audit": {
+    "divergence": 0,
+    "audit_error": null,
+    "graph_facts": 40473
+   },
+   "commit_entities": 432
+  }
+ }
+}

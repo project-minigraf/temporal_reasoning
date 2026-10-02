@@ -187,6 +187,11 @@ When the MCP server is configured and hooks are enabled, memory is managed autom
 
 - **Before each turn** — `memory_prepare_turn` is called with the user's message and the result is injected as `hookSpecificOutput.additionalContext` (a top-level `additionalContext` is silently ignored by Claude Code).
 - **After each turn** — `memory_finalize_turn` is called with the user+agent exchange; facts are extracted and stored.
+  While git ingestion is running, the hook cannot take the graph, so it **spools** the facts
+  (`<graph>.spool/`) and ingestion stores them within a couple of seconds, at the valid time they
+  were extracted. Until then a just-stated fact may not be returned by `minigraf_query` or the
+  next turn's retrieval. `minigraf_ingest_status` reports `hook_spool` (records drained this run)
+  and `handle_drops` (graph handle drops this run, each a full checkpoint).
 
 Extraction strategy is controlled by `MINIGRAF_EXTRACTION_STRATEGY` (env var):
 - `heuristic` (default) — regex signal detection, zero API calls
