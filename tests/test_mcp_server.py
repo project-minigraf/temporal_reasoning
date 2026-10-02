@@ -3517,6 +3517,45 @@ class TestGraphFormatVersion:
             mcp_server._graph_format_version_verify(real_db)
         mcp_server._graph_format_version_stamp_if_new(real_db, TS)
 
+    def test_every_format_version_names_what_it_changed(self):
+        """A bump without an entry would refuse with a reason-less line."""
+        import mcp_server
+        assert set(mcp_server._FORMAT_VERSION_CHANGES) == set(
+            range(1, mcp_server.GRAPH_FORMAT_VERSION + 1)
+        )
+
+    def test_refusal_names_only_the_changes_since_the_graphs_version(self, real_db):
+        """A 0.8.0 graph (version 1) is refused for #384, not #263 -- the old
+        message blamed the ident rule for every refusal."""
+        import mcp_server
+        mcp_server._transact(
+            real_db,
+            '[[:ingestion/format-version :entity-type :type/ingestion]'
+            ' [:ingestion/format-version :ident ":ingestion/format-version"]'
+            ' [:ingestion/format-version :description "graph format version"]'
+            ' [:ingestion/format-version :version 1]]',
+            TS,
+        )
+        assert mcp_server._graph_format_version_read(real_db) == 1
+        with pytest.raises(mcp_server.GraphFormatVersionError) as exc:
+            mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        msg = str(exc.value)
+        assert "version 1" in msg and "#384" in msg
+        assert "#263" not in msg
+        assert "FRESH graph path" in msg
+
+    def test_refusal_wording_per_stamp(self):
+        import mcp_server
+        current = mcp_server.GRAPH_FORMAT_VERSION
+        unstamped = mcp_server._graph_format_version_refusal(None)
+        assert "no version stamp" in unstamped
+        assert "#263" in unstamped and "#384" in unstamped
+        ahead = mcp_server._graph_format_version_refusal(current + 1)
+        assert "newer than this build" in ahead and "FRESH" not in ahead
+        corrupt = mcp_server._graph_format_version_refusal(-1)
+        assert "unreadable" in corrupt and "#263" not in corrupt
+
     def test_stamping_refuses_a_graph_that_already_has_ingestion_state(self, real_db):
         """What forces the stamp to be a run's FIRST write. If it could stamp a
         graph that already carries ingestion state, then a pre-#263 graph would
