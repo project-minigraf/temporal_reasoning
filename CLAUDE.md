@@ -2350,6 +2350,31 @@ wait; DB exec (108 -> 114 s) and drops (223 -> 199 s) barely moved, so Stage
 B's remaining cost is now the window boundary and policy checkpoints. No
 `GRAPH_FORMAT_VERSION` bump: nothing written changes.
 
+**A forward position's three "contiguous from C0" markers go down in ONE
+retract and ONE transact (#377).** `:ingestion/watermark`, frontier-low's
+moved bound + `:pos-count` and `:ingestion/lineage-confirmed-through` were
+three retract+transact pairs per forward position. They are now built by
+`_ingestion_marker_delta` / `_frontier_claim_delta` and written together in
+`_forward_apply`. Three distinct entities, so minigraf#287 cannot collapse
+them, and #342's "together or not at all" becomes atomic. `_watermark_update`,
+`_lineage_confirmed_through_update` and `_frontier_persist_claim` still exist
+for every other caller; a test that breaks the forward write phase patches
+`_ingestion_marker_delta`, not `_watermark_update`.
+
+**The issue's premise was measured before anything was built, and it was
+smaller than claimed.** `probe_sweep_retract_attribution.py` on full history at
+`b6fb093`: bookkeeping was 12.1% of Stage A write calls, 2.1% of Stage B's,
+0.7% of facts and 1.8 s of 55 s write exec — not "a large share" of the graph.
+The issue's "replay is cheap because of #326's skip" is also wrong (the skip
+is vestigial since #325). So cadence batching (deferring claims to a window
+flush) was DECLINED by the user: it would buy the other ~6% at the price of
+re-proving #326's per-interval floor, #342's ceiling and the end-of-walk span
+flush under deferral. The value is at scale, where minigraf's 1000-entry
+auto-checkpoint counts CALLS and is the dominant checkpoint term since #379.
+Measured (`results/377-forward-bookkeeping-batch.json`): Stage A write calls
+14,354 -> 13,488 (-6.0%), Stage B unchanged, current facts identical
+(40,817 = 40,817, only `:last-run-at` differs). No `GRAPH_FORMAT_VERSION` bump.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.

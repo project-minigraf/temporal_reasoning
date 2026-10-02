@@ -1,0 +1,36 @@
+{
+  "issue": 377,
+  "ref": "b6fb093c9d94cd8360c1f045d9e800e4c68fa5ed",
+  "minigraf_version": "2.0.2",
+  "python_version": "3.14.7",
+  "instrument": "evals/at_scale/probe_sweep_retract_attribution.py run, full history, master tree vs branch tree, one run each (call COUNTS are deterministic; wall is not compared)",
+  "write_calls_by_phase": {
+    "master": {
+      "converging": 14354,
+      "sweeping": 20980
+    },
+    "branch": {
+      "converging": 13488,
+      "sweeping": 20980
+    }
+  },
+  "write_calls_total": {
+    "master": 35334,
+    "branch": 34468
+  },
+  "final_status": {
+    "master": "complete",
+    "branch": "complete"
+  },
+  "current_fact_parity": {
+    "master": 40817,
+    "branch": 40817,
+    "differences": "only :ingestion/last-run-at"
+  },
+  "pre_fix_bookkeeping_share_master": {
+    "stage_a_calls": "1730 of 14354 (12.1%)",
+    "stage_b_calls": "433 of 20980 (2.1%)",
+    "facts": "3042 of 444634 (0.7%)",
+    "write_exec": "1.8 s of 55.4 s"
+  }
+}
