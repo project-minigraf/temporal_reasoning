@@ -27812,6 +27812,134 @@ class TestRebirthInsideReverseRegion:
                 assert seen == want, f"{name}: {ident} lives {seen}, expected {want}"
 
 
+class TestStageBResumeReanchorsWalkState:
+    """#393: Stage B resumed mid-region must walk on from the state its
+    previous run left, not from the forward watermark's.
+
+    Stage B's lifecycle pass (_forward_apply(lifecycle_only=True)) mutates
+    the same _ForwardWalkState dicts the forward walk does, at every position
+    it sweeps. A resumed run preloads that state at :ingestion/watermark,
+    which sits BELOW the reverse region, while the sweep resumes at
+    :ingestion/correction-sweep-through + 1. Every position swept in between
+    was missing from the state: the first later commit touching a file whose
+    imports changed there re-diffed against the stale edge set and wrote the
+    same [module :depends-on dep] again at its own date -- two live rows,
+    #156's shape. A graceful shutdown reaches it; a SIGKILL is not needed.
+    """
+
+    def _parity(self):
+        return TestMultiStreamParityWithForwardOnly()
+
+    async def _ingest_stopping_after_sweep(self, h, repo, graph, monkeypatch, ratio, stop_after):
+        """Run to `stop_after` fully swept Stage B commits, then shut down."""
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph))
+        h._reset_progress()
+        real = mcp_server._correction_sweep_through_update
+        calls = {"n": 0}
+
+        def stopping(*args, **kwargs):
+            out = real(*args, **kwargs)
+            calls["n"] += 1
+            if calls["n"] == stop_after:
+                mcp_server._shutdown_requested.set()
+            return out
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_through_update", stopping)
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+        finally:
+            monkeypatch.setattr(mcp_server, "_correction_sweep_through_update", real)
+        assert mcp_server._ingest_progress["status"] == "stopped", mcp_server._ingest_progress
+        assert calls["n"] == stop_after, "the run never swept that far -- this stop proves nothing"
+        mcp_server._reset_db_state()
+
+    async def _every_sweep_stop_matches_forward_only(self, repo, tmp_path, monkeypatch, ratio):
+        import mcp_server
+        h = self._parity()
+        forward_only = tmp_path / "fwd.graph"
+        await h._ingest(repo, forward_only, monkeypatch, f"{10**6}:1")
+
+        real = mcp_server._correction_sweep_through_update
+        swept = {"n": 0}
+
+        def counting(*args, **kwargs):
+            swept["n"] += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_through_update", counting)
+        await h._ingest(repo, tmp_path / "count.graph", monkeypatch, ratio)
+        monkeypatch.setattr(mcp_server, "_correction_sweep_through_update", real)
+        assert swept["n"] >= 3, f"only {swept['n']} swept commits -- nothing to stop between"
+
+        reanchored = []
+        real_reanchor = mcp_server._forward_walk_state_reanchor
+
+        def spy(*args, **kwargs):
+            reanchored.append(args[-1])
+            return real_reanchor(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_walk_state_reanchor", spy)
+        for stop_after in range(1, swept["n"]):
+            graph = tmp_path / f"stop{stop_after}.graph"
+            await self._ingest_stopping_after_sweep(
+                h, repo, graph, monkeypatch, ratio, stop_after,
+            )
+            reanchored.clear()
+            await h._ingest(repo, graph, monkeypatch, ratio)
+            # Positive control: the resume really did start mid-region.
+            assert len(reanchored) == 1, (stop_after, reanchored)
+            # The issue's own symptom, named before the full oracle runs.
+            deps = h._query(graph, "(query [:find ?i ?v :where [?e :ident ?i] [?e :depends-on ?v]])")
+            assert len(deps) == len(set(deps)), (
+                f"stop after {stop_after}: duplicate live :depends-on rows "
+                f"{sorted(r for r in set(deps) if deps.count(r) > 1)}"
+            )
+            h._assert_parity(graph, forward_only)
+
+    @pytest.mark.asyncio
+    async def test_parity_fixture_at_1_3(self, tmp_path, monkeypatch):
+        """The issue's reproduction: duplicate :depends-on. 1:3, because at
+        1:1 this fixture's reverse region holds no import change followed by
+        a later commit touching the same file."""
+        repo = self._parity()._repo(tmp_path)
+        await self._every_sweep_stop_matches_forward_only(repo, tmp_path, monkeypatch, "1:3")
+
+    @pytest.mark.asyncio
+    async def test_rebirth_fixture_at_1_1(self, tmp_path, monkeypatch):
+        """Not only edges: a stale file_entities/entity_valid_from made the
+        resumed lifecycle pass miss closes and rebirths. On master every
+        stop point here failed -- wrong :introduced-by on the reborn
+        entities, and a lost :depends-on."""
+        repo = TestRebirthInsideReverseRegion()._repo(tmp_path)
+        await self._every_sweep_stop_matches_forward_only(repo, tmp_path, monkeypatch, "1:1")
+
+    @pytest.mark.asyncio
+    async def test_an_uninterrupted_run_never_reanchors(self, tmp_path, monkeypatch):
+        """The sweep starts at region_lo on a run that was not interrupted
+        mid-sweep, where the walk state is already the right one."""
+        import mcp_server
+        h = self._parity()
+        repo = h._repo(tmp_path)
+        calls = []
+        real = mcp_server._forward_walk_state_reanchor
+        monkeypatch.setattr(
+            mcp_server, "_forward_walk_state_reanchor",
+            lambda *a, **kw: calls.append(a[-1]) or real(*a, **kw),
+        )
+        swept = []
+        real_update = mcp_server._correction_sweep_through_update
+        monkeypatch.setattr(
+            mcp_server, "_correction_sweep_through_update",
+            lambda *a, **kw: swept.append(a[1]) or real_update(*a, **kw),
+        )
+        await h._ingest(repo, tmp_path / "m.graph", monkeypatch, "1:3")
+        assert swept, "Stage B swept nothing -- this run proves nothing about it"
+        assert calls == []
+
+
 class TestDuplicateNameInOneFile:
     """#351: one file defining one name twice -- a method name shared by
     several classes, a redefined function, a class-level attribute that

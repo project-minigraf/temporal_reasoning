@@ -557,6 +557,30 @@ and 15/141 -> 7/118 (1:3); the 7 left are all #393's `:depends-on`, none new.
 writes, and end to end inside a `legacy.py` close; both are red without the
 fix. The public close (`_retract_closing_at`) still retracts per triple.
 
+**Stage B resumed mid-region re-anchors the walk state (#393).** Stage B's
+lifecycle pass mutates the same `_ForwardWalkState` the forward walk does,
+at every position it sweeps, but a resumed run preloaded that state at
+`:ingestion/watermark` -- below the reverse region -- while the sweep resumed
+at `:ingestion/correction-sweep-through + 1`. Every position swept in between
+was missing from the state. The issue saw only its mildest symptom (a
+later commit touching a file whose imports changed there re-diffed against
+the stale edge set and wrote the same `:depends-on` again at its own date,
+#156's duplicate), and blamed a SIGKILL inside the sweep's non-atomic unit.
+Neither was the mechanism: a plain graceful shutdown between two fully swept
+commits reproduces it, and on `TestRebirthInsideReverseRegion`'s fixture
+every stop point at 1:1 (5/5, and 5/8 at 1:3) left wrong `:introduced-by` on
+reborn entities or LOST a `:depends-on` -- stale `file_entities` /
+`entity_valid_from` made the resumed pass miss closes and rebirths. Stage B
+now calls `_forward_walk_state_reanchor` once, when its first plan selects a
+start above `region_lo`, which re-reads the state at the last swept commit
+through the same `_preload_walk_state_at` the run-start preload uses (that this
+equals the state an uninterrupted sweep carries is MEASURED by the parity
+oracle below, not proven). An uninterrupted run never takes it. The kill sweep
+went 0/102 (1:1) and 7/118 -> 0/118 (1:3); `TestStageBResumeReanchorsWalkState`
+stops after every swept commit of both fixtures, and a no-op reanchor reddens
+each test on its own defect. No format bump: existing graphs are not
+repaired.
+
 **R3's zero ident collisions is MEASURED, never proven — and #267 is what keeps
 measuring it.** `_canonical_ident`'s rule (keep `_`, drop the hyphen-run
 collapse) was chosen over R4's hash suffix in full knowledge that a contrived

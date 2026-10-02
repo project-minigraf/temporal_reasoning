@@ -11874,7 +11874,6 @@ def _load_ingestion_preload_state(
                     "keep lengths equal while permuting hashes"
                 )
         hash_to_pos = {h: i for i, h in enumerate(linearization)}
-        watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
 
         # #391: no watermark AND no frontier-low means the forward walk starts
         # at C0, so the graph "as it stood at the resume position" is the graph
@@ -11914,100 +11913,126 @@ def _load_ingestion_preload_state(
                 submodule_paths, {},
             )
 
-        # #238/#245: two DIFFERENT bounds now, deliberately.
-        #
-        # resume_valid_at is ts(W), the watermark commit's own :date. As of #245,
-        # :depends-on and :pinned-commit are ALSO position-filtered -- both via
-        # the inversion of their own :db/valid-from/:db/valid-to, the same
-        # mechanism entities use, not by adopting the envelope as their date
-        # bound. resume_valid_at survives only for two callers:
-        # _preload_unresolved_dep_idents (position-unaware by design, see its own
-        # docstring), and as the degraded-path bound _preload_known_deps /
-        # _preload_pinned_commits fall back to when watermark_pos is None (see
-        # the t_hi_ms guard ~12 lines below). It is no longer true that deps/pins
-        # "admit no position clause" -- see how ts_positions/watermark_pos/
-        # t_hi_ms are threaded into both calls below.
-        #
-        # entity_valid_at is the monotone envelope T_hi(W) = max(ts[0..W]), which
-        # is safe only because _preload_known_entities pairs it with the
-        # conjunctive position clause below. A None watermark_pos (fresh graph, or
-        # a watermark absent from this linearization -- a rewritten history)
-        # degrades both to the pre-#222 unrestricted queries rather than to an
-        # empty state.
-        resume_valid_at = _commit_date_query(db, watermark)
-        resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
-        ts_positions = _build_ts_positions(commit_metadata)
-
-        # #238/#245: membership at all four sites is decided by POSITION.
-        #
-        # t_hi_ms is derived from _resume_envelope BEFORE entity_valid_at's
-        # fallback below, and stays None whenever watermark_pos is None. That
-        # guard is load-bearing: a watermark that exists but is absent from this
-        # linearization leaves resume_valid_at a real ts(W) while disabling the
-        # position filter, and letting that become t_hi_ms would hand the deps and
-        # pins queries a WIDENED prefilter with no position clause -- exactly the
-        # widening #245 forbids. With t_hi_ms None they keep the ts(W) date
-        # window, which is strictly no worse than today.
-        #
-        # resume_valid_at (the ISO string) survives for _preload_unresolved_dep_idents
-        # only. resume_valid_at_ms (derived above) is different: it remains the
-        # degraded-path bound for _preload_known_deps and _preload_pinned_commits,
-        # used whenever position_mode is off in either.
-        entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
-        t_hi_ms = _iso_to_epoch_ms(entity_valid_at)
-        assert watermark_pos is not None or t_hi_ms is None, (
-            "t_hi_ms must stay None whenever watermark_pos is None -- callees "
-            "only read t_hi_ms inside their own position_mode branch, which "
-            "already requires watermark_pos is not None (#245); a non-None "
-            "t_hi_ms here would hand a widened prefilter to a callee with its "
-            "position filter off, exactly the 'add-back union' #238 forbids"
-        )
-        if entity_valid_at is None:
-            entity_valid_at = resume_valid_at
-        position_stats: Dict[str, int] = {}
-        prior_ingested = _count_commit_entities(db)
-        (
-            entity_valid_from, entity_descriptions, entity_introduced_by,
-            file_entities, submodule_paths,
-        ) = _preload_known_entities(
-            db, repo_path, valid_at=entity_valid_at,
-            hash_to_pos=hash_to_pos, watermark_pos=watermark_pos,
-            ts_positions=ts_positions, t_hi_ms=t_hi_ms, stats=position_stats,
-        )
-        file_deps, dep_valid_from = _preload_known_deps(
-            db, file_entities, valid_at_ms=resume_valid_at_ms,
-            ts_positions=ts_positions, watermark_pos=watermark_pos,
-            t_hi_ms=t_hi_ms, stats=position_stats,
-        )
-        pinned_commit_state = _preload_pinned_commits(
-            db, valid_at_ms=resume_valid_at_ms,
-            ts_positions=ts_positions, watermark_pos=watermark_pos,
-            t_hi_ms=t_hi_ms, stats=position_stats,
-        )
-        _announce_unplaceable_facts(position_stats)
-        field_class_ident = _preload_field_class_idents(db)
-        field_static_ident = _preload_field_static_idents(db)
-        # Independent of _preload_known_entities' bound now (#238): the subtrahend
-        # is that function's own unbounded :path query, so stub classification no
-        # longer moves with the resume position. Keeps ts(W), not the envelope --
-        # see its docstring for why narrower is safer for this set.
-        unresolved_dep_idents = _preload_unresolved_dep_idents(
-            db, valid_at=resume_valid_at,
-        )
-        # No provisional-ident preload (#235): the forward walk's reconciliation
-        # gate is _lineage_is_provisional(db, ident), queried per ident at the
-        # moment it matters. A run-start snapshot cannot serve that purpose -- it
-        # is empty on a fresh ingest, where Stream 2 writes its guesses during
-        # this same run -- so preloading one only invites a future maintainer to
-        # re-derive a gate from it. _preload_provisional_idents still exists for
-        # whole-graph assertions ("no markers left after a full ingest"); it is
-        # deliberately not part of the walk's state.
         return (
-            watermark, prior_ingested, entity_valid_from, entity_descriptions,
-            entity_introduced_by, file_entities, file_deps, dep_valid_from,
-            pinned_commit_state, field_class_ident, field_static_ident,
-            submodule_paths, unresolved_dep_idents,
+            watermark, _count_commit_entities(db),
+            *_preload_walk_state_at(db, repo_path, commit_metadata, hash_to_pos, watermark),
         )
+
+
+def _preload_walk_state_at(
+    db: Any,
+    repo_path: str,
+    commit_metadata: List[Tuple[str, str, str, str]],
+    hash_to_pos: Dict[str, int],
+    watermark: Optional[str],
+) -> tuple:
+    """The forward walk's preload dicts, read from the graph as it stood at
+    `watermark` -- everything _load_ingestion_preload_state returns after
+    (watermark, prior_ingested), in the same order.
+
+    Two callers, two anchors. _load_ingestion_preload_state anchors at
+    :ingestion/watermark, where the forward walk resumes. Stage B anchors at
+    :ingestion/correction-sweep-through when it resumes mid-region (#393):
+    its lifecycle pass mutated the same dicts at every position it swept, so
+    a state read at the forward watermark is missing exactly those positions'
+    effects, and the first later commit touching such a file re-adds a
+    :depends-on edge already in the graph, at a different valid-from.
+    """
+    watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
+
+    # #238/#245: two DIFFERENT bounds now, deliberately.
+    #
+    # resume_valid_at is ts(W), the watermark commit's own :date. As of #245,
+    # :depends-on and :pinned-commit are ALSO position-filtered -- both via
+    # the inversion of their own :db/valid-from/:db/valid-to, the same
+    # mechanism entities use, not by adopting the envelope as their date
+    # bound. resume_valid_at survives only for two callers:
+    # _preload_unresolved_dep_idents (position-unaware by design, see its own
+    # docstring), and as the degraded-path bound _preload_known_deps /
+    # _preload_pinned_commits fall back to when watermark_pos is None (see
+    # the t_hi_ms guard ~12 lines below). It is no longer true that deps/pins
+    # "admit no position clause" -- see how ts_positions/watermark_pos/
+    # t_hi_ms are threaded into both calls below.
+    #
+    # entity_valid_at is the monotone envelope T_hi(W) = max(ts[0..W]), which
+    # is safe only because _preload_known_entities pairs it with the
+    # conjunctive position clause below. A None watermark_pos (fresh graph, or
+    # a watermark absent from this linearization -- a rewritten history)
+    # degrades both to the pre-#222 unrestricted queries rather than to an
+    # empty state.
+    resume_valid_at = _commit_date_query(db, watermark)
+    resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
+    ts_positions = _build_ts_positions(commit_metadata)
+
+    # #238/#245: membership at all four sites is decided by POSITION.
+    #
+    # t_hi_ms is derived from _resume_envelope BEFORE entity_valid_at's
+    # fallback below, and stays None whenever watermark_pos is None. That
+    # guard is load-bearing: a watermark that exists but is absent from this
+    # linearization leaves resume_valid_at a real ts(W) while disabling the
+    # position filter, and letting that become t_hi_ms would hand the deps and
+    # pins queries a WIDENED prefilter with no position clause -- exactly the
+    # widening #245 forbids. With t_hi_ms None they keep the ts(W) date
+    # window, which is strictly no worse than today.
+    #
+    # resume_valid_at (the ISO string) survives for _preload_unresolved_dep_idents
+    # only. resume_valid_at_ms (derived above) is different: it remains the
+    # degraded-path bound for _preload_known_deps and _preload_pinned_commits,
+    # used whenever position_mode is off in either.
+    entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
+    t_hi_ms = _iso_to_epoch_ms(entity_valid_at)
+    assert watermark_pos is not None or t_hi_ms is None, (
+        "t_hi_ms must stay None whenever watermark_pos is None -- callees "
+        "only read t_hi_ms inside their own position_mode branch, which "
+        "already requires watermark_pos is not None (#245); a non-None "
+        "t_hi_ms here would hand a widened prefilter to a callee with its "
+        "position filter off, exactly the 'add-back union' #238 forbids"
+    )
+    if entity_valid_at is None:
+        entity_valid_at = resume_valid_at
+    position_stats: Dict[str, int] = {}
+    (
+        entity_valid_from, entity_descriptions, entity_introduced_by,
+        file_entities, submodule_paths,
+    ) = _preload_known_entities(
+        db, repo_path, valid_at=entity_valid_at,
+        hash_to_pos=hash_to_pos, watermark_pos=watermark_pos,
+        ts_positions=ts_positions, t_hi_ms=t_hi_ms, stats=position_stats,
+    )
+    file_deps, dep_valid_from = _preload_known_deps(
+        db, file_entities, valid_at_ms=resume_valid_at_ms,
+        ts_positions=ts_positions, watermark_pos=watermark_pos,
+        t_hi_ms=t_hi_ms, stats=position_stats,
+    )
+    pinned_commit_state = _preload_pinned_commits(
+        db, valid_at_ms=resume_valid_at_ms,
+        ts_positions=ts_positions, watermark_pos=watermark_pos,
+        t_hi_ms=t_hi_ms, stats=position_stats,
+    )
+    _announce_unplaceable_facts(position_stats)
+    field_class_ident = _preload_field_class_idents(db)
+    field_static_ident = _preload_field_static_idents(db)
+    # Independent of _preload_known_entities' bound now (#238): the subtrahend
+    # is that function's own unbounded :path query, so stub classification no
+    # longer moves with the resume position. Keeps ts(W), not the envelope --
+    # see its docstring for why narrower is safer for this set.
+    unresolved_dep_idents = _preload_unresolved_dep_idents(
+        db, valid_at=resume_valid_at,
+    )
+    # No provisional-ident preload (#235): the forward walk's reconciliation
+    # gate is _lineage_is_provisional(db, ident), queried per ident at the
+    # moment it matters. A run-start snapshot cannot serve that purpose -- it
+    # is empty on a fresh ingest, where Stream 2 writes its guesses during
+    # this same run -- so preloading one only invites a future maintainer to
+    # re-derive a gate from it. _preload_provisional_idents still exists for
+    # whole-graph assertions ("no markers left after a full ingest"); it is
+    # deliberately not part of the walk's state.
+    return (
+        entity_valid_from, entity_descriptions,
+        entity_introduced_by, file_entities, file_deps, dep_valid_from,
+        pinned_commit_state, field_class_ident, field_static_ident,
+        submodule_paths, unresolved_dep_idents,
+    )
 
 
 # Tag attributes whose value is a keyword reference, not an EDN string literal
@@ -15322,6 +15347,26 @@ class _ForwardWalkState:
     entity_introduced_by: Dict[str, str] = field(default_factory=dict)
 
 
+def _forward_walk_state_reanchor(
+    db: Any,
+    repo_path: str,
+    state: _ForwardWalkState,
+    commit_metadata: List[Tuple[str, str, str, str]],
+    hash_to_pos: Dict[str, int],
+    anchor: str,
+) -> None:
+    """Replace `state`'s preload dicts, in place, with the graph as it stood
+    at `anchor` (#393). ts_by_commit_ident is full-history and does not
+    depend on the anchor, so it is kept."""
+    (
+        state.entity_valid_from, state.entity_descriptions,
+        state.entity_introduced_by, state.file_entities, state.file_deps,
+        state.dep_valid_from, state.pinned_commit_state,
+        state.field_class_ident, state.field_static_ident,
+        state.submodule_paths, state.unresolved_dep_idents,
+    ) = _preload_walk_state_at(db, repo_path, commit_metadata, hash_to_pos, anchor)
+
+
 def _build_run_progress(
     linearization: List[str],
     allocator: "frontier_registry.FrontierAllocator",
@@ -16523,6 +16568,21 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     run_progress.sweep_planned(
                                         nxt.reason, nxt.region_lo, nxt.start_pos, nxt.ceiling_pos,
                                     )
+                                    if nxt.selected is not None and nxt.start_pos > nxt.region_lo:
+                                        # #393: resuming mid-region. A previous run's
+                                        # lifecycle pass already swept region_lo..
+                                        # start_pos-1 and mutated the walk state as it
+                                        # went, but `state` was preloaded at the forward
+                                        # watermark, below region_lo. Re-anchor it where
+                                        # the sweep actually resumes, or the first later
+                                        # commit touching such a file re-diffs against a
+                                        # stale edge set and re-adds a :depends-on edge
+                                        # at a different valid-from (#156's duplicate).
+                                        await loop.run_in_executor(
+                                            write_executor, _forward_walk_state_reanchor,
+                                            db, repo_path, state, commit_metadata,
+                                            hash_to_pos, linearization[nxt.start_pos - 1],
+                                        )
                                 while not _shutdown_requested.is_set():
                                     if nxt.selected is None:
                                         run_progress.sweep_ended(nxt.reason)
