@@ -11850,6 +11850,44 @@ def _load_ingestion_preload_state(
         hash_to_pos = {h: i for i, h in enumerate(linearization)}
         watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
 
+        # #391: no watermark AND no frontier-low means the forward walk starts
+        # at C0, so the graph "as it stood at the resume position" is the graph
+        # before C0: nothing known. That is not only a fresh graph. A kill
+        # inside p0's write, before its first marker, or between the retract
+        # and the transact of a later forward position's marker rewrite (#377
+        # made it one of each) leaves facts in the graph and neither marker.
+        # The unbounded read this used to fall through to then marks every
+        # entity already written as known -- the "wrongly INCLUDED" direction
+        # _preload_known_entities calls unrecoverable: the replay takes no
+        # introduction, loses [module :contains fn], and writes :modified-in
+        # at each entity's own introducing commit. Replaying from the fresh
+        # state is what an uninterrupted run did: its forward writes land at
+        # identical valid-from and collapse, and reverse-stream entities are
+        # reconciled per ident through _lineage_is_provisional, exactly as
+        # when both streams start on an empty graph.
+        #
+        # A watermark that EXISTS but does not resolve (a rewritten history)
+        # is a different None and keeps the unbounded read: there the live
+        # entities of the old chain must read as known for the replay to
+        # close them.
+        if watermark is None and _frontier_read_bounds(db, _FRONTIER_LOW_IDENT) is None:
+            # Position -1 rejects every entity row and keeps the ls-files
+            # seed, which is _preload_known_entities' answer on an empty graph.
+            entity_valid_from, entity_descriptions, entity_introduced_by, file_entities, submodule_paths = (
+                _preload_known_entities(
+                    db, repo_path, hash_to_pos=hash_to_pos, watermark_pos=-1,
+                )
+            )
+            return (
+                watermark, _count_commit_entities(db), entity_valid_from,
+                entity_descriptions, entity_introduced_by, file_entities,
+                {}, {}, {},
+                # Unbounded by design even on an ordinary resume (see their
+                # docstrings): side tables an extra entry cannot mislead.
+                _preload_field_class_idents(db), _preload_field_static_idents(db),
+                submodule_paths, {},
+            )
+
         # #238/#245: two DIFFERENT bounds now, deliberately.
         #
         # resume_valid_at is ts(W), the watermark commit's own :date. As of #245,

@@ -23207,6 +23207,84 @@ class TestProvisionalGuessAndMarkerAreOneWrite:
         h._assert_parity(multi, forward_only)
 
 
+class TestAbsentWatermarkReplaysFromAFreshPreload:
+    """#391: a graph holding ingested facts but NO watermark and no
+    frontier-low is what two kills leave behind -- one inside position 0's
+    write, before its first marker exists, and one between the retract and
+    the transact of a later forward position's marker rewrite (#377 made
+    that one retract plus one transact). Either way the forward walk restarts
+    at C0, and the preload used to read the absent watermark as "fresh graph"
+    and run UNBOUNDED, so every entity already written read as known: the
+    replay never took an introduction, lost its [module :contains fn] edges
+    and wrote :modified-in at each entity's own introducing commit.
+
+    The kill is aimed at the n-th transact that writes :ingestion/watermark,
+    so n=1 is p0's first marker write and n=2 is the transact half of p1's
+    rewrite, whose retract has already landed.
+    """
+
+    @staticmethod
+    def _kill_at_watermark_write(monkeypatch, nth):
+        import mcp_server
+
+        real_t, real_r = mcp_server._transact, mcp_server._retract
+        state = {"seen": 0, "fired": False}
+
+        def transact(db, facts, *a, **kw):
+            if state["fired"]:
+                raise _HardKill()
+            if ":ingestion/watermark :hash" in facts:
+                state["seen"] += 1
+                if state["seen"] == nth:
+                    state["fired"] = True
+                    raise _HardKill()
+            return real_t(db, facts, *a, **kw)
+
+        def retract(*a, **kw):
+            if state["fired"]:
+                raise _HardKill()
+            return real_r(*a, **kw)
+
+        monkeypatch.setattr(mcp_server, "_transact", transact)
+        monkeypatch.setattr(mcp_server, "_retract", retract)
+        return state
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("nth", [1, 2])
+    async def test_resumed_ingest_matches_forward_only(self, tmp_path, monkeypatch, nth):
+        import mcp_server
+
+        h = TestMultiStreamParityWithForwardOnly()
+        repo = h._repo(tmp_path)
+        forward_only = tmp_path / "fwd.graph"
+        multi = tmp_path / "multi.graph"
+        await h._ingest(repo, forward_only, monkeypatch, f"{10**6}:1")
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(multi))
+        h._reset_progress()
+        with monkeypatch.context() as mp:
+            fired = self._kill_at_watermark_write(mp, nth)
+            with pytest.raises(_HardKill):
+                await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._reset_db_state()
+        assert fired["fired"], "the kill never reached a watermark write"
+
+        # Positive control: the kill left the state this test is about -- facts
+        # written, no watermark, no frontier-low. Without it the resume below
+        # is an ordinary one and passes vacuously.
+        mcp_server.open_db(str(multi))
+        with mcp_server.db_lease() as db:
+            assert mcp_server._watermark_query(db) is None
+            assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) is None
+            assert mcp_server._count_commit_entities(db) > 0
+        mcp_server._reset_db_state()
+
+        await h._ingest(repo, multi, monkeypatch, "1:1")
+        h._assert_parity(multi, forward_only)
+
+
 class TestSkipFastPathDoesNotSkipTornWrites:
     """#326 acceptance test 2, and the one that matters. A fast path whose
     predicate quietly matched nothing would pass the skip test by doing no
