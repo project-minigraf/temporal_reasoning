@@ -160,21 +160,27 @@ Turn-by-turn automatic memory injection and extraction (Phase 3) is the right di
 2. **Extraction corrupts memory** — the post-turn extractor is itself an LLM call and can hallucinate. A misread sarcastic remark becomes a permanent fact that compounds across future turns.
 3. **Latency and cost** — each turn triggers at minimum two additional LLM calls (prepare + finalize); without parallelism and model-tier selection this doubles per-turn cost.
 4. **Trust and consent** — users may not know which parts of their messages are stored, or be able to inspect or correct the stored form.
+5. **Invisible value**: the hooks work silently. Prepare-turn context reaches the model through `additionalContext` but is never shown to the user, and finalize-turn reports nothing. A user cannot see what memory did on a turn, or whether it helped, so the plugin looks like it does nothing even when it works.
 
 The bi-temporal model partially addresses (2): wrong facts can be retracted without losing audit history, and point-in-time queries can recover the pre-corruption state. But structural observability tooling is still needed before this pattern is appropriate in any hosted or multi-user deployment.
 
 ### Proposed work
 
-- **Injection trace logging** — for each `memory_prepare_turn` call, log which facts were retrieved, how they were ranked, and how they were formatted. Queryable via a `memory_audit_query` tool.
+- **Injection trace logging** — for each `memory_prepare_turn` call, log which facts were retrieved, how they were ranked, and how they were formatted. Queryable via a `memory_trace` tool. (Earlier drafts called this `memory_audit_query`; renamed so it is not confused with `minigraf_audit`, the schema check.)
 - **Extraction confidence tagging** — tag every auto-extracted datom with `{:source "heuristic"|"llm"|"agent", :confidence 0.0–1.0, :model "...", :turn N}`. Low-confidence datoms can be auto-flagged for review rather than silently committed.
 - **Provisional extraction mode** — store extracted facts in a staging namespace (`:staged/...`) for a configurable number of turns before promoting to permanent; reversals during the staging window are low-cost.
 - **Periodic correction pass** — a background task (or agent-invocable tool) that scans recent extractions for internal contradictions and flags them. Leverages the bi-temporal graph's ability to show the full history of an entity's values.
 - **User-visible memory summary** — a `memory_summarize` tool that returns a human-readable summary of what is currently known about the session, queryable by topic, so users can spot and correct errors.
+- **Per-turn status line and usage stats**: show the user a short line each turn (facts injected, stored, retracted), measure whether the agent referred to injected facts, and expose session totals through a `memory_stats` tool and a `stats` plugin command.
 - **Scoped injection** — allow `memory_prepare_turn` to be restricted to specific namespaces or entity types (e.g. `:decision/...` only, not `:user-preference/...`) to limit the blast radius of bad extractions.
 
 ### When this matters
 
-For a local single-user developer tool (the current Phase 5 target), stored data stays on the user's machine, the user can inspect the `.graph` file directly, and wrong facts can be corrected manually. The risk profile is manageable without this work. For any hosted or multi-tenant deployment the observability layer is a prerequisite. Phase 5 git ingestion clarified the actual observability pain points and this phase will be designed in detail after Phase 5 production use.
+There are two reasons to do this work, and they apply to different deployments.
+
+**Adoption (local single-user, today).** For a local developer tool, stored data stays on the user's machine, the user can inspect the `.graph` file directly, and wrong facts can be corrected manually, so the safety risk is manageable. But if the user cannot see what memory injected, what it stored, or whether the agent used it, the plugin has no visible value. Visibility is therefore needed now, not only for hosted use. The first slice (status line, `memory_trace`, usage signal, provenance tags, `memory_summarize`, `stats` command, session report) is tracked in #401. Plugin commands for the existing tools, starting with git ingestion, follow in #402.
+
+**Safety (hosted or multi-tenant, later).** For any hosted or multi-tenant deployment the full observability layer is a prerequisite, including confidence scores, provisional extraction, the correction pass and scoped injection. These stay deferred until after the #401 slice and Phase 5 production use.
 
 ## Backlog (unscheduled)
 
