@@ -3890,7 +3890,7 @@ async def _db_lease_async_committing_index(loop, write_executor, index_con):
     then fails "database is locked" and is swallowed by
     _index_write, so the fact is in the graph and missing from the index --
     a #302 divergence. Reproduced 2 of 2 at shipped defaults (100 commits)
-    before this existed; see CLAUDE.md, "Stage B now yields its lease".
+    before this existed; see docs/design-notes.md, "Stage B now yields its lease".
 
     The commit sits INSIDE the lease and after the window's last
     _correction_sweep_through_update, so a window still ends only between
@@ -9006,7 +9006,7 @@ def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
 
     So an entity left corrupt by a COMPLETED run stays corrupt, and no amount
     of re-ingestion changes that: the graph must be REBUILT into a fresh graph
-    path (CLAUDE.md's standing decision). evals/at_scale/introduced_by_audit.py
+    path (docs/design-notes.md's standing decision). evals/at_scale/introduced_by_audit.py
     is how a graph is asked whether it is in that state.
 
     The warning is rate-capped per run (_INTRODUCED_BY_AMBIGUITY_LOG_CAP);

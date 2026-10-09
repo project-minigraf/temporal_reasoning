@@ -439,7 +439,7 @@ def _orphan_introduced_by_row(metrics: dict[str, Any]) -> str:
 
     The clean rendering carries the DENOMINATOR, not a bare 0. A check that
     matched no code entities would also report 0 entities, so "0" alone is not
-    evidence; "0 of 3150 code entities" is. That is the half CLAUDE.md
+    evidence; "0 of 3150 code entities" is. That is the half docs/design-notes.md
     requires alongside a measured baseline before a zero-tolerance gate is
     believed, and putting it in the row means every run re-states it.
 

@@ -1204,7 +1204,7 @@ class TestResolveGraphPath:
             assert path.parent.is_dir()
 
     def test_refuses_an_existing_path(self, tmp_path):
-        """CLAUDE.md's standing rule: graphs are rebuilt, never re-ingested in
+        """docs/design-notes.md's standing rule: graphs are rebuilt, never re-ingested in
         place. run_ingestion_benchmark's docstring states the same
         precondition; this enforces it."""
         target = tmp_path / "already.graph"

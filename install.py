@@ -145,7 +145,7 @@ def check_python_version():
     No ceiling, deliberately. CI covers every released interpreter from the floor
     up (.github/workflows/pytest.yml), so refusing to install on a newer one
     would cost a working install to buy nothing. See "Python Version Support" in
-    CLAUDE.md.
+    docs/design-notes.md.
     """
     if sys.version_info < (3, 10):
         print(f"ERROR: Python 3.10+ required, "

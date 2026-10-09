@@ -259,7 +259,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
     if args.ref == "HEAD":
-        print("refusing a literal HEAD ref (CLAUDE.md, #330)", file=sys.stderr)
+        print("refusing a literal HEAD ref (docs/design-notes.md, #330)", file=sys.stderr)
         return 2
     return _arm(args)
 

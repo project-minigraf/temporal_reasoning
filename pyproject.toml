@@ -11,7 +11,7 @@ license = {text = "MIT"}
 # Deliberately unbounded above, and the bound below is the real claim: every
 # released interpreter from 3.10 up is exercised by .github/workflows/pytest.yml
 # and the classifiers below list exactly that set. See "Python Version Support"
-# in CLAUDE.md for why an unbounded ceiling is the honest choice here and what
+# in docs/design-notes.md for why an unbounded ceiling is the honest choice here and what
 # to do when a new interpreter ships (#331).
 requires-python = ">=3.10"
 authors = [

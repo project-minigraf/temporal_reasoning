@@ -357,7 +357,7 @@ class TestTheScannedDenominatorIsReported:
     """The positive control, IN THE ARTIFACT rather than in one afternoon's
     measurement.
 
-    CLAUDE.md's standing requirement for a zero-tolerance gate is that its
+    docs/design-notes.md's standing requirement for a zero-tolerance gate is that its
     clean baseline is measured AND its positive control checked -- a check
     that matched no entities at all also reports 0. Reporting the denominator
     means every future run re-proves the check scanned something, instead of

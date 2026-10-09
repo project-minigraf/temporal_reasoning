@@ -616,7 +616,7 @@ def resolve_graph_path(graph_path_arg: Optional[str]):
 
     Refuses an existing path -- and, as of the #256 review round, its
     sidecars too. run_ingestion_benchmark's own docstring states the
-    no-preexisting-path precondition, and CLAUDE.md's standing rule is that
+    no-preexisting-path precondition, and docs/design-notes.md's standing rule is that
     graphs are rebuilt into a fresh path, never re-ingested in place --
     re-running over an existing file repairs nothing and silently doubles
     the history. Checking only the main graph file missed that minigraf also

@@ -97,7 +97,7 @@ completes.
 WHY THE PROBE'S OWN `ok` IS `repo_vs_graph`, NOT collect_commit_census's --
 A CONTROLLER RULING, not this file's own design choice. Two earlier stated
 reasons for this were wrong; the mechanism is the one already measured in
-CLAUDE.md's #326 section (`walk_vs_graph` is nonzero on ANY resume that
+docs/design-notes.md's #326 section (`walk_vs_graph` is nonzero on ANY resume that
 touches already-ingested territory, skip or no skip -- measured 10 with the
 fast path against 9 without). `commit_census`'s `ok` gates on
 `ident_collisions`, `walk_vs_graph` (always) and `repo_vs_walk` (when
@@ -350,7 +350,7 @@ async def run_resume_census(
     # archived `:type/completed-region` without parsing or writing it) --
     # and after #325 that path is narrowed to the unresolvable-bounds
     # ("divergent-ref leak") case, mutually exclusive within one run with
-    # what this probe's own resume can ever produce (see CLAUDE.md's "#326's
+    # what this probe's own resume can ever produce (see docs/design-notes.md's "#326's
     # skip fast path is now VESTIGIAL" paragraph). The measured baseline
     # (results/325-resume-census.json) is exactly this: `skipped_this_run: 0`
     # alongside `retention_engaged: true` on a perfectly healthy resume -- 0

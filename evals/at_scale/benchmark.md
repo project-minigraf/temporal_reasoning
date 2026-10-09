@@ -2231,7 +2231,7 @@ covers more than 30 positions in `build_linearization`'s full topological
 order — expected, not a bug in the probe or in git's `~N` syntax).
 
 **Result — clean, measured BEFORE `--fail-on-mismatch` was added to the
-nightly, per CLAUDE.md's rule against gating on a prediction:**
+nightly, per docs/design-notes.md's rule against gating on a prediction:**
 
 | Metric | Value |
 |---|---|
@@ -2285,7 +2285,7 @@ together for exactly this reason.
 **Why the probe's own `ok` is `repo_vs_graph`, not `collect_commit_census`'s
 `ok` — a controller ruling, verified against the numbers above, not merely
 followed.** Two earlier stated reasons for this were wrong; the mechanism is
-the one already measured in CLAUDE.md's #326 section (`walk_vs_graph` "is
+the one already measured in docs/design-notes.md's #326 section (`walk_vs_graph` "is
 nonzero on ANY resume that touches already-ingested territory, skip or no
 skip — measured 10 with the fast path against 9 without"). `commit_census`'s
 `ok` gates on `ident_collisions`, `walk_vs_graph` (always) and `repo_vs_walk`
@@ -2337,7 +2337,7 @@ run. That is enough to catch a REGRESSION in the retention predicate itself
 `retention_engaged` above additionally confirms this baseline actually
 exercises — but it can NEVER observe a newly landed commit arriving INSIDE an
 already-retained interval's bounds, the exact scenario the interval's
-`:pos-count` checksum was written to catch (see CLAUDE.md's "A region is
+`:pos-count` checksum was written to catch (see docs/design-notes.md's "A region is
 stored as two HASHES but consumed as a closed POSITION RANGE" section). The
 ident-collision census immediately above this one in the nightly deliberately
 carries no `--since`
@@ -2424,7 +2424,7 @@ Call-site attribution (`probe_sweep_retract_attribution.py`,
 `results/369-retract-attribution.json`, full history at `daf1b8d`): 232,182
 of Stage B's 239,866 retracts (545 s of 650 s write time) removed the reverse
 walk's retroactive `:modified-in` at a superseded guess where the entity was
-unchanged. #369 stops writing those edges (see CLAUDE.md).
+unchanged. #369 stops writing those edges (see docs/design-notes.md).
 
 Code A/B (`probe_code_ab.py`, `results/369-sweep-retract-ab.json`, master
 `daf1b8d` vs branch as two source trees,

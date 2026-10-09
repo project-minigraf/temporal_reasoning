@@ -5,7 +5,7 @@
 tree. This compares two builds of mcp_server (e.g. a `git worktree` of master
 against a branch): each arm runs THAT probe's own `arm` mode from its own
 tree, so it imports that tree's mcp_server, with PYTHONHASHSEED=0 and its own
-process group killed on exit (CLAUDE.md, #313). The verdict is the upgrade
+process group killed on exit (docs/design-notes.md, #313). The verdict is the upgrade
 probe's pure `verdict()` -- parity fingerprints across every run, each arm's
 spread beside every delta. Both trees must carry the upgrade probe. First used
 for #369 (`results/369-sweep-retract-ab.json`).
@@ -63,7 +63,7 @@ def main(argv=None):
     p.add_argument("--issue", type=int)
     args = p.parse_args(argv)
     if args.ref == "HEAD":
-        print("refusing a literal HEAD ref (CLAUDE.md, #330)", file=sys.stderr)
+        print("refusing a literal HEAD ref (docs/design-notes.md, #330)", file=sys.stderr)
         return 2
     repo = str(pathlib.Path(args.repo).resolve())
     trees = {a: str(pathlib.Path(t).expanduser().resolve())

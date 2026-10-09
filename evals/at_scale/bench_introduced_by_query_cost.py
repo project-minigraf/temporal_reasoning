@@ -27,7 +27,7 @@ timed query. Skipping this is a trap -- an uncheckpointed graph answers the
 point query and the whole-relation query differently once enough facts
 accumulate, which would silently invert the verdict.
 
-SINGLE-HANDLE INVARIANT: at most one live MiniGrafDb per process (CLAUDE.md).
+SINGLE-HANDLE INVARIANT: at most one live MiniGrafDb per process (docs/design-notes.md).
 `del db` before opening the next fixture.
 """
 

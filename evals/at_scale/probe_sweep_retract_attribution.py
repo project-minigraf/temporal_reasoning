@@ -52,7 +52,7 @@ transact from that site carrying the same triple within the same commit.
 
 PYTHONHASHSEED=0 is required (set-iteration order of emitted triples; see
 `probe_forward_apply_write_parity.py`). `run` sets it for its child and kills
-the child's whole process group on exit (CLAUDE.md, #313). The frame walk and
+the child's whole process group on exit (docs/design-notes.md, #313). The frame walk and
 tracker add overhead: absolute times are inflated uniformly per call, so read
 SHARES and per-call ratios, not wall clock.
 
@@ -324,7 +324,7 @@ def _arm(args: argparse.Namespace) -> int:
 
 def _run(args: argparse.Namespace) -> int:
     if args.ref == "HEAD":
-        print("refusing a literal HEAD ref (CLAUDE.md, #330)", file=sys.stderr)
+        print("refusing a literal HEAD ref (docs/design-notes.md, #330)", file=sys.stderr)
         return 2
     sha = subprocess.check_output(
         ["git", "-C", args.repo, "rev-parse", "--verify", f"{args.ref}^{{commit}}"],

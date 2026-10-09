@@ -9,7 +9,7 @@ detector by construction, so they are reported separately; but both read the
 same Counter, so the second costs nothing the first had not already paid.
 
 WHY DETECTION, WITH NO REPAIR. #244 proposed repairing this and was closed on
-the standing "rebuild, never migrate" decision (CLAUDE.md; docs/superpowers/
+the standing "rebuild, never migrate" decision (docs/design-notes.md; docs/superpowers/
 specs/2026-08-14-ident-rule-r3-and-format-version-design.md). The detection is
 worth having on its own terms, because the answer decides whether a graph must
 be thrown away and rebuilding is not free. Without it a user cannot tell a
@@ -174,7 +174,7 @@ def entities_without_introduced_by(
     [ident, ...]}`.
 
     `code_entities_scanned` IS THE POSITIVE CONTROL, IN THE ARTIFACT.
-    CLAUDE.md's standing requirement for a zero-tolerance gate is that its
+    docs/design-notes.md's standing requirement for a zero-tolerance gate is that its
     clean baseline is measured AND its positive control checked -- a check
     that matched no entities at all also reports 0, so the zero is only
     believable next to a denominator. Reporting it means every future run

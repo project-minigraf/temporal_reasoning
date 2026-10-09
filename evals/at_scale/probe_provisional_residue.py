@@ -6,7 +6,7 @@ handle live anywhere in the process -- querying in-process while the
 benchmark's handle lifecycle unwinds is the exact hazard class that produced
 #251/#253, and this probe exists to confirm that bug is gone.
 
-It only ever QUERIES, but it is not a read-only probe in the sense CLAUDE.md
+It only ever QUERIES, but it is not a read-only probe in the sense docs/design-notes.md
 uses for the `evals/at_scale/probe_*.py` convention: minigraf exposes no
 read-only open, so this takes the graph's file lock and replays/compacts the
 WAL like any other opener. Harmless for the disposable at-scale graph, and
@@ -191,7 +191,7 @@ def require_ingested_graph(db: Any, graph_path: str) -> None:
     catch, so reusing it would reinstate the bug. Requiring the stamp to be
     present AND equal to GRAPH_FORMAT_VERSION closes the fail-open and, for
     free, catches a graph built by a different code version -- which under
-    CLAUDE.md's no-migration rule is not a graph whose residue means anything
+    docs/design-notes.md's no-migration rule is not a graph whose residue means anything
     to this build either.
     """
     import mcp_server
