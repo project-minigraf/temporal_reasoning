@@ -282,7 +282,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # resolve_graph_path enforces the fresh-path rule -- it refuses the
         # graph, its .wal AND its fact index, because minigraf replays a
         # leftover .wal and re-ingesting into an existing graph repairs
-        # nothing (see CLAUDE.md and #235).
+        # nothing (see docs/design-notes.md and #235).
         with bench.resolve_graph_path(args.graph_path) as graph_path:
             metrics = asyncio.run(bench.run_ingestion_benchmark(
                 args.repo_path, args.branch, graph_path,

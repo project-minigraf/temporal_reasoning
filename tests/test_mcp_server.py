@@ -9326,7 +9326,7 @@ class TestFrontierLowRetentionCheck:
         master's tip INTO `side`, so GRAFTED's descendant chain is the
         merge's first parent, then fast-forward master onto it. GRAFTED
         then surfaces at position 1 -- strictly inside frontier-low's
-        [0, 4] -- which is CLAUDE.md's own description of the hazard read
+        [0, 4] -- which is docs/design-notes.md's own description of the hazard read
         literally ("branch off an old commit, merge the mainline in,
         fast-forward the mainline")."""
         base = self._git(repo, "rev-list", "--max-parents=0", "HEAD")

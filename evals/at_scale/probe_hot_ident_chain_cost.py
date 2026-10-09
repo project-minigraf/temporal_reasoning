@@ -71,7 +71,7 @@ FIDELITY NOTES.
  * The three updates are called through their production functions, not
    reimplemented, so the query-before-write and retract-only-if-changed
    behaviour is whatever mcp_server actually does.
- * SINGLE-HANDLE INVARIANT (CLAUDE.md): at most one live MiniGrafDb per
+ * SINGLE-HANDLE INVARIANT (docs/design-notes.md): at most one live MiniGrafDb per
    process. Every fixture drops its handle before the next one opens.
 
 Run with .venv/bin/python -- bare python on this machine carries minigraf 1.1.1

@@ -110,7 +110,7 @@ class TestAnIncompleteRunIsNotFailedForWalkingFewer:
 
 
 class TestTheDenominatorIsThePositiveControl:
-    """CLAUDE.md's standing requirement: a zero-tolerance gate reports the
+    """docs/design-notes.md's standing requirement: a zero-tolerance gate reports the
     denominator that makes its zero believable. Three counts that are all
     zero also match, and a census that proved nothing must not read as a
     census that proved something."""

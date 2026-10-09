@@ -400,7 +400,7 @@ class TestAppendIngestionReport:
     def test_a_clean_run_reports_zero_orphans_with_its_denominator(self, tmp_path):
         """0 is never rendered bare. A check that matched no code entities
         would also report 0 entities, so the denominator is the half that
-        makes the zero mean anything -- CLAUDE.md's standing requirement for
+        makes the zero mean anything -- docs/design-notes.md's standing requirement for
         a zero-tolerance gate, restated by every run instead of once."""
         metrics = {
             **self._clean_256_metrics(),

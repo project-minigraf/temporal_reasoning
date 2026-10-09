@@ -58,7 +58,7 @@ process changes nothing.
 
 Each arm runs in its own process group and the whole group is killed when it
 exits: `_run_ingestion`'s spawn-context pool leaves orphaned workers otherwise
-(CLAUDE.md, #313). Put `--workroot` on a real disk, never tmpfs -- graph I/O
+(docs/design-notes.md, #313). Put `--workroot` on a real disk, never tmpfs -- graph I/O
 is part of what is measured, and every arm must share one filesystem.
 
     .venv/bin/python evals/at_scale/probe_minigraf_upgrade_cost.py batch \\
@@ -506,7 +506,7 @@ def _batch(args: argparse.Namespace) -> int:
         print("need exactly two --python interpreters (A then B)", file=sys.stderr)
         return 2
     if args.ref == "HEAD":
-        print("refusing a literal HEAD ref (CLAUDE.md, #330)", file=sys.stderr)
+        print("refusing a literal HEAD ref (docs/design-notes.md, #330)", file=sys.stderr)
         return 2
     sha = subprocess.check_output(
         ["git", "-C", args.repo, "rev-parse", "--verify", f"{args.ref}^{{commit}}"],

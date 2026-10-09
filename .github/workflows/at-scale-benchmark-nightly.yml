@@ -214,7 +214,7 @@ jobs:
       # the slice out from under this step, silently, the next time it runs
       # -- even though nothing about trunk's own history changed. `git log
       # --topo-order --reverse` is what `build_linearization` (the code path
-      # this whole nightly measures) actually walks, per CLAUDE.md's #316/
+      # this whole nightly measures) actually walks, per docs/design-notes.md's #316/
       # #317 notes, so `--topo-order` here makes "the 300th commit" track the
       # same position ingestion would ever assign it, immune to a date-order
       # merge doing this. See evals/at_scale/benchmark.md for the measured
@@ -223,7 +223,7 @@ jobs:
       # --fail-on-mismatch is passed HERE, unlike the initial measurement that
       # chose this baseline (results/325-resume-census.json): repo_vs_graph
       # was confirmed 0 against a nonzero repo_commits before this flag was
-      # added, per CLAUDE.md's rule against gating on a prediction. A
+      # added, per docs/design-notes.md's rule against gating on a prediction. A
       # census_error fails the step regardless of the flag (see
       # probe_resume_census.py's main()).
       #

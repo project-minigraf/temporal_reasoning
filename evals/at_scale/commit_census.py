@@ -38,7 +38,7 @@ That is the case no in-process counter can see, because the counter and the
 walk share the bug.
 
 WHAT WAS MEASURED BEFORE THIS WAS GATED (see results/317-commit-census.json).
-CLAUDE.md's standing rule is that a zero-tolerance gate needs its clean
+docs/design-notes.md's standing rule is that a zero-tolerance gate needs its clean
 baseline measured AND its positive control checked, and this one had a
 specific extra hazard: the clean difference might not have been zero, and
 shipping it as if it were would have repeated the trap #316 had to avoid with
