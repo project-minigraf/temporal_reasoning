@@ -200,6 +200,8 @@ Extraction strategy is controlled by `MINIGRAF_EXTRACTION_STRATEGY` (env var):
   client's request timeout defaults to 30s, override via `MINIGRAF_LLM_TIMEOUT_SECONDS`.
 - `agent` — MCP sampling asks the connected agent to identify facts
 
+**Codex:** `install.py --harness codex` registers the MCP server and memory hooks in project `.codex/config.toml`. Restart in the trusted project, then review and trust the exact definitions through `/hooks`. Until trusted, hooks are skipped. The Stop adapter supports Codex `event_msg` and `response_item` transcript records; if no readable transcript is available, it leaves memory unchanged.
+
 **Without hooks** (OpenCode, OpenClaw, or unconfigured): call the tools explicitly at the start and end of each turn.
 
 ### memory_prepare_turn
@@ -1046,9 +1048,10 @@ minigraf_report_issue(issue_type="parse_error",
 | `hooks/claude-code.json` | Claude Code settings fragment (MCP server + auto-memory hooks) |
 | `hooks/prepare_hook.py` | UserPromptSubmit hook script for Claude Code |
 | `hooks/finalize_hook.py` | Stop hook script for Claude Code |
+| `hooks/codex_hook.py` | Codex prepare/finalize adapter; shares MCP settings and reads Codex transcripts |
 | `hooks/opencode.json` | OpenCode MCP config (degraded mode — no hook support yet) |
 | `hooks/openclaw.json` | OpenClaw MCP config (degraded mode — issue #28596) |
-| `hooks/codex.toml` | Codex CLI MCP config with hook wiring |
+| `hooks/codex.toml` | Codex MCP + UserPromptSubmit/Stop hook configuration template |
 | `hooks/hermes.yaml` | Hermes MCP config with commented hook stubs |
 | `skill.json` | Portable skill manifest — mirrors `plugin.json` and `pyproject.toml` |
 | `tools/*.json` | Portable copies of the ten tool schemas, generated from `mcp_server._TOOLS` |

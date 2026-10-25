@@ -1,3 +1,4 @@
+from pathlib import Path
 import json
 import os
 import subprocess
@@ -397,3 +398,86 @@ class TestHookTimeoutsAreSeconds:
         with open(os.path.join(install.REPO_DIR, "hooks", "claude-code.json")) as f:
             sample = json.load(f)
         assert self._timeouts(sample) == {"UserPromptSubmit": [30], "Stop": [60]}
+
+
+class TestCodexRegistration:
+    _patch_common = TestMainHarnessGating._patch_common
+    def test_main_registers_project_server_and_is_idempotent(self, monkeypatch, tmp_path):
+        try:
+            import tomllib
+        except ImportError:
+            from pip._vendor import tomli as tomllib
+        self._patch_common(monkeypatch)
+        config = tmp_path / '.codex' / 'config.toml'
+        config.parent.mkdir()
+        original = '# keep my settings\nmodel = "example"\n[mcp_servers.other]\ncommand = "other"\n'
+        config.write_text(original)
+        install.main(str(tmp_path), 'codex')
+        first = config.read_text()
+        assert first.startswith(original)
+        server = tomllib.loads(first)['mcp_servers']['temporal-reasoning']
+        assert server['command'] == install.VENV_PYTHON
+        assert server['args'] == [str(Path(install.REPO_DIR) / 'mcp_server.py')]
+        assert server['cwd'] == str(tmp_path)
+        assert server['env']['MINIGRAF_GRAPH_PATH'] == str(tmp_path / 'memory.graph')
+        install.main(str(tmp_path), 'codex')
+        assert config.read_text() == first
+
+    def test_invalid_config_is_not_overwritten_or_reported_success(self, monkeypatch, tmp_path, capsys):
+        self._patch_common(monkeypatch)
+        config = tmp_path / '.codex' / 'config.toml'
+        config.parent.mkdir()
+        config.write_text('broken = [')
+        with pytest.raises(SystemExit):
+            install.main(str(tmp_path), 'codex')
+        assert config.read_text() == 'broken = ['
+        assert 'Setup complete!' not in capsys.readouterr().out
+
+    def test_existing_server_settings_are_preserved(self, monkeypatch, tmp_path):
+        self._patch_common(monkeypatch)
+        config = tmp_path / '.codex' / 'config.toml'
+        config.parent.mkdir()
+        original = '[mcp_servers."temporal-reasoning"]\ncommand = "custom-python"\nenabled = false\n'
+        config.write_text(original)
+        install.main(str(tmp_path), 'codex')
+        assert config.read_text().startswith(original)
+
+    def test_template_has_codex_command_shape(self):
+        try:
+            import tomllib
+        except ImportError:
+            from pip._vendor import tomli as tomllib
+        template = Path(install.REPO_DIR, 'hooks', 'codex.toml').read_text()
+        parsed = tomllib.loads(template)
+        server = parsed['mcp_servers']['temporal-reasoning']
+        assert isinstance(server['command'], str)
+        assert isinstance(server['args'], list)
+        assert '.codex/config.toml' in template
+        assert set(parsed['hooks']) == {'UserPromptSubmit', 'Stop'}
+
+    def test_new_project_gets_config_without_claude_files(self, monkeypatch, tmp_path):
+        self._patch_common(monkeypatch)
+        install.main(str(tmp_path), 'codex')
+        assert (tmp_path / '.codex/config.toml').is_file()
+        assert not (tmp_path / '.claude').exists()
+        assert not (tmp_path / '.mcp.json').exists()
+
+    @pytest.mark.parametrize('text', [
+        'mcp_servers = {}\n',  # Inline tables cannot be extended with subtables.
+        '[mcp_servers."temporal-reasoning"]\ncommand = ["python", "server.py"]\n',
+    ])
+    def test_unsupported_existing_config_is_preserved(self, monkeypatch, tmp_path, text):
+        self._patch_common(monkeypatch)
+        config = tmp_path / '.codex/config.toml'
+        config.parent.mkdir()
+        config.write_text(text)
+        with pytest.raises(SystemExit):
+            install.main(str(tmp_path), 'codex')
+        assert config.read_text() == text
+
+    def test_failed_checks_do_not_register_server(self, monkeypatch, tmp_path):
+        self._patch_common(monkeypatch)
+        monkeypatch.setattr(install, 'check_mcp_package', lambda: False)
+        with pytest.raises(SystemExit):
+            install.main(str(tmp_path), 'codex')
+        assert not (tmp_path / '.codex').exists()

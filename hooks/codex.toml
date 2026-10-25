@@ -1,20 +1,29 @@
-# Temporal Reasoning — Codex CLI configuration
-# Merge into ~/.codex/config.toml or codex.toml in your project root.
+# Temporal Reasoning — Codex configuration
+# install.py --harness codex registers the MCP server and memory hooks automatically.
+# For manual setup, merge into project .codex/config.toml.
+# Project configuration is loaded only for trusted projects. Restart Codex after setup.
 # Replace PATH_TO_REPO and PATH_TO_PROJECT with absolute paths.
+# Use the virtualenv populated by install.py so server dependencies are available.
 
 [mcp_servers."temporal-reasoning"]
-command = ["python", "PATH_TO_REPO/mcp_server.py"]
+command = "PATH_TO_REPO/.venv/bin/python"
+args = ["PATH_TO_REPO/mcp_server.py"]
+cwd = "PATH_TO_PROJECT"
 
 [mcp_servers."temporal-reasoning".env]
 MINIGRAF_GRAPH_PATH = "PATH_TO_PROJECT/memory.graph"
-MINIGRAF_EXTRACTION_STRATEGY = "llm"
-MINIGRAF_LLM_MODEL = "gpt-4o-mini"
-OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
+MINIGRAF_EXTRACTION_STRATEGY = "heuristic"
 
-[hooks.pre_turn]
-command = ["python", "PATH_TO_REPO/hooks/prepare_hook.py"]
-timeout_ms = 5000
+# Review and trust these hooks through /hooks after restarting Codex.
+# The wrapper reads the MCP environment above so both hooks use the same graph.
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = '"PATH_TO_REPO/.venv/bin/python" "PATH_TO_REPO/hooks/codex_hook.py" prepare --config "PATH_TO_PROJECT/.codex/config.toml"'
+timeout = 30
 
-[hooks.post_turn]
-command = ["python", "PATH_TO_REPO/hooks/finalize_hook.py"]
-timeout_ms = 10000
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = '"PATH_TO_REPO/.venv/bin/python" "PATH_TO_REPO/hooks/codex_hook.py" finalize --config "PATH_TO_PROJECT/.codex/config.toml"'
+timeout = 60
