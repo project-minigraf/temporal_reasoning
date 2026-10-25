@@ -1,6 +1,6 @@
 # Temporal Reasoning — Codex configuration
-# install.py --harness codex registers the MCP server automatically.
-# For manual setup, merge into ~/.codex/config.toml or project .codex/config.toml.
+# install.py --harness codex registers the MCP server and memory hooks automatically.
+# For manual setup, merge into project .codex/config.toml.
 # Project configuration is loaded only for trusted projects. Restart Codex after setup.
 # Replace PATH_TO_REPO and PATH_TO_PROJECT with absolute paths.
 # Use the virtualenv populated by install.py so server dependencies are available.
@@ -14,5 +14,16 @@ cwd = "PATH_TO_PROJECT"
 MINIGRAF_GRAPH_PATH = "PATH_TO_PROJECT/memory.graph"
 MINIGRAF_EXTRACTION_STRATEGY = "heuristic"
 
-# No automatic hooks are installed. Call memory_prepare_turn at the start of
-# each turn and memory_finalize_turn at the end, as described in SKILL.md.
+# Review and trust these hooks through /hooks after restarting Codex.
+# The wrapper reads the MCP environment above so both hooks use the same graph.
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = '"PATH_TO_REPO/.venv/bin/python" "PATH_TO_REPO/hooks/codex_hook.py" prepare --config "PATH_TO_PROJECT/.codex/config.toml"'
+timeout = 30
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = '"PATH_TO_REPO/.venv/bin/python" "PATH_TO_REPO/hooks/codex_hook.py" finalize --config "PATH_TO_PROJECT/.codex/config.toml"'
+timeout = 60

@@ -44,7 +44,7 @@ There is no `minigraf` CLI on `PATH`, and no `minigraf.py` wrapper in this repo.
 python install.py --harness claude-code   # or: opencode, codex
 ```
 
-Run it from your project root. It creates a virtualenv, pip-installs the dependencies, syncs the skill into the harness's project-local skill directory, and — for `claude-code` — writes `.mcp.json` and `.claude/settings*.json`. For `codex`, it registers the server in project-local `.codex/config.toml` while preserving existing settings; restart Codex in the trusted project. Codex memory hooks remain explicit per-turn tool calls.
+Run it from your project root. It creates a virtualenv, pip-installs the dependencies, syncs the skill into the harness's project-local skill directory, and — for `claude-code` — writes `.mcp.json` and `.claude/settings*.json`. For `codex`, it registers the server in project-local `.codex/config.toml` while preserving existing settings; restart Codex in the trusted project. It also installs `UserPromptSubmit` and `Stop` memory hooks; review and trust them through `/hooks`.
 
 ## Usage
 

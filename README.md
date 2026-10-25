@@ -156,7 +156,7 @@ This syncs the skill into `.opencode/skills/temporal-reasoning`. OpenCode's MCP 
 python /path/to/temporal_reasoning/install.py --harness codex
 ```
 
-This syncs the skill into `.agents/skills/temporal-reasoning` — Codex CLI's documented project-local skill scope (it scans `.agents/skills` from the current working directory up to the repository root). The installer also registers the MCP server in the target project's `.codex/config.toml`, using the installer virtualenv and an absolute project graph path. Existing settings and server registrations are preserved. Trust the project and restart Codex to load the configuration. No automatic hooks are installed: call `memory_prepare_turn` and `memory_finalize_turn` explicitly per `SKILL.md`. For manual setup, see `hooks/codex.toml`.
+This syncs the skill into `.agents/skills/temporal-reasoning` — Codex CLI's documented project-local skill scope (it scans `.agents/skills` from the current working directory up to the repository root). The installer also registers the MCP server in the target project's `.codex/config.toml`, using the installer virtualenv and an absolute project graph path. Existing settings and server registrations are preserved. Trust the project and restart Codex to load the configuration. The installer adds `UserPromptSubmit` and `Stop` memory hooks. Open `/hooks` to review and trust their definitions; until trusted, Codex skips them. Both hooks read the MCP configuration so they use the same graph and extraction settings, even from subdirectories. Existing hook groups are preserved. If hooks are disabled or unavailable in your client, use explicit memory tool calls per `SKILL.md`. For manual setup, see `hooks/codex.toml`.
 
 ## Quick Start
 

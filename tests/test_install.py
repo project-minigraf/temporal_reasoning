@@ -440,7 +440,7 @@ class TestCodexRegistration:
         original = '[mcp_servers."temporal-reasoning"]\ncommand = "custom-python"\nenabled = false\n'
         config.write_text(original)
         install.main(str(tmp_path), 'codex')
-        assert config.read_text() == original
+        assert config.read_text().startswith(original)
 
     def test_template_has_codex_command_shape(self):
         try:
@@ -453,7 +453,7 @@ class TestCodexRegistration:
         assert isinstance(server['command'], str)
         assert isinstance(server['args'], list)
         assert '.codex/config.toml' in template
-        assert 'hooks' not in parsed
+        assert set(parsed['hooks']) == {'UserPromptSubmit', 'Stop'}
 
     def test_new_project_gets_config_without_claude_files(self, monkeypatch, tmp_path):
         self._patch_common(monkeypatch)
