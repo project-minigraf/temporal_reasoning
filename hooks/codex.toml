@@ -1,20 +1,18 @@
-# Temporal Reasoning — Codex CLI configuration
-# Merge into ~/.codex/config.toml or codex.toml in your project root.
+# Temporal Reasoning — Codex configuration
+# install.py --harness codex registers the MCP server automatically.
+# For manual setup, merge into ~/.codex/config.toml or project .codex/config.toml.
+# Project configuration is loaded only for trusted projects. Restart Codex after setup.
 # Replace PATH_TO_REPO and PATH_TO_PROJECT with absolute paths.
+# Use the virtualenv populated by install.py so server dependencies are available.
 
 [mcp_servers."temporal-reasoning"]
-command = ["python", "PATH_TO_REPO/mcp_server.py"]
+command = "PATH_TO_REPO/.venv/bin/python"
+args = ["PATH_TO_REPO/mcp_server.py"]
+cwd = "PATH_TO_PROJECT"
 
 [mcp_servers."temporal-reasoning".env]
 MINIGRAF_GRAPH_PATH = "PATH_TO_PROJECT/memory.graph"
-MINIGRAF_EXTRACTION_STRATEGY = "llm"
-MINIGRAF_LLM_MODEL = "gpt-4o-mini"
-OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
+MINIGRAF_EXTRACTION_STRATEGY = "heuristic"
 
-[hooks.pre_turn]
-command = ["python", "PATH_TO_REPO/hooks/prepare_hook.py"]
-timeout_ms = 5000
-
-[hooks.post_turn]
-command = ["python", "PATH_TO_REPO/hooks/finalize_hook.py"]
-timeout_ms = 10000
+# No automatic hooks are installed. Call memory_prepare_turn at the start of
+# each turn and memory_finalize_turn at the end, as described in SKILL.md.

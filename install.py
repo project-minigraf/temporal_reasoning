@@ -4,13 +4,13 @@ Installation script for temporal-reasoning skill.
 Installs minigraf and mcp Python packages, syncs skill files, provides next steps.
 
 --harness is required and selects exactly one target; only that harness's
-skill directory (and, for claude-code, Claude Code's config files) is
+skill directory and supported harness config files are
 created or updated. Supported values: claude-code, opencode, codex.
 
 Usage:
     python install.py --harness claude-code            # Full install for Claude Code
     python install.py --harness opencode                # Sync skill files for OpenCode
-    python install.py --harness codex                   # Sync skill files for Codex CLI
+    python install.py --harness codex                   # Install skill and project-local MCP server for Codex
     python install.py --harness claude-code --check      # Just check dependencies
     python install.py --harness claude-code --force      # Force reinstall even if recent
     python install.py --harness claude-code --target DIR # Install into a specific project directory
@@ -897,6 +897,74 @@ def register_plugin_with_claude() -> bool:
     return True
 
 
+def setup_codex_config(target_dir: str) -> bool:
+    """Register a project-scoped server without rewriting user settings.
+
+    Existing registrations (including enabled=false) belong to the user. Keep
+    them intact. Parse both input and output so inline tables or malformed TOML
+    cannot result in a corrupt configuration. Replace atomically on success.
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10; pip is installed by ensure_venv.
+        try:
+            from pip._vendor import tomli as tomllib
+        except ImportError:
+            print(f"✗ TOML parsing unavailable; rerun with {VENV_PYTHON} install.py --harness codex")
+            return False
+
+    target = Path(target_dir).resolve()
+    config = target / '.codex' / 'config.toml'
+    temporary = None
+    try:
+        original = config.read_text(encoding='utf-8') if config.exists() else ''
+        parsed = tomllib.loads(original)
+        servers = parsed.get('mcp_servers', {})
+        if not isinstance(servers, dict):
+            raise ValueError('mcp_servers must be a TOML table')
+        if 'temporal-reasoning' in servers:
+            server = servers['temporal-reasoning']
+            if not isinstance(server, dict) or not (
+                isinstance(server.get('command'), str) or isinstance(server.get('url'), str)
+            ):
+                raise ValueError('existing temporal-reasoning server needs a string command or url; see hooks/codex.toml')
+            print(f"✓ Preserved existing temporal-reasoning registration in {config}")
+            return True
+        # JSON string escaping is compatible with TOML basic strings for paths.
+        quote = lambda value: json.dumps(str(value), ensure_ascii=False)
+        block = (
+            '\n[mcp_servers."temporal-reasoning"]\n'
+            f'command = {quote(VENV_PYTHON)}\n'
+            f'args = [{quote(Path(REPO_DIR) / "mcp_server.py")}]\n'
+            f'cwd = {quote(target)}\n'
+            '\n[mcp_servers."temporal-reasoning".env]\n'
+            f'MINIGRAF_GRAPH_PATH = {quote(target / "memory.graph")}\n'
+            'MINIGRAF_EXTRACTION_STRATEGY = "heuristic"\n'
+        )
+        updated = original + '\n' + block
+        tomllib.loads(updated)
+        config.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=config.parent,
+                                         delete=False) as stream:
+            temporary = stream.name
+            stream.write(updated)
+        if config.exists():
+            os.chmod(temporary, config.stat().st_mode & 0o777)
+        os.replace(temporary, config)
+        temporary = None
+        print(f"✓ Registered temporal-reasoning in {config}")
+        return True
+    except (OSError, ValueError) as exc:
+        print(f"✗ Could not configure {config}: {exc}")
+        return False
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+
+
 def main(target_dir: str = "", harness: str = "claude-code", update_ok: bool = True) -> None:
     print("=" * 50)
     print("Temporal Reasoning Skill Setup")
@@ -929,6 +997,17 @@ def main(target_dir: str = "", harness: str = "claude-code", update_ok: bool = T
         print(f"Checking {name}...")
         results.append(check_func())
         print()
+
+    if harness == "codex":
+        ok = all(results) and update_ok
+        if ok:
+            ok = setup_codex_config(target_dir)
+        print("✓ Setup complete!" if ok else "✗ Setup incomplete — fix errors above")
+        if not ok:
+            sys.exit(1)
+        print("Restart Codex in the trusted target project to load its MCP configuration.")
+        print("Call memory_prepare_turn / memory_finalize_turn explicitly; no hooks were installed.")
+        return
 
     if harness != "claude-code":
         ok = all(results) and update_ok

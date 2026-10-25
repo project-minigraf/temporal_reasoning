@@ -1048,7 +1048,7 @@ minigraf_report_issue(issue_type="parse_error",
 | `hooks/finalize_hook.py` | Stop hook script for Claude Code |
 | `hooks/opencode.json` | OpenCode MCP config (degraded mode — no hook support yet) |
 | `hooks/openclaw.json` | OpenClaw MCP config (degraded mode — issue #28596) |
-| `hooks/codex.toml` | Codex CLI MCP config with hook wiring |
+| `hooks/codex.toml` | Codex MCP config template (explicit per-turn memory calls) |
 | `hooks/hermes.yaml` | Hermes MCP config with commented hook stubs |
 | `skill.json` | Portable skill manifest — mirrors `plugin.json` and `pyproject.toml` |
 | `tools/*.json` | Portable copies of the ten tool schemas, generated from `mcp_server._TOOLS` |
